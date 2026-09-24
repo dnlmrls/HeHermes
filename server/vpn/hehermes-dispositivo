@@ -1,0 +1,927 @@
+#!/usr/bin/env python3
+"""hehermes-dispositivo: altas y bajas de dispositivos en los túneles de HeHermes, WireGuard e IKEv2.
+
+Uso (siempre como root):
+  hehermes-dispositivo alta <nombre> [--pubkey <clave pública>] [--servidor <dirección>]
+  hehermes-dispositivo alta <nombre> --ikev2 [--servidor <dirección>]   # la VPN nativa de la app
+  hehermes-dispositivo lista
+  hehermes-dispositivo baja <nombre>
+  hehermes-dispositivo qr <nombre>          # solo una persona, con sudo y en un terminal
+  hehermes-dispositivo limpiar <nombre>     # borra del VPS el .conf con la clave privada
+  hehermes-dispositivo clave                # recarga en nginx (y en el vigía de avisos) la clave del api_server
+  hehermes-dispositivo clave --solo-vigia   # solo la copia del vigía, sin tocar nginx (el instalador de avisos)
+  hehermes-dispositivo estado
+  hehermes-dispositivo iniciar              # clave del servidor y wg0.conf (instalación)
+  hehermes-dispositivo iniciar --ikev2      # comprueba que strongSwan tiene lo que necesita el alta IKEv2
+
+El registro (`dispositivos.json`) es la única fuente de verdad de quién hay: `wg0.conf` se
+regenera desde él y se aplica en caliente con `wg syncconf`, sin cortar el túnel. Un
+dispositivo IKEv2 tiene además su propia conexión de strongSwan en
+`/etc/swanctl/conf.d/hehermes-<nombre>.conf`, que es donde vive su clave compartida.
+Si existe `/etc/hehermes/servidor.ini` (lo deja el instalador, `server/instalador`), de ahí salen la dirección del
+servidor, el .env de Hermes, la carpeta del registro y la de swanctl; sin él, los de una instalación a mano.
+La dirección del servidor no va escrita en el script: sale de `--servidor`, de servidor.ini, del registro (la de un
+alta IKEv2 anterior) o del `Endpoint` de un .conf de WireGuard ya dado; sin ninguna, el alta se para y la pide.
+El script nunca escribe una clave privada, una clave compartida ni la API_SERVER_KEY en
+la salida, salvo `qr`, que pinta la del dispositivo como QR y se niega a hacerlo si no
+lo lanza una persona con sudo desde un terminal.
+"""
+
+import base64
+import configparser
+import datetime
+import glob
+import ipaddress
+import json
+import os
+import pwd
+import re
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+DIR = "/etc/wireguard"
+DIR_HH = os.path.join(DIR, "hehermes")
+REGISTRO = os.path.join(DIR_HH, "dispositivos.json")
+CLAVE_SERVIDOR = os.path.join(DIR, "servidor.key")
+PUBLICA_SERVIDOR = os.path.join(DIR, "servidor.pub")
+WG_CONF = os.path.join(DIR, "wg0.conf")
+INTERFAZ = "wg0"
+RED = ipaddress.ip_network("10.77.0.0/24")
+IP_SERVIDOR = ipaddress.ip_address("10.77.0.1")
+PUERTO = 51820
+ENV_HERMES = "/root/.hermes/.env"
+BEARER_NGINX = "/etc/nginx/hehermes-bearer.conf"
+# El vigía de avisos (server/avisos) lee al api_server directo, con su propia copia de la clave: así no depende del
+# nginx del túnel. Solo si está instalado (existe su carpeta).
+DIR_VIGIA = "/etc/hehermes-avisos/vigia"
+CLAVE_VIGIA = os.path.join(DIR_VIGIA, "clave-hermes")
+USUARIO_VIGIA = "hh-vigia"
+SERVICIO_VIGIA = "hehermes-vigia"
+NOMBRE_VALIDO = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+CLAVE_VALIDA = re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$")
+
+# IKEv2 nativo (`server/vpn/README.md`, «VPN IKEv2 nativa»). Cada dispositivo es una conexión de swanctl en su propio
+# fichero: darlo de baja es quitar ese fichero, y los demás, empezando por el `hehermes-poc.conf` que se escribió a mano
+# para el iPhone de Daniel (`hh-iphone-poc`), ni se reescriben ni se leen más que para no pisarlos.
+DIR_SWANCTL = "/etc/swanctl/conf.d"
+SWANCTL_CONF = "/etc/swanctl/swanctl.conf"
+RED_IKEV2 = ipaddress.ip_network("10.77.1.0/24")
+# La .1 no se da (la tabla del README empieza la red en la .2) y la .2 es el pool de `hh-iphone-poc`. Las de los
+# ficheros de conf.d que no son nuestros se leen además de ahí (`ips_ajenas`), por si un día hay otro escrito a mano.
+IPS_RESERVADAS_IKEV2 = {"10.77.1.1", "10.77.1.2"}
+INTERFAZ_XFRM = "hh-ipsec"
+IF_ID_XFRM = "0x77"
+# Lo que pide la app (`ConfiguracionIKEv2.swift`): AES-256-GCM, PRF SHA2-384, grupo 20 y PFS, en IKE y en el Child.
+PROPUESTA_IKE = "aes256gcm16-prfsha384-ecp384"
+PROPUESTA_ESP = "aes256gcm16-ecp384"
+# 33 bytes aleatorios son 264 bits, y en base64 dan 44 caracteres justos: sin relleno, y sin nada fuera de
+# `A-Za-z0-9+/`, que ni swanctl ni el QR tienen que proteger.
+BYTES_PSK = 33
+# Lo mismo que `LecturaQRVPN.longitudMinimaDeClave`: por debajo, la app lo toma por un trozo de clave y lo rechaza.
+LONGITUD_MINIMA_PSK = 16
+# La primera línea de cada fichero que escribe el script. Es lo que distingue los suyos de los escritos a mano: los
+# que no la llevan no se sobrescriben ni se borran nunca.
+CABECERA_SWANCTL = "# Generado por hehermes-dispositivo. No editar a mano: usa el script.\n"
+# La de servidor.ini, si lo hay. No hay ninguna escrita aquí: cada servidor tiene la suya (`direccion_del_servidor`).
+SERVIDOR_POR_DEFECTO = None
+# Una dirección IP o un nombre de host: va tal cual en la URL del QR y en el `local.id` de swanctl.
+SERVIDOR_VALIDO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:-]{0,252}$")
+PUERTOS_IKE = (500, 4500)
+SERVIDOR_INI = "/etc/hehermes/servidor.ini"
+
+
+def aplicar_servidor_ini(ruta=SERVIDOR_INI):
+    """Lo que el instalador sabe de este servidor y el script no puede llevar escrito: su dirección (la del QR y el
+    `local.id`), dónde está el .env de Hermes, dónde va el registro y dónde tiene swanctl su configuración (en la
+    familia Red Hat, `/etc/strongswan/swanctl`). Sin el fichero, lo de una instalación a mano."""
+    global SERVIDOR_POR_DEFECTO, ENV_HERMES, DIR_HH, REGISTRO, DIR_SWANCTL, SWANCTL_CONF
+    if not os.path.exists(ruta):
+        return
+    ini = configparser.ConfigParser()
+    try:
+        ini.read(ruta)
+    except configparser.Error as error:
+        fallar("%s no se puede leer: %s" % (ruta, error))
+    direccion = ini.get("servidor", "direccion", fallback=None)
+    if direccion is not None:
+        if not SERVIDOR_VALIDO.match(direccion):
+            fallar("la direccion de %s no es una IP ni un nombre de host" % ruta)
+        SERVIDOR_POR_DEFECTO = direccion
+    ENV_HERMES = ini.get("hermes", "env", fallback=ENV_HERMES)
+    registro = ini.get("dispositivos", "registro", fallback=None)
+    if registro:
+        DIR_HH = registro
+        REGISTRO = os.path.join(DIR_HH, "dispositivos.json")
+    swanctl = ini.get("strongswan", "carpeta", fallback=None)
+    if swanctl:
+        if not swanctl.startswith("/"):
+            fallar("la carpeta de strongswan de %s no es una ruta absoluta" % ruta)
+        DIR_SWANCTL = os.path.join(swanctl, "conf.d")
+        SWANCTL_CONF = os.path.join(swanctl, "swanctl.conf")
+
+
+def servidor_del_registro():
+    """La dirección con la que se dio el último alta IKEv2 (`servidor`), mejor la de uno que siga activo."""
+    try:
+        dispositivos = leer_registro()["dispositivos"]
+    except (OSError, ValueError, KeyError):
+        return None
+    for d in sorted(dispositivos, key=lambda d: (not d.get("baja"), d.get("alta", "")), reverse=True):
+        if SERVIDOR_VALIDO.match(d.get("servidor") or ""):
+            return d["servidor"]
+    return None
+
+
+def servidor_de_wireguard():
+    """El `Endpoint` de un .conf de WireGuard que el script ya dio (los de los dispositivos, en la carpeta del
+    registro), sin su puerto: es la dirección con la que el iPhone llega a este servidor."""
+    for ruta in sorted(glob.glob(os.path.join(DIR_HH, "*.conf"))):
+        try:
+            texto = leer(ruta)
+        except OSError:
+            continue
+        m = re.search(r"^\s*Endpoint\s*=\s*(\S+)\s*$", texto, re.M)
+        if not m:
+            continue
+        host = m.group(1).rsplit(":", 1)[0].strip("[]")
+        if SERVIDOR_VALIDO.match(host):
+            return host
+    return None
+
+
+def direccion_del_servidor(dada=None):
+    """La dirección pública de este servidor, que va en el QR, en el `local.id` y en el `Endpoint` de WireGuard.
+
+    Por orden: la de `--servidor`, la de servidor.ini, la del registro y la de un .conf de WireGuard. Así un servidor
+    montado a mano, sin servidor.ini, sigue dando altas con lo que ya tiene; y si no tiene nada, se para y la pide en
+    vez de poner la de otro."""
+    for candidata in (dada, SERVIDOR_POR_DEFECTO, servidor_del_registro(), servidor_de_wireguard()):
+        if candidata:
+            if not SERVIDOR_VALIDO.match(candidata):
+                fallar("--servidor tiene que ser una dirección IP o un nombre de host")
+            return candidata
+    fallar("no sé la dirección pública de este servidor: no está %s ni hay ningún dispositivo que la tenga. "
+           "Dímela con --servidor <IP o nombre>" % SERVIDOR_INI)
+
+
+def endpoint(servidor):
+    """El `Endpoint` de WireGuard: la dirección con el puerto, y una IPv6 entre corchetes."""
+    return ("[%s]:%d" if ":" in servidor else "%s:%d") % (servidor, PUERTO)
+
+
+def leer_clave_del_env(texto):
+    """La API_SERVER_KEY de un .env, como lo escribe la gente: con `export`, comillas o un comentario detrás."""
+    clave = None
+    for linea in texto.splitlines():
+        m = re.match(r"^\s*(?:export\s+)?API_SERVER_KEY\s*=\s*(.*?)\s*$", linea)
+        if not m:
+            continue
+        valor = m.group(1)
+        if valor[:1] in ("'", '"') and valor.find(valor[0], 1) > 0:
+            valor = valor[1:valor.find(valor[0], 1)]
+        else:
+            valor = re.split(r"\s+#", valor, maxsplit=1)[0].strip()
+        clave = valor
+    return clave
+
+
+def fallar(mensaje):
+    print("error: " + mensaje, file=sys.stderr)
+    sys.exit(1)
+
+
+def ejecutar(*args, entrada=None):
+    r = subprocess.run(args, input=entrada, capture_output=True, text=True)
+    if r.returncode != 0:
+        fallar("%s falló: %s" % (args[0], r.stderr.strip()))
+    return r.stdout
+
+
+def ahora():
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def escribir_privado(ruta, contenido, uid=None, gid=None):
+    """Escribe con permisos 0600 de forma atómica, y del dueño que se diga (root si no)."""
+    carpeta = os.path.dirname(ruta)
+    fd, tmp = tempfile.mkstemp(dir=carpeta, prefix=".tmp-")
+    try:
+        os.fchmod(fd, 0o600)
+        if uid is not None:
+            # Antes del rename: el fichero nunca existe en su sitio con otro dueño.
+            os.fchown(fd, uid, gid)
+        with os.fdopen(fd, "w") as f:
+            f.write(contenido)
+        os.replace(tmp, ruta)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def leer_registro():
+    if not os.path.exists(REGISTRO):
+        return {"dispositivos": []}
+    with open(REGISTRO) as f:
+        return json.load(f)
+
+
+def guardar_registro(registro):
+    escribir_privado(REGISTRO, json.dumps(registro, indent=2, ensure_ascii=False) + "\n")
+
+
+def activos(registro):
+    return [d for d in registro["dispositivos"] if not d.get("baja")]
+
+
+def buscar(registro, nombre):
+    for d in activos(registro):
+        if d["nombre"] == nombre:
+            return d
+    return None
+
+
+def tipo(d):
+    """Los registros de antes de IKEv2 no llevan `tipo`: todos eran de WireGuard."""
+    return d.get("tipo", "wireguard")
+
+
+def siguiente_ip(registro):
+    usadas = {d["ip"] for d in registro["dispositivos"]}
+    for ip in RED.hosts():
+        if ip != IP_SERVIDOR and str(ip) not in usadas:
+            return str(ip)
+    fallar("no quedan direcciones libres en %s" % RED)
+
+
+def aplicar(registro):
+    """Regenera wg0.conf desde el registro y lo aplica sin cortar el túnel."""
+    with open(CLAVE_SERVIDOR) as f:
+        privada = f.read().strip()
+    partes = [
+        "# Generado por hehermes-dispositivo. No editar a mano: usa el script.\n"
+        "[Interface]\nAddress = %s/%d\nListenPort = %d\nPrivateKey = %s\n"
+        % (IP_SERVIDOR, RED.prefixlen, PUERTO, privada)
+    ]
+    for d in activos(registro):
+        if tipo(d) != "wireguard":
+            continue
+        partes.append("\n# %s\n[Peer]\nPublicKey = %s\nAllowedIPs = %s/32\n" % (d["nombre"], d["clavePublica"], d["ip"]))
+    escribir_privado(WG_CONF, "".join(partes))
+    if subprocess.run(["ip", "link", "show", INTERFAZ], capture_output=True).returncode == 0:
+        despojada = ejecutar("wg-quick", "strip", INTERFAZ)
+        fd, tmp = tempfile.mkstemp(dir=DIR, prefix=".tmp-strip-")
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(despojada)
+            ejecutar("wg", "syncconf", INTERFAZ, tmp)
+        finally:
+            os.unlink(tmp)
+
+
+def publica_servidor():
+    with open(PUBLICA_SERVIDOR) as f:
+        return f.read().strip()
+
+
+def fichero_hehermes(d, servidor):
+    """El fichero de alta para HeHermes. Nunca lleva secretos."""
+    return {
+        "v": 1,
+        "nombre": d["nombre"],
+        "wireguard": {
+            "direccion": d["ip"] + "/32",
+            "clavePublica": d["clavePublica"],
+            "servidor": {
+                "clavePublica": publica_servidor(),
+                "endpoint": endpoint(servidor),
+                "allowedIPs": ["%s/32" % IP_SERVIDOR],
+                "keepalive": 0,
+            },
+        },
+        "hermes": {"baseURL": "http://%s" % IP_SERVIDOR, "auth": "tunel"},
+    }
+
+
+def correr(*args, entrada=None):
+    """Como `ejecutar`, pero sin salir si falla: para lo que hay que deshacer o seguir haciendo aunque algo falle."""
+    return subprocess.run(args, input=entrada, capture_output=True, text=True)
+
+
+# MARK: IKEv2
+
+
+def ruta_swanctl(nombre):
+    return os.path.join(DIR_SWANCTL, "hehermes-%s.conf" % nombre)
+
+
+def conexion_ikev2(nombre):
+    """El nombre de la conexión, que es también el de su Child: `swanctl --terminate --ike` lo busca por él."""
+    return "hh-" + nombre
+
+
+def pool_ikev2(nombre):
+    return "hehermes-" + nombre
+
+
+def secreto_ikev2(nombre):
+    return "ike-hehermes-" + nombre
+
+
+def leer(ruta):
+    with open(ruta, errors="replace") as f:
+        return f.read()
+
+
+def es_nuestro(ruta):
+    try:
+        with open(ruta, errors="replace") as f:
+            return f.readline() == CABECERA_SWANCTL
+    except FileNotFoundError:
+        return False
+
+
+def ficheros_ajenos():
+    """Los `.conf` de conf.d que no escribió este script. Entre ellos, `hehermes-poc.conf`, el de `hh-iphone-poc`."""
+    return [ruta for ruta in sorted(glob.glob(os.path.join(DIR_SWANCTL, "*.conf"))) if not es_nuestro(ruta)]
+
+
+def rangos_de_addrs(texto):
+    """Lo que los `addrs = …` de un fichero de swanctl dan a los pools: direcciones sueltas, redes o `a-b`."""
+    rangos = []
+    for valor in re.findall(r"^\s*addrs\s*=\s*(.+?)\s*$", texto, re.M):
+        for trozo in valor.split(","):
+            trozo = trozo.strip().strip('"')
+            try:
+                if "-" in trozo:
+                    primera, ultima = (ipaddress.ip_address(x.strip()) for x in trozo.split("-", 1))
+                else:
+                    red = ipaddress.ip_network(trozo, strict=False)
+                    primera, ultima = red.network_address, red.broadcast_address
+            except ValueError:
+                continue
+            rangos.append((primera, ultima))
+    return rangos
+
+
+def ips_ajenas():
+    """Las direcciones de la red IKEv2 que ya reparte algún pool escrito a mano, para no dar dos veces la misma."""
+    rangos = [r for ruta in ficheros_ajenos() for r in rangos_de_addrs(leer(ruta))]
+    return {str(ip) for ip in RED_IKEV2
+            if any(primera.version == ip.version and primera <= ip <= ultima for primera, ultima in rangos)}
+
+
+def siguiente_ip_ikev2(registro):
+    """La primera de la red IKEv2 que no haya tenido nadie. Las de las bajas no se vuelven a dar, igual que en
+    WireGuard: así una dirección que sale en un registro de strongSwan o de nginx es siempre de un solo dispositivo."""
+    usadas = {d["ip"] for d in registro["dispositivos"]} | IPS_RESERVADAS_IKEV2 | ips_ajenas()
+    for ip in RED_IKEV2.hosts():
+        if str(ip) not in usadas:
+            return str(ip)
+    fallar("no quedan direcciones libres en %s" % RED_IKEV2)
+
+
+def choca_con_ajenos(nombre):
+    """El fichero escrito a mano que ya usa la identidad del dispositivo o alguno de los nombres que tendrían su
+    conexión, su pool o su secreto; `None` si ninguno. Un `alta iphone-poc` le quitaría la conexión al iPhone de
+    Daniel: dos conexiones con el mismo `remote.id` y strongSwan se queda con una sola."""
+    nombres = "|".join(re.escape(x) for x in (conexion_ikev2(nombre), pool_ikev2(nombre), secreto_ikev2(nombre)))
+    patrones = (re.compile(r"^\s*(%s)\s*\{" % nombres, re.M),
+                re.compile(r"^\s*id(-[\w-]+)?\s*=\s*\"?%s\"?\s*$" % re.escape(nombre), re.M))
+    for ruta in ficheros_ajenos():
+        texto = leer(ruta)
+        if any(patron.search(texto) for patron in patrones):
+            return ruta
+    return None
+
+
+def nueva_psk():
+    """264 bits del generador del sistema, en base64. Es lo mismo que `openssl rand -base64 33`, sin depender de él."""
+    return base64.b64encode(secrets.token_bytes(BYTES_PSK)).decode("ascii")
+
+
+def conf_swanctl(d, psk):
+    """La conexión de un dispositivo. Es la de `hh-iphone-poc` (tabla del README) con su identidad y su dirección.
+
+    - `pools` con una sola dirección, y no un `remote_ts` fijo: iOS pide siempre una dirección interna
+      (`INTERNAL_IP4_ADDRESS`) y, si la conexión no tiene pool, strongSwan no se la da y el iPhone no levanta el túnel.
+      Con el pool, el `remote_ts` por defecto (`dynamic`) ya es esa dirección y nada más, así que fijarlo no añade nada.
+    - `local.id` explícito, el mismo `servidor` que va en el QR como `rid`: sin él strongSwan manda su IP, y con un
+      `--servidor` que fuera un nombre de host el iPhone esperaría una identidad que el VPS no manda.
+    - `unique = replace`: si el mismo iPhone vuelve a conectar (se reinicia, cambia de red sin MOBIKE), la sesión nueva
+      sustituye a la vieja en vez de quedarse las dos con la misma dirección del pool.
+    - El secreto va ligado a la identidad del dispositivo: con otra identidad no se encuentra.
+    """
+    nombre = d["nombre"]
+    return (
+        CABECERA_SWANCTL
+        + "# Dispositivo «%s», alta %s. La clave de abajo es su única credencial: no la copies a ningún sitio.\n"
+        "connections {\n"
+        "    %s {\n"
+        "        version = 2\n"
+        "        proposals = %s\n"
+        "        encap = yes\n"
+        "        unique = replace\n"
+        "        send_certreq = no\n"
+        "        pools = %s\n"
+        "        local {\n"
+        "            auth = psk\n"
+        "            id = %s\n"
+        "        }\n"
+        "        remote {\n"
+        "            auth = psk\n"
+        "            id = %s\n"
+        "        }\n"
+        "        children {\n"
+        "            %s {\n"
+        "                local_ts = %s/32\n"
+        "                esp_proposals = %s\n"
+        "                if_id_in = %s\n"
+        "                if_id_out = %s\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+        "pools {\n"
+        "    %s {\n"
+        "        addrs = %s/32\n"
+        "    }\n"
+        "}\n"
+        "secrets {\n"
+        "    %s {\n"
+        "        id = %s\n"
+        "        secret = \"%s\"\n"
+        "    }\n"
+        "}\n"
+    ) % (nombre, d["alta"], d["conexion"], PROPUESTA_IKE, pool_ikev2(nombre), d["servidor"], nombre, d["conexion"],
+         IP_SERVIDOR, PROPUESTA_ESP, IF_ID_XFRM, IF_ID_XFRM, pool_ikev2(nombre), d["ip"], secreto_ikev2(nombre),
+         nombre, psk)
+
+
+def cargar_swanctl():
+    """`--load-all` carga lo que hay en conf.d y descarga lo que ya no está, sin tocar las sesiones de las conexiones
+    que siguen igual: los demás dispositivos no se enteran. `--noprompt`, para que nunca se quede esperando una
+    contraseña de clave privada."""
+    return correr("swanctl", "--load-all", "--noprompt")
+
+
+def conexiones_cargadas():
+    r = correr("swanctl", "--list-conns")
+    return set(re.findall(r"^([\w.-]+): IKEv", r.stdout, re.M)) if r.returncode == 0 else set()
+
+
+def sas_ikev2():
+    """El estado de cada IKE_SA por nombre de conexión (`ESTABLISHED`, `CONNECTING`…); `None` si no se puede mirar."""
+    if not shutil.which("swanctl"):
+        return None
+    r = correr("swanctl", "--list-sas")
+    if r.returncode != 0:
+        return None
+    return dict(re.findall(r"^([\w.-]+): #\d+, (\w+),", r.stdout, re.M))
+
+
+def puertos_udp_abiertos(texto):
+    """Los puertos UDP que deja entrar `ufw status`: `500/udp`, `500,4500/udp`, `4000:5000/udp` o `500` a secas."""
+    abiertos = set()
+    for linea in texto.splitlines():
+        if "ALLOW" not in linea or "DENY" in linea or "REJECT" in linea:
+            continue
+        destino = linea.split()[0]
+        puertos, _, protocolo = destino.partition("/")
+        if protocolo not in ("", "udp"):
+            continue
+        for trozo in puertos.split(","):
+            desde, _, hasta = trozo.partition(":")
+            if not desde.isdigit() or (hasta and not hasta.isdigit()):
+                continue
+            abiertos.update(range(int(desde), int(hasta or desde) + 1))
+    return abiertos
+
+
+def cortafuegos_conocido():
+    """Si hay un cortafuegos que el script sepa mirar: ufw, o firewalld (la familia Red Hat)."""
+    return bool(shutil.which("ufw") or shutil.which("firewall-cmd"))
+
+
+def faltas_de_firewalld():
+    """Con firewalld en marcha, que deje entrar UDP 500 y 4500 ahora (puerto a puerto o con el servicio ipsec).
+    Apagado no hay nada que abrir, como con ufw."""
+    if correr("firewall-cmd", "--state").returncode != 0:
+        return []
+    if correr("firewall-cmd", "--query-service=ipsec").returncode == 0:
+        return []
+    return ["firewalld no deja entrar UDP %d (sudo firewall-cmd --add-port=%d/udp, y lo mismo con --permanent)"
+            % (p, p) for p in PUERTOS_IKE if correr("firewall-cmd", "--query-port=%d/udp" % p).returncode != 0]
+
+
+def faltas_del_cortafuegos():
+    if not shutil.which("ufw"):
+        # Sin ufw ni firewalld no hay nada que mirar: no es una falta, pero `iniciar --ikev2` lo dice.
+        return faltas_de_firewalld() if shutil.which("firewall-cmd") else []
+    r = subprocess.run(["ufw", "status"], capture_output=True, text=True, env=dict(os.environ, LC_ALL="C"))
+    if r.returncode != 0:
+        return ["«ufw status» ha fallado: %s" % r.stderr.strip()]
+    if re.search(r"^Status: inactive", r.stdout, re.M):
+        return []
+    abiertos = puertos_udp_abiertos(r.stdout)
+    return ["el cortafuegos no deja entrar UDP %d (sudo ufw allow %d/udp)" % (p, p) for p in PUERTOS_IKE
+            if p not in abiertos]
+
+
+def faltas_ikev2():
+    """Lo que le falta al strongSwan del sistema para que un alta IKEv2 funcione. Solo mira: instalar es cosa del
+    instalador, que va aparte."""
+    faltas = []
+    if not shutil.which("swanctl"):
+        faltas.append("no está swanctl (paquetes strongswan-swanctl y charon-systemd)")
+    elif correr("swanctl", "--stats").returncode != 0:
+        faltas.append("swanctl no habla con charon: ¿está en marcha el servicio strongswan?")
+    if not os.path.isdir(DIR_SWANCTL):
+        faltas.append("no existe %s" % DIR_SWANCTL)
+    elif not os.path.exists(SWANCTL_CONF) or not re.search(r"^\s*include\s+conf\.d/\*\.conf", leer(SWANCTL_CONF),
+                                                          re.M):
+        faltas.append("%s no incluye conf.d/*.conf: swanctl no cargaría las conexiones de los dispositivos"
+                      % SWANCTL_CONF)
+    r = correr("ip", "-d", "link", "show", INTERFAZ_XFRM)
+    if r.returncode != 0:
+        faltas.append("no está la interfaz XFRM %s (if_id %s)" % (INTERFAZ_XFRM, IF_ID_XFRM))
+    elif not re.search(r"\bxfrm\b.*\bif_id %s\b" % IF_ID_XFRM, r.stdout):
+        faltas.append("%s existe, pero no es una interfaz XFRM con if_id %s" % (INTERFAZ_XFRM, IF_ID_XFRM))
+    return faltas + faltas_del_cortafuegos()
+
+
+def comprobar_ikev2():
+    faltas = faltas_ikev2()
+    if faltas:
+        fallar("strongSwan no está listo para IKEv2; falta:\n  - " + "\n  - ".join(faltas)
+               + "\nNo instalo nada: eso lo hace el instalador.")
+
+
+def comprobar_psk(psk):
+    """Lo que la app necesita de la clave para guardarla entera. Los mensajes nunca la llevan."""
+    if not psk:
+        fallar("la clave compartida está vacía: el QR saldría sin clave")
+    if len(psk) < LONGITUD_MINIMA_PSK or not all(" " <= c <= "~" for c in psk):
+        fallar("la clave no es texto imprimible de %d o más caracteres: rótala a una en base64 "
+               "(baja y alta de nuevo) antes de pintar el QR" % LONGITUD_MINIMA_PSK)
+    if psk != psk.strip():
+        # La app quita los espacios de los extremos de lo que lee: guardaría otra clave y el VPS la rechazaría.
+        fallar("la clave empieza o acaba en espacio y la app lo quitaría: rótala antes de pintar el QR")
+
+
+def leer_psk(ruta):
+    """El `secret` del fichero del dispositivo, entre comillas o en hexadecimal (`0x…`), como lo admite swanctl."""
+    bruto = None
+    for linea in leer(ruta).splitlines():
+        m = re.match(r"^\s*secret\s*=\s*(.*?)\s*$", linea)
+        if m:
+            bruto = m.group(1)
+            break
+    if bruto is None:
+        fallar("no hay ningún secret en %s" % ruta)
+    if bruto[:2] in ("0x", "0X"):
+        try:
+            return bytes.fromhex(bruto[2:]).decode("ascii")
+        except (ValueError, UnicodeDecodeError):
+            fallar("la clave de %s no es texto: rótala a una en base64 antes de pintar el QR" % ruta)
+    if len(bruto) >= 2 and bruto[0] == bruto[-1] == '"':
+        return bruto[1:-1]
+    return bruto
+
+
+def codificar_byte_a_byte(texto):
+    """Cada byte como `%XX`, sin excepciones: ni un `&` ni un `#` ni un `%` de la clave pueden partirla o cambiarla
+    por el camino (`server/vpn/README.md`, «El código QR del alta»)."""
+    return "".join("%%%02X" % byte for byte in texto.encode("utf-8"))
+
+
+def texto_qr_ikev2(servidor, nombre, psk):
+    """El texto del QR que lee `LecturaQRVPN` en la app. `rid` es el `local.id` que pone `conf_swanctl`."""
+    comprobar_psk(psk)
+    if not SERVIDOR_VALIDO.match(servidor) or not NOMBRE_VALIDO.match(nombre):
+        fallar("el servidor o el nombre del registro no son válidos")
+    return "hehermes-vpn:1?h=%s&rid=%s&lid=%s&k=%s" % (servidor, servidor, nombre, codificar_byte_a_byte(psk))
+
+
+def alta_ikev2(nombre, servidor):
+    comprobar_ikev2()
+    registro = leer_registro()
+    if buscar(registro, nombre):
+        fallar("ya hay un dispositivo activo con ese nombre; da de baja el anterior")
+    ruta = ruta_swanctl(nombre)
+    if os.path.exists(ruta) and not es_nuestro(ruta):
+        fallar("%s ya existe y no lo escribió este script: no lo toco. Elige otro nombre" % ruta)
+    ajeno = choca_con_ajenos(nombre)
+    if ajeno:
+        fallar("%s ya usa la identidad o la conexión de «%s»: elige otro nombre" % (ajeno, nombre))
+    d = {"nombre": nombre, "tipo": "ikev2", "ip": siguiente_ip_ikev2(registro), "servidor": servidor,
+         "conexion": conexion_ikev2(nombre), "alta": ahora()}
+    escribir_privado(ruta, conf_swanctl(d, nueva_psk()))
+    r = cargar_swanctl()
+    if r.returncode != 0 or d["conexion"] not in conexiones_cargadas():
+        # Se deshace: sin conexión cargada, un QR solo llevaría a «El servidor ha rechazado la clave».
+        os.unlink(ruta)
+        cargar_swanctl()
+        fallar("swanctl no ha cargado la conexión %s (%s); no se ha dado de alta nada"
+               % (d["conexion"], (r.stderr or r.stdout).strip() or "no aparece en --list-conns"))
+    registro["dispositivos"].append(d)
+    guardar_registro(registro)
+    print("Alta IKEv2 de «%s» con IP %s (conexión %s). La clave se ha quedado en el VPS, en %s."
+          % (nombre, d["ip"], d["conexion"], ruta))
+    print("Para instalarla en la app HeHermes Mensajes, desde tu terminal:  sudo hehermes-dispositivo qr %s" % nombre)
+
+
+def baja_ikev2(d):
+    ruta = ruta_swanctl(d["nombre"])
+    if os.path.exists(ruta) and es_nuestro(ruta):
+        os.unlink(ruta)
+    r = cargar_swanctl()
+    # Sin esto la sesión viva sigue: ni el rekey de IKE ni el del Child vuelven a mirar las credenciales.
+    t = correr("swanctl", "--terminate", "--ike", d["conexion"], "--force")
+    if r.returncode != 0:
+        fallar("el fichero ya no está, pero swanctl no ha recargado (%s): la conexión de «%s» puede seguir cargada. "
+               "Arréglalo y ejecuta swanctl --load-all --noprompt" % ((r.stderr or r.stdout).strip(), d["nombre"]))
+    if t.returncode != 0 and "no matching" not in (t.stdout + t.stderr).lower():
+        fallar("swanctl --terminate ha fallado (%s): corta la sesión a mano con "
+               "swanctl --terminate --ike %s --force" % ((t.stderr or t.stdout).strip(), d["conexion"]))
+
+
+# MARK: Órdenes
+
+
+def ruta_conf(nombre):
+    return os.path.join(DIR_HH, nombre + ".conf")
+
+
+def cmd_alta(args):
+    if not args:
+        fallar("falta el nombre")
+    nombre = args[0]
+    if not NOMBRE_VALIDO.match(nombre):
+        fallar("nombre no válido (minúsculas, números y guiones, hasta 31)")
+    uso = ("uso: alta <nombre> [--pubkey <clave pública>] [--servidor <dirección>] | "
+           "alta <nombre> --ikev2 [--servidor <dirección>]")
+    opciones, resto = {}, list(args[1:])
+    while resto:
+        opcion = resto.pop(0)
+        if opcion in opciones:
+            fallar(uso)
+        if opcion == "--ikev2":
+            opciones[opcion] = True
+        elif opcion in ("--pubkey", "--servidor") and resto:
+            opciones[opcion] = resto.pop(0)
+        else:
+            fallar(uso)
+    if "--ikev2" in opciones:
+        if "--pubkey" in opciones:
+            fallar(uso)
+        alta_ikev2(nombre, direccion_del_servidor(opciones.get("--servidor")))
+        return
+    pubkey = opciones.get("--pubkey")
+    if pubkey is not None and not CLAVE_VALIDA.match(pubkey):
+        fallar("la clave pública no tiene formato WireGuard")
+    # Antes de tocar el registro: sin dirección no hay Endpoint, y un alta a medias no serviría de nada.
+    servidor = direccion_del_servidor(opciones.get("--servidor"))
+    registro = leer_registro()
+    if buscar(registro, nombre):
+        fallar("ya hay un dispositivo activo con ese nombre; da de baja el anterior")
+    if pubkey and any(d.get("clavePublica") == pubkey for d in activos(registro)):
+        fallar("esa clave pública ya está dada de alta")
+    ip = siguiente_ip(registro)
+    privada = None
+    if pubkey is None:
+        privada = ejecutar("wg", "genkey").strip()
+        pubkey = ejecutar("wg", "pubkey", entrada=privada + "\n").strip()
+    d = {"nombre": nombre, "ip": ip, "clavePublica": pubkey, "alta": ahora(),
+         "origen": "servidor" if privada else "dispositivo"}
+    registro["dispositivos"].append(d)
+    guardar_registro(registro)
+    aplicar(registro)
+    if privada:
+        escribir_privado(ruta_conf(nombre), (
+            "[Interface]\nPrivateKey = %s\nAddress = %s/32\n\n"
+            "[Peer]\nPublicKey = %s\nEndpoint = %s\nAllowedIPs = %s/32\n"
+        ) % (privada, ip, publica_servidor(), endpoint(servidor), IP_SERVIDOR))
+        print("Alta de «%s» con IP %s. La clave privada se ha quedado en el VPS (%s)." % (nombre, ip, ruta_conf(nombre)))
+        print("Para importarla en la app WireGuard, desde tu terminal:  sudo hehermes-dispositivo qr %s" % nombre)
+        print("Cuando esté importada:  sudo hehermes-dispositivo limpiar %s" % nombre)
+    else:
+        print(json.dumps(fichero_hehermes(d, servidor), indent=2, ensure_ascii=False))
+
+
+def cmd_lista(_args):
+    registro = leer_registro()
+    handshakes = {}
+    if subprocess.run(["ip", "link", "show", INTERFAZ], capture_output=True).returncode == 0:
+        for linea in ejecutar("wg", "show", INTERFAZ, "latest-handshakes").splitlines():
+            clave, _, t = linea.partition("\t")
+            handshakes[clave] = int(t or 0)
+    if not registro["dispositivos"]:
+        print("Sin dispositivos.")
+        return
+    sas = sas_ikev2() if any(tipo(d) == "ikev2" for d in activos(registro)) else {}
+    for d in registro["dispositivos"]:
+        if d.get("baja"):
+            estado = "baja " + d["baja"]
+        elif tipo(d) == "ikev2":
+            if sas is None:
+                estado = "sin saber (swanctl no contesta)"
+            else:
+                sa = sas.get(d["conexion"])
+                estado = "SA viva" if sa == "ESTABLISHED" else ("SA " + sa.lower() if sa else "sin SA")
+        else:
+            t = handshakes.get(d["clavePublica"], 0)
+            estado = ("último contacto " + datetime.datetime.fromtimestamp(t, datetime.timezone.utc).isoformat()) if t else "sin contacto"
+        pendiente = "  (.conf con clave privada aún en el VPS)" if os.path.exists(ruta_conf(d["nombre"])) else ""
+        print("%-20s %-9s %-12s alta %s  %s%s" % (d["nombre"], tipo(d), d["ip"], d["alta"], estado, pendiente))
+
+
+def cmd_baja(args):
+    if len(args) != 1:
+        fallar("uso: baja <nombre>")
+    registro = leer_registro()
+    d = buscar(registro, args[0])
+    if not d:
+        fallar("no hay ningún dispositivo activo con ese nombre")
+    d["baja"] = ahora()
+    guardar_registro(registro)
+    if tipo(d) == "ikev2":
+        baja_ikev2(d)
+    else:
+        aplicar(registro)
+    if os.path.exists(ruta_conf(d["nombre"])):
+        os.unlink(ruta_conf(d["nombre"]))
+    print("Baja de «%s» (%s). Ya no puede conectarse." % (d["nombre"], d["ip"]))
+
+
+def cmd_qr(args):
+    if len(args) != 1:
+        fallar("uso: qr <nombre>")
+    if not os.environ.get("SUDO_USER") or not sys.stdout.isatty():
+        fallar("qr solo se ejecuta con sudo desde un terminal interactivo: el QR contiene la clave del dispositivo")
+    d = buscar(leer_registro(), args[0])
+    if d and tipo(d) == "ikev2":
+        ruta = ruta_swanctl(d["nombre"])
+        if not os.path.exists(ruta):
+            fallar("no está %s: sin él el dispositivo no puede conectar. Dalo de baja y de alta otra vez" % ruta)
+        texto = texto_qr_ikev2(d["servidor"], d["nombre"], leer_psk(ruta))
+        # Por la entrada de qrencode y no como argumento: lo que va en la línea de órdenes lo ve cualquiera con `ps`.
+        sys.stdout.write(ejecutar("qrencode", "-t", "ansiutf8", entrada=texto))
+        print("Escanéalo desde la app HeHermes Mensajes. Lleva la clave de «%s»: ni lo compartas ni le hagas captura."
+              % d["nombre"])
+        return
+    ruta = ruta_conf(args[0])
+    if not os.path.exists(ruta):
+        fallar("no hay .conf pendiente para ese dispositivo (¿se dio de alta con --pubkey o ya se limpió?)")
+    with open(ruta) as f:
+        contenido = f.read()
+    sys.stdout.write(ejecutar("qrencode", "-t", "ansiutf8", entrada=contenido))
+    print("Escanéalo con la app WireGuard (+ → Crear desde código QR). Después: sudo hehermes-dispositivo limpiar %s" % args[0])
+
+
+def cmd_limpiar(args):
+    if len(args) != 1:
+        fallar("uso: limpiar <nombre>")
+    d = buscar(leer_registro(), args[0])
+    if d and tipo(d) == "ikev2":
+        print("«%s» es IKEv2: no hay nada pendiente que borrar. Su clave está en %s y ahí se queda, que el "
+              "servidor la necesita." % (d["nombre"], ruta_swanctl(d["nombre"])))
+        return
+    ruta = ruta_conf(args[0])
+    if os.path.exists(ruta):
+        os.unlink(ruta)
+        print("Borrado %s." % ruta)
+    else:
+        print("No había nada que borrar.")
+
+
+def cmd_clave(args):
+    # --solo-vigia es para el instalador de los avisos: la copia del vigía y nada más. Así una pasada del instalador en
+    # la que no cambia nada no recarga nginx (el instalador solo lo recarga cuando cambia lo suyo).
+    if args not in ([], ["--solo-vigia"]):
+        fallar("uso: hehermes-dispositivo clave [--solo-vigia]")
+    solo_vigia = bool(args)
+    with open(ENV_HERMES) as f:
+        clave = leer_clave_del_env(f.read())
+    if not clave:
+        fallar("no encuentro API_SERVER_KEY en " + ENV_HERMES)
+    if not re.match(r"^[\x21-\x7e]+$", clave) or '"' in clave or "\\" in clave:
+        fallar("la clave tiene caracteres que no sé escribir en nginx")
+    if not solo_vigia:
+        escribir_privado(BEARER_NGINX, 'proxy_set_header Authorization "Bearer %s";\n' % clave)
+        if subprocess.run(["systemctl", "is-active", "--quiet", "nginx"]).returncode == 0:
+            ejecutar("nginx", "-t")
+            ejecutar("systemctl", "reload", "nginx")
+        print("Clave del api_server copiada a %s (0600). nginx la usa desde ya." % BEARER_NGINX)
+    if copiar_clave_al_vigia(clave):
+        print("%s %s (0600, %s): el vigía de avisos la usa desde ya." % (
+            "Clave del api_server copiada a" if solo_vigia else "Y a", CLAVE_VIGIA, USUARIO_VIGIA))
+    elif solo_vigia:
+        fallar("no existe %s: el vigía de avisos no está instalado" % DIR_VIGIA)
+
+
+def copiar_clave_al_vigia(clave):
+    """La copia de la clave del vigía de avisos, si está instalado. Es el mismo camino que la de nginx a propósito:
+    cuando la clave cambia, `hehermes-dispositivo clave` lo arregla todo. El vigía la lee al arrancar, así que se
+    reinicia si está en marcha; si la copia ya estaba al día, ni se escribe ni se reinicia (el instalador la pide en
+    cada pasada). Nunca se imprime."""
+    if not os.path.isdir(DIR_VIGIA):
+        return False
+    try:
+        usuario = pwd.getpwnam(USUARIO_VIGIA)
+    except KeyError:
+        fallar("existe %s pero no el usuario %s: vuelve a ejecutar el instalador de los avisos" % (DIR_VIGIA,
+                                                                                                   USUARIO_VIGIA))
+    contenido = clave + "\n"
+    if copia_al_dia(CLAVE_VIGIA, contenido, usuario):
+        return True
+    escribir_privado(CLAVE_VIGIA, contenido, uid=usuario.pw_uid, gid=usuario.pw_gid)
+    if subprocess.run(["systemctl", "is-active", "--quiet", SERVICIO_VIGIA]).returncode == 0:
+        ejecutar("systemctl", "restart", SERVICIO_VIGIA)
+    return True
+
+
+def copia_al_dia(ruta, contenido, usuario):
+    """Si ya hay en `ruta` un fichero normal con ese contenido, de ese usuario y 0600. Sin seguir enlaces."""
+    try:
+        fd = os.open(ruta, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    with os.fdopen(fd, "rb") as f:
+        datos = os.fstat(f.fileno())
+        return (stat.S_ISREG(datos.st_mode) and stat.S_IMODE(datos.st_mode) == 0o600
+                and (datos.st_uid, datos.st_gid) == (usuario.pw_uid, usuario.pw_gid)
+                and f.read() == contenido.encode())
+
+
+def cmd_iniciar(args):
+    """Crea la clave del servidor si falta y escribe wg0.conf. Se puede repetir. Con `--ikev2`, solo comprueba."""
+    if args == ["--ikev2"]:
+        comprobar_ikev2()
+        if cortafuegos_conocido():
+            print("strongSwan tiene lo que hace falta: swanctl, %s (if_id %s) y UDP 500 y 4500 abiertos." % (
+                INTERFAZ_XFRM, IF_ID_XFRM))
+        else:
+            print("strongSwan tiene lo que hace falta: swanctl y %s (if_id %s). No hay ni ufw ni firewalld: no sé si "
+                  "entran UDP 500 y 4500, ábrelos en el cortafuegos que haya." % (INTERFAZ_XFRM, IF_ID_XFRM))
+        print("Ya se pueden dar altas:  sudo hehermes-dispositivo alta <nombre> --ikev2")
+        return
+    if args:
+        fallar("uso: iniciar [--ikev2]")
+    if not os.path.exists(CLAVE_SERVIDOR):
+        privada = ejecutar("wg", "genkey").strip()
+        escribir_privado(CLAVE_SERVIDOR, privada + "\n")
+        with open(PUBLICA_SERVIDOR, "w") as f:
+            f.write(ejecutar("wg", "pubkey", entrada=privada + "\n"))
+        os.chmod(PUBLICA_SERVIDOR, 0o644)
+        print("Clave del servidor creada. Pública: " + publica_servidor())
+    aplicar(leer_registro())
+    print("wg0.conf escrito. Para levantarlo: systemctl enable --now wg-quick@wg0")
+
+
+def cmd_estado(_args):
+    for servicio in ("wg-quick@wg0", "strongswan", "nginx", "hermes-gateway"):
+        r = subprocess.run(["systemctl", "is-active", servicio], capture_output=True, text=True)
+        print("%-16s %s" % (servicio, r.stdout.strip()))
+    r = subprocess.run(["curl", "-s", "-m", "5", "http://%s/health" % IP_SERVIDOR], capture_output=True, text=True)
+    print("%-16s %s" % ("api por túnel", r.stdout.strip() or "sin respuesta"))
+    vivos = activos(leer_registro())
+    ikev2 = [d for d in vivos if tipo(d) == "ikev2"]
+    print("%-16s %d activos (%d wireguard, %d ikev2)" % ("dispositivos", len(vivos), len(vivos) - len(ikev2),
+                                                         len(ikev2)))
+    sas = sas_ikev2()
+    if sas is None:
+        print("%-16s %s" % ("SA IKEv2", "sin saber (swanctl no contesta)"))
+    else:
+        conectados = [d["nombre"] for d in ikev2 if sas.get(d["conexion"]) == "ESTABLISHED"]
+        otras = sorted(n for n, e in sas.items() if e == "ESTABLISHED"
+                       and n not in {d["conexion"] for d in ikev2})
+        print("%-16s %d de %d vivas%s%s" % ("SA IKEv2", len(conectados), len(ikev2),
+                                            (": " + ", ".join(conectados)) if conectados else "",
+                                            ("; y fuera del registro: " + ", ".join(otras)) if otras else ""))
+
+
+COMANDOS = {"alta": cmd_alta, "lista": cmd_lista, "baja": cmd_baja, "qr": cmd_qr,
+            "limpiar": cmd_limpiar, "clave": cmd_clave, "estado": cmd_estado,
+            "iniciar": cmd_iniciar}
+
+
+def main():
+    if os.geteuid() != 0:
+        fallar("hay que ejecutarlo como root (sudo)")
+    if len(sys.argv) < 2 or sys.argv[1] not in COMANDOS:
+        print(__doc__.strip().split("\n\n")[1])
+        sys.exit(2)
+    os.umask(0o077)
+    aplicar_servidor_ini()
+    os.makedirs(DIR_HH, mode=0o700, exist_ok=True)
+    COMANDOS[sys.argv[1]](sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()

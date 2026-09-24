@@ -1,0 +1,15 @@
+# /etc/systemd/system/hehermes-vigia.socket
+# El puerto del vigía es de systemd, esté el vigía en marcha o no: con el servicio parado, reiniciándose o sin arrancar,
+# ningún otro proceso de la máquina puede escuchar en 127.0.0.1:8790 y quedarse con lo que le manda nginx (el secreto
+# del túnel y la clave de cada alta). El vigía atiende en este socket, que hereda al arrancar (LISTEN_FDS).
+[Unit]
+Description=HeHermes: el puerto del vigía de avisos
+
+[Socket]
+ListenStream=127.0.0.1:8790
+# El filtro del servicio no vale para los sockets que le pasa systemd: el de las conexiones que acepta es este.
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=sockets.target

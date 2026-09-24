@@ -1,0 +1,50 @@
+# HeHermes: el api_server de Hermes, solo dentro del túnel WireGuard.
+# Instalar en /etc/nginx/sites-available/hehermes-tunel y enlazar en sites-enabled.
+# Escucha únicamente en 10.77.0.1 (wg0); ufw solo deja entrar a este puerto por wg0.
+# nginx añade el Bearer del api_server (fichero 0600 que escribe
+# `hehermes-dispositivo clave`) y sustituye cualquier Authorization del cliente:
+# la credencial del iPhone es su clave WireGuard.
+#
+# OJO: es el sitio de una instalación a mano de antes del instalador, y su `location /` no niega nada. Los procesos
+# del propio servidor llegan a 10.77.0.1 desde 10.77.0.1, así que cualquier usuario de la máquina tiene la API de
+# Hermes con su clave (el agujero del túnel). El sitio que escribe el instalador lo cierra; aquí, al principio de la
+# `location /`:   deny 10.77.0.1;  allow 10.77.0.0/24;  allow 10.77.1.0/24;  deny all;
+server {
+    listen 10.77.0.1:80;
+    server_name _;
+
+    access_log /var/log/nginx/hehermes-tunel.access.log;
+    error_log  /var/log/nginx/hehermes-tunel.error.log;
+
+    # Fotos por /v1/runs (base64 dentro del JSON).
+    client_max_body_size 25m;
+
+    # Comprimir el JSON del historial, que es lo que pesa (medido el 2026-09-20: 3.896 B -> 977 B).
+    # Solo application/json: el SSE de /v1/runs/{id}/events es text/event-stream y se queda sin
+    # comprimir, para que la respuesta siga llegando token a token (comprobado con un run real).
+    # gzip_proxied any, porque aquí todo viene de proxy_pass y por defecto no se comprimiría.
+    gzip_types application/json;
+    gzip_proxied any;
+    gzip_min_length 1024;
+    gzip_comp_level 5;
+    gzip_vary on;
+
+    # El vigía de avisos (server/avisos): la location /avisos/, que no lleva el Bearer de Hermes. La pone el instalador
+    # de los avisos. Con comodín: mientras no esté instalado, no incluye nada y `nginx -t` sigue pasando, así que este
+    # fichero se puede copiar al VPS antes.
+    include /etc/nginx/hehermes-avisos/sitio/*.conf;
+
+    location / {
+        proxy_pass http://127.0.0.1:8642;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header X-Forwarded-For $remote_addr;
+        include /etc/nginx/hehermes-bearer.conf;
+
+        # SSE de /v1/runs/{id}/events: sin búfer y con conexiones largas.
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+    }
+}

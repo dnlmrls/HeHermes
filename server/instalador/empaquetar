@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""empaquetar: genera el paquete de una versión de hehermes-servidor, su suma SHA-256 y el comando que da la app.
+
+  server/instalador/empaquetar [--version X.Y.Z] [--salida <carpeta>] [--url-base https://…]
+                               [--iphone <nombre>] [--firmar <clave-privada.pem>]
+
+Deja en la carpeta de salida (por defecto `server/instalador/dist/`):
+  hehermes-servidor-<versión>.tar.gz          el paquete, reproducible: la misma versión da siempre la misma suma
+  hehermes-servidor-<versión>.tar.gz.sha256   su suma, en el formato de `sha256sum -c`
+  hehermes-servidor-<versión>.tar.gz.sig      con --firmar: la firma Ed25519 (openssl pkeyutl -rawin, OpenSSL 3)
+
+El paquete se descarga de `<URL base>/v<versión>/hehermes-servidor-<versión>.tar.gz`. La URL base es, por ahora, la de
+las Releases del repositorio público (`https://github.com/dnlmrls/HeHermes/releases/download`, una Release
+`v<versión>` con el .tar.gz y su .sha256 como assets); más adelante, un dominio de Daniel con el mismo esquema. Se
+cambia con --url-base o con HEHERMES_URL_BASE. Cada versión tiene su URL y no cambia nunca: una versión nueva es un
+paquete nuevo, con otra suma.
+"""
+
+import argparse
+import gzip
+import hashlib
+import io
+import os
+import re
+import subprocess
+import sys
+import tarfile
+
+AQUI = os.path.dirname(os.path.realpath(__file__))
+SERVER = os.path.dirname(AQUI)
+URL_BASE = "https://github.com/dnlmrls/HeHermes/releases/download"
+# Un instante fijo para todo lo del paquete: con la hora de verdad, cada vez saldría otra suma.
+INSTANTE = 1_788_220_800  # 2026-09-01T00:00:00Z
+EJECUTABLES = {"hehermes-servidor", "hehermes-dispositivo", "avisos/despliegue/instalar.sh"}
+
+
+def ficheros():
+    """(ruta dentro del paquete, ruta en el repositorio) de todo lo que lleva, en orden."""
+    lista = [("hehermes-servidor", os.path.join(AQUI, "hehermes-servidor")),
+             ("clave-publica.pem", os.path.join(AQUI, "clave-publica.pem")),
+             ("requirements-canje.txt", os.path.join(AQUI, "requirements-canje.txt")),
+             ("README.md", os.path.join(AQUI, "README.md")),
+             ("hehermes-dispositivo", os.path.join(SERVER, "vpn", "hehermes-dispositivo"))]
+    for nombre in sorted(os.listdir(os.path.join(AQUI, "hehermes_servidor"))):
+        if nombre.endswith(".py"):
+            lista.append(("hehermes_servidor/" + nombre, os.path.join(AQUI, "hehermes_servidor", nombre)))
+    avisos = os.path.join(SERVER, "avisos")
+    lista += [("avisos/README.md", os.path.join(avisos, "README.md")),
+              ("avisos/requirements.txt", os.path.join(avisos, "requirements.txt"))]
+    for nombre in sorted(os.listdir(os.path.join(avisos, "despliegue"))):
+        lista.append(("avisos/despliegue/" + nombre, os.path.join(avisos, "despliegue", nombre)))
+    codigo = os.path.join(avisos, "hehermes_avisos")
+    for carpeta, carpetas, nombres in os.walk(codigo):
+        carpetas[:] = sorted(c for c in carpetas if c != "__pycache__")
+        for nombre in sorted(nombres):
+            if nombre.endswith(".py"):
+                ruta = os.path.join(carpeta, nombre)
+                lista.append(("avisos/hehermes_avisos/" + os.path.relpath(ruta, codigo), ruta))
+    return sorted(lista)
+
+
+def _info(nombre, tipo, tamano=0, modo=0o644):
+    info = tarfile.TarInfo(nombre)
+    info.type, info.size, info.mode, info.mtime = tipo, tamano, modo, INSTANTE
+    info.uid = info.gid = 0
+    info.uname = info.gname = "root"
+    return info
+
+
+def construir(version, salida):
+    if not re.match(r"^\d+\.\d+\.\d+$", version):
+        raise ValueError("versión no válida: %s" % version)
+    raiz = "hehermes-servidor-%s" % version
+    tar_bytes = io.BytesIO()
+    with tarfile.open(fileobj=tar_bytes, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        carpetas = {raiz}
+        tar.addfile(_info(raiz, tarfile.DIRTYPE, modo=0o755))
+        for dentro, fuera in ficheros():
+            partes = dentro.split("/")
+            for i in range(1, len(partes)):
+                carpeta = raiz + "/" + "/".join(partes[:i])
+                if carpeta not in carpetas:
+                    carpetas.add(carpeta)
+                    tar.addfile(_info(carpeta, tarfile.DIRTYPE, modo=0o755))
+            with open(fuera, "rb") as f:
+                datos = f.read()
+            modo = 0o755 if dentro in EJECUTABLES else 0o644
+            tar.addfile(_info(raiz + "/" + dentro, tarfile.REGTYPE, len(datos), modo), io.BytesIO(datos))
+    comprimido = io.BytesIO()
+    # Sin nombre ni hora en la cabecera de gzip: también cambiarían la suma.
+    with gzip.GzipFile(filename="", mode="wb", fileobj=comprimido, mtime=0, compresslevel=9) as gz:
+        gz.write(tar_bytes.getvalue())
+    datos = comprimido.getvalue()
+    os.makedirs(salida, exist_ok=True)
+    nombre = raiz + ".tar.gz"
+    ruta = os.path.join(salida, nombre)
+    with open(ruta, "wb") as f:
+        f.write(datos)
+    suma = hashlib.sha256(datos).hexdigest()
+    with open(ruta + ".sha256", "w") as f:
+        f.write("%s  %s\n" % (suma, nombre))
+    return ruta, suma
+
+
+def url_base(dada):
+    base = (dada or os.environ.get("HEHERMES_URL_BASE") or URL_BASE).rstrip("/")
+    if not re.match(r"^https://[A-Za-z0-9.-]+(:\d+)?(/[A-Za-z0-9._~/-]*)?$", base):
+        raise ValueError("la URL base tiene que ser https:// y sin nada raro: %s" % base)
+    return base
+
+
+def url_del_paquete(base, version):
+    """Una por versión, y la misma en la app: `curl -O` guarda el fichero con el nombre del final de esta URL (no con
+    el de la redirección de GitHub), que es el que comprueba `sha256sum -c`."""
+    return "%s/v%s/hehermes-servidor-%s.tar.gz" % (base, version, version)
+
+
+def comando(base, version, suma, iphone):
+    """La línea que la app copia al portapapeles (spec, «Cómo se distribuye»)."""
+    fichero = "hehermes-servidor-%s.tar.gz" % version
+    return ('d=$(mktemp -d) && cd "$d" && curl -fsSLO %s && echo "%s  %s" | sha256sum -c - && tar -xzf %s'
+            ' && sudo ./hehermes-servidor-%s/hehermes-servidor instalar --iphone %s'
+            % (url_del_paquete(base, version), suma, fichero, fichero, version, iphone))
+
+
+def frase(base, version, suma, iphone, llave):
+    """La frase para pegarle a Hermes en el chat (spec, «La frase»), con el comando de --por-chat. La app escribe la
+    misma, con su llave; `tests/test_paquete.py` las ata a las dos con la spec."""
+    fichero = "hehermes-servidor-%s.tar.gz" % version
+    orden = ('d=$(mktemp -d) && cd "$d" && curl -fsSLO %s && echo "%s  %s" | sha256sum -c - && tar -xzf %s'
+             ' && sudo ./hehermes-servidor-%s/hehermes-servidor instalar --por-chat --activar-api --iphone %s --llave %s'
+             % (url_del_paquete(base, version), suma, fichero, fichero, version, iphone, llave))
+    return ("Hermes, quiero conectar la app HeHermes Mensajes de mi iPhone contigo. Ejecuta en tu servidor este comando "
+            "tal cual, sin cambiar nada (comprueba él solo lo que descarga):\n\n`%s`\n\nTarda unos minutos. Al acabar "
+            "imprime una línea que empieza por «hehermes-canje:». Contéstame solo con esa línea, exacta y en un bloque de "
+            "código. No lleva ninguna clave y caduca en diez minutos. Si el comando falla, no lo arregles por tu cuenta: "
+            "dime el error tal cual." % orden)
+
+
+def firmar(ruta, clave):
+    """Con OpenSSL 3 (el LibreSSL de macOS no sabe Ed25519). La clave no se copia a ningún sitio."""
+    subprocess.run(["openssl", "pkeyutl", "-sign", "-inkey", clave, "-rawin", "-in", ruta, "-out", ruta + ".sig"],
+                   check=True)
+    return ruta + ".sig"
+
+
+def main(argv):
+    sys.path.insert(0, AQUI)
+    from hehermes_servidor import VERSION
+    analizador = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    analizador.add_argument("--version", default=VERSION)
+    analizador.add_argument("--salida", default=os.path.join(AQUI, "dist"))
+    analizador.add_argument("--url-base")
+    analizador.add_argument("--iphone", default="mi-iphone")
+    analizador.add_argument("--firmar", metavar="CLAVE.pem")
+    op = analizador.parse_args(argv)
+    base = url_base(op.url_base)
+    ruta, suma = construir(op.version, op.salida)
+    print("Paquete: %s\nSHA-256: %s" % (ruta, suma))
+    if op.firmar:
+        print("Firma:   %s" % firmar(ruta, op.firmar))
+    print("URL:     %s" % url_del_paquete(base, op.version))
+    print("\nEl comando de la app:\n" + comando(base, op.version, suma, op.iphone))
+    print("\nLa frase por chat (la app pone su llave):\n" + frase(base, op.version, suma, op.iphone, "{llave}"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
