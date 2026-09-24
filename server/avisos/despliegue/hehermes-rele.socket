@@ -1,0 +1,15 @@
+# /etc/systemd/system/hehermes-rele.socket
+# El puerto del relé es de systemd, tenga el relé la clave de APNs o no: ningún otro proceso de la máquina puede
+# escuchar en 127.0.0.1:8791 y quedarse con lo que le manda el vigía (su credencial). El relé atiende en este socket,
+# que hereda al arrancar (LISTEN_FDS). Se habilita siempre: sin la clave, el relé arranca igual y contesta 503.
+[Unit]
+Description=HeHermes: el puerto del relé de avisos
+
+[Socket]
+ListenStream=127.0.0.1:8791
+# Solo le habla el vigía, desde esta máquina. (El filtro del servicio no vale para los sockets que le pasa systemd.)
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=sockets.target

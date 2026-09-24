@@ -1,0 +1,46 @@
+# Configuración del vigía de avisos de HeHermes.
+# Va en /etc/hehermes-avisos/vigia.ini (root:hh-vigia, 0640). Aquí no hay secretos: solo dónde están.
+# Tras cambiarla: sudo systemctl restart hehermes-vigia
+
+[vigia]
+# Donde escucha la API para la app. Solo en 127.0.0.1: la app llega por el nginx del túnel (location /avisos/).
+escucha = 127.0.0.1:8790
+# La memoria del vigía: dispositivos (con la clave de cada iPhone) y hasta dónde ha leído cada conversación.
+# systemd crea la carpeta con StateDirectory=, del usuario hh-vigia y 0700.
+base_de_datos = /var/lib/hehermes-vigia/vigia.db
+# Segundos entre dos lecturas de la bandeja de Hermes mientras pasa algo (una conversación cambia, una app está delante
+# o se acaba de ir, hay algo pendiente), y tras tres minutos de calma. Sin ningún iPhone dado de alta no se lee nada.
+intervalo = 5
+intervalo_en_calma = 25
+# Lo escrito en Hermes hace más de esto (segundos) no se avisa aunque el vigía no lo haya visto: tras un reinicio largo,
+# un aviso de hace una hora es ruido.
+antiguedad_maxima = 900
+# Filas que se leen de una conversación que ha cambiado (como la revisión de subagentes de la app).
+filas_por_lectura = 100
+# iPhone que se recuerdan como mucho; por encima, se olvida el que lleva más tiempo sin darse de alta.
+max_dispositivos = 20
+# Segundos que Apple guarda un aviso de aprobación o de prueba si el iPhone no está localizable. Pasado eso ya no sirve.
+caducidad_aprobacion = 120
+caducidad_prueba = 300
+registro = INFO
+# El secreto que pone nginx en cada petición de /avisos/ (cabecera X-HeHermes-Vigia): sin él, la API no atiende nada.
+# Fichero 0600 de hh-vigia; lo crea el instalador, a la vez que /etc/nginx/hehermes-avisos/secreto/vigia.conf, y no
+# lo pisa.
+secreto_tunel = /etc/hehermes-avisos/vigia/secreto-tunel
+
+[hermes]
+# Directo al api_server, no por el nginx del túnel: ese pone el Bearer a cualquier conexión local, y así el vigía no
+# depende de ello.
+base = http://127.0.0.1:8642
+# La API_SERVER_KEY, en un fichero 0600 de hh-vigia. La escribe `sudo hehermes-dispositivo clave`, igual que la de
+# nginx: si la clave cambia, esa orden lo arregla todo y reinicia el vigía.
+clave = /etc/hehermes-avisos/vigia/clave-hermes
+plazo = 15
+
+[rele]
+url = http://127.0.0.1:8791/v1/avisos
+# La credencial de este vigía ante el relé (fichero 0600 de hh-vigia). La crea el instalador.
+credencial = /etc/hehermes-avisos/vigia/credencial-rele
+# Menos que los 10 s que espera la app al pedir el aviso de prueba, que espera la respuesta de Apple, y más que lo
+# que puede tardar el relé con Apple ([rele] plazo_apns, 6 s).
+plazo = 8

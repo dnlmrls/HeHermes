@@ -1,0 +1,27 @@
+#!/usr/bin/python3 -IB
+"""hehermes-servidor: instala, comprueba, actualiza o desinstala lo de HeHermes Mensajes en este servidor.
+
+Uso (como root):
+  hehermes-servidor instalar [--plan] [--iphone <nombre>] [--direccion <IP o nombre>] [--avisos]
+                             [--hermes-home <carpeta>] [--reemplazar <fichero>]... [--si]
+  hehermes-servidor comprobar
+  hehermes-servidor actualizar --paquete <hehermes-servidor-X.tar.gz> --firma <hehermes-servidor-X.tar.gz.sig>
+  hehermes-servidor desinstalar [--si] [--quitar-paquetes]
+"""
+
+import os
+import sys
+
+# Con -I, Python no pone en sys.path ni la carpeta del script ni nada del entorno: se añade a mano, y solo esta, que es
+# la carpeta 0700 de mktemp o /opt/hehermes-servidor (de root).
+AQUI = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, AQUI)
+# Tampoco deja rastro: sin -B, un `--plan` como root escribiría __pycache__ en la carpeta del paquete.
+sys.dont_write_bytecode = True
+# Nada de lo que corre como root puede leer nada del directorio desde el que se lanzó.
+os.chdir("/")
+
+from hehermes_servidor import cli  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(cli.main(sys.argv[1:], __doc__, AQUI))

@@ -1,0 +1,4 @@
+# Lo que genera `empaquetar`: va como asset de la Release de su versión, nunca al repositorio.
+dist/
+__pycache__/
+*.pyc

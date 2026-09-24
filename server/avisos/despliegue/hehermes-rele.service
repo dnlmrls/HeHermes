@@ -1,0 +1,61 @@
+# /etc/systemd/system/hehermes-rele.service
+# El relé de avisos de HeHermes: el único con la clave .p8 de APNs. No guarda nada en disco. Sin la clave arranca
+# igual, con su puerto, y a los avisos contesta 503 hasta que se le reinicie con ella.
+[Unit]
+Description=HeHermes: relé de avisos (APNs)
+Documentation=file:///opt/hehermes-avisos/src/README.md
+Wants=network-online.target
+# El puerto es de hehermes-rele.socket, que se lo pasa al arrancar.
+Requires=hehermes-rele.socket
+After=network-online.target hehermes-rele.socket
+
+[Service]
+Type=simple
+User=hh-rele
+Group=hh-rele
+# -I: nada del entorno (PYTHON*) ni del directorio actual en el camino de los módulos; el paquete lo encuentra el .pth
+# del venv. -B: sin escribir bytecode, que el código es de solo lectura.
+ExecStart=/opt/hehermes-avisos/venv/bin/python -I -B -m hehermes_avisos.rele --config /etc/hehermes-avisos/rele.ini servir
+Restart=always
+RestartSec=5
+UMask=0077
+# Un volcado de memoria llevaría la clave .p8 de APNs.
+LimitCORE=0
+
+# Lo justo: lee su configuración y su clave, no escribe nada y solo habla por TCP (con el vigía y con Apple).
+# Sin IPAddressAllow a propósito: api.push.apple.com contesta desde rangos de Apple que cambian, y también por IPv6. Se
+# decide en el VPS, mirando qué resuelve allí; si se pone, que sea con esos rangos y localhost (el vigía):
+#   IPAddressDeny=any
+#   IPAddressAllow=localhost 17.0.0.0/8 <los de IPv6 que resuelva api.push.apple.com>
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+# Lo del vigía (las claves de los iPhone, su base de datos) y los secretos de nginx, la VPN y strongSwan no son asunto
+# del relé.
+InaccessiblePaths=-/etc/hehermes-avisos/vigia -/var/lib/hehermes-vigia -/etc/nginx -/etc/wireguard -/etc/swanctl
+# AF_NETLINK por getaddrinfo, que lo usa para resolver api.push.apple.com.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# Una llamada fuera del grupo falla con EPERM (y Python lo ve como un error normal) en vez de matar el proceso
+# con SIGSYS: un fallo que se lee en el registro, no un servicio que se cae sin decir por qué.
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
+Also=hehermes-rele.socket

@@ -1,0 +1,38 @@
+# Configuración del relé de avisos de HeHermes: el único que tiene la clave .p8 de APNs.
+# Va en /etc/hehermes-avisos/rele.ini (root:hh-rele, 0640). Aquí no hay secretos: solo dónde están.
+# Tras cambiarla: sudo systemctl restart hehermes-rele
+
+[rele]
+# Solo en 127.0.0.1 mientras viva en el mismo VPS que el vigía. Para mudarlo a su propia máquina: detrás de un proxy con
+# TLS, y el vigía con url = https://…/v1/avisos (ver el README).
+escucha = 127.0.0.1:8791
+# El bundle de la app (apns-topic) y el Team ID (iss del JWT).
+tema = com.danielmorales.HeHermesMensajes
+equipo = 8X7L8YHD9M
+# El Key ID de la clave de APNs (developer.apple.com › Keys). Sin él el relé no arranca.
+clave_id = CAMBIAME
+# La clave .p8 que da Apple, tal cual: fichero de hh-rele, 0600. La misma sirve para pruebas y producción.
+clave_p8 = /etc/hehermes-avisos/rele/AuthKey.p8
+# Las credenciales de los vigías, como huellas. Las escribe `python -m hehermes_avisos.rele credencial`.
+credenciales = /etc/hehermes-avisos/rele/credenciales.ini
+# Segundos que se reutiliza el JWT de APNs. Apple rechaza uno de más de una hora y castiga renovarlo más de una vez cada
+# veinte minutos: entre 1200 y 3599.
+renovar_jwt = 2700
+# Segundos que puede tardar un aviso en Apple, reintento incluido. Tiene que ser menos que lo que el vigía espera al
+# relé (su [rele] plazo, 8 s): si no, el vigía lo daría por perdido y lo repetiría aunque hubiera llegado.
+plazo_apns = 6
+registro = INFO
+# El texto de reserva que se acepta en aps.alert, como «título|cuerpo» (uno por línea, con sangría, si hay más). Nada
+# que no sea esto llega a Apple en claro.
+reserva = Hermes|Tienes una respuesta nueva
+
+[apns]
+sandbox = https://api.sandbox.push.apple.com
+production = https://api.push.apple.com
+
+[limites]
+# Avisos por minuto, con ráfagas de hasta ese mismo número.
+por_credencial = 60
+por_token = 10
+# Segundos que se recuerda un token que Apple dio por muerto, para no volver a preguntarle.
+recordar_bajas = 3600

@@ -1,0 +1,64 @@
+# /etc/systemd/system/hehermes-vigia.service
+# El vigía de avisos de HeHermes: lee a Hermes (sin tocarlo) y pide los avisos al relé.
+[Unit]
+Description=HeHermes: vigía de avisos
+Documentation=file:///opt/hehermes-avisos/src/README.md
+Wants=network-online.target
+# El puerto es de hehermes-vigia.socket, que se lo pasa al arrancar; y al relé se le habla por el suyo.
+Requires=hehermes-vigia.socket
+After=network-online.target nginx.service hehermes-vigia.socket hehermes-rele.socket
+
+[Service]
+Type=simple
+User=hh-vigia
+Group=hh-vigia
+# -I: nada del entorno (PYTHON*) ni del directorio actual en el camino de los módulos; el paquete lo encuentra el .pth
+# del venv. -B: sin escribir bytecode, que el código es de solo lectura.
+ExecStart=/opt/hehermes-avisos/venv/bin/python -I -B -m hehermes_avisos.vigia --config /etc/hehermes-avisos/vigia.ini servir
+Restart=always
+RestartSec=5
+
+# La base de datos lleva la clave de cada iPhone: /var/lib/hehermes-vigia, de hh-vigia y de nadie más.
+StateDirectory=hehermes-vigia
+StateDirectoryMode=0700
+UMask=0077
+# Un volcado de memoria llevaría las claves de los iPhone y la de Hermes.
+LimitCORE=0
+
+# Lo justo: lee su configuración y sus secretos, escribe solo su base de datos, y solo habla con su propia máquina
+# (Hermes en 127.0.0.1:8642, el relé en 127.0.0.1:8791, y nginx, que le llega desde 127.0.0.1). Si el relé se muda a
+# otra máquina, su dirección tiene que entrar en IPAddressAllow.
+IPAddressDeny=any
+IPAddressAllow=localhost
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+# Lo del relé (su .p8) y los secretos de nginx, la VPN y strongSwan no son asunto del vigía.
+InaccessiblePaths=-/etc/hehermes-avisos/rele -/etc/nginx -/etc/wireguard -/etc/swanctl
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# Una llamada fuera del grupo falla con EPERM (y Python lo ve como un error normal) en vez de matar el proceso
+# con SIGSYS: un fallo que se lee en el registro, no un servicio que se cae sin decir por qué.
+SystemCallErrorNumber=EPERM
+# Sin MemoryDenyWriteExecute: cffi (de cryptography) puede necesitar memoria ejecutable según la plataforma, y un
+# vigía que no arranca no avisa de nada.
+
+[Install]
+WantedBy=multi-user.target
+Also=hehermes-vigia.socket
