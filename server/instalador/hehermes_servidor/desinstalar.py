@@ -9,8 +9,15 @@ from . import manifiesto as m
 from . import piezas as p
 from .plan import registro_de_dispositivos
 
-UNIDADES_AVISOS = ("hehermes-vigia.socket", "hehermes-vigia.service", "hehermes-rele.socket", "hehermes-rele.service")
+# El lector de ficheros primero: su socket es de root y es lo único de los avisos que lee como root.
+UNIDADES_AVISOS = ("hehermes-leer-media.socket", "hehermes-vigia.socket", "hehermes-vigia.service",
+                   "hehermes-rele.socket", "hehermes-rele.service")
 CARPETAS_AVISOS = ("/opt/hehermes-avisos", "/etc/hehermes-avisos", "/etc/nginx/hehermes-avisos", "/var/lib/hehermes-vigia")
+# La plantilla del lector (se para con sus instancias, no se deshabilita: no tiene [Install]), su añadido si Hermes
+# vive fuera de /root/.hermes (el fichero y luego su carpeta, que solo se borra vacía) y el propio lector.
+FICHEROS_AVISOS = ("/etc/systemd/system/hehermes-leer-media@.service",
+                   "/etc/systemd/system/hehermes-leer-media@.service.d/hermes-home.conf",
+                   "/etc/systemd/system/hehermes-leer-media@.service.d", "/usr/local/libexec/hehermes-leer-media")
 NGINX = (p.SITIO_ENLACE, p.SITIO, p.SITIO_CONF_D, p.BEARER, p.DROP_IN_NGINX)
 
 
@@ -42,7 +49,8 @@ def resumen(sis, man) -> str:
     for ruta in man.quitados:
         lineas.append("  y vuelvo a poner " + ruta)
     if man.datos.get("avisos"):
-        lineas.append("  los avisos: " + ", ".join(UNIDADES_AVISOS + CARPETAS_AVISOS) + ", y los usuarios hh-vigia "
+        lineas.append("  los avisos: " + ", ".join(UNIDADES_AVISOS + CARPETAS_AVISOS + FICHEROS_AVISOS)
+                      + ", y los usuarios hh-vigia "
                       "y hh-rele")
     if man.paquetes:
         lineas.append("Los paquetes que instalé se quedan (%s); --quitar-paquetes los quita." % ", ".join(man.paquetes))
@@ -88,6 +96,9 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print) -> list:
         for unidad in UNIDADES_AVISOS:
             sis.ejecutar(["systemctl", "disable", "--now", unidad])
             sis.borrar("/etc/systemd/system/" + unidad)
+        sis.ejecutar(["systemctl", "stop", "hehermes-leer-media@*.service"])
+        for ruta in FICHEROS_AVISOS:
+            sis.borrar(ruta)
         for carpeta in CARPETAS_AVISOS:
             sis.borrar_arbol(carpeta)
         for usuario in ("hh-vigia", "hh-rele"):

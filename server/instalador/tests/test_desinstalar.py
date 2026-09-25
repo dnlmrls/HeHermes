@@ -126,6 +126,27 @@ class Desinstalar(Base):
         self.assertEqual(self.sis.foto(), antes)
         self.assertEqual([o for o in self.sis.ordenes if o[:2] != ["systemctl", "is-active"]], [])
 
+    def test_con_los_avisos_quita_tambien_el_lector_de_ficheros(self):
+        self.montar(self.servidor_con_todo())
+        self.instalar(avisos=True)
+        lector = "/usr/local/libexec/hehermes-leer-media"
+        unidades = ["/etc/systemd/system/hehermes-leer-media.socket", "/etc/systemd/system/hehermes-leer-media@.service",
+                    "/etc/systemd/system/hehermes-leer-media@.service.d/hermes-home.conf",
+                    "/etc/systemd/system/hehermes-leer-media@.service.d"]
+        # Como si Hermes viviera fuera de /root/.hermes: el añadido que deja instalar.sh.
+        self.sis.poner(unidades[2], "[Service]\n")
+        self.assertTrue(all(self.sis.existe(r) for r in [lector] + unidades))
+        texto = resumen(self.sis, Manifiesto.leer(self.sis))
+        self.assertIn("hehermes-leer-media.socket", texto)
+        self.assertIn(lector, texto)
+        self.desinstalar()
+        self.assertEqual([r for r in [lector] + unidades if self.sis.existe(r)], [])
+        self.assertNotIn("hehermes-leer-media.socket", self.falso.activos)
+        # El socket del lector, el primero: nada de root de los avisos se queda escuchando mientras se quita lo demás.
+        paradas = [o[-1] for o in self.sis.ordenes if o[:3] == ["systemctl", "disable", "--now"]]
+        self.assertEqual(paradas[0], "hehermes-leer-media.socket")
+        self.assertIn(["systemctl", "stop", "hehermes-leer-media@*.service"], self.sis.ordenes)
+
     def test_el_resumen_dice_lo_que_quita(self):
         self.montar(self.servidor_con_todo())
         self.instalar()

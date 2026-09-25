@@ -6,7 +6,9 @@ Documentation=file:///opt/hehermes-avisos/src/README.md
 Wants=network-online.target
 # El puerto es de hehermes-vigia.socket, que se lo pasa al arrancar; y al relé se le habla por el suyo.
 Requires=hehermes-vigia.socket
-After=network-online.target nginx.service hehermes-vigia.socket hehermes-rele.socket
+# El lector de los ficheros de Hermes (GET /avisos/v1/fichero). Sin él, el vigía funciona igual y esa ruta da 503.
+Wants=hehermes-leer-media.socket
+After=network-online.target nginx.service hehermes-vigia.socket hehermes-rele.socket hehermes-leer-media.socket
 
 [Service]
 Type=simple

@@ -1,0 +1,20 @@
+# /etc/systemd/system/hehermes-leer-media.socket
+# La puerta del lector de los ficheros que Hermes marca con MEDIA: (despliegue/hehermes-leer-media). Solo root y el
+# grupo hh-vigia pueden conectarse (0660), y el lector lo vuelve a mirar con SO_PEERCRED. Con Accept=yes, systemd
+# lanza un lector nuevo, de root y con su propia jaula (hehermes-leer-media@.service), por cada conexión: el vigía no
+# tiene nada de root, ni sudo, y conserva su NoNewPrivileges.
+[Unit]
+Description=HeHermes: el socket del lector de ficheros de Hermes
+
+[Socket]
+ListenStream=/run/hehermes-leer-media.sock
+SocketUser=root
+SocketGroup=hh-vigia
+SocketMode=0660
+Accept=yes
+# El vigía no pasa de dos a la vez; esto es el tope por si algo va mal, no el límite de la app.
+MaxConnections=4
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

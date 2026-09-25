@@ -505,7 +505,12 @@ class ServidorFalso:
     def _bash(self, args, entrada):
         # El instalador de los avisos.
         self.avisos_instalados = True
-        self.activos |= {"hehermes-vigia.socket", "hehermes-vigia", "hehermes-rele.socket", "hehermes-rele"}
+        self.activos |= {"hehermes-vigia.socket", "hehermes-vigia", "hehermes-rele.socket", "hehermes-rele",
+                         "hehermes-leer-media.socket"}
+        # Lo que deja fuera de sus carpetas: el lector de ficheros y sus dos unidades.
+        self.sis.poner("/usr/local/libexec/hehermes-leer-media", "#!/usr/bin/python3 -IS\n", modo=0o755)
+        for unidad in ("hehermes-leer-media.socket", "hehermes-leer-media@.service"):
+            self.sis.poner("/etc/systemd/system/" + unidad, "[Unit]\n")
         return Resultado(0, "Hecho.\n")
 
     def _python3(self, args, entrada):

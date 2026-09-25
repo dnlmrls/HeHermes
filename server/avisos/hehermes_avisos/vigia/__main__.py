@@ -20,11 +20,12 @@ import urllib.error
 import urllib.request
 
 from .. import VERSION, comun
-from ..comun import ErrorDeSecreto, ServidorHTTP, cola, configurar_registro, leer_secreto
+from ..comun import ErrorDeSecreto, ErrorHTTP, ServidorHTTP, cola, configurar_registro, leer_secreto
 from .almacen import Almacen
 from .api import AppVigia, ManejadorVigia
 from .configuracion import ConfigVigia
 from .envio import ClienteRele, Mensajero
+from .fichero import ClienteLector, Ficheros, Limites
 from .hermes import ClienteHermes, ErrorHermes
 from .vigilante import Vigilante
 
@@ -57,8 +58,10 @@ def servir(config: ConfigVigia) -> int:
     vigilante = Vigilante(almacen, hermes, mensajero, intervalo=config.intervalo,
                           intervalo_en_calma=config.intervalo_en_calma, antiguedad_maxima=config.antiguedad_maxima,
                           filas_por_lectura=config.filas_por_lectura, caducidad_aprobacion=config.caducidad_aprobacion)
+    ficheros = Ficheros(hermes, ClienteLector(config.ficheros_lector),
+                        Limites(config.ficheros_por_minuto, config.ficheros_simultaneos), casa=config.ficheros_casa)
     app = AppVigia(almacen, mensajero, secreto_tunel=secreto_tunel, caducidad_prueba=config.caducidad_prueba,
-                   al_moverse=vigilante.despertar)
+                   al_moverse=vigilante.despertar, ficheros=ficheros)
     servidor = ServidorHTTP(config.escucha, ManejadorVigia, app, heredado=heredado)
     _avisar_si_no_coincide(heredado, config.escucha)
     threading.Thread(target=servidor.serve_forever, name="api", daemon=True).start()
@@ -144,6 +147,7 @@ def comprobar(config: ConfigVigia) -> int:
                   f"y sin el secreto contesta {error.code}")
         except (urllib.error.URLError, OSError):
             pass
+    decir(*_comprobar_lector(config.ficheros_lector))
     base_rele = config.rele_url.rsplit("/v1/", 1)[0]
     try:
         with abridor.open(f"{base_rele}/v1/salud", timeout=config.rele_plazo) as respuesta:
@@ -166,6 +170,19 @@ def comprobar(config: ConfigVigia) -> int:
         except (urllib.error.URLError, OSError, ValueError) as error:
             decir(False, f"el relé no contesta a la credencial: {getattr(error, 'reason', error)}")
     return 1 if fallos else 0
+
+
+def _comprobar_lector(ruta_socket: str) -> tuple:
+    """El lector de los ficheros de Hermes, sin leer nada: pedir «/» tiene que dar «no es un fichero»."""
+    try:
+        conexion, _, _ = ClienteLector(ruta_socket, plazo=5).abrir("/")
+        conexion.close()
+    except ErrorHTTP as error:
+        if error.estado == 403:
+            return True, f"el lector de ficheros contesta en {ruta_socket}"
+        return False, f"el lector de ficheros en {ruta_socket}: {error.estado} {error.codigo} (¿está en marcha " \
+                      f"hehermes-leer-media.socket?)"
+    return False, f"el lector de ficheros en {ruta_socket} ha dado «/» por un fichero"
 
 
 def _sin_clave(error: urllib.error.HTTPError) -> bool:

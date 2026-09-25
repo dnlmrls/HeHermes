@@ -33,6 +33,12 @@ class ConfigVigia:
     rele_url: str = "http://127.0.0.1:8791/v1/avisos"
     rele_credencial: str = "/etc/hehermes-avisos/vigia/credencial-rele"
     rele_plazo: float = 8.0
+    # Los ficheros que Hermes marca con `MEDIA:`: el socket del lector de root (`hehermes-leer-media.socket`), la casa
+    # de Hermes (lo que vale `~`) y cuántas descargas se aceptan por minuto y a la vez.
+    ficheros_lector: str = "/run/hehermes-leer-media.sock"
+    ficheros_casa: str = "/root"
+    ficheros_por_minuto: int = 30
+    ficheros_simultaneos: int = 2
 
     @classmethod
     def leer(cls, ruta: str) -> ConfigVigia:
@@ -64,4 +70,8 @@ class ConfigVigia:
             rele_url=texto("rele", "url", base.rele_url),
             rele_credencial=texto("rele", "credencial", base.rele_credencial),
             rele_plazo=numero("rele", "plazo", base.rele_plazo),
+            ficheros_lector=texto("ficheros", "lector", base.ficheros_lector).strip(),
+            ficheros_casa=texto("ficheros", "casa", base.ficheros_casa).strip(),
+            ficheros_por_minuto=max(1, int(numero("ficheros", "por_minuto", base.ficheros_por_minuto))),
+            ficheros_simultaneos=max(1, int(numero("ficheros", "simultaneos", base.ficheros_simultaneos))),
         )

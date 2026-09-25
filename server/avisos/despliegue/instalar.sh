@@ -18,6 +18,15 @@
 #   /etc/nginx/hehermes-avisos/sitio/avisos.conf    la location /avisos/, que incluye el server {} del túnel
 #   /etc/nginx/hehermes-avisos/secreto/vigia.conf   el secreto que esa location le pone al vigía (root 0600)
 #   /etc/nginx/hehermes-avisos/sello                la huella de lo último que nginx cargó bien de los avisos
+#   /usr/local/libexec/hehermes-leer-media          el lector de los ficheros que Hermes marca con MEDIA: (root 0755)
+#   /etc/systemd/system/hehermes-leer-media.socket y hehermes-leer-media@.service   su socket (root:hh-vigia 0660) y
+#                                                   un lector de root, enjaulado, por cada conexión
+#
+#   sudo …/instalar.sh --desinstalar-lector         quita solo el lector (y con él, GET /avisos/v1/fichero da 503)
+#
+# El lector va por un socket de systemd y no por sudo: el vigía corre con NoNewPrivileges (sudo no podría subir) y
+# ProtectHome (no vería /root), y quitárselos sería abrir el proceso que atiende al túnel. Así el vigía no tiene nada
+# de root y el lector, su propia jaula (despliegue/hehermes-leer-media@.service).
 #
 # Los puertos del vigía y del relé (127.0.0.1:8790 y 8791) son de systemd, con activación por socket: nadie más puede
 # escuchar en ellos, esté o no en marcha el servicio. El relé se habilita siempre: sin la clave de APNs arranca igual,
@@ -49,6 +58,121 @@ SECRETO_NGINX="$NGINX_AVISOS/secreto/vigia.conf"
 SELLO="$NGINX_AVISOS/sello"
 DISPOSITIVO=/usr/local/sbin/hehermes-dispositivo
 VENV_PY="$PREFIJO/venv/bin/python"
+SYSTEMD=/etc/systemd/system
+LECTOR=/usr/local/libexec/hehermes-leer-media
+UNIDADES_LECTOR="hehermes-leer-media.socket hehermes-leer-media@.service"
+PROC=/proc
+
+# --- El lector de ficheros (funciones) ---------------------------------------------------------------------------------
+# Lo usan la instalación (en el paso de systemd) y --desinstalar-lector. Todo por las variables de arriba.
+LECTOR_CAMBIADO=0
+HERMES_DE_SERIE=/root/.hermes
+# Lo que se sabe que hay en la carpeta de Hermes, para taparlo también con la jaula si vive en otro sitio (lo mismo que
+# lleva la unidad para /root/.hermes). El lector prohíbe la carpeta entera, menos image_cache/ y audio_cache/.
+SECRETOS_HERMES=".env auth.json config.yaml state.db state.db-wal state.db-shm SOUL.md backups cron hooks engagements"
+ANADIDO_LECTOR="$SYSTEMD/hehermes-leer-media@.service.d/hermes-home.conf"
+
+hermes_del_gateway() {
+  # HERMES_HOME de hermes-gateway: el de su proceso en marcha (así cuenta también un EnvironmentFile=), y si no está
+  # en marcha, el Environment= de su unidad. Sin nada, el de serie.
+  local pid casa="" variable
+  pid="$(systemctl show -p MainPID --value hermes-gateway 2>/dev/null || true)"
+  if [[ "$pid" =~ ^[1-9][0-9]*$ && -r "$PROC/$pid/environ" ]]; then
+    # Cada variable hasta su NUL, con lo que lleve dentro (un salto de línea incluido: así lo ve la comprobación).
+    while IFS= read -r -d '' variable; do
+      if [[ "$variable" == HERMES_HOME=* ]]; then casa="${variable#HERMES_HOME=}"; break; fi
+    done < "$PROC/$pid/environ"
+  fi
+  if [[ -z "$casa" ]]; then
+    local entorno
+    entorno="$(systemctl show -p Environment --value hermes-gateway 2>/dev/null || true)"
+    casa="$(printf '%s\n' "$entorno" | tr ' ' '\n' | sed -n 's/^HERMES_HOME=//p' | head -1)"
+    # systemd pone entre comillas lo que lleva espacios: eso no se adivina, se dice.
+    [[ -n "$casa" || "$entorno" != *HERMES_HOME=* ]] \
+      || fallar "no entiendo el HERMES_HOME de la unidad de hermes-gateway (${entorno})"
+  fi
+  casa="${casa:-$HERMES_DE_SERIE}"
+  casa="${casa%/}"
+  # Va a una línea de systemd: solo lo que no puede romperla ni meterle otra opción.
+  [[ "$casa" =~ ^/[A-Za-z0-9._/-]+$ && "$casa" != *"/../"* && "$casa" != *"/.." ]] \
+    || fallar "HERMES_HOME de hermes-gateway («${casa}») no es una carpeta absoluta que el lector pueda usar"
+  echo "$casa"
+}
+
+instalar_lector() {
+  # El script, con un rename: systemd lanza uno por conexión, y ninguno puede encontrarse medio fichero escrito.
+  install -d -m 0755 -o root -g root "$(dirname "$LECTOR")"
+  if ! cmp -s "$AQUI/hehermes-leer-media" "$LECTOR"; then
+    install -m 0755 -o root -g root "$AQUI/hehermes-leer-media" "$LECTOR.nuevo"
+    mv -f "$LECTOR.nuevo" "$LECTOR"
+    echo "    lector puesto en $LECTOR"
+  fi
+  local unidad
+  for unidad in $UNIDADES_LECTOR; do
+    if ! cmp -s "$AQUI/$unidad" "$SYSTEMD/$unidad"; then
+      install -m 0644 -o root -g root "$AQUI/$unidad" "$SYSTEMD/$unidad"
+      LECTOR_CAMBIADO=1
+    fi
+  done
+  # Si Hermes no vive en /root/.hermes, un añadido a la unidad le dice al lector dónde (y tapa sus secretos allí).
+  local casa texto secreto tapadas=""
+  casa="$(hermes_del_gateway)"
+  if [[ "$casa" == "$HERMES_DE_SERIE" ]]; then
+    if [[ -e "$ANADIDO_LECTOR" ]]; then
+      rm -f "$ANADIDO_LECTOR"
+      rmdir "$(dirname "$ANADIDO_LECTOR")" 2>/dev/null || true
+      LECTOR_CAMBIADO=1
+    fi
+    return 0
+  fi
+  for secreto in $SECRETOS_HERMES; do tapadas="$tapadas -$casa/$secreto"; done
+  texto="# Lo escribe instalar.sh: el HERMES_HOME de hermes-gateway es $casa, no $HERMES_DE_SERIE.
+[Service]
+ExecStart=
+ExecStart=/usr/bin/python3 -I -S -B $LECTOR --hermes-home=$casa --conexion
+InaccessiblePaths=${tapadas# }"
+  if [[ ! -f "$ANADIDO_LECTOR" || "$(cat "$ANADIDO_LECTOR")" != "$texto" ]]; then
+    install -d -m 0755 -o root -g root "$(dirname "$ANADIDO_LECTOR")"
+    printf '%s\n' "$texto" > "$ANADIDO_LECTOR.nuevo"
+    chmod 0644 "$ANADIDO_LECTOR.nuevo"
+    mv -f "$ANADIDO_LECTOR.nuevo" "$ANADIDO_LECTOR"
+    LECTOR_CAMBIADO=1
+  fi
+  echo "    Hermes vive en $casa (del entorno de hermes-gateway): el lector prohíbe esa carpeta, menos sus caches"
+}
+
+arrancar_lector() {
+  # Solo el socket se habilita: el servicio es una plantilla, que lanza el socket por cada conexión. Si su unidad cambió,
+  # se reinicia (las descargas en marcha siguen: cada una es su propio proceso con su propia conexión).
+  systemctl enable --quiet hehermes-leer-media.socket
+  if [[ $LECTOR_CAMBIADO -eq 1 ]]; then
+    systemctl restart hehermes-leer-media.socket
+  else
+    systemctl start hehermes-leer-media.socket
+  fi
+}
+
+desinstalar_lector() {
+  paso "quitando el lector de ficheros"
+  systemctl disable --now --quiet hehermes-leer-media.socket 2>/dev/null || true
+  systemctl stop 'hehermes-leer-media@*.service' 2>/dev/null || true
+  local unidad
+  for unidad in $UNIDADES_LECTOR; do
+    rm -f "$SYSTEMD/$unidad"
+  done
+  rm -f "$ANADIDO_LECTOR" "$ANADIDO_LECTOR.nuevo"
+  rmdir "$(dirname "$ANADIDO_LECTOR")" 2>/dev/null || true
+  rm -f "$LECTOR" "$LECTOR.nuevo"
+  systemctl daemon-reload
+  echo "    quitado: GET /avisos/v1/fichero contesta 503 hasta que se vuelva a instalar"
+}
+# --- fin del lector ----------------------------------------------------------------------------------------------------
+
+if [[ $# -gt 0 ]]; then
+  [[ $# -eq 1 && "$1" == "--desinstalar-lector" ]] || fallar "uso: instalar.sh [--desinstalar-lector]"
+  desinstalar_lector
+  exit 0
+fi
 
 [[ -f "$ORIGEN/requirements.txt" && -d "$ORIGEN/hehermes_avisos" ]] || fallar "no encuentro el código junto a $AQUI"
 if ! grep -q -- "--solo-vigia" "$DISPOSITIVO" 2>/dev/null; then
@@ -62,6 +186,9 @@ paso "Python"
 command -v "$PY" >/dev/null || fallar "no hay $PY"
 "$PY" -I -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
   || fallar "hace falta Python 3.10 o más nuevo ($("$PY" -I --version 2>&1))"
+# El lector de ficheros corre con el Python del sistema, sin venv (no tiene dependencias).
+/usr/bin/python3 -I -S -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' \
+  || fallar "el lector de ficheros necesita /usr/bin/python3, 3.9 o más nuevo"
 if ! "$PY" -I -c 'import ensurepip, venv' 2>/dev/null; then
   # En Debian y Ubuntu, venv sin ensurepip viene aparte.
   paso "instalando python3-venv"
@@ -280,9 +407,11 @@ for unidad in hehermes-vigia hehermes-rele; do
   install -m 0644 -o root -g root "$AQUI/$unidad.socket" "/etc/systemd/system/$unidad.socket"
   install -m 0644 -o root -g root "$AQUI/$unidad.service" "/etc/systemd/system/$unidad.service"
 done
+instalar_lector
 systemctl daemon-reload
 systemd-analyze verify /etc/systemd/system/hehermes-vigia.socket /etc/systemd/system/hehermes-vigia.service \
   /etc/systemd/system/hehermes-rele.socket /etc/systemd/system/hehermes-rele.service \
+  "$SYSTEMD/hehermes-leer-media.socket" \
   || echo "    (systemd-analyze avisa de algo en las unidades: míralo arriba)"
 for unidad in hehermes-vigia hehermes-rele; do
   systemctl enable --quiet "$unidad.socket" "$unidad.service"
@@ -293,6 +422,9 @@ for unidad in hehermes-vigia hehermes-rele; do
     systemctl start "$unidad.socket"
   fi
 done
+# El socket del lector, antes que el vigía: el vigía no lo necesita para arrancar, pero así nunca contesta 503 a un
+# fichero por haber arrancado primero.
+arrancar_lector
 # Con los dos puertos ya de systemd, los servicios: con el código nuevo, y el relé con la clave si Daniel ya la ha
 # puesto (sin ella, arranca igual y contesta 503).
 for unidad in hehermes-vigia hehermes-rele; do
