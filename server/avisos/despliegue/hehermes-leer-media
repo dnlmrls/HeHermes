@@ -1,0 +1,358 @@
+#!/usr/bin/python3 -IS
+"""Lee como root un fichero que Hermes marcó con ``MEDIA:``, y nada más. Va en /usr/local/libexec/hehermes-leer-media.
+
+Hermes corre como root y deja sus ficheros donde quiere (``/root``, ``/tmp``…), donde el vigía (``hh-vigia``) no puede
+leer. Este lector es lo único que lee por él, y está hecho para que no sirva de nada más aunque el vigía estuviera
+comprometido y le pidiera cualquier cosa:
+
+- **Solo rutas absolutas y limpias** (sin NUL, sin saltos de línea, hasta 4096 bytes).
+- **Una lista de prohibidas** que se mira sobre la ruta pedida y sobre la resuelta (``realpath``), así que un enlace
+  que escapa a ``/etc/shadow`` se queda fuera. La carpeta de Hermes está prohibida entera, menos sus dos caches, y lo
+  pedido en una cache tiene que estar, resuelto, en esa misma cache. Es texto y no depende de que el fichero exista: la respuesta no dice
+  qué hay en una zona prohibida.
+- **Sin carreras.** Entre resolver la ruta y abrirla, otro proceso podría cambiar una carpeta del camino por un enlace.
+  Por eso no se abre la ruta de golpe: se baja desde ``/`` carpeta a carpeta con ``O_NOFOLLOW``, relativo a la carpeta
+  anterior (``dir_fd``). Un enlace que aparezca por el camino hace fallar la apertura, y lo que se abre está en una
+  ruta sin enlaces que es justo la que se dio por buena. El fichero se mira con ``lstat`` antes de abrirlo (un FIFO o
+  un dispositivo ni se abren), se abre con ``O_NOFOLLOW | O_NONBLOCK`` y se comprueba con ``fstat`` del descriptor
+  abierto: el mismo inodo, un fichero normal, **un solo enlace duro** (otro nombre del mismo inodo no se ve en la ruta)
+  y no más de 50 MB.
+- **Sin dependencias**, y nada del entorno: ``-IS`` en la primera línea, y ninguna variable cambia lo que hace.
+
+Dos maneras de lanzarlo:
+
+- ``hehermes-leer-media --conexion``: lo que ejecuta ``hehermes-leer-media@.service`` por cada conexión a
+  ``/run/hehermes-leer-media.sock`` (``Accept=yes``), con el socket en la entrada y la salida. Solo atiende a root o a
+  ``hh-vigia`` (``SO_PEERCRED``). Lee **una línea**, ``<ruta>\\n``, y contesta ``ok <tamaño>\\n`` y los bytes, o
+  ``<estado>\\n``.
+- ``hehermes-leer-media <ruta>``: para root a mano, y para las pruebas. Los bytes por la salida estándar y el estado,
+  si no es ``ok``, en la de errores.
+
+Delante de cualquiera de las dos puede ir ``--hermes-home=<carpeta>``, si Hermes no vive en ``/root/.hermes``: esa
+carpeta entera queda prohibida salvo ``image_cache/`` y ``audio_cache/``. La pone la unidad de systemd, nunca el vigía.
+
+En los dos, el código de salida dice qué pasó (``SALIDAS``). Nunca apunta el contenido ni la ruta.
+"""
+
+from __future__ import annotations
+
+import errno
+import os
+import pwd
+import socket
+import stat
+import struct
+import sys
+
+TOPE = 50 * 1024 * 1024
+MAX_RUTA = 4096
+TROZO = 64 * 1024
+USUARIO_VIGIA = "hh-vigia"
+
+SALIDAS = {
+    "ok": 0,
+    "invalida": 2,
+    "no_existe": 3,
+    "prohibida": 4,
+    "no_es_fichero": 5,
+    "demasiado_grande": 6,
+    "carrera": 7,
+    "error": 8,
+    "no_autorizado": 9,
+}
+
+# Lo que no sale aunque Hermes lo marque: la ruta misma y todo lo que hay debajo.
+PROHIBIDAS = (
+    "/proc", "/sys", "/dev", "/run",
+    "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-", "/etc/sudoers", "/etc/sudoers.d",
+    "/etc/ssh", "/etc/ssl/private", "/etc/letsencrypt",
+    "/etc/nginx", "/etc/swanctl", "/etc/strongswan", "/etc/wireguard",
+)
+# Lo que empieza así en una carpeta: /etc/hehermes, /etc/hehermes-avisos…, /var/lib/hehermes-vigia, /etc/ipsec.*
+EMPIEZAN = (("/etc", "hehermes"), ("/var/lib", "hehermes"), ("/etc", "ipsec."))
+# En cualquier sitio: las claves de SSH y GnuPG de cualquier casa, y cualquier .env (el de Hermes lleva su clave).
+CARPETAS_EN_CUALQUIER_SITIO = (".ssh", ".gnupg")
+# La carpeta de Hermes (HERMES_HOME), entera: .env, auth.json, config.yaml y sus copias, state.db, backups/, cron/,
+# hooks/, engagements/, SOUL.md, gateway.sock… Menos las dos donde deja lo que genera, que sí marca con MEDIA:. La de
+# otro sitio se pasa con --hermes-home (la pone el instalador en la unidad, si el entorno de hermes-gateway dice otra).
+HERMES_HOME = "/root/.hermes"
+CACHES_DE_HERMES = ("image_cache", "audio_cache")
+
+
+class Rechazo(Exception):
+    def __init__(self, estado: str):
+        super().__init__(estado)
+        self.estado = estado
+
+
+def canonica(ruta: str) -> str:
+    """La ruta sin ``.``, ``..`` ni barras de más, como texto (sin mirar el disco)."""
+    partes: list = []
+    for parte in ruta.split("/"):
+        if parte in ("", "."):
+            continue
+        if parte == "..":
+            if partes:
+                partes.pop()
+            continue
+        partes.append(parte)
+    return "/" + "/".join(partes)
+
+
+def casas_de_hermes(hermes: str) -> tuple:
+    """La carpeta de Hermes como se dio y como está en el disco: si es un enlace, lo que se resuelva cae en la otra."""
+    return tuple(dict.fromkeys((canonica(hermes), canonica(os.path.realpath(hermes)))))
+
+
+def cache_de(ruta: str, casas: tuple) -> str | None:
+    """En qué cache de Hermes está (``casa/image_cache/…``, estrictamente dentro), o ``None``."""
+    for casa in casas:
+        for cache in CACHES_DE_HERMES:
+            if ruta.startswith(casa.rstrip("/") + "/" + cache + "/"):
+                return casa.rstrip("/") + "/" + cache
+    return None
+
+
+def fuera_de_las_caches(ruta: str, casas: tuple) -> bool:
+    """Si está en la carpeta de Hermes y no en una de sus caches."""
+    ruta = canonica(ruta)
+    en_casa = any(ruta == casa or ruta.startswith(casa.rstrip("/") + "/") for casa in casas)
+    return en_casa and cache_de(ruta, casas) is None
+
+
+def es_prohibida(ruta: str, casas: tuple = (HERMES_HOME,)) -> bool:
+    ruta = canonica(ruta)
+    if fuera_de_las_caches(ruta, casas):
+        return True
+    for prohibida in PROHIBIDAS:
+        if ruta == prohibida or ruta.startswith(prohibida + "/"):
+            return True
+    for carpeta, principio in EMPIEZAN:
+        if ruta.startswith(carpeta + "/"):
+            primera = ruta[len(carpeta) + 1:].split("/", 1)[0]
+            if primera.startswith(principio):
+                return True
+    partes = ruta.split("/")[1:]
+    if any(parte in CARPETAS_EN_CUALQUIER_SITIO for parte in partes):
+        return True
+    nombre = partes[-1] if partes else ""
+    return nombre == ".env" or nombre.startswith(".env.")
+
+
+def validar(ruta: object) -> str:
+    if not isinstance(ruta, str) or not ruta.startswith("/") or len(ruta.encode("utf-8", "surrogatepass")) > MAX_RUTA:
+        raise Rechazo("invalida")
+    if any(ord(caracter) < 0x20 or ord(caracter) == 0x7F for caracter in ruta):
+        raise Rechazo("invalida")
+    return ruta
+
+
+def validar_casa(hermes: object) -> str:
+    """La carpeta de Hermes que viene de --hermes-home: absoluta, limpia y que no sea «/» (lo prohibiría todo menos
+    dos carpetas, pero una opción mal puesta tiene que decirse, no adivinarse)."""
+    hermes = validar(hermes)
+    if canonica(hermes) == "/":
+        raise Rechazo("invalida")
+    return hermes
+
+
+def _por_errno(error: OSError) -> Rechazo:
+    if error.errno in (errno.ENOENT, errno.ENOTDIR):
+        return Rechazo("no_existe")
+    if error.errno == errno.ELOOP:
+        # `realpath` ya resolvió todos los enlaces: si ahora hay uno, alguien ha cambiado el camino.
+        return Rechazo("carrera")
+    if error.errno in (errno.EACCES, errno.EPERM):
+        # Lo que la jaula de systemd tapa (InaccessiblePaths) llega aquí.
+        return Rechazo("prohibida")
+    return Rechazo("error")
+
+
+def _es_enlace(nombre: str, carpeta: int) -> bool:
+    try:
+        return stat.S_ISLNK(os.stat(nombre, dir_fd=carpeta, follow_symlinks=False).st_mode)
+    except OSError:
+        return False
+
+
+def abrir(ruta: str, *, prohibidas=es_prohibida, hermes: str = HERMES_HOME, tope: int = TOPE, _costura=None) -> tuple:
+    """El descriptor del fichero, abierto para leer, y su tamaño; o ``Rechazo``. ``_costura(momento)`` es para las
+    pruebas: se llama con ``"resuelta"`` (la ruta dada por buena, sin abrir nada) y ``"vista"`` (el fichero mirado con
+    ``lstat``, sin abrir), los dos momentos en los que otro proceso podría colarse."""
+    ruta = validar(ruta)
+    casas = casas_de_hermes(validar_casa(hermes))
+    pedida = canonica(ruta)
+    if prohibidas(pedida) or fuera_de_las_caches(pedida, casas):
+        raise Rechazo("prohibida")
+    real = os.path.realpath(ruta)
+    if prohibidas(canonica(real)) or fuera_de_las_caches(real, casas):
+        raise Rechazo("prohibida")
+    # Lo pedido en una cache de Hermes tiene que estar de verdad en esa cache: un enlace de dentro (o la cache misma, si
+    # fuera un enlace) no lleva a ningún otro sitio, ni a otra cache, ni fuera de Hermes.
+    cache, cache_real = cache_de(pedida, casas), cache_de(canonica(real), casas)
+    if cache is not None and (cache_real is None or cache.rsplit("/", 1)[1] != cache_real.rsplit("/", 1)[1]):
+        raise Rechazo("prohibida")
+    if _costura:
+        _costura("resuelta")
+    partes = [parte for parte in real.split("/") if parte]
+    if not partes:
+        raise Rechazo("no_es_fichero")
+    carpeta_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    carpeta = os.open("/", carpeta_flags)
+    try:
+        for parte in partes[:-1]:
+            try:
+                siguiente = os.open(parte, carpeta_flags, dir_fd=carpeta)
+            except OSError as error:
+                # Un enlace con O_DIRECTORY | O_NOFOLLOW da ELOOP en Linux y ENOTDIR en macOS: se mira qué es.
+                if error.errno == errno.ENOTDIR and _es_enlace(parte, carpeta):
+                    raise Rechazo("carrera") from None
+                raise _por_errno(error) from None
+            os.close(carpeta)
+            carpeta = siguiente
+        nombre = partes[-1]
+        try:
+            visto = os.stat(nombre, dir_fd=carpeta, follow_symlinks=False)
+        except OSError as error:
+            raise _por_errno(error) from None
+        if stat.S_ISLNK(visto.st_mode):
+            raise Rechazo("carrera")
+        if not stat.S_ISREG(visto.st_mode):
+            raise Rechazo("no_es_fichero")
+        if _costura:
+            _costura("vista")
+        try:
+            fd = os.open(nombre, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | getattr(os, "O_CLOEXEC", 0),
+                         dir_fd=carpeta)
+        except OSError as error:
+            raise _por_errno(error) from None
+    finally:
+        os.close(carpeta)
+    try:
+        abierto = os.fstat(fd)
+        if (abierto.st_dev, abierto.st_ino) != (visto.st_dev, visto.st_ino):
+            raise Rechazo("carrera")
+        if not stat.S_ISREG(abierto.st_mode):
+            raise Rechazo("no_es_fichero")
+        if abierto.st_nlink != 1:
+            raise Rechazo("prohibida")
+        if abierto.st_size > tope:
+            raise Rechazo("demasiado_grande")
+        os.set_blocking(fd, True)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, abierto.st_size
+
+
+def copiar(fd: int, tamano: int, escribir) -> int:
+    """Manda exactamente lo que medía al abrirlo (o menos, si lo han acortado: quien recibe lo nota por el tamaño)."""
+    quedan = tamano
+    while quedan > 0:
+        trozo = os.read(fd, min(TROZO, quedan))
+        if not trozo:
+            break
+        escribir(trozo)
+        quedan -= len(trozo)
+    return tamano - quedan
+
+
+def par_del_vigia(conexion, uid_vigia: int | None = None) -> bool:
+    """Si al otro lado del socket está root o el vigía, según el núcleo (``SO_PEERCRED``). Sin eso, nadie."""
+    try:
+        if uid_vigia is None:
+            uid_vigia = pwd.getpwnam(USUARIO_VIGIA).pw_uid
+        credenciales = conexion.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", credenciales)
+    except (OSError, KeyError, AttributeError, struct.error):
+        return False
+    return uid in (0, uid_vigia)
+
+
+def _leer_linea(conexion, plazo: float) -> str:
+    conexion.settimeout(plazo)
+    recibido = b""
+    try:
+        while b"\n" not in recibido and len(recibido) <= MAX_RUTA + 1:
+            trozo = conexion.recv(MAX_RUTA + 2 - len(recibido))
+            if not trozo:
+                break
+            recibido += trozo
+    except OSError:
+        raise Rechazo("invalida") from None
+    linea, salto, resto = recibido.partition(b"\n")
+    if not salto or resto:
+        raise Rechazo("invalida")
+    try:
+        return linea.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Rechazo("invalida") from None
+
+
+def _decir(estado: str, tamano: int | None = None) -> None:
+    sys.stderr.write("hehermes-leer-media: %s%s\n" % (estado, "" if tamano is None else " (%d bytes)" % tamano))
+
+
+def atender(conexion, *, prohibidas=es_prohibida, par_permitido=par_del_vigia, plazo: float = 10.0,
+            hermes: str = HERMES_HOME) -> int:
+    """Una conexión: una línea con la ruta, y la respuesta. Devuelve el código de salida."""
+    try:
+        if not par_permitido(conexion):
+            raise Rechazo("no_autorizado")
+        fd, tamano = abrir(_leer_linea(conexion, plazo), prohibidas=prohibidas, hermes=hermes)
+    except Rechazo as rechazo:
+        _decir(rechazo.estado)
+        try:
+            conexion.sendall(rechazo.estado.encode("ascii") + b"\n")
+        except OSError:
+            pass
+        return SALIDAS[rechazo.estado]
+    try:
+        conexion.settimeout(60)
+        conexion.sendall(b"ok %d\n" % tamano)
+        enviados = copiar(fd, tamano, conexion.sendall)
+    except OSError:
+        _decir("error")
+        return SALIDAS["error"]
+    finally:
+        os.close(fd)
+    _decir("ok" if enviados == tamano else "error", enviados)
+    return SALIDAS["ok"] if enviados == tamano else SALIDAS["error"]
+
+
+def main(argv: list) -> int:
+    hermes = HERMES_HOME
+    if argv and argv[0].startswith("--hermes-home="):
+        try:
+            hermes = validar_casa(argv[0][len("--hermes-home="):])
+        except Rechazo:
+            sys.stderr.write("hehermes-leer-media: --hermes-home tiene que ser una carpeta absoluta\n")
+            return SALIDAS["invalida"]
+        argv = argv[1:]
+    if argv == ["--conexion"]:
+        conexion = socket.socket(fileno=0)
+        try:
+            return atender(conexion, hermes=hermes)
+        finally:
+            conexion.detach()
+    if len(argv) != 1 or argv[0].startswith("-"):
+        sys.stderr.write("uso: hehermes-leer-media [--hermes-home=<carpeta>] <ruta absoluta> | --conexion\n")
+        return SALIDAS["invalida"]
+    try:
+        fd, tamano = abrir(argv[0], hermes=hermes)
+    except Rechazo as rechazo:
+        _decir(rechazo.estado)
+        return SALIDAS[rechazo.estado]
+    try:
+        salida = sys.stdout.buffer
+        copiar(fd, tamano, salida.write)
+        salida.flush()
+    except OSError:
+        return SALIDAS["error"]
+    finally:
+        os.close(fd)
+    return SALIDAS["ok"]
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

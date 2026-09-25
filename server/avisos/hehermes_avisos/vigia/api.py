@@ -6,6 +6,8 @@
 - ``POST   /avisos/v1/prueba``                           manda un aviso de prueba, y espera a lo que diga Apple
 - ``DELETE /avisos/v1/dispositivos/{token}``             baja (un 404 también le vale a la app)
 - ``GET    /avisos/v1/salud``                            para ver desde Safari que nginx llega al vigía
+- ``GET    /avisos/v1/fichero?sesion=&ruta=``            un fichero que Hermes marcó con ``MEDIA:`` (``fichero.py``),
+  los bytes por partes; es la única que no contesta JSON cuando va bien
 
 Todo contesta 204 si va bien, y los errores con el envoltorio del api_server de Hermes, que es el que entiende la app.
 
@@ -35,6 +37,7 @@ from . import avisos
 from .ajustes import MAX_ID_SESION, Ajustes
 from .almacen import Almacen
 from .envio import BAJA, ENVIADO, LIMITADO, REINTENTABLE, Mensajero
+from .fichero import Descarga, Ficheros, disposicion, parametros
 
 registro = logging.getLogger("vigia.api")
 
@@ -62,7 +65,7 @@ class AppVigia:
     """La lógica de la API, sin HTTP: así se prueba llamándola, y el manejador solo traduce."""
 
     def __init__(self, almacen: Almacen, mensajero: Mensajero, *, secreto_tunel: str, caducidad_prueba: int = 300,
-                 reloj=time.time, al_moverse=None):
+                 reloj=time.time, al_moverse=None, ficheros: Ficheros | None = None):
         if not secreto_tunel:
             raise ValueError("sin el secreto del túnel, la API del vigía quedaría abierta a cualquier proceso local")
         self.almacen = almacen
@@ -73,6 +76,8 @@ class AppVigia:
         # Lo que hay que hacer cuando una app se va a segundo plano o deja turnos: despertar al bucle (`Vigilante`).
         self.al_moverse = al_moverse or (lambda: None)
         self._ultimo_sin_tunel = -REPETIR_SIN_TUNEL
+        # Los ficheros que Hermes marca con `MEDIA:` (`fichero.py`). Sin ellos, la ruta contesta 503.
+        self.ficheros = ficheros
 
     def viene_del_tunel(self, valor: str | None) -> bool:
         """Si la petición trae el secreto que pone nginx. Comparado en tiempo constante."""
@@ -139,6 +144,11 @@ class AppVigia:
         codigo = "rele_no_disponible" if resultado.tipo == REINTENTABLE else "aviso_rechazado"
         raise ErrorHTTP(502, codigo, f"El aviso no ha salido: {resultado.motivo}")
 
+    def fichero(self, consulta: dict) -> Descarga:
+        if self.ficheros is None:
+            raise ErrorHTTP(503, "lector_no_disponible", "Este vigía no tiene el lector de ficheros")
+        return self.ficheros.preparar(consulta.get("sesion"), consulta.get("ruta"))
+
     def baja(self, token: str) -> None:
         if not self.almacen.borrar_dispositivo(token):
             raise ErrorHTTP(404, "dispositivo_desconocido", "Este dispositivo no estaba dado de alta")
@@ -178,6 +188,10 @@ class ManejadorVigia(ManejadorJSON):
         elif ruta == "/avisos/v1/salud":
             self._exigir(metodo, "GET")
             return self.enviar_json(200, {"estado": "ok", "servicio": "vigia", "version": VERSION})
+        elif ruta == "/avisos/v1/fichero":
+            self._exigir(metodo, "GET")
+            sesion, ruta_fichero = parametros(self.path.partition("?")[2])
+            return self._enviar_descarga(app.fichero({"sesion": sesion, "ruta": ruta_fichero}))
         else:
             encontrada = RUTA_DISPOSITIVO.fullmatch(ruta)
             if not encontrada:
@@ -193,6 +207,32 @@ class ManejadorVigia(ManejadorJSON):
                 self._exigir(metodo, "PUT")
                 app.primer_plano(token, self.leer_json())
         self.enviar_json(204)
+
+    def _enviar_descarga(self, descarga: Descarga) -> None:
+        """Los bytes según llegan del lector, sin juntarlos. Con las cabeceras ya mandadas un fallo no se puede
+        contestar: se corta la conexión, y la app ve que faltan bytes (`Content-Length`)."""
+        enviados = 0
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", descarga.tipo)
+            self.send_header("Content-Length", str(descarga.tamano))
+            self.send_header("Content-Disposition", disposicion(descarga.nombre))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            # Que nginx lo pase según llega, sin guardarlo en sus temporales del disco.
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            for trozo in descarga.trozos():
+                self.wfile.write(trozo)
+                enviados += len(trozo)
+            self.wfile.flush()
+        except OSError:
+            pass
+        finally:
+            descarga.cerrar()
+        if enviados != descarga.tamano:
+            self.close_connection = True
+            registro.warning("fichero: cortado a los %d de %d bytes", enviados, descarga.tamano)
 
     @staticmethod
     def _exigir(metodo: str, permitido: str) -> None:

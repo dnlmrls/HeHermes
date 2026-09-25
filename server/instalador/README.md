@@ -31,7 +31,7 @@ d=$(mktemp -d) && cd "$d" && curl -fsSLO {url-base}/v{versión}/hehermes-servido
 `server/instalador/empaquetar` genera el paquete, su `.sha256` y esa línea ya rellena:
 
 ```bash
-server/instalador/empaquetar                                   # dist/hehermes-servidor-0.3.0.tar.gz y .sha256
+server/instalador/empaquetar                                   # dist/hehermes-servidor-0.3.1.tar.gz y .sha256
 server/instalador/empaquetar --url-base https://ejemplo.org/hehermes --iphone mi-iphone
 server/instalador/empaquetar --firmar hehermes-firma.pem       # y el .sig (hace falta OpenSSL 3)
 ```
@@ -118,7 +118,7 @@ otro paso no se abre. El vector que lo fija lo comparten el servidor y la app:
 | firewalld (familia Red Hat) | En la zona por defecto: `--add-port=500/udp`, `--add-port=4500/udp` y una regla rica que deja entrar el TCP 80 solo desde `10.77.1.0/24` hacia `10.77.0.1` (firewalld no sabe de «entra por hh-ipsec»). En marcha, en la configuración de ahora y en la permanente, **sin `--reload`**, que se llevaría las reglas de ahora de los demás; apagado, con `firewall-offline-cmd`. **No lo enciende** |
 | SELinux (si está puesto) | `semanage port -a -t http_port_t -p tcp <puerto de Hermes>`, para que nginx llegue a Hermes, y nada más (no el booleano `httpd_can_network_connect`, que le dejaría llegar a todo); si el puerto ya lo tiene otro tipo, se para. Cada fichero que escribe, con `restorecon` |
 | La clave de Hermes | `hehermes-clave.path` vigila el `.env` y, si cambia, `hehermes-clave.service` ejecuta `hehermes-dispositivo clave` |
-| Avisos (`--avisos`) | El `instalar.sh` de `server/avisos`, tal cual: vigía y relé local |
+| Avisos (`--avisos`) | El `instalar.sh` de `server/avisos`, tal cual: vigía, relé local y el lector de los ficheros que marca Hermes (`/usr/local/libexec/hehermes-leer-media` y `hehermes-leer-media.socket`, que desinstalar también quita) |
 | El primer iPhone | `hehermes-dispositivo alta <nombre> --ikev2 --servidor <dirección>` y su `qr`, que se pinta directo en el terminal |
 
 ### El agujero del túnel, cerrado de fábrica

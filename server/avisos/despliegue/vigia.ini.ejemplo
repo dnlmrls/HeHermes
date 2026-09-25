@@ -44,3 +44,13 @@ credencial = /etc/hehermes-avisos/vigia/credencial-rele
 # Menos que los 10 s que espera la app al pedir el aviso de prueba, que espera la respuesta de Apple, y más que lo
 # que puede tardar el relé con Apple ([rele] plazo_apns, 6 s).
 plazo = 8
+
+[ficheros]
+# Los ficheros que Hermes marca con MEDIA: (GET /avisos/v1/fichero). Los lee como root el lector de
+# /usr/local/libexec/hehermes-leer-media, que systemd lanza por cada conexión a este socket (root:hh-vigia 0660).
+lector = /run/hehermes-leer-media.sock
+# Lo que vale «~» en una línea MEDIA:~/… (Hermes corre como root).
+casa = /root
+# Descargas por minuto (cuentan también las que no estaban marcadas) y a la vez.
+por_minuto = 30
+simultaneos = 2

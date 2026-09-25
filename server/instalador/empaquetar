@@ -31,7 +31,8 @@ SERVER = os.path.dirname(AQUI)
 URL_BASE = "https://github.com/dnlmrls/HeHermes/releases/download"
 # Un instante fijo para todo lo del paquete: con la hora de verdad, cada vez saldría otra suma.
 INSTANTE = 1_788_220_800  # 2026-09-01T00:00:00Z
-EJECUTABLES = {"hehermes-servidor", "hehermes-dispositivo", "avisos/despliegue/instalar.sh"}
+EJECUTABLES = {"hehermes-servidor", "hehermes-dispositivo", "avisos/despliegue/instalar.sh",
+               "avisos/despliegue/hehermes-leer-media"}
 
 
 def ficheros():
