@@ -41,7 +41,8 @@ class Instalar(Base):
     def test_sin_root_se_niega(self):
         self.assertEqual(self.orden("instalar", "--plan", euid=1000), 1)
         self.assertIn("root", self.salida)
-        self.assertEqual(self.sis.ordenes, [])
+        # Solo pregunta a sudo, sin contraseña (lo demás, en test_permisos).
+        self.assertEqual(self.sis.ordenes, [["sudo", "-n", "true"]])
 
     def test_plan_ensena_y_no_cambia_nada(self):
         antes = self.sis.foto()
@@ -129,6 +130,51 @@ class LasDemas(Base):
         self.assertEqual(self.orden("actualizar", "--paquete", "/tmp/x.tar.gz", "--firma", "/tmp/x.sig"), 1)
         self.assertIn("PENDIENTE-DE-DANIEL", self.salida)
 
+    def empaquetar(self, version):
+        import importlib.machinery
+        import importlib.util
+        cargador = importlib.machinery.SourceFileLoader("empaquetar_cli", str(apoyo.RAIZ / "empaquetar"))
+        e = importlib.util.module_from_spec(importlib.util.spec_from_loader("empaquetar_cli", cargador))
+        cargador.exec_module(e)
+        carpeta = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, carpeta)
+        paquete, _ = e.construir(version, carpeta)
+        with open(paquete + ".sig", "wb") as f:
+            f.write(b"firma")
+        return paquete
+
+    def test_una_version_mas_vieja_no_se_instala_aunque_este_firmada(self):
+        self.orden("instalar", "--si")
+        self.sis.poner(p.PREFIJO + "/clave-publica.pem", PUBLICA.read_bytes())
+        self.sis.responder["openssl"] = apoyo.bien("Signature Verified Successfully\n")
+        paquete = self.empaquetar("0.1.0")
+        desde = len(self.sis.ordenes)
+        self.assertEqual(self.orden("actualizar", "--paquete", paquete, "--firma", paquete + ".sig"), 1)
+        self.assertIn("más vieja", self.salida)
+        self.assertFalse([o for o in self.sis.ordenes[desde:] if o[:1] == ["python3"]])
+
+    def test_se_comprueba_y_se_abre_una_copia_de_root_no_el_fichero_de_otro(self):
+        """Entre la firma y el tar, quien pudiera escribir en la carpeta del paquete podría cambiarlo."""
+        self.orden("instalar", "--si")
+        self.sis.poner(p.PREFIJO + "/clave-publica.pem", PUBLICA.read_bytes())
+        paquete = self.empaquetar("9.0.0")
+        vistas = []
+
+        def openssl(args, entrada):
+            copia = args[args.index("-in") + 1]
+            vistas.append((copia, oct(os.stat(os.path.dirname(copia)).st_mode & 0o777)))
+            # Justo después de comprobarla, alguien cambia el original: no tiene que importar.
+            with open(paquete, "wb") as f:
+                f.write(b"otro paquete")
+            return Resultado(0, "Signature Verified Successfully\n")
+
+        self.sis.responder["openssl"] = openssl
+        self.sis.responder["python3 -I"] = apoyo.bien("Todo al día: 0 cambios.\n")
+        self.assertEqual(self.orden("actualizar", "--paquete", paquete, "--firma", paquete + ".sig"), 0, self.salida)
+        self.assertNotEqual(vistas[0][0], paquete)
+        self.assertEqual(vistas[0][1], "0o700")
+        self.assertTrue([o for o in self.sis.ordenes if o[:2] == ["python3", "-I"] and "hehermes-servidor-9.0.0" in o[2]])
+
     def test_actualizar_con_firma_buena_instala_la_nueva(self):
         self.orden("instalar", "--si")
         # Como si el paquete trajera ya la clave de Daniel (aquí, la de prueba).
@@ -140,7 +186,9 @@ class LasDemas(Base):
         cargador.exec_module(e)
         carpeta = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, carpeta)
-        paquete, _ = e.construir("0.1.0", carpeta)
+        paquete, _ = e.construir("9.0.0", carpeta)
+        with open(paquete + ".sig", "wb") as f:
+            f.write(b"firma")
         vistas = []
 
         def openssl(args, entrada):
@@ -154,7 +202,7 @@ class LasDemas(Base):
         self.assertEqual(len(vistas), 1)
         nueva = [o for o in self.sis.ordenes if o[:2] == ["python3", "-I"]]
         self.assertEqual(len(nueva), 1)
-        self.assertTrue(nueva[0][2].endswith("/hehermes-servidor-0.1.0/hehermes-servidor"))
+        self.assertTrue(nueva[0][2].endswith("/hehermes-servidor-9.0.0/hehermes-servidor"))
         self.assertEqual(nueva[0][3:], ["instalar", "--si"])
         self.assertFalse(os.path.exists(os.path.dirname(os.path.dirname(nueva[0][2]))), "la carpeta temporal, fuera")
 
@@ -162,8 +210,9 @@ class LasDemas(Base):
         self.orden("instalar", "--si")
         self.sis.poner(p.PREFIJO + "/clave-publica.pem", PUBLICA.read_bytes())
         self.sis.responder["openssl"] = apoyo.mal(salida="Signature Verification Failure\n")
+        paquete = self.empaquetar("9.0.0")
         desde = len(self.sis.ordenes)
-        self.assertEqual(self.orden("actualizar", "--paquete", "/tmp/x.tar.gz", "--firma", "/tmp/x.sig"), 1)
+        self.assertEqual(self.orden("actualizar", "--paquete", paquete, "--firma", paquete + ".sig"), 1)
         self.assertIn("firma", self.salida)
         self.assertEqual([o[0] for o in self.sis.ordenes[desde:]], ["openssl"])
 

@@ -129,7 +129,7 @@ def frase(base, version, suma, iphone, llave):
     misma, con su llave; `tests/test_paquete.py` las ata a las dos con la spec."""
     fichero = "hehermes-servidor-%s.tar.gz" % version
     orden = ('d=$(mktemp -d) && cd "$d" && curl -fsSLO %s && echo "%s  %s" | sha256sum -c - && tar -xzf %s'
-             ' && sudo ./hehermes-servidor-%s/hehermes-servidor instalar --por-chat --activar-api --iphone %s --llave %s'
+             ' && ./hehermes-servidor-%s/hehermes-servidor instalar --por-chat --activar-api --iphone %s --llave %s'
              % (url_del_paquete(base, version), suma, fichero, fichero, version, iphone, llave))
     return ("Hermes, quiero conectar la app HeHermes Mensajes de mi iPhone contigo. Ejecuta en tu servidor este comando "
             "tal cual, sin cambiar nada (comprueba él solo lo que descarga):\n\n`%s`\n\nTarda unos minutos. Al acabar "

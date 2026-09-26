@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import binascii
 import re
+import secrets
 import time
 
 from . import piezas as p
@@ -78,6 +79,22 @@ def activar_api(sis, man, accion, salida) -> None:
     salida("==> la API de Hermes: %s en %s" % (", ".join(l.split("=", 1)[0] for l in lineas), ruta))
 
 
+def corregir_exposicion(sis, man, accion, salida) -> None:
+    """--corregir-exposicion: `API_SERVER_HOST=127.0.0.1` al final del .env (la de detrás es la que cuenta), con una copia
+    antes. Desinstalar no lo quita: volvería a abrir la API a quien llegue al servidor."""
+    from . import manifiesto as m
+    ruta, linea = accion.objeto, accion.datos[0]
+    actual = sis.leer_texto(ruta)
+    if actual is None:
+        raise ValueError("no puedo leer %s" % ruta)
+    copia = m.guardar_copia(sis, ruta)
+    nuevo = actual + ("" if actual.endswith("\n") or not actual else "\n") + linea + "\n"
+    sis.escribir(ruta, nuevo.encode("utf-8"), modo=sis.modo(ruta) or 0o600, mismo_dueno=True)
+    man.datos["exposicion"] = {"env": ruta, "linea": linea, "copia": copia}
+    man.guardar(sis)
+    salida("==> la API de Hermes: %s en %s (se cierra al reiniciarse Hermes)" % (linea, ruta))
+
+
 def reiniciar_hermes_luego(sis, salida) -> None:
     """A los 90 s, y lanzado lo último: si Hermes se reiniciara antes de acabar el comando, se cortaría el turno en el
     que tiene que contestar con el enlace."""
@@ -122,7 +139,10 @@ CARPETA_VENV = "/opt/hehermes-canje"
 VENV = CARPETA_VENV + "/venv"
 PYTHON_VENV = VENV + "/bin/python"
 REQUISITOS = p.PREFIJO + "/requirements-canje.txt"
-PUERTOS = (443,) + tuple(range(8443, 8454))
+#: Daniel (2026-09-26): alto y al azar, para que no sea fácil de encontrar. Los dos extremos entran.
+PUERTO_MINIMO, PUERTO_MAXIMO = 58000, 65500
+#: El generador del puerto: el criptográfico del sistema. Las pruebas lo sustituyen para fijarlo.
+_azar = secrets.randbelow
 COMENTARIO_UFW = "hehermes-canje"
 LIMPIAR = "/usr/bin/python3 -I -B %s/hehermes-servidor canje-limpiar" % p.PREFIJO
 
@@ -189,8 +209,18 @@ def lanzar(sis, man, det, op, salida) -> str:
                     raise ParadaDelCanje("firewalld no ha abierto el TCP %d: %s" % (puerto,
                                                                                  (r.error or r.salida).strip()))
                 regla, cortafuegos = [opcion], "firewalld"
-        sis.escribir(RUN + "/estado.json", json.dumps({"puerto": puerto, "regla": regla,
-                                                       "cortafuegos": cortafuegos}).encode(), modo=0o600)
+        propio = False
+        if det.lugares:
+            # nftables o iptables a pelo: en las mismas cadenas que las de siempre, con su propia marca.
+            from . import cortafuegos as cf
+            try:
+                cf.poner(sis, cf.MARCA_CANJE, cf.del_canje(puerto), det.con_iptables)
+            except cf.NoSe as error:
+                raise ParadaDelCanje("no he podido abrir el TCP %d en tu cortafuegos: %s" % (puerto, error)) from None
+            propio = True
+        sis.escribir(RUN + "/estado.json", json.dumps({"puerto": puerto, "regla": regla, "cortafuegos": cortafuegos,
+                                                       "propio": propio, "con_iptables": det.con_iptables}).encode(),
+                     modo=0o600)
         r = sis.ejecutar(_systemd_run())
         if not r.bien or not sis.ejecutar(["systemctl", "is-active", UNIDAD]).bien:
             raise ParadaDelCanje("el canje no ha arrancado (%s). Mira «journalctl -u %s»"
@@ -198,15 +228,39 @@ def lanzar(sis, man, det, op, salida) -> str:
     except ParadaDelCanje:
         limpiar(sis, {})
         raise
+    abierto_en = ([cortafuegos] if regla else []) + (["tu nftables o iptables"] if propio else [])
     salida("==> el canje: abierto 10 minutos en el TCP %d%s" % (
-        puerto, " (y en %s, solo mientras dure)" % cortafuegos if regla else ""))
-    if det.ufw != "activo" and det.firewalld != "activo":
-        salida("    Si tu proveedor tiene un cortafuegos propio, el TCP %d tiene que estar abierto ahí" % puerto)
+        puerto, " (y en %s, solo mientras dure)" % " y ".join(abierto_en) if abierto_en else ""))
+    if det.cortafuegos_a_mano:
+        salida("    Tu cortafuegos lo llevas tú: ábrele ahora el TCP %d, solo mientras dure el canje" % puerto)
+    salida("    Si tu proveedor tiene un cortafuegos propio, el TCP %d tiene que estar abierto ahí" % puerto)
     el_enlace = enlace(servidor, puerto, codigo, huella)
     if op.qr_png:
-        r = sis.ejecutar(["qrencode", "-t", "PNG", "-o", op.qr_png], entrada=el_enlace)
-        salida("==> el QR del enlace, en %s" % op.qr_png if r.bien else "No he podido dejar el QR en %s" % op.qr_png)
+        salida(_qr_png(sis, op.qr_png, el_enlace))
     return el_enlace
+
+
+def _qr_png(sis, ruta, el_enlace) -> str:
+    """El PNG se hace en /run (de root) y se deja en `ruta` como lo haría quien lanzó sudo: con la línea de sudoers de
+    la salida 2, `--qr-png /etc/…` no puede pisar ni crear nada que su usuario no pudiera. Nunca sobre algo que ya
+    exista, ni a través de un enlace."""
+    import os
+    if not ruta.startswith("/"):
+        return "No dejo el QR en %s: dame una ruta absoluta" % ruta
+    temporal = RUN + "/qr.png"
+    r = sis.ejecutar(["qrencode", "-t", "PNG", "-o", temporal], entrada=el_enlace)
+    datos = sis.leer(temporal) if r.bien else None
+    if sis.existe(temporal):
+        sis.borrar(temporal)
+    if datos is None:
+        return "No he podido hacer el QR del enlace"
+    uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
+    try:
+        sis.crear_nuevo(ruta, datos, int(uid) if uid and uid.isdigit() else None,
+                        int(gid) if gid and gid.isdigit() else None)
+    except OSError as error:
+        return "No he podido dejar el QR en %s (%s)" % (ruta, error.strerror or error)
+    return "==> el QR del enlace, en %s" % ruta
 
 
 def _systemd_run() -> list:
@@ -219,14 +273,26 @@ def _systemd_run() -> list:
         "LoadCredential=canje:%s/canje.json" % RUN,
         "LoadCredential=cert:%s/cert.pem" % RUN,
         "LoadCredential=clave:%s/clave.pem" % RUN,
-        # El 443 es un puerto de root: solo esa capacidad, y nada más.
-        "AmbientCapabilities=CAP_NET_BIND_SERVICE",
-        "CapabilityBoundingSet=CAP_NET_BIND_SERVICE",
+        # Un puerto alto no pide ninguna capacidad: el canje corre sin ninguna (el vacío deja el conjunto vacío).
+        "CapabilityBoundingSet=",
         "NoNewPrivileges=yes",
         "ProtectSystem=strict",
         "ProtectHome=yes",
         "PrivateTmp=yes",
         "PrivateDevices=yes",
+        "ProtectKernelTunables=yes",
+        "ProtectKernelModules=yes",
+        "ProtectKernelLogs=yes",
+        "ProtectControlGroups=yes",
+        "ProtectClock=yes",
+        "ProtectHostname=yes",
+        "RestrictNamespaces=yes",
+        "RestrictRealtime=yes",
+        "RestrictSUIDSGID=yes",
+        "LockPersonality=yes",
+        "SystemCallArchitectures=native",
+        "SystemCallFilter=@system-service",
+        "UMask=0077",
         "RestrictAddressFamilies=AF_INET AF_INET6",
         # Diez minutos del canje y un margen: si algo se cuelga, systemd lo para igual.
         "RuntimeMaxSec=660",
@@ -238,13 +304,35 @@ def _systemd_run() -> list:
     return orden + [PYTHON_VENV, "-I", "-B", "-m", "hehermes_servidor.canje", "servir"]
 
 
-def _puerto_libre(sis) -> int:
-    from .deteccion import _escuchan
-    ocupados = {int(puerto) for _, puerto, _ in _escuchan(sis, "tcp") if puerto.isdigit()}
-    for puerto in PUERTOS:
+def elegir_puerto(ocupados, azar=None) -> int | None:
+    """Uno libre del rango, empezando por uno al azar y dando la vuelta: si el primero está ocupado, el siguiente libre.
+    `None` si no queda ninguno."""
+    azar = azar or _azar
+    total = PUERTO_MAXIMO - PUERTO_MINIMO + 1
+    inicio = azar(total)
+    for paso in range(total):
+        puerto = PUERTO_MINIMO + (inicio + paso) % total
         if puerto not in ocupados:
             return puerto
-    raise ParadaDelCanje("no hay ningún puerto libre para el canje: ni el 443 ni del 8443 al 8453")
+    return None
+
+
+def _puertos_tcp_ocupados(sis) -> set:
+    """Todos los puertos TCP locales en uso, escuchen o no: uno de una conexión de salida tampoco se puede atar."""
+    ocupados = set()
+    for linea in sis.ejecutar(["ss", "-H", "-tan"]).salida.splitlines():
+        campos = linea.split()
+        if len(campos) >= 4 and campos[3].rsplit(":", 1)[-1].isdigit():
+            ocupados.add(int(campos[3].rsplit(":", 1)[-1]))
+    return ocupados
+
+
+def _puerto_libre(sis) -> int:
+    puerto = elegir_puerto(_puertos_tcp_ocupados(sis))
+    if puerto is None:
+        raise ParadaDelCanje("no hay ningún puerto libre para el canje entre el %d y el %d"
+                             % (PUERTO_MINIMO, PUERTO_MAXIMO))
+    return puerto
 
 
 def _venv(sis, man, salida):
@@ -284,8 +372,25 @@ def limpiar_restos(sis) -> None:
     _barrer(sis)
 
 
+def volver_a_abrir(sis, propio_de_la_instalacion=None) -> None:
+    """Si el cortafuegos del sistema se recarga (y vacía sus cadenas) con un canje abierto, la regla del canje se va
+    con él: `hehermes-cortafuegos` la vuelve a poner, mientras el canje siga en marcha."""
+    import json
+    if not sis.ejecutar(["systemctl", "is-active", UNIDAD]).bien:
+        return
+    try:
+        estado = json.loads(sis.leer_texto(RUN + "/estado.json") or "{}")
+    except ValueError:
+        return
+    if estado.get("propio") and estado.get("puerto"):
+        from . import cortafuegos as cf
+        cf.poner(sis, cf.MARCA_CANJE, cf.del_canje(int(estado["puerto"])), estado.get("con_iptables", True))
+
+
 def _barrer(sis):
     import shlex
+    from . import cortafuegos as cf
+    cf.quitar(sis, cf.MARCA_CANJE)
     if sis.cual("ufw"):
         for linea in sis.ejecutar(["ufw", "show", "added"]).salida.splitlines():
             linea = linea.strip()

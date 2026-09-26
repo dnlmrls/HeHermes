@@ -155,6 +155,27 @@ class Sistema:
                 os.unlink(temporal)
             raise
 
+    def crear_nuevo(self, ruta: str, datos: bytes, uid: int | None = None, gid: int | None = None) -> None:
+        """Un fichero que no existía (`O_EXCL`, sin seguir enlaces), creado con los permisos de `uid`/`gid` si se dan
+        y esto corre como root: lo que pide quien lanzó `sudo` no puede pisar ni crear nada que él no pudiera."""
+        real = self.ruta(ruta)
+        banderas = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        if uid is not None and gid is not None and os.geteuid() == 0:
+            grupos = os.getgroups()
+            os.setgroups([gid])
+            os.setegid(gid)
+            os.seteuid(uid)
+            try:
+                fd = os.open(real, banderas, 0o644)
+            finally:
+                os.seteuid(0)
+                os.setegid(0)
+                os.setgroups(grupos)
+        else:
+            fd = os.open(real, banderas, 0o644)
+        with os.fdopen(fd, "wb") as f:
+            f.write(datos)
+
     def enlazar(self, ruta: str, destino: str) -> None:
         real = self.ruta(ruta)
         os.makedirs(os.path.dirname(real), exist_ok=True)

@@ -21,6 +21,10 @@ FICHEROS_AVISOS = ("/etc/systemd/system/hehermes-leer-media@.service",
 NGINX = (p.SITIO_ENLACE, p.SITIO, p.SITIO_CONF_D, p.BEARER, p.DROP_IN_NGINX)
 
 
+_EXPOSICION = ("%s, en %s: la puso --corregir-exposicion y se queda, porque quitarla volvería a abrir la API de "
+               "Hermes a quien llegue al servidor. Si la quieres fuera, quítala tú")
+
+
 def _iphones(sis):
     return [d["nombre"] for d in registro_de_dispositivos(sis) if d.get("tipo") == "ikev2"]
 
@@ -54,6 +58,8 @@ def resumen(sis, man) -> str:
                       "y hh-rele")
     if man.paquetes:
         lineas.append("Los paquetes que instalé se quedan (%s); --quitar-paquetes los quita." % ", ".join(man.paquetes))
+    if man.datos.get("exposicion"):
+        lineas.append("Se queda " + _EXPOSICION % (man.datos["exposicion"]["linea"], man.datos["exposicion"]["env"]))
     if quedan:
         lineas += ["Se queda, porque no es como lo dejé:"] + ["  " + q for q in quedan]
     return "\n".join(lineas) + "\n"
@@ -147,12 +153,21 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print) -> list:
             man.datos["selinux_puertos"].remove(puerto)
         else:
             quedan.append("la etiqueta de SELinux de tcp/%s: semanage no la ha quitado" % puerto)
+    #    Las de nftables e iptables, por su marca; y se dice si el sistema las guardó con las suyas.
+    if man.datos.get("cortafuegos_propio"):
+        from . import cortafuegos as cf
+        cf.quitar(sis, cf.MARCA)
+        for ruta in cf.guardadas(sis):
+            quedan.append("%s: tu cortafuegos guardado lleva reglas de HeHermes (se guardó con ellas puestas). No lo "
+                          "toco: quítalas de ahí o vuelve a guardarlo ahora" % ruta)
     # 5. Las unidades, de la última a la primera: la XFRM, al final, cuando nginx ya no escucha en 10.77.0.1.
     for unidad in reversed(man.unidades):
         sis.ejecutar(["systemctl", "disable", "--now", unidad])
     # 6. Las líneas de --activar-api, y el resto de ficheros.
     from .porchat import quitar_lineas_api
     quitar_lineas_api(sis, man, quedan, salida)
+    if man.datos.get("exposicion"):
+        quedan.append(_EXPOSICION % (man.datos["exposicion"]["linea"], man.datos["exposicion"]["env"]))
     for ruta in sorted(man.ficheros):
         if ruta not in NGINX:
             quitar(ruta)

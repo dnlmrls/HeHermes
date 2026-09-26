@@ -41,6 +41,7 @@ sudo hehermes-dispositivo alta otro-iphone && sudo hehermes-dispositivo qr otro-
 sudo hehermes-dispositivo limpiar otro-iphone   # tras importar el QR en la app WireGuard
 sudo hehermes-dispositivo lista                 # tipo, IP y si hay sesión (handshake o SA IKEv2)
 sudo hehermes-dispositivo baja otro-iphone      # corta el acceso al momento, sea del tipo que sea
+sudo hehermes-dispositivo rotar mi-iphone       # IKEv2: una clave nueva (si el QR ha podido verse); luego, qr
 sudo hehermes-dispositivo estado
 sudo hehermes-dispositivo iniciar --ikev2       # solo mira si strongSwan tiene lo que hace falta
 ```
@@ -137,6 +138,9 @@ Ese bloque es solo para una conexión escrita a mano. Para un iPhone nuevo, o pa
 
 ### Bajas
 
+- **Si el QR ha podido verse** (una foto, una pantalla compartida): `sudo hehermes-dispositivo rotar <nombre>` le da
+  una PSK nueva en el mismo fichero (la misma conexión, dirección e identidad), la carga, corta la sesión viva y dice
+  que se pinte el QR nuevo con `qr`. Si swanctl no la carga, vuelve la de antes. Solo con las que escribió el script.
 - **En el servidor:** `sudo hehermes-dispositivo baja <nombre>`, que quita su fichero de `conf.d`, hace `swanctl --load-all --noprompt` y `swanctl --terminate --ike hh-<nombre> --force`, por ese orden. Sin el `terminate`, la sesión viva sigue: el rekey de IKE no vuelve a mirar las credenciales. Para una conexión escrita a mano, que el script no conoce, lo mismo a mano.
 - **En el iPhone:** «Eliminar la VPN» en la pantalla de la VPN de la app (quita la configuración de Ajustes y la clave del llavero). Si en vez de eso se borra el perfil en Ajustes › General › VPN y gestión de dispositivos, **la clave se queda en el llavero del iPhone**: la app lo detecta al abrir su pantalla y deja ahí el botón de eliminar para quitarla. Ni una cosa ni otra revocan nada en el servidor.
 

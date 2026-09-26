@@ -266,6 +266,40 @@ def unidad_clave_service() -> str:
     ) % DISPOSITIVO
 
 
+# MARK: El cortafuegos, tras un reinicio
+
+
+UNIDAD_CORTAFUEGOS = "/etc/systemd/system/hehermes-cortafuegos.service"
+_ORDEN_PYTHON = "/usr/bin/python3 -I -B %s/hehermes-servidor" % PREFIJO
+#: Lo que carga el cortafuegos del sistema al arrancar: nftables.conf, rules.v4 (iptables-persistent) o
+#: /etc/sysconfig/iptables. La unidad va detrás, y con ellos: si se reinician o se recargan (y vacían todo), vuelve a
+#: poner las suyas.
+_DEL_SISTEMA = "nftables.service netfilter-persistent.service iptables.service"
+
+
+def unidad_cortafuegos() -> str:
+    return (
+        CABECERA
+        + "# Al arrancar, después del cortafuegos del sistema: vuelve a poner las reglas de HeHermes en nftables o\n"
+        "# iptables (sin escribir en lo que guarda el usuario) y quita la del canje si un reinicio la dejó en ufw.\n"
+        "[Unit]\n"
+        "Description=HeHermes: sus reglas del cortafuegos\n"
+        "After=%s ufw.service firewalld.service\n"
+        "PartOf=%s\n"
+        "ReloadPropagatedFrom=%s\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        "RemainAfterExit=yes\n"
+        "ExecStart=%s cortafuegos poner\n"
+        "ExecReload=%s cortafuegos poner\n"
+        "ExecStop=%s cortafuegos quitar\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    ) % (_DEL_SISTEMA, _DEL_SISTEMA, _DEL_SISTEMA, _ORDEN_PYTHON, _ORDEN_PYTHON, _ORDEN_PYTHON)
+
+
 # MARK: servidor.ini
 
 

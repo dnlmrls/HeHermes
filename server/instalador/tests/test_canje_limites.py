@@ -172,6 +172,23 @@ class Intentos(Base):
         self.assertTrue(self.canje.cerrado)
 
 
+class Conexiones(Base):
+    def test_un_tope_por_ip(self):
+        for _ in range(canje.MAX_CONEXIONES_POR_IP):
+            self.assertTrue(self.canje.admitir(IP))
+        self.assertFalse(self.canje.admitir(IP))
+        self.assertTrue(self.canje.admitir("192.0.2.77"), "las demás IP siguen entrando")
+
+    def test_un_tope_de_ips_recordadas(self):
+        for i in range(canje.MAX_IPS):
+            self.assertTrue(self.canje.admitir("10.%d.%d.%d" % (i >> 16 & 255, i >> 8 & 255, i & 255)))
+        self.assertFalse(self.canje.admitir("192.0.2.1"), "la memoria del canje no crece sin fin")
+        self.assertTrue(self.canje.admitir("10.0.0.0"), "las que ya conoce, hasta su tope")
+
+    def test_otra_ruta_no_devuelve_nada(self):
+        self.assertEqual(self.pedir("/", b""), (404, None))
+
+
 class Pausa(Base):
     def test_una_por_segundo_y_por_ip(self):
         self.assertEqual(self.pedir("/canje/v1/reto", {"c": CODIGO})[0], 200)

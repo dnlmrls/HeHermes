@@ -6,6 +6,7 @@ Uso (siempre como root):
   hehermes-dispositivo alta <nombre> --ikev2 [--servidor <dirección>]   # la VPN nativa de la app
   hehermes-dispositivo lista
   hehermes-dispositivo baja <nombre>
+  hehermes-dispositivo rotar <nombre>       # IKEv2: una clave nueva, si el QR ha podido verse (corta la sesión)
   hehermes-dispositivo qr <nombre>          # solo una persona, con sudo y en un terminal
   hehermes-dispositivo limpiar <nombre>     # borra del VPS el .conf con la clave privada
   hehermes-dispositivo clave                # recarga en nginx (y en el vigía de avisos) la clave del api_server
@@ -651,6 +652,27 @@ def baja_ikev2(d):
                "swanctl --terminate --ike %s --force" % ((t.stderr or t.stdout).strip(), d["conexion"]))
 
 
+def rotar_ikev2(d):
+    """Una PSK nueva en el mismo fichero: la misma conexión, la misma dirección y la misma identidad. Si swanctl no la
+    carga, vuelve la de antes. Con la nueva cargada, se corta la sesión viva, que seguiría con la vieja."""
+    ruta = ruta_swanctl(d["nombre"])
+    if not os.path.exists(ruta) or not es_nuestro(ruta):
+        fallar("%s no lo escribió este script: no lo toco. Si es una conexión hecha a mano, cámbiale tú el secret"
+               % ruta)
+    antes = leer(ruta)
+    escribir_privado(ruta, conf_swanctl(d, nueva_psk()))
+    r = cargar_swanctl()
+    if r.returncode != 0 or d["conexion"] not in conexiones_cargadas():
+        escribir_privado(ruta, antes)
+        cargar_swanctl()
+        fallar("swanctl no ha cargado la clave nueva (%s): sigue la de antes"
+               % ((r.stderr or r.stdout).strip() or "la conexión no aparece en --list-conns"))
+    t = correr("swanctl", "--terminate", "--ike", d["conexion"], "--force")
+    if t.returncode != 0 and "no matching" not in (t.stdout + t.stderr).lower():
+        print("Aviso: no he podido cortar la sesión viva (%s): córtala con swanctl --terminate --ike %s --force"
+              % ((t.stderr or t.stdout).strip(), d["conexion"]))
+
+
 # MARK: Órdenes
 
 
@@ -757,6 +779,23 @@ def cmd_baja(args):
     if os.path.exists(ruta_conf(d["nombre"])):
         os.unlink(ruta_conf(d["nombre"]))
     print("Baja de «%s» (%s). Ya no puede conectarse." % (d["nombre"], d["ip"]))
+
+
+def cmd_rotar(args):
+    if len(args) != 1:
+        fallar("uso: rotar <nombre>")
+    registro = leer_registro()
+    d = buscar(registro, args[0])
+    if not d:
+        fallar("no hay ningún dispositivo activo con ese nombre")
+    if tipo(d) != "ikev2":
+        fallar("«%s» es de WireGuard: su clave privada la tiene el dispositivo. Dalo de baja y de alta otra vez"
+               % d["nombre"])
+    rotar_ikev2(d)
+    d["rotada"] = ahora()
+    guardar_registro(registro)
+    print("Clave de «%s» cambiada: la de antes ya no vale, y su sesión se ha cortado. Para ponérsela a la app, "
+          "desde tu terminal:  sudo hehermes-dispositivo qr %s" % (d["nombre"], d["nombre"]))
 
 
 def cmd_qr(args):
@@ -906,7 +945,7 @@ def cmd_estado(_args):
                                             ("; y fuera del registro: " + ", ".join(otras)) if otras else ""))
 
 
-COMANDOS = {"alta": cmd_alta, "lista": cmd_lista, "baja": cmd_baja, "qr": cmd_qr,
+COMANDOS = {"alta": cmd_alta, "lista": cmd_lista, "baja": cmd_baja, "rotar": cmd_rotar, "qr": cmd_qr,
             "limpiar": cmd_limpiar, "clave": cmd_clave, "estado": cmd_estado,
             "iniciar": cmd_iniciar}
 

@@ -16,7 +16,8 @@ from hehermes_servidor.manifiesto import Manifiesto
 QUE_LEEN = (["dpkg", "--print-architecture"], ["dpkg-query"], ["systemctl", "is-active"], ["systemctl", "is-enabled"],
             ["systemctl", "show"], ["ps"], ["ss"], ["ip", "-4", "-j", "route", "get"], ["ip", "-j"], ["ip", "-d", "-j"],
             ["nginx", "-t"], ["swanctl", "--stats"], ["swanctl", "--list-conns"], ["ufw", "status"],
-            ["ufw", "show", "added"])
+            ["ufw", "show", "added"], ["nft", "-j", "list", "ruleset"], ["iptables", "-S", "INPUT"],
+            ["iptables", "-V"])
 
 
 class Base(unittest.TestCase):
@@ -316,13 +317,10 @@ class Cortafuegos(Base):
         self.assertNotEqual(canon("ufw deny 500,4500/udp"), canon("ufw allow 500,4500/udp"))
         self.assertIsNone(canon("ufw allow OpenSSH"))
 
-    def test_firewalld_y_nftables_avisan(self):
-        sis, falso = sf.servidor()
-        falso.activos |= {"firewalld", "nftables"}
-        self.montar((sis, falso))
-        det = self.detectar()
-        self.aviso(det, "firewalld")
-        self.aviso(det, "nftables")
+    def test_sin_ninguno_avisa_de_que_no_hay(self):
+        # nftables, iptables y firewalld en Debian, en test_cortafuegos.
+        self.montar(sf.servidor())
+        self.aviso(self.detectar(), "No hay ningún cortafuegos")
 
 
 class ElDeDaniel(Base):

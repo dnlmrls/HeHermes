@@ -63,6 +63,14 @@ class Hermes:
         #: Con --activar-api y la API apagada: las líneas que hay que añadir al .env (la clave va en claro: no se
         #: pinta nunca, solo sus nombres).
         self.api_pendiente = []
+        #: El entorno con el que corre (el de su unidad o el de su proceso): puede fijar API_SERVER_* por encima del .env.
+        self.entorno = {}
+        #: Si la unidad está en marcha (None: no es una unidad, o no se sabe).
+        self.en_marcha = None
+        #: Dónde escucha su API si es en todas las interfaces («0.0.0.0:8642»), o None.
+        self.expuesta = None
+        #: Con --corregir-exposicion: la línea que cierra la API a 127.0.0.1, si se puede poner en el .env.
+        self.exposicion_pendiente = None
 
     @property
     def clave(self):
@@ -93,6 +101,11 @@ class Deteccion:
         self.strongswan = {"swanctl": False, "activo": False}
         self.ufw = None
         self.reglas_ufw = []
+        #: nftables e iptables a pelo: las cadenas que cierran y donde van las reglas (`cortafuegos.Lugar`).
+        self.lugares = []
+        #: Si iptables es del usuario (no lo llevan por debajo ufw ni firewalld).
+        self.con_iptables = True
+        self.cortafuegos_a_mano = False
         self.a_mano = []
         self.bloqueos = []
         self.avisos = []
@@ -102,11 +115,12 @@ class Deteccion:
         return p.SITIO if self.nginx["sitios"] == "sites-enabled" else p.SITIO_CONF_D
 
 
-def detectar(sis, man, direccion=None, hermes_home=None, activar_api=False) -> Deteccion:
+def detectar(sis, man, direccion=None, hermes_home=None, activar_api=False, cortafuegos_a_mano=False,
+             corregir_exposicion=False) -> Deteccion:
     det = Deteccion()
     if not _distro(sis, det):
         return det
-    _hermes(sis, det, hermes_home, activar_api)
+    _hermes(sis, det, hermes_home, activar_api, corregir_exposicion)
     _direccion(sis, det, direccion)
     _paquetes(sis, det)
     _nginx(sis, det, man)
@@ -114,7 +128,7 @@ def detectar(sis, man, direccion=None, hermes_home=None, activar_api=False) -> D
     _strongswan(sis, det, man)
     _redes(sis, det, man)
     _a_mano(sis, det, man)
-    _cortafuegos(sis, det)
+    _cortafuegos(sis, det, cortafuegos_a_mano)
     _selinux(sis, det)
     return det
 
@@ -223,14 +237,17 @@ def _propiedades(texto):
 
 def _candidatos(sis):
     candidatos = []
-    r = sis.ejecutar(["systemctl", "show", "hermes-gateway.service", "-p", "LoadState", "-p", "User",
-                      "-p", "Environment"])
+    r = sis.ejecutar(["systemctl", "show", "hermes-gateway.service", "-p", "LoadState", "-p", "ActiveState",
+                      "-p", "User", "-p", "Environment"])
     props = _propiedades(r.salida)
     if props.get("LoadState") == "loaded":
         usuario = props.get("User") or "root"
         entorno = dict(x.split("=", 1) for x in props.get("Environment", "").split() if "=" in x)
-        candidatos.append(Hermes(usuario, entorno.get("HERMES_HOME") or _home(sis, usuario) + "/.hermes",
-                                 "la unidad hermes-gateway"))
+        hermes = Hermes(usuario, entorno.get("HERMES_HOME") or _home(sis, usuario) + "/.hermes",
+                        "la unidad hermes-gateway")
+        hermes.entorno = entorno
+        hermes.en_marcha = props.get("ActiveState") in ("active", "reloading", "activating")
+        candidatos.append(hermes)
     r = sis.ejecutar(["ps", "-eo", "pid=,user=,args="])
     for linea in r.salida.splitlines():
         partes = linea.split(None, 2)
@@ -242,25 +259,40 @@ def _candidatos(sis):
             if b"=" in par:
                 clave, _, valor = par.decode("utf-8", "replace").partition("=")
                 entorno[clave] = valor
-        candidatos.append(Hermes(usuario, entorno.get("HERMES_HOME") or _home(sis, usuario) + "/.hermes",
-                                 "el proceso %s" % pid))
+        hermes = Hermes(usuario, entorno.get("HERMES_HOME") or _home(sis, usuario) + "/.hermes", "el proceso %s" % pid)
+        hermes.entorno = entorno
+        candidatos.append(hermes)
     vistos, unicos = set(), []
     for c in candidatos:
         if c.home.rstrip("/") not in vistos:
             vistos.add(c.home.rstrip("/"))
             unicos.append(c)
+        elif c.origen.startswith("el proceso"):
+            # La unidad y su proceso son el mismo Hermes: si el proceso está, está en marcha.
+            next(u for u in unicos if u.home.rstrip("/") == c.home.rstrip("/")).en_marcha = True
     return unicos
 
 
-def _hermes(sis, det, hermes_home, activar_api=False):
+def _carpetas_de_hermes(sis) -> list:
+    """Las carpetas `.hermes` con un `.env` en las casas de los usuarios: un Hermes instalado, aunque no corra."""
+    casas = ["/root"] + ["/home/" + n for n in sis.listar("/home")]
+    return [c + "/.hermes" for c in casas if sis.existe(c + "/.hermes/.env")]
+
+
+def _hermes(sis, det, hermes_home, activar_api=False, corregir_exposicion=False):
     candidatos = _candidatos(sis)
     det.hermes_encontrados = candidatos
     if hermes_home:
         elegido = next((c for c in candidatos if c.home.rstrip("/") == hermes_home.rstrip("/")), None)
         elegido = elegido or Hermes("?", hermes_home, "--hermes-home")
     elif not candidatos:
-        det.bloqueos.append("No encuentro Hermes (ni la unidad hermes-gateway ni su proceso). Este instalador no "
-                            "instala Hermes: instálalo y arráncalo antes")
+        carpetas = _carpetas_de_hermes(sis)
+        if carpetas:
+            det.bloqueos.append("Hermes parece instalado (%s), pero no está en marcha: no encuentro ni la unidad "
+                                "hermes-gateway ni su proceso. Arráncalo y vuelve a lanzarme" % ", ".join(carpetas))
+        else:
+            det.bloqueos.append("No encuentro Hermes (ni la unidad hermes-gateway ni su proceso). Este instalador no "
+                                "instala Hermes: instálalo y arráncalo antes")
         return
     elif len(candidatos) > 1:
         det.bloqueos.append("Hay varios Hermes; dime cuál con --hermes-home:\n" + "\n".join(
@@ -269,6 +301,10 @@ def _hermes(sis, det, hermes_home, activar_api=False):
     else:
         elegido = candidatos[0]
     det.hermes = elegido
+    if elegido.en_marcha is False:
+        det.bloqueos.append("Hermes está instalado (la unidad hermes-gateway), pero parado. Arráncalo (systemctl start "
+                            "hermes-gateway) y vuelve a lanzarme")
+        return
     texto = sis.leer_texto(elegido.env)
     if texto is None:
         det.bloqueos.append("no puedo leer %s, el .env de Hermes" % elegido.env)
@@ -276,7 +312,8 @@ def _hermes(sis, det, hermes_home, activar_api=False):
     env = leer_env(texto)
     elegido.habilitada = env.get("API_SERVER_ENABLED", "").lower() in ("1", "true", "yes", "on")
     elegido._clave = env.get("API_SERVER_KEY") or None
-    elegido.host = env.get("API_SERVER_HOST") or "127.0.0.1"
+    # Lo que fija su entorno manda sobre el .env (python-dotenv no pisa lo que ya está en el entorno).
+    elegido.host = elegido.entorno.get("API_SERVER_HOST") or env.get("API_SERVER_HOST") or "127.0.0.1"
     try:
         elegido.puerto = int(env.get("API_SERVER_PORT") or 8642)
         if not 0 < elegido.puerto < 65536:
@@ -299,18 +336,19 @@ def _hermes(sis, det, hermes_home, activar_api=False):
     except ValueError:
         det.bloqueos.append("la API_SERVER_KEY de %s tiene caracteres que no sé poner en nginx" % elegido.env)
         return
-    if elegido.host in ("0.0.0.0", "::", "[::]", "*"):
-        det.avisos.append(ROJO + "Hermes escucha en %s:%d, en todas las interfaces: su API está abierta a quien "
-                          "llegue a este servidor. No lo toco; ponle API_SERVER_HOST=127.0.0.1" % (elegido.host,
-                                                                                                  elegido.puerto)
-                          + NORMAL)
-    elif elegido.host not in ("127.0.0.1", "localhost"):
+    if elegido.host not in TODAS and elegido.host not in ("127.0.0.1", "localhost"):
         det.bloqueos.append("Hermes escucha en %s y no en 127.0.0.1: nginx no lo alcanzaría" % elegido.host)
         return
+    _exposicion(sis, det, elegido, env, corregir_exposicion)
     base = "http://127.0.0.1:%d" % elegido.puerto
     estado, _ = sis.http_get(base + "/health")
     if estado is None:
-        det.bloqueos.append("Hermes no contesta en 127.0.0.1:%d: ¿está en marcha?" % elegido.puerto)
+        det.bloqueos.append("Hermes está en marcha, pero su API no contesta en 127.0.0.1:%d: ¿la tiene encendida "
+                            "(API_SERVER_ENABLED) y en ese puerto (API_SERVER_PORT)?" % elegido.puerto)
+        return
+    if estado != 200:
+        det.bloqueos.append("En 127.0.0.1:%d contesta algo que no es la API de Hermes (/health da %s): mira qué usa "
+                            "ese puerto, o el API_SERVER_PORT de %s" % (elegido.puerto, estado, elegido.env))
         return
     estado, _ = sis.http_get(base + "/api/sessions?limit=1", {"Authorization": "Bearer " + elegido.clave})
     elegido.clave_vale = estado == 200
@@ -319,6 +357,49 @@ def _hermes(sis, det, hermes_home, activar_api=False):
                             % elegido.env)
     elif estado != 200:
         det.bloqueos.append("Hermes contesta %s a /api/sessions con su clave" % estado)
+
+
+TODAS = ("0.0.0.0", "::", "[::]", "*")
+
+
+def _exposicion(sis, det, elegido, env, corregir):
+    """La API de Hermes escuchando en todas las interfaces: se mira lo que dice su configuración y lo que de verdad
+    escucha (`ss`). Se avisa muy claro; solo con --corregir-exposicion se cambia, y solo en el .env."""
+    donde = None
+    if elegido.host in TODAS:
+        donde = "%s:%d" % (elegido.host, elegido.puerto)
+    for host, puerto, _ in _escuchan(sis, "tcp"):
+        if puerto == str(elegido.puerto) and host in TODAS:
+            donde = "%s:%d" % (host, elegido.puerto)
+    elegido.expuesta = donde
+    if not donde:
+        return
+    riesgo = ("La API de Hermes escucha en %s, en todas las interfaces: cualquiera que llegue a este servidor puede "
+              "hablar con ella sin pasar por la VPN, y solo la protege su clave. No lo cambio sin que me lo pidas, "
+              "porque puede que otra cosa tuya la use así" % donde)
+    if "API_SERVER_HOST" in elegido.entorno:
+        como = ("Lo fija el entorno de %s (Environment=API_SERVER_HOST=%s): cámbialo ahí a 127.0.0.1 y reinícialo"
+                % (elegido.origen, elegido.entorno["API_SERVER_HOST"]))
+        puede = False
+    elif env.get("API_SERVER_HOST") in ("127.0.0.1", "localhost"):
+        como = ("Su .env ya dice 127.0.0.1, así que lo saca de otro sitio: mira cómo lo arrancas")
+        puede = False
+    else:
+        como = ("Para que escuche solo en 127.0.0.1, vuelve a lanzarme con --corregir-exposicion: añado "
+                "API_SERVER_HOST=127.0.0.1 al final de %s (con una copia antes) y reinicio Hermes 90 s después"
+                % elegido.env)
+        puede = True
+    if corregir and puede and elegido.origen != "la unidad hermes-gateway":
+        det.bloqueos.append("Con --corregir-exposicion tendría que reiniciar Hermes, y no corre como la unidad "
+                            "hermes-gateway (lo encuentro por %s): no sé reiniciarlo. Añade tú API_SERVER_HOST=127.0.0.1 "
+                            "a %s y reinícialo" % (elegido.origen, elegido.env))
+    elif corregir and puede:
+        elegido.exposicion_pendiente = "API_SERVER_HOST=127.0.0.1"
+        det.avisos.append("La API de Hermes escucha en %s: la cierro a 127.0.0.1 (--corregir-exposicion)" % donde)
+        return
+    elif corregir:
+        det.bloqueos.append("Con --corregir-exposicion no puedo cerrarla desde el .env. %s" % como)
+    det.avisos.append(ROJO + "%s. %s" % (riesgo, como) + NORMAL)
 
 
 def _activar_api(det, elegido, env):
@@ -667,8 +748,21 @@ def regla_ufw_canonica(texto):
     return (accion,) + tuple(sorted(regla.items()))
 
 
-def _cortafuegos(sis, det):
-    if det.familia == "rhel" and sis.cual("firewall-cmd"):
+QUE_ABRIR = ("UDP 500 y 4500 desde internet; el TCP 80 que entra por %s hacia %s; y, si vas a conectar el iPhone "
+             "por chat, el TCP del canje (uno al azar del %d al %d, que te diré) solo mientras dure")
+SIN_CORTAFUEGOS = ("No hay ningún cortafuegos que cierre el paso en este servidor: lo que escucha en todas las "
+                   "direcciones está abierto a internet. No enciendo ninguno (podría dejarte fuera del SSH), y mejor "
+                   "que no sea yo quien lo haga: si pones uno, abre UDP 500 y 4500. Lo de HeHermes escucha solo donde "
+                   "hace falta: nginx en %s y strongSwan en UDP 500 y 4500")
+
+
+def _cortafuegos(sis, det, a_mano=False):
+    """Quién lleva el cortafuegos: firewalld (en marcha, o en la familia Red Hat), ufw, o nftables e iptables a pelo
+    (`cortafuegos.analizar`), que se miran siempre que no los lleve ufw o firewalld por debajo."""
+    from . import cortafuegos as cf
+    from .porchat import PUERTO_MAXIMO, PUERTO_MINIMO
+    firewalld = sis.cual("firewall-cmd") and (det.familia == "rhel" or _activo(sis, "firewalld"))
+    if firewalld:
         _firewalld(sis, det)
     elif sis.cual("ufw"):
         r = sis.ejecutar(["ufw", "status"])
@@ -678,13 +772,23 @@ def _cortafuegos(sis, det):
         if det.ufw == "inactivo":
             det.avisos.append("ufw está apagado: añado sus reglas, pero no lo enciendo (podría dejarte fuera del SSH). "
                               "Si un día lo enciendes, ya van dentro")
+    gestor = det.ufw == "activo" or det.firewalld == "activo"
+    det.con_iptables = not gestor
+    lugares, dudas = cf.analizar(sis, con_iptables=det.con_iptables)
+    que_abrir = QUE_ABRIR % (p.INTERFAZ, p.IP_TUNEL, PUERTO_MINIMO, PUERTO_MAXIMO)
+    if a_mano:
+        det.cortafuegos_a_mano = True
+        if lugares or dudas:
+            det.avisos.append("Tu cortafuegos lo llevas tú (--cortafuegos-a-mano): no lo toco. Tiene que dejar pasar %s"
+                              % que_abrir)
+    elif dudas:
+        det.bloqueos.append("Tu cortafuegos cierra el paso, pero no sé abrirlo sin riesgo: %s. No he tocado nada. Abre "
+                            "tú, en él, %s. Luego vuelve a lanzarme con --cortafuegos-a-mano" % ("; ".join(dudas),
+                                                                                                que_abrir))
     else:
-        det.avisos.append("No hay ufw%s: no toco el cortafuegos. Si tienes otro, abre UDP 500 y 4500"
-                          % (" ni firewalld" if det.familia == "rhel" else ""))
-    if det.familia == "debian" and _activo(sis, "firewalld"):
-        det.avisos.append("firewalld está en marcha: no lo toco. Abre UDP 500 y 4500 (firewall-cmd --add-service=ipsec)")
-    if _activo(sis, "nftables"):
-        det.avisos.append("nftables está en marcha: si tiene reglas propias, abre UDP 500 y 4500")
+        det.lugares = lugares
+    if not gestor and not lugares and not dudas and det.ufw is None and det.firewalld is None:
+        det.avisos.append(SIN_CORTAFUEGOS % p.IP_TUNEL)
     det.avisos.append("Si tu proveedor tiene un cortafuegos propio, en su panel, abre ahí UDP 500 y 4500")
 
 
