@@ -16,7 +16,8 @@ from hehermes_servidor import canje
 
 HUELLA = bytes(range(32))
 CODIGO = canje.b64url(bytes(range(16)))
-CARGA = {"h": "203.0.113.7", "rid": "203.0.113.7", "lid": "mi-iphone", "k": "psk-de-prueba-que-no-es-de-nadie-1234"}
+CARGA = {"h": "203.0.113.7", "p": 61234, "f": "0GUKsxTavhZWbjkIBTXZmhJX0PMoBKdRcxK1ljakLyc",
+         "t": "dG9rZW4tZGUtcHJ1ZWJhLXF1ZS1uby1lcy1kZS1uYWQ"}
 IP = "198.51.100.20"
 
 

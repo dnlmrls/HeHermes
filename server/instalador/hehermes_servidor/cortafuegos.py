@@ -16,7 +16,7 @@ quitan buscándolo: ni una regla del usuario se reescribe ni se borra. No se esc
 `/etc/iptables/rules.v4`: tras un reinicio las vuelve a poner `hehermes-cortafuegos.service`, que corre después de que
 el sistema cargue las suyas (`piezas.unidad_cortafuegos`).
 
-Solo IPv4: el QR lleva la dirección IPv4 de salida, y el túnel es 10.77.0.1.
+Solo IPv4: el QR lleva la dirección IPv4 de salida.
 """
 
 from __future__ import annotations
@@ -67,8 +67,9 @@ class Regla:
 
 
 def permanentes(modo: str = "vpn", puerto: int | None = None) -> list:
-    """Lo mismo que las de ufw: solo el UDP de IKE queda abierto a internet; el TCP 80, solo por hh-ipsec. En modo
-    TLS, solo el TCP de la pasarela."""
+    """Lo mismo que las de ufw. En modo TLS, solo el TCP de la pasarela. Las de la VPN de antes de la 0.6.0 (el UDP de
+    IKE y el TCP 80 por hh-ipsec) ya no las pone ninguna instalación nueva: siguen aquí para que, mientras quede esa
+    VPN, `hehermes-cortafuegos` las vuelva a poner tras un reinicio, y para quitarlas con ella."""
     if modo == "tls":
         return [Regla("TCP %d (la pasarela)" % int(puerto), "tcp", str(int(puerto)))]
     return [Regla("UDP 500 y 4500 (IKEv2)", "udp", "500,4500"),

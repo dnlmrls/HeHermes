@@ -31,12 +31,12 @@ SERVER = os.path.dirname(AQUI)
 URL_BASE = "https://github.com/dnlmrls/HeHermes/releases/download"
 # Un instante fijo para todo lo del paquete: con la hora de verdad, cada vez saldría otra suma.
 INSTANTE = 1_788_220_800  # 2026-09-01T00:00:00Z
-EJECUTABLES = {"hehermes-servidor", "hehermes-pasarela", "hehermes-dispositivo", "avisos/despliegue/instalar.sh",
-               "avisos/despliegue/hehermes-leer-media"}
+EJECUTABLES = {"hehermes-servidor", "hehermes-pasarela", "hehermes-dispositivo"}
 
 
 def ficheros():
-    """(ruta dentro del paquete, ruta en el repositorio) de todo lo que lleva, en orden."""
+    """(ruta dentro del paquete, ruta en el repositorio) de todo lo que lleva, en orden. Desde la 0.6.0 ya no lleva los
+    avisos (`server/avisos`): solo los instalaba `--avisos`, que iba con la VPN y se fue con ella."""
     lista = [("hehermes-servidor", os.path.join(AQUI, "hehermes-servidor")),
              ("hehermes-pasarela", os.path.join(AQUI, "hehermes-pasarela")),
              ("clave-publica.pem", os.path.join(AQUI, "clave-publica.pem")),
@@ -46,18 +46,6 @@ def ficheros():
     for nombre in sorted(os.listdir(os.path.join(AQUI, "hehermes_servidor"))):
         if nombre.endswith(".py"):
             lista.append(("hehermes_servidor/" + nombre, os.path.join(AQUI, "hehermes_servidor", nombre)))
-    avisos = os.path.join(SERVER, "avisos")
-    lista += [("avisos/README.md", os.path.join(avisos, "README.md")),
-              ("avisos/requirements.txt", os.path.join(avisos, "requirements.txt"))]
-    for nombre in sorted(os.listdir(os.path.join(avisos, "despliegue"))):
-        lista.append(("avisos/despliegue/" + nombre, os.path.join(avisos, "despliegue", nombre)))
-    codigo = os.path.join(avisos, "hehermes_avisos")
-    for carpeta, carpetas, nombres in os.walk(codigo):
-        carpetas[:] = sorted(c for c in carpetas if c != "__pycache__")
-        for nombre in sorted(nombres):
-            if nombre.endswith(".py"):
-                ruta = os.path.join(carpeta, nombre)
-                lista.append(("avisos/hehermes_avisos/" + os.path.relpath(ruta, codigo), ruta))
     return sorted(lista)
 
 

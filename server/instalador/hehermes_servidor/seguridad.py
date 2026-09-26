@@ -24,8 +24,8 @@ LARGO_PSK = 44
 
 
 def revisar(sis, man, ambito=None) -> list:
-    """La de la VPN, la de la pasarela o, con los dos modos, las dos juntas (lo común, una vez). Sin manifiesto, la de
-    una VPN hecha a mano."""
+    """La de la pasarela, la de una VPN de antes de la 0.6.0 (que ya no se instala, pero mientras esté se mira) o, con
+    las dos, las dos juntas (lo común, una vez). Sin manifiesto, la de una VPN hecha a mano."""
     from . import ambito as amb
     ambito = ambito or amb.de_root()
     modos = man.modos or ["vpn"]
@@ -77,7 +77,7 @@ def _api_de_hermes(sis, env, puerto):
         if suyo == str(puerto) and escucha in TODAS:
             donde = "%s:%d" % (escucha, puerto)
     if donde:
-        return (MAL, "la API de Hermes escucha en %s, en todas las interfaces: se llega a ella sin la VPN. "
+        return (MAL, "la API de Hermes escucha en %s, en todas las interfaces: se llega a ella sin pasar por la pasarela. "
                      "sudo hehermes-servidor instalar --corregir-exposicion la cierra a 127.0.0.1" % donde)
     return (BIEN, "la API de Hermes solo escucha en 127.0.0.1:%d" % puerto)
 

@@ -1,7 +1,8 @@
 """Dónde va cada cosa: con root, en el sistema; sin root, en la casa del usuario (el de Hermes).
 
 En modo TLS se puede instalar sin root (spec 2026-09-26, «El alta», «Sin root»): nada de paquetes ni de cortafuegos, y
-todo lo que se escribe, en `~/.local` y `~/.config`, que es suyo. El modo VPN solo existe con root. Todo lo que se
+todo lo que se escribe, en `~/.local` y `~/.config`, que es suyo. (La VPN de antes de la 0.6.0 solo existía con
+root, y por eso quitarla también es cosa de root.) Todo lo que se
 escribe sigue llamándose `hehermes*`: `borrar_arbol` no borra nada que no lo sea.
 """
 

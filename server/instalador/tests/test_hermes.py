@@ -1,7 +1,7 @@
 """Que haya un Hermes de verdad (instalado, en marcha y con su api_server contestando) y que su API no esté expuesta.
 
-La API de Hermes en 0.0.0.0 se deja a quien llegue al servidor sin pasar por la VPN, con su clave como única defensa.
-Se avisa muy claro y no se cambia sin permiso (`--corregir-exposicion`): podría romper otra cosa del usuario.
+La API de Hermes en 0.0.0.0 se deja a quien llegue al servidor sin pasar por la pasarela, con su clave como única
+defensa. Se avisa muy claro y no se cambia sin permiso (`--corregir-exposicion`): podría romper otra cosa del usuario.
 """
 
 import apoyo
@@ -9,20 +9,11 @@ import apoyo
 import unittest
 
 import servidor_falso as sf
+from hehermes_servidor import ambito as amb
 from hehermes_servidor import cli
 from hehermes_servidor import deteccion as d
 from hehermes_servidor.manifiesto import Manifiesto
-
-
-
-def con_modo_vpn(argv):
-    """Estas pruebas son del modo VPN, que desde la pasarela (0.5.0) ya no es el de por defecto."""
-    argv = list(argv)
-    if argv[:1] == ["instalar"] and "--modo" not in argv:
-        argv.append("--modo")
-        argv.append("vpn")
-    return argv
-
+from hehermes_servidor.modo_tls import detectar_tls
 
 ORIGEN = str(apoyo.RAIZ)
 ENV = "/root/.hermes/.env"
@@ -34,11 +25,11 @@ class Base(unittest.TestCase):
         self.addCleanup(self.sis.limpiar)
 
     def detectar(self, **opciones):
-        return d.detectar(self.sis, Manifiesto.leer(self.sis), **opciones)
+        return detectar_tls(self.sis, Manifiesto.leer(self.sis), amb.de_root(), **opciones)
 
     def orden(self, *argv):
         self.texto = []
-        codigo = cli.main(con_modo_vpn(argv), "uso", ORIGEN, sis=self.sis, entrada=lambda _: "n", salida=self.texto.append,
+        codigo = cli.main(list(argv), "uso", ORIGEN, sis=self.sis, entrada=lambda _: "n", salida=self.texto.append,
                           terminal=False, euid=0)
         self.salida = "\n".join(self.texto)
         return codigo
@@ -94,7 +85,7 @@ class LaExposicion(Base):
     def test_en_0000_por_el_env_avisa_en_rojo_y_propone_corregirlo(self):
         self.montar(host="0.0.0.0")
         texto = self.aviso(self.detectar())
-        for trozo in ("0.0.0.0:8642", "sin pasar por la VPN", "--corregir-exposicion", "No lo cambio"):
+        for trozo in ("0.0.0.0:8642", "sin pasar por la pasarela", "--corregir-exposicion", "No lo cambio"):
             self.assertIn(trozo, texto)
 
     def test_por_lo_que_escucha_aunque_el_env_no_lo_diga(self):

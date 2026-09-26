@@ -1,12 +1,15 @@
 #!/usr/bin/python3 -IB
 """hehermes-servidor: instala, comprueba, actualiza o desinstala lo de HeHermes Mensajes en este servidor.
 
-Uso (como root; en modo TLS, que es el de por defecto, también sin root):
-  hehermes-servidor instalar [--modo tls|vpn] [--plan] [--iphone <nombre>] [--direccion <IP o nombre>] [--avisos]
-                             [--hermes-home <carpeta>] [--reemplazar <fichero>]... [--si]
+Uso (como root, o sin root en la casa del usuario de Hermes):
+  hehermes-servidor instalar [--plan] [--iphone <nombre>] [--direccion <IP o nombre>] [--hermes-home <carpeta>]
+                             [--reemplazar <fichero>]... [--si]
   hehermes-servidor comprobar
   hehermes-servidor actualizar --paquete <hehermes-servidor-X.tar.gz> --firma <hehermes-servidor-X.tar.gz.sig>
-  hehermes-servidor desinstalar [--si] [--quitar-paquetes]
+  hehermes-servidor desinstalar [--modo vpn|tls] [--si] [--quitar-paquetes]
+
+Instala la conexión directa (la pasarela TLS). La VPN IKEv2 ya no se instala desde la 0.6.0; la de una versión
+anterior se quita con «desinstalar --modo vpn».
 """
 
 import os

@@ -1,4 +1,5 @@
-"""El canje del alta por chat (spec, sección B): lo que entrega la PSK de un iPhone, cifrada para la llave de su frase.
+"""El canje del alta por chat (spec, sección B): lo que entrega el acceso de un iPhone a la pasarela (`{h, p, f, t}`:
+la dirección, el puerto, la huella y su token), cifrado para la llave de su frase.
 
 Corre aparte del instalador, en su propio venv con `cryptography` (`/opt/hehermes-canje/venv`), como un usuario de usar
 y tirar (`DynamicUser`) dentro de la unidad temporal `hehermes-canje` que lanza `porchat.lanzar`. El instalador, con el
@@ -11,7 +12,8 @@ un sobre de otro servidor, de otro canje o del otro paso no se abre aunque vaya 
 
     {"v": 1, "e": base64(efímera pública), "n": base64(nonce de 12), "t": base64(cifrado ‖ etiqueta de 16)}
 
-Lo abre `CifradoDelCanje.swift` en la app; lo fija el vector compartido `HeHermesMensajesTests/Fixtures/canje-vpn.json`.
+Lo abre `CifradoDelCanje.swift` en la app; lo fijan los vectores compartidos de `HeHermesMensajesTests/Fixtures`
+(`canje-vpn.json`, el del sobre, de cuando lo que iba dentro era la PSK de la VPN, y `canje-modo-tls.json`).
 """
 
 from __future__ import annotations
@@ -33,7 +35,11 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 VERSION = 1
 PREFIJO_INFO = b"hehermes-canje/v1/"
+#: Los dos pasos. El segundo se llama «psk» por lo que entregaba cuando había VPN: es parte del protocolo (va dentro del
+#: HKDF, y la app lo usa igual), así que se queda con ese nombre aunque lo que entrega ya sea el token de la pasarela.
 PROPOSITOS = ("reto", "psk")
+#: Lo único que entrega el canje desde la 0.6.0, en este orden: la dirección, el puerto, la huella y el token.
+CLAVES_DE_LA_CARGA = ["h", "p", "f", "t"]
 BYTES_CODIGO = 16
 
 
@@ -409,6 +415,10 @@ def main(argv) -> int:
         nombres = ("canje", "cert", "clave") if len(argv) == 1 else ("canje.json", "cert.pem", "clave.pem")
         with open(os.path.join(credenciales, nombres[0]), "rb") as f:
             datos = json.load(f)
+        if not isinstance(datos.get("carga"), dict) or list(datos["carga"]) != CLAVES_DE_LA_CARGA:
+            # Nada que no sea el acceso a la pasarela: ni la PSK de una VPN, que ya no existe, ni nada más.
+            print("error: el canje solo entrega {h, p, f, t}, el acceso a la pasarela", flush=True)
+            return 2
         el_canje = Canje(de_b64url(datos["llave"], 32), datos["codigo"], de_b64url(datos["huella"], 32),
                          json.dumps(datos["carga"], separators=(",", ":")).encode())
         puerto, direccion = int(datos["puerto"]), datos.get("direccion", "")

@@ -1,8 +1,10 @@
-"""El modo TLS del instalador (spec 2026-09-26): la pasarela en vez de la VPN. Detectar, planear, aplicar y comprobar.
+"""El modo TLS del instalador (spec 2026-09-26): la pasarela. Desde la 0.6.0 es lo único que se instala. Detectar,
+planear, aplicar y comprobar.
 
 Reutiliza lo de siempre (el manifiesto, las transacciones de `aplicar`, el cortafuegos, la API de Hermes), pero no
-toca nada de la VPN: ni strongSwan, ni nginx, ni XFRM, ni `/etc/hehermes/servidor.ini`, que es lo que lee el
-`hehermes-dispositivo` de una VPN hecha a mano. Por eso puede convivir con una, como la del VPS de Daniel.
+toca nada de una VPN: ni strongSwan, ni nginx, ni XFRM, ni `/etc/hehermes/servidor.ini`, que es lo que lee el
+`hehermes-dispositivo` para quitar las altas de la VPN de antes. Por eso puede convivir con una (la de una versión
+anterior del instalador, o una hecha a mano) hasta que se quite.
 
 Con root: un usuario propio (`hh-pasarela`), la unidad de sistema con su sandbox, las credenciales, la copia de la
 clave de Hermes vigilada y la regla del cortafuegos. Sin root: todo en la casa del usuario, una unidad de
@@ -44,7 +46,7 @@ def detectar_tls(sis, man, ambito, direccion=None, hermes_home=None, activar_api
     det.gestor_usuario = det.linger = None
     det.dispositivo_ajeno = False
     det.venv_listo = False
-    if not _distro(sis, det, modo="tls"):
+    if not _distro(sis, det):
         return det
     _hermes(sis, det, hermes_home, activar_api, corregir_exposicion)
     if not ambito.root and det.hermes is not None and (det.hermes.api_pendiente or det.hermes.exposicion_pendiente):
@@ -114,13 +116,15 @@ def _systemd(sis, det, ambito):
 
 
 def _convivir(sis, det, man, ambito):
-    """Una VPN de HeHermes, hecha a mano o del instalador, no impide la pasarela: van por separado, y la pasarela se
-    añade a su lado. Si la VPN es del instalador, las dos quedan en el mismo manifiesto, y cada una se puede quitar
-    sin la otra (`desinstalar --modo`)."""
+    """Una VPN de HeHermes, hecha a mano o de una versión anterior del instalador, no impide la pasarela: van por
+    separado, y la pasarela se añade a su lado. Si la VPN es del instalador, las dos quedan en el mismo manifiesto, y
+    la VPN se quita sin tocar la pasarela (`desinstalar --modo vpn`). Desde la 0.6.0 la VPN ya no se instala ni se
+    repara: solo se dice que sigue ahí y cómo quitarla."""
     if "vpn" in man.modos:
-        det.avisos.append("Aquí ya está la VPN IKEv2 que instalé (%s). No la toco: la pasarela se añade a su lado, en "
-                          "su puerto, y las dos conviven. Para quitar luego solo la VPN: sudo hehermes-servidor "
-                          "desinstalar --modo vpn" % man.ruta)
+        det.avisos.append("Aquí sigue la VPN IKEv2 que instaló una versión anterior (%s). Desde la 0.6.0 ya no la "
+                          "instalo ni la reparo, y no la toco: la pasarela va a su lado, en su puerto. Cuando tus "
+                          "iPhone vayan por la pasarela, quítala con: sudo hehermes-servidor desinstalar --modo vpn"
+                          % man.ruta)
     elif ambito.root:
         vpn = [r for r in (p.SITIO, p.SITIO_CONF_D, "/etc/swanctl/conf.d/hehermes-poc.conf", "/etc/wireguard/hehermes")
                if sis.existe(r)] + (["hh-ipsec"] if sis.ejecutar(["ip", "link", "show", p.INTERFAZ]).bien else [])
@@ -149,9 +153,6 @@ def calcular_plan_tls(sis, det, man, op, origen) -> Plan:
         acciones.append(Accion(tipo, ruta, estado, detalle, datos, modo, grupo))
         return acciones[-1]
 
-    if op.avisos:
-        bloqueos.append("Los avisos (--avisos), en modo TLS todavía no: su instalador necesita nginx y la VPN. Si ya "
-                        "están instalados, la pasarela los sirve igual")
     if getattr(det, "falta_venv", False):
         acciones.append(Accion("paquete", PAQUETE_VENV, m.NUEVO, "para el venv de cryptography"))
 
@@ -235,7 +236,7 @@ def calcular_plan_tls(sis, det, man, op, origen) -> Plan:
     if op.por_chat:
         from . import porchat
         bloqueos.extend(porchat.bloqueos(sis, man, op, op.ahora,
-                                         activos=porchat.activos_de_los_dos(sis, man, "tls", ambito)))
+                                         activos=porchat.activos_del_servidor(sis, man, ambito)))
         acciones.append(Accion("canje", "hehermes-canje", m.NUEVO,
                                "10 minutos en un TCP al azar del 58000 al 65500, %sde un solo uso; al acabar, la línea "
                                "del enlace" % ("abierto solo mientras dura y " if ambito.root else "")))
