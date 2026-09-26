@@ -252,9 +252,11 @@ def _igual(dado, esperado: str) -> bool:
 # MARK: El certificado
 
 
-def preparar(carpeta: str) -> str:
+def preparar(carpeta: str, dias: int = 1) -> str:
     """La clave y el certificado de este canje, autofirmado y sin ningún dato: quien escanee el puerto no saca de él ni
-    de quién es el servidor. Un día de validez, que es de sobra para diez minutos. Devuelve la huella de su SPKI."""
+    de quién es el servidor. Un día de validez, que es de sobra para diez minutos. Devuelve la huella de su SPKI.
+
+    La pasarela usa lo mismo con diez años (`--dias 3650`): la app solo ancla la huella, y no mira las fechas."""
     import datetime
     from cryptography import x509
     from cryptography.hazmat.primitives.asymmetric import ec
@@ -268,7 +270,7 @@ def preparar(carpeta: str) -> str:
     cert = (x509.CertificateBuilder().subject_name(nombre).issuer_name(nombre).public_key(clave.public_key())
             .serial_number(x509.random_serial_number())
             .not_valid_before(ahora - datetime.timedelta(minutes=5))
-            .not_valid_after(ahora + datetime.timedelta(days=1))
+            .not_valid_after(ahora + datetime.timedelta(days=dias))
             .sign(clave, hashes.SHA256()))
     _escribir_privado(os.path.join(carpeta, "clave.pem"),
                       clave.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()))
@@ -390,23 +392,31 @@ def _responder(tls, estado, datos):
 def main(argv) -> int:
     """`preparar <carpeta>`: la clave, el certificado y su huella, como root, antes de lanzar la unidad.
     `servir`: el canje, desde las credenciales que le pasa systemd (`LoadCredential`), como un DynamicUser."""
-    if argv[:1] == ["preparar"] and len(argv) == 2:
-        print(json.dumps({"huella": preparar(argv[1])}))
+    if argv[:1] == ["preparar"] and len(argv) in (2, 4) and (len(argv) == 2 or argv[2] == "--dias"):
+        dias = int(argv[3]) if len(argv) == 4 else 1
+        if not 1 <= dias <= 3650:
+            print("error: --dias va de 1 a 3650", flush=True)
+            return 2
+        print(json.dumps({"huella": preparar(argv[1], dias)}))
         return 0
-    if argv == ["servir"]:
-        credenciales = os.environ.get("CREDENTIALS_DIRECTORY")
+    if argv[:1] == ["servir"] and len(argv) in (1, 3) and (len(argv) == 1 or argv[1] == "--carpeta"):
+        # Con root, systemd le pasa las credenciales (LoadCredential, a un DynamicUser); sin root, en modo TLS, una
+        # carpeta 0700 del usuario en /run/user/<uid>, que borra la limpieza al acabar.
+        credenciales = argv[2] if len(argv) == 3 else os.environ.get("CREDENTIALS_DIRECTORY")
         if not credenciales:
             print("error: servir lo lanza systemd, con las credenciales del canje", flush=True)
             return 2
-        with open(os.path.join(credenciales, "canje"), "rb") as f:
+        nombres = ("canje", "cert", "clave") if len(argv) == 1 else ("canje.json", "cert.pem", "clave.pem")
+        with open(os.path.join(credenciales, nombres[0]), "rb") as f:
             datos = json.load(f)
         el_canje = Canje(de_b64url(datos["llave"], 32), datos["codigo"], de_b64url(datos["huella"], 32),
                          json.dumps(datos["carga"], separators=(",", ":")).encode())
         puerto, direccion = int(datos["puerto"]), datos.get("direccion", "")
         del datos
-        return servir(el_canje, os.path.join(credenciales, "cert"), os.path.join(credenciales, "clave"), puerto,
+        return servir(el_canje, os.path.join(credenciales, nombres[1]), os.path.join(credenciales, nombres[2]), puerto,
                       direccion)
-    print("uso: python -m hehermes_servidor.canje preparar <carpeta> | servir", flush=True)
+    print("uso: python -m hehermes_servidor.canje preparar <carpeta> [--dias N] | servir [--carpeta <carpeta>]",
+          flush=True)
     return 2
 
 

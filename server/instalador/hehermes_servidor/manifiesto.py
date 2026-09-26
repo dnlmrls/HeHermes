@@ -29,13 +29,27 @@ BLOQUEAN = (AJENO, MODIFICADO)
 ESCRIBEN = (NUEVO, CAMBIA, REEMPLAZA)
 
 
+#: Los dos modos, en el orden en que se enumeran y se reparan: la VPN y la pasarela.
+MODOS = ("vpn", "tls")
+
+
+def modos_de(datos: dict) -> list:
+    """Los modos de un manifiesto. Hasta la 0.5.0 había uno solo, en `modo`; una instalación de antes de la pasarela no
+    lleva ninguno, y es de la VPN."""
+    if isinstance(datos.get("modos"), list):
+        return [m for m in MODOS if m in datos["modos"]]
+    return [datos.get("modo", "vpn")]
+
+
 class ManifiestoRoto(Exception):
     pass
 
 
 class Manifiesto:
-    def __init__(self, datos: dict | None = None, en_disco: bool = False):
+    def __init__(self, datos: dict | None = None, en_disco: bool = False, ruta: str = RUTA_MANIFIESTO):
         self.datos = datos or {"v": 1}
+        #: Con root, /etc/hehermes/instalacion.json; sin root (modo TLS), el de la casa del usuario (`ambito`).
+        self.ruta = ruta
         for clave, vacio in (("ficheros", {}), ("paquetes", []), ("reglas", []), ("unidades", []),
                              ("quitados", {}), ("dispositivos", []), ("carpetas", [])):
             self.datos.setdefault(clave, vacio)
@@ -100,23 +114,42 @@ class Manifiesto:
 
     # Disco
 
+    @property
+    def modos(self) -> list:
+        """Los modos instalados, «vpn» y «tls», en ese orden: los dos pueden convivir (`modos_de`)."""
+        if not self.en_disco and not ("modos" in self.datos or "modo" in self.datos):
+            return []
+        return modos_de(self.datos)
+
+    def anadir_modo(self, modo: str) -> None:
+        """Apunta un modo más. Va antes de escribir nada suyo: si se para a medias, desinstalar sabe de él."""
+        self.datos["modos"] = [m for m in MODOS if m in set(self.modos) | {modo}]
+        self.datos.pop("modo", None)
+
+    def quitar_modo(self, modo: str) -> None:
+        self.datos["modos"] = [m for m in self.modos if m != modo]
+        self.datos.pop("modo", None)
+
     @classmethod
-    def leer(cls, sis) -> "Manifiesto":
-        datos = sis.leer(RUTA_MANIFIESTO)
+    def leer(cls, sis, ruta: str = RUTA_MANIFIESTO) -> "Manifiesto":
+        datos = sis.leer(ruta)
         if datos is None:
-            return cls()
+            return cls(ruta=ruta)
         try:
             leido = json.loads(datos)
         except ValueError as error:
-            raise ManifiestoRoto("%s no se puede leer (%s): no sigo sin saber qué es mío" % (RUTA_MANIFIESTO, error))
+            raise ManifiestoRoto("%s no se puede leer (%s): no sigo sin saber qué es mío" % (ruta, error))
         if not isinstance(leido, dict) or leido.get("v") != 1:
-            raise ManifiestoRoto("%s no es de una versión que conozca" % RUTA_MANIFIESTO)
-        return cls(leido, en_disco=True)
+            raise ManifiestoRoto("%s no es de una versión que conozca" % ruta)
+        return cls(leido, en_disco=True, ruta=ruta)
 
     def guardar(self, sis) -> None:
-        sis.carpeta(CARPETA, 0o700)
-        sis.escribir(RUTA_MANIFIESTO, (json.dumps(self.datos, indent=2, ensure_ascii=False, sort_keys=True)
-                                       + "\n").encode(), modo=0o600)
+        carpeta = self.ruta.rsplit("/", 1)[0]
+        if not sis.existe(carpeta) and carpeta not in self.carpetas and self.ruta != RUTA_MANIFIESTO:
+            self.apuntar_carpetas(sis, self.ruta)
+        sis.carpeta(carpeta, 0o700)
+        sis.escribir(self.ruta, (json.dumps(self.datos, indent=2, ensure_ascii=False, sort_keys=True)
+                                 + "\n").encode(), modo=0o600)
         self.en_disco = True
 
 

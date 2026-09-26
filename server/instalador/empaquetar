@@ -31,13 +31,14 @@ SERVER = os.path.dirname(AQUI)
 URL_BASE = "https://github.com/dnlmrls/HeHermes/releases/download"
 # Un instante fijo para todo lo del paquete: con la hora de verdad, cada vez saldría otra suma.
 INSTANTE = 1_788_220_800  # 2026-09-01T00:00:00Z
-EJECUTABLES = {"hehermes-servidor", "hehermes-dispositivo", "avisos/despliegue/instalar.sh",
+EJECUTABLES = {"hehermes-servidor", "hehermes-pasarela", "hehermes-dispositivo", "avisos/despliegue/instalar.sh",
                "avisos/despliegue/hehermes-leer-media"}
 
 
 def ficheros():
     """(ruta dentro del paquete, ruta en el repositorio) de todo lo que lleva, en orden."""
     lista = [("hehermes-servidor", os.path.join(AQUI, "hehermes-servidor")),
+             ("hehermes-pasarela", os.path.join(AQUI, "hehermes-pasarela")),
              ("clave-publica.pem", os.path.join(AQUI, "clave-publica.pem")),
              ("requirements-canje.txt", os.path.join(AQUI, "requirements-canje.txt")),
              ("README.md", os.path.join(AQUI, "README.md")),

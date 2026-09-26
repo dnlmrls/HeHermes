@@ -299,7 +299,7 @@ class FamiliaRedHat(Base):
     def test_el_canje_por_chat_abre_su_puerto_solo_mientras_dura(self):
         sis, falso = self.rocky()
         texto = []
-        codigo = cli.main(["instalar", "--por-chat", "--iphone", "mi-iphone", "--llave",
+        codigo = cli.main(["instalar", "--modo", "vpn", "--por-chat", "--iphone", "mi-iphone", "--llave",
                            "KCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEFCQ0RFRkc"], "uso", ORIGEN, sis=sis,
                           entrada=lambda _: "n", salida=texto.append, terminal=False, euid=0)
         self.assertEqual(codigo, 0, "\n".join(texto))
@@ -318,7 +318,7 @@ class FamiliaRedHat(Base):
         sis, falso = self.rocky()
         falso.fw_ahora.add("port=58443/tcp")
         texto = []
-        cli.main(["instalar", "--por-chat", "--iphone", "mi-iphone", "--llave",
+        cli.main(["instalar", "--modo", "vpn", "--por-chat", "--iphone", "mi-iphone", "--llave",
                   "KCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEFCQ0RFRkc"], "uso", ORIGEN, sis=sis, entrada=lambda _: "n",
                  salida=texto.append, terminal=False, euid=0)
         porchat.limpiar(sis, {})

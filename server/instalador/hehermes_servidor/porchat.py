@@ -34,20 +34,39 @@ def llave_valida(texto) -> bool:
     return len(datos) == 32 and base64.urlsafe_b64encode(datos).rstrip(b"=").decode() == texto
 
 
-def bloqueos(sis, man, op, ahora=None) -> list:
+def activos_de_los_dos(sis, man, modo, ambito=None) -> list:
+    """Los iPhone del servidor, de la VPN y de la pasarela si están los dos: «el primer iPhone» es el primero del
+    servidor, no el del modo que se instala ahora. Si no, con una VPN dada por chat, un correo que leyera Hermes
+    podría pedir otra alta por la pasarela."""
+    from . import ambito as amb
+    from .modo_tls import nombres_de_la_pasarela
+    ambito = ambito or amb.de_root()
+    modos = set(man.modos) | {modo}
+    lista = list(registro_de_dispositivos(sis)) if "vpn" in modos and ambito.root else []
+    if "tls" in modos:
+        lista += [{"nombre": n} for n in nombres_de_la_pasarela(sis, ambito)]
+    return lista
+
+
+def bloqueos(sis, man, op, ahora=None, activos=None) -> list:
     """Lo que impide un alta por chat (decisión 7). Una web o un correo que lea Hermes pueden llevar escondida la orden
-    de dar un alta con la llave de otro: por eso solo vale para el primer iPhone, una vez, y recién instalado."""
+    de dar un alta con la llave de otro: por eso solo vale para el primer iPhone, una vez, y recién instalado. En modo
+    TLS, `activos` son los iPhone de la pasarela."""
     ahora = time.time() if ahora is None else ahora
     salida = []
     por_chat = man.datos.get("por_chat") or {}
-    activos = [d for d in registro_de_dispositivos(sis)]
+    activos = list(registro_de_dispositivos(sis) if activos is None else activos)
     otros = sorted(d["nombre"] for d in activos if d.get("nombre") != op.iphone)
+    tls = getattr(op, "modo", "vpn") == "tls"
+    # Con los dos modos, `alta` sin más no sabe cuál: se dice.
+    alta = "hehermes-dispositivo alta <nombre>" + ((" --tls" if "vpn" in man.modos else "") if tls else " --ikev2")
     if otros:
         salida.append("Por chat solo se conecta el primer iPhone, y aquí ya hay: %s. El siguiente, desde la app o "
-                      "por SSH (sudo hehermes-dispositivo alta <nombre> --ikev2)" % ", ".join(otros))
+                      "por SSH (%s)" % (", ".join(otros), alta))
     elif any(d.get("nombre") == op.iphone for d in activos) and por_chat.get("iphone") != op.iphone:
         salida.append("«%s» ya está dado de alta y no se dio de alta por chat: por chat solo se conecta el primer "
-                      "iPhone. Por SSH: sudo hehermes-dispositivo qr %s" % (op.iphone, op.iphone))
+                      "iPhone. Por SSH: %s" % (op.iphone, "hehermes-dispositivo rotar %s" % op.iphone if tls
+                                              else "sudo hehermes-dispositivo qr %s" % op.iphone))
     if por_chat.get("canjeado"):
         salida.append("El alta por chat de «%s» ya se canjeó: por chat solo se conecta una vez. Otro iPhone, desde la "
                       "app o por SSH" % por_chat.get("iphone", "?"))
@@ -56,7 +75,7 @@ def bloqueos(sis, man, op, ahora=None) -> list:
         if not isinstance(instalado, (int, float)) or ahora - instalado > VENTANA:
             salida.append("Esta instalación es de hace más de media hora: por chat solo se da de alta en la media "
                           "hora siguiente a instalar, para que nada que lea Hermes le pueda pedir un alta nueva. Por "
-                          "SSH: sudo hehermes-dispositivo alta <nombre> --ikev2")
+                          "SSH: %s" % alta)
     return salida
 
 
@@ -165,35 +184,55 @@ def leer_psk(texto: str) -> str:
     raise ValueError("no hay ningún secret entre comillas")
 
 
-def lanzar(sis, man, det, op, salida) -> str:
-    """Prepara y lanza el canje del iPhone de `op.iphone`. Devuelve el enlace; no lo imprime (va el último)."""
+def carga_tls(direccion: str, puerto: int, huella: str, token: str) -> dict:
+    """Lo que entrega el canje en modo TLS (server/API-CONTRACT.md, §12.2): en este orden, y `p` como número."""
+    from .tokens import texto_qr
+    texto_qr(direccion, puerto, huella, token)  # la misma validación que el QR
+    return {"h": direccion, "p": puerto, "f": huella, "t": token}
+
+
+def lanzar(sis, man, det, op, salida, carga=None, ambito=None) -> str:
+    """Prepara y lanza el canje del iPhone de `op.iphone`. Devuelve el enlace; no lo imprime (va el último).
+
+    En modo VPN la carga es la PSK del iPhone, que se lee de su conexión; en modo TLS se da hecha (`carga_tls`). Sin
+    root (`ambito` de un usuario), el canje es una unidad de usuario y no se toca el cortafuegos."""
     import json
     import secrets as azar
+    from . import ambito as amb
 
-    parar(sis)
-    limpiar_restos(sis)
-    _venv(sis, man, salida)
+    ambito = ambito or amb.de_root()
+    run = ambito.run_canje
+    python = ambito.python_venv
+    parar(sis, ambito)
+    limpiar_restos(sis, ambito)
+    _venv(sis, man, salida, ambito)
+    regla, cortafuegos, propio = None, None, False
     try:
-        sis.carpeta(RUN, 0o700)
-        r = sis.ejecutar([PYTHON_VENV, "-I", "-B", "-m", "hehermes_servidor.canje", "preparar", RUN])
+        sis.carpeta(run, 0o700)
+        r = sis.ejecutar([python, "-I", "-B", "-m", "hehermes_servidor.canje", "preparar", run])
         if not r.bien:
             raise ParadaDelCanje("no he podido crear el certificado del canje: %s" % (r.error or r.salida).strip())
         huella = json.loads(r.salida)["huella"]
-        registro = next(d for d in registro_de_dispositivos(sis) if d.get("nombre") == op.iphone)
-        servidor = registro.get("servidor") or det.direccion
-        texto = sis.leer_texto("%s/conf.d/hehermes-%s.conf" % (det.swanctl, op.iphone))
-        try:
-            psk = leer_psk(texto or "")
-        except ValueError:
-            raise ParadaDelCanje("no encuentro la clave de «%s» en su conexión de strongSwan" % op.iphone) from None
+        if carga is None:
+            registro = next(d for d in registro_de_dispositivos(sis) if d.get("nombre") == op.iphone)
+            servidor = registro.get("servidor") or det.direccion
+            texto = sis.leer_texto("%s/conf.d/hehermes-%s.conf" % (det.swanctl, op.iphone))
+            try:
+                psk = leer_psk(texto or "")
+            except ValueError:
+                raise ParadaDelCanje("no encuentro la clave de «%s» en su conexión de strongSwan" % op.iphone) from None
+            carga = {"h": servidor, "rid": servidor, "lid": op.iphone, "k": psk}
+            del psk
+        servidor = carga["h"]
         puerto = _puerto_libre(sis)
         codigo = base64.urlsafe_b64encode(azar.token_bytes(16)).rstrip(b"=").decode()
         datos = {"llave": op.llave, "codigo": codigo, "huella": huella, "puerto": puerto, "direccion": "",
-                 "carga": {"h": servidor, "rid": servidor, "lid": op.iphone, "k": psk}}
-        sis.escribir(RUN + "/canje.json", json.dumps(datos).encode(), modo=0o600)
-        del datos, psk
-        regla, cortafuegos = None, None
-        if det.ufw == "activo":
+                 "carga": carga}
+        sis.escribir(run + "/canje.json", json.dumps(datos).encode(), modo=0o600)
+        del datos, carga
+        if not ambito.root:
+            pass  # sin root no se toca el cortafuegos: se dice qué abrir
+        elif det.ufw == "activo":
             regla, cortafuegos = ["allow", "proto", "tcp", "from", "any", "to", "any", "port", str(puerto), "comment",
                                   COMENTARIO_UFW], "ufw"
             r = sis.ejecutar(["ufw"] + regla)
@@ -209,8 +248,7 @@ def lanzar(sis, man, det, op, salida) -> str:
                     raise ParadaDelCanje("firewalld no ha abierto el TCP %d: %s" % (puerto,
                                                                                  (r.error or r.salida).strip()))
                 regla, cortafuegos = [opcion], "firewalld"
-        propio = False
-        if det.lugares:
+        if ambito.root and det.lugares:
             # nftables o iptables a pelo: en las mismas cadenas que las de siempre, con su propia marca.
             from . import cortafuegos as cf
             try:
@@ -218,36 +256,40 @@ def lanzar(sis, man, det, op, salida) -> str:
             except cf.NoSe as error:
                 raise ParadaDelCanje("no he podido abrir el TCP %d en tu cortafuegos: %s" % (puerto, error)) from None
             propio = True
-        sis.escribir(RUN + "/estado.json", json.dumps({"puerto": puerto, "regla": regla, "cortafuegos": cortafuegos,
+        sis.escribir(run + "/estado.json", json.dumps({"puerto": puerto, "regla": regla, "cortafuegos": cortafuegos,
                                                        "propio": propio, "con_iptables": det.con_iptables}).encode(),
                      modo=0o600)
-        r = sis.ejecutar(_systemd_run())
-        if not r.bien or not sis.ejecutar(["systemctl", "is-active", UNIDAD]).bien:
-            raise ParadaDelCanje("el canje no ha arrancado (%s). Mira «journalctl -u %s»"
-                                 % ((r.error or r.salida).strip() or "se ha parado nada más empezar", UNIDAD))
+        r = sis.ejecutar(_systemd_run() if ambito.root else _systemd_run_usuario(ambito))
+        if not r.bien or not sis.ejecutar(ambito.systemctl + ["is-active", UNIDAD]).bien:
+            raise ParadaDelCanje("el canje no ha arrancado (%s). Mira «journalctl %s-u %s»"
+                                 % ((r.error or r.salida).strip() or "se ha parado nada más empezar",
+                                    "" if ambito.root else "--user ", UNIDAD))
     except ParadaDelCanje:
-        limpiar(sis, {})
+        limpiar(sis, {}, ambito)
         raise
     abierto_en = ([cortafuegos] if regla else []) + (["tu nftables o iptables"] if propio else [])
     salida("==> el canje: abierto 10 minutos en el TCP %d%s" % (
         puerto, " (y en %s, solo mientras dure)" % " y ".join(abierto_en) if abierto_en else ""))
-    if det.cortafuegos_a_mano:
+    if not ambito.root:
+        salida("    Sin root no toco el cortafuegos: si hay uno, ábrele ahora el TCP %d, solo mientras dure el canje"
+               % puerto)
+    elif det.cortafuegos_a_mano:
         salida("    Tu cortafuegos lo llevas tú: ábrele ahora el TCP %d, solo mientras dure el canje" % puerto)
     salida("    Si tu proveedor tiene un cortafuegos propio, el TCP %d tiene que estar abierto ahí" % puerto)
     el_enlace = enlace(servidor, puerto, codigo, huella)
     if op.qr_png:
-        salida(_qr_png(sis, op.qr_png, el_enlace))
+        salida(_qr_png(sis, op.qr_png, el_enlace, run))
     return el_enlace
 
 
-def _qr_png(sis, ruta, el_enlace) -> str:
+def _qr_png(sis, ruta, el_enlace, run=RUN) -> str:
     """El PNG se hace en /run (de root) y se deja en `ruta` como lo haría quien lanzó sudo: con la línea de sudoers de
     la salida 2, `--qr-png /etc/…` no puede pisar ni crear nada que su usuario no pudiera. Nunca sobre algo que ya
     exista, ni a través de un enlace."""
     import os
     if not ruta.startswith("/"):
         return "No dejo el QR en %s: dame una ruta absoluta" % ruta
-    temporal = RUN + "/qr.png"
+    temporal = run + "/qr.png"
     r = sis.ejecutar(["qrencode", "-t", "PNG", "-o", temporal], entrada=el_enlace)
     datos = sis.leer(temporal) if r.bien else None
     if sis.existe(temporal):
@@ -304,6 +346,30 @@ def _systemd_run() -> list:
     return orden + [PYTHON_VENV, "-I", "-B", "-m", "hehermes_servidor.canje", "servir"]
 
 
+def _systemd_run_usuario(ambito) -> list:
+    """Sin root (modo TLS): una unidad temporal de usuario. Sin `DynamicUser` ni `LoadCredential`, que un gestor de
+    usuario no da: el canje lee su carpeta de /run/user/<uid> (0700, en memoria), y la limpieza, también como el
+    usuario, la borra al pararse."""
+    limpiar_orden = "/usr/bin/python3 -I -B %s/hehermes-servidor canje-limpiar" % ambito.prefijo
+    propiedades = [
+        "Description=HeHermes: el canje del alta por chat (10 minutos, un solo uso)",
+        "NoNewPrivileges=yes",
+        "UMask=0077",
+        "RestrictAddressFamilies=AF_INET AF_INET6",
+        "LockPersonality=yes",
+        "RestrictRealtime=yes",
+        "SystemCallArchitectures=native",
+        "SystemCallFilter=@system-service",
+        "RuntimeMaxSec=660",
+        "ExecStopPost=" + limpiar_orden,
+    ]
+    orden = ["systemd-run", "--user", "--unit=" + UNIDAD, "--collect", "--quiet"]
+    for propiedad in propiedades:
+        orden += ["-p", propiedad]
+    return orden + [ambito.python_venv, "-I", "-B", "-m", "hehermes_servidor.canje", "servir", "--carpeta",
+                    ambito.run_canje]
+
+
 def elegir_puerto(ocupados, azar=None) -> int | None:
     """Uno libre del rango, empezando por uno al azar y dando la vuelta: si el primero está ocupado, el siguiente libre.
     `None` si no queda ninguno."""
@@ -335,41 +401,55 @@ def _puerto_libre(sis) -> int:
     return puerto
 
 
-def _venv(sis, man, salida):
-    """El venv del canje, con `cryptography` fijada por hash y el código del instalador por un `.pth` (con -I no vale
-    PYTHONPATH). Si ya está y funciona, no se toca."""
-    comprobar = [PYTHON_VENV, "-I", "-B", "-c", "import cryptography, hehermes_servidor.canje"]
-    if sis.existe(PYTHON_VENV) and sis.ejecutar(comprobar).bien:
+def venv_listo(sis, ambito=None) -> bool:
+    from . import ambito as amb
+    ambito = ambito or amb.de_root()
+    return sis.existe(ambito.python_venv) and sis.ejecutar(
+        [ambito.python_venv, "-I", "-B", "-c", "import cryptography, hehermes_servidor.canje"]).bien
+
+
+def _venv(sis, man, salida, ambito=None):
+    """El venv del canje (y del certificado de la pasarela), con `cryptography` fijada por hash y el código del
+    instalador por un `.pth` (con -I no vale PYTHONPATH). Si ya está y funciona, no se toca."""
+    from . import ambito as amb
+    ambito = ambito or amb.de_root()
+    python, venv = ambito.python_venv, ambito.venv
+    comprobar = [python, "-I", "-B", "-c", "import cryptography, hehermes_servidor.canje"]
+    if venv_listo(sis, ambito):
         return
-    salida("==> el entorno de Python del canje (%s)" % VENV)
-    man.datos["venv_canje"] = VENV
+    salida("==> el entorno de Python de cryptography (%s)" % venv)
+    man.datos["venv_canje"] = venv
     man.guardar(sis)
-    pasos = ([] if sis.existe(PYTHON_VENV) else [["python3", "-I", "-m", "venv", VENV]]) + [
-        [PYTHON_VENV, "-I", "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--quiet",
-         "--only-binary=:all:", "--require-hashes", "-r", REQUISITOS]]
+    pasos = ([] if sis.existe(python) else [["python3", "-I", "-m", "venv", venv]]) + [
+        [python, "-I", "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--quiet",
+         "--only-binary=:all:", "--require-hashes", "-r", ambito.prefijo + "/requirements-canje.txt"]]
     for paso in pasos:
         r = sis.ejecutar(paso)
         if not r.bien:
-            raise ParadaDelCanje("el entorno del canje ha fallado (%s): %s" % (paso[2 if paso[0] == "python3" else 3],
+            raise ParadaDelCanje("el entorno de Python ha fallado (%s): %s" % (paso[2 if paso[0] == "python3" else 3],
                                                                              (r.error or r.salida).strip()[-400:]))
-    r = sis.ejecutar([PYTHON_VENV, "-I", "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"])
-    sis.escribir(r.salida.strip() + "/hehermes-servidor.pth", (p.PREFIJO + "\n").encode())
+    r = sis.ejecutar([python, "-I", "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"])
+    sis.escribir(r.salida.strip() + "/hehermes-servidor.pth", (ambito.prefijo + "\n").encode())
     if not sis.ejecutar(comprobar).bien:
-        raise ParadaDelCanje("el entorno del canje no importa cryptography")
+        raise ParadaDelCanje("el entorno de Python no importa cryptography")
 
 
-def parar(sis) -> None:
+def _systemctl(ambito):
+    return ambito.systemctl if ambito is not None else ["systemctl"]
+
+
+def parar(sis, ambito=None) -> None:
     """Un canje anterior se para antes de lanzar otro: `systemctl stop` espera a su limpieza (`ExecStopPost`)."""
-    if sis.ejecutar(["systemctl", "is-active", UNIDAD]).bien:
-        sis.ejecutar(["systemctl", "stop", UNIDAD])
+    if sis.ejecutar(_systemctl(ambito) + ["is-active", UNIDAD]).bien:
+        sis.ejecutar(_systemctl(ambito) + ["stop", UNIDAD])
 
 
-def limpiar_restos(sis) -> None:
+def limpiar_restos(sis, ambito=None) -> None:
     """Lo que un canje pudo dejar sin su limpieza: tras un reinicio, /run ya está vacío, pero la regla de ufw no. Solo
     con el canje parado."""
-    if sis.ejecutar(["systemctl", "is-active", UNIDAD]).bien:
+    if sis.ejecutar(_systemctl(ambito) + ["is-active", UNIDAD]).bien:
         return
-    _barrer(sis)
+    _barrer(sis, ambito)
 
 
 def volver_a_abrir(sis, propio_de_la_instalacion=None) -> None:
@@ -387,36 +467,39 @@ def volver_a_abrir(sis, propio_de_la_instalacion=None) -> None:
         cf.poner(sis, cf.MARCA_CANJE, cf.del_canje(int(estado["puerto"])), estado.get("con_iptables", True))
 
 
-def _barrer(sis):
+def _barrer(sis, ambito=None):
     import shlex
     from . import cortafuegos as cf
-    cf.quitar(sis, cf.MARCA_CANJE)
-    if sis.cual("ufw"):
-        for linea in sis.ejecutar(["ufw", "show", "added"]).salida.splitlines():
-            linea = linea.strip()
-            if linea.startswith("ufw ") and COMENTARIO_UFW in linea:
-                sis.ejecutar(["ufw", "delete"] + shlex.split(linea)[1:])
-    if sis.existe(RUN):
-        sis.borrar_arbol(RUN)
+    run = ambito.run_canje if ambito is not None else RUN
+    if ambito is None or ambito.root:
+        cf.quitar(sis, cf.MARCA_CANJE)
+        if sis.cual("ufw"):
+            for linea in sis.ejecutar(["ufw", "show", "added"]).salida.splitlines():
+                linea = linea.strip()
+                if linea.startswith("ufw ") and COMENTARIO_UFW in linea:
+                    sis.ejecutar(["ufw", "delete"] + shlex.split(linea)[1:])
+    if sis.existe(run):
+        sis.borrar_arbol(run)
 
 
-def limpiar(sis, entorno) -> None:
+def limpiar(sis, entorno, ambito=None) -> None:
     """`ExecStopPost`: la regla de ufw fuera, /run/hehermes-canje fuera, y si el canje salió con 0 por sí mismo (se
     canjeó), apuntado: por chat no se da de alta nada más (decisión 7)."""
     import json
+    run = ambito.run_canje if ambito is not None else RUN
     try:
-        estado = json.loads(sis.leer_texto(RUN + "/estado.json") or "{}")
+        estado = json.loads(sis.leer_texto(run + "/estado.json") or "{}")
     except ValueError:
         estado = {}
     if estado.get("regla") and estado.get("cortafuegos") == "firewalld":
         sis.ejecutar(["firewall-cmd", estado["regla"][0].replace("--add-", "--remove-", 1)])
     elif estado.get("regla"):
         sis.ejecutar(["ufw", "delete"] + estado["regla"])
-    _barrer(sis)
+    _barrer(sis, ambito)
     canjeado = (entorno.get("SERVICE_RESULT") == "success" and entorno.get("EXIT_CODE") == "exited"
                 and entorno.get("EXIT_STATUS") == "0")
     if canjeado:
-        from .manifiesto import Manifiesto
-        man = Manifiesto.leer(sis)
+        from .manifiesto import Manifiesto, RUTA_MANIFIESTO
+        man = Manifiesto.leer(sis, ambito.manifiesto if ambito is not None else RUTA_MANIFIESTO)
         man.datos.setdefault("por_chat", {})["canjeado"] = time.time()
         man.guardar(sis)

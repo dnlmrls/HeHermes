@@ -67,7 +67,9 @@ class Paquete(unittest.TestCase):
                 self.assertNotIn("/tests/", nombre)
                 self.assertFalse(nombre.endswith(".pyc"))
                 self.assertEqual((m.uid, m.gid, m.uname, m.gname), (0, 0, "root", "root"))
-        for nombre, modo in (("hehermes-servidor", 0o755), ("hehermes_servidor/cli.py", 0o644),
+        for nombre, modo in (("hehermes-servidor", 0o755), ("hehermes-pasarela", 0o755),
+                             ("hehermes_servidor/pasarela.py", 0o644), ("hehermes_servidor/qr.py", 0o644),
+                             ("hehermes_servidor/cli.py", 0o644),
                              ("hehermes_servidor/plan.py", 0o644), ("clave-publica.pem", 0o644),
                              ("hehermes-dispositivo", 0o755), ("avisos/despliegue/instalar.sh", 0o755),
                              ("avisos/despliegue/hehermes-leer-media", 0o755),

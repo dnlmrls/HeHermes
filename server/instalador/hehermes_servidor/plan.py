@@ -20,7 +20,8 @@ PAQUETES = ("charon-systemd", "strongswan-swanctl", "libstrongswan-standard-plug
 PAQUETES_RPM = ("strongswan", "qrencode", "nginx")
 # Lo que va en /opt/hehermes-servidor: con eso, `comprobar`, `actualizar` y `desinstalar` siguen ahí después de que se
 # borre la carpeta temporal del comando.
-PROPIOS = ("hehermes-servidor", "clave-publica.pem", "requirements-canje.txt")
+PROPIOS = ("hehermes-servidor", "hehermes-pasarela", "clave-publica.pem", "requirements-canje.txt")
+EJECUTABLES_PROPIOS = ("hehermes-servidor", "hehermes-pasarela")
 #: Lo que hace falta además para el canje del alta por chat: su venv (en Debian y Ubuntu, `venv` sin `ensurepip` viene
 #: aparte).
 PAQUETES_POR_CHAT = ("python3-venv",)
@@ -29,7 +30,11 @@ PAQUETES_POR_CHAT = ("python3-venv",)
 class Opciones:
     def __init__(self, iphone=None, direccion=None, avisos=False, hermes_home=None, reemplazar=(), si=False,
                  solo_plan=False, por_chat=False, llave=None, activar_api=False, qr_png=None, ahora=None,
-                 cortafuegos_a_mano=False, corregir_exposicion=False):
+                 cortafuegos_a_mano=False, corregir_exposicion=False, modo="vpn"):
+        #: «vpn» o «tls» (la pasarela).
+        self.modo = modo
+        #: Si hay alguien delante de un terminal (el QR de la pasarela solo se pinta ahí).
+        self.terminal = True
         self.iphone = iphone
         self.direccion = direccion
         self.avisos = avisos
@@ -80,24 +85,25 @@ class Plan:
         return not self.bloqueos
 
 
-def ficheros_propios(origen: str) -> list:
-    """(ruta en /opt, contenido, modo) de lo que se copia del paquete: el lanzador, el código y la clave pública."""
+def ficheros_propios(origen: str, prefijo: str = p.PREFIJO) -> list:
+    """(ruta en /opt, contenido, modo) de lo que se copia del paquete: los lanzadores, el código y la clave pública. Sin
+    root, `prefijo` es el de la casa del usuario (`ambito`)."""
     salida = []
     for nombre in PROPIOS:
         ruta = os.path.join(origen, nombre)
         if os.path.exists(ruta):
             with open(ruta, "rb") as f:
-                salida.append((p.PREFIJO + "/" + nombre, f.read(), 0o755 if nombre == "hehermes-servidor" else 0o644))
+                salida.append((prefijo + "/" + nombre, f.read(), 0o755 if nombre in EJECUTABLES_PROPIOS else 0o644))
     # hehermes-dispositivo también: sin él, repetir o reparar desde lo instalado no tendría de dónde sacarlo.
     fuente = buscar_en_origen(origen, "hehermes-dispositivo", "../vpn/hehermes-dispositivo")
     if fuente is not None:
         with open(fuente, "rb") as f:
-            salida.append((p.PREFIJO + "/hehermes-dispositivo", f.read(), 0o755))
+            salida.append((prefijo + "/hehermes-dispositivo", f.read(), 0o755))
     carpeta = os.path.join(origen, "hehermes_servidor")
     for nombre in sorted(os.listdir(carpeta)):
         if nombre.endswith(".py"):
             with open(os.path.join(carpeta, nombre), "rb") as f:
-                salida.append((p.PREFIJO + "/hehermes_servidor/" + nombre, f.read(), 0o644))
+                salida.append((prefijo + "/hehermes_servidor/" + nombre, f.read(), 0o644))
     return salida
 
 
@@ -121,6 +127,7 @@ def registro_de_dispositivos(sis) -> list:
 def calcular_plan(sis, det, man, op: Opciones, origen: str) -> Plan:
     acciones, bloqueos = [], list(det.bloqueos)
     avisos = list(det.avisos)
+    det.al_lado = "tls" in man.modos
     if not det.distro.get("arquitectura") or det.hermes is None or det.hermes.clave is None:
         # Sin un sistema que se pueda instalar o sin un Hermes con su clave, no hay plan que enseñar.
         return Plan(det, acciones, bloqueos, avisos, op)
@@ -238,7 +245,8 @@ def calcular_plan(sis, det, man, op: Opciones, origen: str) -> Plan:
 
     # nftables e iptables a pelo: en cada cadena que cierra, las reglas justas y con la marca (`cortafuegos`)
     from . import cortafuegos as cf
-    reglas = cf.permanentes()
+    # Con la pasarela al lado, en cada cadena van también las suyas: todas llevan la misma marca.
+    reglas = cf.permanentes_de(man.datos, modos=set(man.modos) | {"vpn"})
     for lugar in det.lugares:
         estado = m.YA_ESTA if lugar.marcadas >= len(reglas) else m.NUEVO
         acciones.append(Accion("propio", lugar.nombre, estado, "%s, %s (con el comentario %s)" % (
@@ -291,7 +299,8 @@ def calcular_plan(sis, det, man, op: Opciones, origen: str) -> Plan:
     # El canje del alta por chat: cada vez que se lanza, uno nuevo (un enlace nuevo para la llave de esta frase).
     if op.por_chat:
         from . import porchat
-        bloqueos.extend(porchat.bloqueos(sis, man, op, op.ahora))
+        bloqueos.extend(porchat.bloqueos(sis, man, op, op.ahora,
+                                         activos=porchat.activos_de_los_dos(sis, man, "vpn")))
         acciones.append(Accion("canje", "hehermes-canje", m.NUEVO,
                                "10 minutos en un TCP al azar del 58000 al 65500, abierto solo "
                                "mientras dura y de un solo uso; al acabar, la línea del enlace"))
@@ -307,12 +316,12 @@ def calcular_plan(sis, det, man, op: Opciones, origen: str) -> Plan:
     return Plan(det, acciones, bloqueos, avisos, op)
 
 
-def _unidad(sis, acciones, unidad, ficheros, detalle, como_recargar):
+def _unidad(sis, acciones, unidad, ficheros, detalle, como_recargar, systemctl=("systemctl",)):
     """Una unidad se habilita y arranca si no lo está; si solo cambian sus ficheros, se recarga: la XFRM con su
     `ExecReload`, que no tumba la interfaz, y la vigilancia de la clave (una `.path`, que no se puede recargar) con
-    un restart, que es suya y no sirve a nada más."""
-    activa = sis.ejecutar(["systemctl", "is-active", unidad]).bien
-    habilitada = sis.ejecutar(["systemctl", "is-enabled", unidad]).bien
+    un restart, que es suya y no sirve a nada más. Sin root, `systemctl --user`."""
+    activa = sis.ejecutar(list(systemctl) + ["is-active", unidad]).bien
+    habilitada = sis.ejecutar(list(systemctl) + ["is-enabled", unidad]).bien
     if not (activa and habilitada):
         estado, que = m.NUEVO, "habilitar y arrancar: " + detalle
     elif any(f.cambia for f in ficheros):
@@ -326,7 +335,9 @@ def _unidad(sis, acciones, unidad, ficheros, detalle, como_recargar):
 # MARK: Pintar
 
 
-SECCIONES = (("Hermes", ("env", "exposicion")), ("Paquetes", ("paquete",)), ("Ficheros", ("fichero", "gestionado", "enlace", "quitar")),
+SECCIONES = (("Hermes", ("env", "exposicion")), ("Paquetes", ("paquete",)),
+             ("La pasarela", ("usuario", "venv", "certificado")),
+             ("Ficheros", ("fichero", "gestionado", "enlace", "quitar")),
              ("Servicios", ("unidad", "recarga")), ("Cortafuegos (ufw)", ("regla",)),
              ("Cortafuegos (firewalld)", ("firewalld",)), ("Cortafuegos (nftables e iptables)", ("propio",)), ("SELinux", ("selinux",)), ("Avisos push", ("avisos",)),
              ("iPhone", ("dispositivo",)), ("Canje por chat", ("canje",)))
@@ -348,8 +359,19 @@ def pintar(plan: Plan, color: bool = False) -> str:
                                                                             h.puerto, estado_clave))
     if det.direccion:
         lineas.append("  Dirección  %s (la que irá en el QR)" % det.direccion)
+    tls = getattr(det, "modo", "vpn") == "tls"
+    if tls:
+        ambito = det.ambito
+        lineas.append("  Modo       TLS: la pasarela, en el TCP %s%s%s" % (
+            det.puerto_pasarela, "" if ambito.root else ", sin root (como %s, en su casa)" % ambito.usuario,
+            ", al lado de la VPN IKEv2 (no la toco)" if getattr(det, "al_lado", False) else ""))
+    else:
+        lineas.append("  Modo       VPN IKEv2%s" % (", al lado de la pasarela TLS (no la toco)"
+                                                   if getattr(det, "al_lado", False) else ""))
     estados = {"activo": "activo", "inactivo": "apagado (no lo enciendo)", None: "no está"}
-    if det.distro.get("arquitectura") and det.firewalld is not None:
+    if tls and not det.ambito.root:
+        pass  # sin root no se mira el cortafuegos
+    elif det.distro.get("arquitectura") and det.firewalld is not None:
         lineas.append("  firewalld  %s" % estados[det.firewalld])
     elif det.distro.get("arquitectura"):
         lineas.append("  ufw        %s" % estados[det.ufw])
@@ -357,12 +379,21 @@ def pintar(plan: Plan, color: bool = False) -> str:
         lineas.append("  SELinux    %s" % det.selinux)
     for titulo, tipos in SECCIONES:
         de_aqui = [a for a in plan.acciones if a.tipo in tipos]
+        if titulo == "Avisos push" and not de_aqui and h is not None and tls:
+            lineas += ["", titulo, "  %-10s %s" % ("sí" if det.con_vigia else "no",
+                                                   "el vigía ya está: la pasarela le pasa /avisos/" if det.con_vigia
+                                                   else "el relé central todavía no existe")]
+            continue
         if titulo == "Avisos push" and not de_aqui and h is not None:
             lineas += ["", titulo, "  %-10s %s" % ("no", "el relé central todavía no existe; --avisos instala el "
                                                           "vigía y un relé local")]
             continue
         if titulo == "iPhone" and not de_aqui and h is not None and plan.opciones.iphone is None:
             lineas += ["", titulo, "  %-10s %s" % ("ninguno", "--iphone <nombre> lo da de alta y pinta su QR")]
+            continue
+        if titulo == "Cortafuegos (ufw)" and not de_aqui and tls and not det.ambito.root:
+            lineas += ["", "Cortafuegos", "  %-10s %s" % ("no lo toco", "sin root: abre tú el TCP %s si hace falta"
+                                                          % det.puerto_pasarela)]
             continue
         if not de_aqui:
             continue

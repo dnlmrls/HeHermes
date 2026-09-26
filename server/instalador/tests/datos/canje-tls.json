@@ -1,0 +1,29 @@
+{
+  "descripcion": "El sobre del segundo paso del canje en modo TLS (server/API-CONTRACT.md, §12.2): lo mismo que canje-vpn.json (la misma llave, el mismo código, el mismo certificado del canje y la misma cuenta del sobre, con el propósito «psk»), pero lo que va dentro es {h, p, f, t}: la dirección, el puerto (un número), la huella de la pasarela y el token del iPhone, en JSON compacto y en ese orden. Lo sella el servidor (hehermes_servidor/canje.py, que lo comprueba en tests/test_canje_cifrado.py). Todo es de prueba: nada es de nadie.",
+  "privada_del_iphone": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+  "publica_del_iphone": "B6N8vBQgk8i3VdwbEOhstCY3StFqqFPtC9/AsrhtHHw=",
+  "llave_de_la_frase": "B6N8vBQgk8i3VdwbEOhstCY3StFqqFPtC9_AsrhtHHw",
+  "codigo": "AAECAwQFBgcICQoLDA0ODw",
+  "certificado": "MIIBHTCBxaADAgECAgEBMAoGCCqGSM49BAMCMBkxFzAVBgNVBAMMDmhlaGVybWVzLWNhbmplMB4XDTI2MDEwMTAwMDAwMFoXDTM2MDEwMTAwMDAwMFowGTEXMBUGA1UEAwwOaGVoZXJtZXMtY2FuamUwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQt2/JW8OAwfUFkkoF1CC5cVQ5l/5WRslWGFNCgrVNGLtceCDHlfMa5dDJQ4zQcMbaZUhGWNyG5bMyMUSQmPF8hMAoGCCqGSM49BAMCA0cAMEQCICP0Vh8M4pVxwDePW+V82TI5VOjjyzj7YvuTF73/UtrMAiAH5cPieRCeQbsj7VDrTwWAxe/M48WHByh4wZsGfXFv7A==",
+  "huella": "Uhfo7S7DmMr3sd399-EUvTg6Z9_hDbthSzm01q1Womo",
+  "carga": {
+    "h": "203.0.113.7",
+    "p": 61234,
+    "f": "vrXpqZOgQjS050NyWV-byRxAgZ8aayoC6hrPdwP2dGY",
+    "t": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8"
+  },
+  "sobres": [
+    {
+      "proposito": "psk",
+      "claro": "eyJoIjoiMjAzLjAuMTEzLjciLCJwIjo2MTIzNCwiZiI6InZyWHBxWk9nUWpTMDUwTnlXVi1ieVJ4QWdaOGFheW9DNmhyUGR3UDJkR1kiLCJ0IjoiUUVGQ1EwUkZSa2RJU1VwTFRFMU9UMUJSVWxOVVZWWlhXRmxhVzF4ZFhsOCJ9",
+      "efimera_privada": "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1+f4A=",
+      "nonce": "MDEyMzQ1Njc4OTo7",
+      "sobre": {
+        "v": 1,
+        "e": "JE/juWPomd0pW6/84kjTUw86mnR5ugYwAmgOv+etrUk=",
+        "n": "MDEyMzQ1Njc4OTo7",
+        "t": "5qtNT0Uk2VEOEkXWEvhhNlvhvDp7nckRu5IjyVPZqhE9EN9b28LiaGi49MYdhEeBtYfM8wI4fs7o4UB5fku60nSdl7ZB0XZBB82wIgY9bIKkE8QwtuuYuoloIZtgV6w9JybktRxDP99xpYxaBGKJvvfAd731MJST5smOciD29Vva1y8IrwkhzOhMeCwU98AQiw=="
+      }
+    }
+  ]
+}

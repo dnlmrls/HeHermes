@@ -19,6 +19,17 @@ from hehermes_servidor.deteccion import detectar
 from hehermes_servidor.manifiesto import Manifiesto
 from hehermes_servidor.plan import Opciones, calcular_plan
 
+
+
+def con_modo_vpn(argv):
+    """Estas pruebas son del modo VPN, que desde la pasarela (0.5.0) ya no es el de por defecto."""
+    argv = list(argv)
+    if argv[:1] == ["instalar"] and "--modo" not in argv:
+        argv.append("--modo")
+        argv.append("vpn")
+    return argv
+
+
 ORIGEN = str(apoyo.RAIZ)
 LLAVE = base64.urlsafe_b64encode(bytes(range(40, 72))).rstrip(b"=").decode()
 MEDIA_HORA = 30 * 60
@@ -31,7 +42,7 @@ class Base(unittest.TestCase):
 
     def orden(self, *argv, terminal=False):
         self.texto = []
-        codigo = cli.main(list(argv), "uso", ORIGEN, sis=self.sis, entrada=lambda _: "n", salida=self.texto.append,
+        codigo = cli.main(con_modo_vpn(argv), "uso", ORIGEN, sis=self.sis, entrada=lambda _: "n", salida=self.texto.append,
                           terminal=terminal, euid=0)
         self.salida = "\n".join(self.texto)
         return codigo

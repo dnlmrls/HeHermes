@@ -13,6 +13,17 @@ from hehermes_servidor import piezas as p
 from hehermes_servidor.manifiesto import RUTA_MANIFIESTO
 from hehermes_servidor.sistema import Resultado
 
+
+
+def con_modo_vpn(argv):
+    """Estas pruebas son del modo VPN, que desde la pasarela (0.5.0) ya no es el de por defecto."""
+    argv = list(argv)
+    if argv[:1] == ["instalar"] and "--modo" not in argv:
+        argv.append("--modo")
+        argv.append("vpn")
+    return argv
+
+
 ORIGEN = str(apoyo.RAIZ)
 PUBLICA = apoyo.DATOS / "clave-de-prueba-NO-ES-DE-DANIEL.pub.pem"
 
@@ -31,7 +42,7 @@ class Base(unittest.TestCase):
             self.preguntas.append(pregunta)
             return pendientes.pop(0)
 
-        codigo = cli.main(list(argv), "uso", ORIGEN, sis=self.sis, entrada=entrada, salida=self.texto.append,
+        codigo = cli.main(con_modo_vpn(argv), "uso", ORIGEN, sis=self.sis, entrada=entrada, salida=self.texto.append,
                           terminal=terminal, euid=euid)
         self.salida = "\n".join(self.texto)
         return codigo
@@ -203,7 +214,8 @@ class LasDemas(Base):
         nueva = [o for o in self.sis.ordenes if o[:2] == ["python3", "-I"]]
         self.assertEqual(len(nueva), 1)
         self.assertTrue(nueva[0][2].endswith("/hehermes-servidor-9.0.0/hehermes-servidor"))
-        self.assertEqual(nueva[0][3:], ["instalar", "--si"])
+        # Con el modo de la instalación: la nueva no cambia una VPN a pasarela por su cuenta.
+        self.assertEqual(nueva[0][3:], ["instalar", "--si", "--modo", "vpn"])
         self.assertFalse(os.path.exists(os.path.dirname(os.path.dirname(nueva[0][2]))), "la carpeta temporal, fuera")
 
     def test_actualizar_con_firma_mala_no_toca_nada(self):

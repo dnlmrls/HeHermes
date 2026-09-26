@@ -1,0 +1,19 @@
+#!/usr/bin/python3 -IB
+"""hehermes-pasarela: la conexión directa (TLS) de la app con Hermes. La lanza su unidad de systemd:
+
+  hehermes-pasarela --config <pasarela.ini>
+"""
+
+import os
+import sys
+
+# Con -I, ni la carpeta del script ni nada del entorno van en sys.path: se añade a mano, y solo esta.
+AQUI = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, AQUI)
+sys.dont_write_bytecode = True
+os.chdir("/")
+
+from hehermes_servidor import pasarela  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(pasarela.main(sys.argv[1:]))
