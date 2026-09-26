@@ -173,19 +173,31 @@ class ConRoot(Base):
         self.assertIn("LoadCredential=vigia:/etc/hehermes-avisos/vigia/secreto-tunel\n", unidad)
         self.assertIn("vigia = 127.0.0.1:8790\n", self.sis.leer_texto("/etc/hehermes-pasarela/pasarela.ini"))
 
-    def test_avisos_en_modo_tls_todavia_no(self):
-        self.assertEqual(self.orden("instalar", "--plan", "--avisos"), 1)
-        self.assertIn("en modo TLS todavía no", self.salida)
+    def test_avisos_ya_no_es_una_opcion(self):
+        """--avisos solo iba con la VPN (su instalador necesita el nginx del túnel), y se fue con ella."""
+        antes = self.sis.foto()
+        self.assertEqual(self.orden("instalar", "--plan", "--avisos"), 2)
+        self.assertIn("--avisos", self.salida)
+        self.assertEqual(self.sis.ordenes, [])
+        self.assertEqual(self.sis.foto(), antes)
 
-    def test_sobre_una_instalacion_vpn_la_pasarela_se_anade(self):
-        """Lo de punta a punta, en `test_dos_modos`."""
-        self.assertEqual(self.orden("instalar", "--si", "--modo", "vpn", terminal=False), 0, self.salida)
-        # Sin --modo, la de siempre: la VPN.
-        self.assertEqual(self.orden("instalar", "--plan"), 0, self.salida)
-        self.assertIn("Modo       VPN IKEv2\n", self.salida)
+    def test_modo_tls_explicito_se_sigue_aceptando(self):
+        """Lo llevan los comandos de antes de la 0.6.0."""
         self.assertEqual(self.orden("instalar", "--plan", "--modo", "tls"), 0, self.salida)
-        self.assertIn("Modo       TLS: la pasarela, en el TCP 61234, al lado de la VPN IKEv2 (no la toco)", self.salida)
-        self.assertNotIn("No puedo seguir", self.salida)
+        self.assertIn("Modo       TLS: la pasarela, en el TCP 61234\n", self.salida)
+
+    def test_sobre_una_vpn_de_antes_la_pasarela_se_anade(self):
+        """Lo de punta a punta, en `test_dos_modos`."""
+        import vpn_antigua
+        vpn_antigua.montar(self.sis, self.falso)
+        for argv in (("instalar", "--plan"), ("instalar", "--plan", "--modo", "tls")):
+            self.assertEqual(self.orden(*argv), 0, self.salida)
+            self.assertIn("Modo       TLS: la pasarela, en el TCP 61234, al lado de la VPN IKEv2 de antes (no la toco)",
+                          self.salida)
+            self.assertIn("Aquí sigue la VPN IKEv2 que instaló una versión anterior (/etc/hehermes/instalacion.json). "
+                          "Desde la 0.6.0 ya no la instalo ni la reparo", self.salida)
+            self.assertIn("sudo hehermes-servidor desinstalar --modo vpn", self.salida)
+            self.assertNotIn("No puedo seguir", self.salida)
 
     def test_comprobar_con_su_seguridad(self):
         self.assertEqual(self.orden("instalar", "--si", terminal=False), 0, self.salida)
@@ -379,11 +391,16 @@ class SinRoot(Base):
         self.assertEqual(len(self.relanzados), 1)
         self.assertEqual(self.relanzados[0][:5], ["sudo", "-n", "-u", "root", "--"])
 
-    def test_la_vpn_sin_root_sigue_parando(self):
+    def test_la_vpn_ya_no_existe_ni_sin_root(self):
+        """Antes, sin root, `--modo vpn` por chat acababa en `hehermes-error:sin-permisos`. Ya no hay VPN que instalar:
+        se dice, sin preguntarle nada a sudo y sin esa línea."""
         codigo = self.orden("instalar", "--modo", "vpn", "--por-chat", "--iphone", "mi-iphone", "--llave", LLAVE,
                             terminal=False)
-        self.assertEqual(codigo, 1)
-        self.assertEqual(self.texto[-1], "hehermes-error:sin-permisos")
+        self.assertEqual(codigo, 2)
+        self.assertEqual(self.texto, [cli.SIN_VPN])
+        self.assertNotIn("hehermes-error", self.salida)
+        self.assertEqual(self.sis.ordenes, [])
+        self.assertEqual(self.relanzados, [])
 
     def test_por_chat_sin_root_el_canje_es_suyo(self):
         codigo = self.orden("instalar", "--por-chat", "--activar-api", "--iphone", "mi-iphone", "--llave", LLAVE,

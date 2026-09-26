@@ -2,7 +2,8 @@
 apagó, y enumera lo que se queda. Los paquetes, solo con `--quitar-paquetes`, y solo los que instaló él.
 
 Con `modo` (`desinstalar --modo vpn` o `--modo tls`), solo lo de ese modo (`modos`): lo del otro y lo común se quedan
-tal cual, y el manifiesto sigue, sin ese modo. Es lo que hace falta para pasar de la VPN a la pasarela sin dejar restos.
+tal cual, y el manifiesto sigue, sin ese modo. Desde la 0.6.0 la VPN ya no se instala: `--modo vpn` es como se quita la
+de una versión anterior dejando la pasarela, sin dejar restos.
 """
 
 from __future__ import annotations
@@ -28,7 +29,8 @@ NGINX = (p.SITIO_ENLACE, p.SITIO, p.SITIO_CONF_D, p.BEARER, p.DROP_IN_NGINX)
 
 _EXPOSICION = ("%s, en %s: la puso --corregir-exposicion y se queda, porque quitarla volvería a abrir la API de "
                "Hermes a quien llegue al servidor. Si la quieres fuera, quítala tú")
-#: Los avisos los instala la VPN (`--avisos`), pero la pasarela también los sirve: quitar solo la VPN no se los lleva.
+#: Los avisos los instalaba la VPN de antes (`--avisos`), pero la pasarela también los sirve: quitar solo la VPN no se
+#: los lleva.
 _AVISOS_SE_QUEDAN = ("los avisos (el vigía y el relé): los instalé con la VPN, pero la pasarela también los sirve, así "
                      "que no los quito. Si cambias la clave de Hermes, pónsela al día al vigía con: sudo "
                      "hehermes-dispositivo clave --solo-vigia. «sudo hehermes-servidor desinstalar», sin --modo, los "
@@ -167,8 +169,8 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
             r = sis.ejecutar([p.DISPOSITIVO, "baja", nombre])
             if not r.bien:
                 quedan.append("el iPhone %s: su baja ha fallado (%s)" % (nombre, (r.error or r.salida).strip()))
-    # 2. El canje, si queda alguno, y su venv. El venv es de los dos, pero solo la pasarela lo necesita siempre (para
-    #    el certificado): sin ella, la VPN lo vuelve a crear si un día da un alta por chat.
+    # 2. El canje, si queda alguno, y su venv. El venv es de los dos (la VPN de antes lo usaba para el canje), pero
+    #    solo la pasarela lo necesita siempre, para el certificado: se va con ella.
     from . import porchat
     if que.todo:
         porchat.parar(sis, ambito)

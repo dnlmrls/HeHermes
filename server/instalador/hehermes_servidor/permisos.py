@@ -8,10 +8,11 @@ instalador pudiera explicar nada), y el instalador mira primero qué puede hacer
 - `sudo -n true` sale bien (sudo sin contraseña): se relanza a sí mismo con `sudo -n`;
 - sudo solo para el instalador ya instalado (`/usr/local/sbin/hehermes-servidor`, de root, la salida 2): se relanza
   con ese, si es de esta misma versión;
-- nada de eso: para sin tocar nada, explica las salidas y, por chat, acaba con `hehermes-error:sin-permisos`.
+- nada de eso: `instalar` pone la pasarela como el usuario, en su casa, que no necesita root (`cli._sin_root`); lo demás
+  (y un `instalar` cuya casa no se puede usar) para sin tocar nada y explica las salidas.
 
-Esto es solo para `--modo vpn`: en modo TLS (el de por defecto), sin root ni sudo se instala como el usuario
-(`cli._sin_root`).
+Hasta la 0.6.0, sin root ni sudo la VPN (`--modo vpn`) se paraba aquí y, por chat, acababa con la línea
+`hehermes-error:sin-permisos` para la app. La VPN ya no existe, y esa línea ya no sale nunca.
 
 Nunca se pide ni se prueba una contraseña: `-n` hace que sudo falle en vez de preguntar.
 """
@@ -27,7 +28,6 @@ from . import URL_BASE, VERSION
 
 INSTALADO = "/usr/local/sbin/hehermes-servidor"
 VERSION_INSTALADA = "/opt/hehermes-servidor/hehermes_servidor/__init__.py"
-ERROR_SIN_PERMISOS = "hehermes-error:sin-permisos"
 SUDOERS = "/etc/sudoers.d/hehermes-servidor"
 _USUARIO = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 
@@ -109,7 +109,7 @@ _MOTIVOS = {
 
 def mensaje(sudo: str, usuario: str, aqui: str, argv: list, por_chat: bool, otra_version: str | None = None) -> list:
     """Las líneas del «no puedo»: qué falta, qué no se ha hecho y las salidas, en este orden. Por chat lo lee Hermes y
-    se lo cuenta al usuario; la última línea, además, la reconoce la app."""
+    se lo cuenta al usuario."""
     motivo = _MOTIVOS.get(sudo, _MOTIVOS["no-permitido"])
     if "%s" in motivo:
         motivo = motivo % usuario
@@ -129,9 +129,5 @@ def mensaje(sudo: str, usuario: str, aqui: str, argv: list, por_chat: bool, otra
         "       " + linea_sudoers(usuario),
         "     Después, en la media hora siguiente a instalar, vuelve a lanzarme." if por_chat else
         "     Después, vuelve a lanzarme.",
-        "  3. Si nadie puede ser administrador de este servidor, usa la conexión directa en vez de la VPN: es la de "
-        "por defecto (el mismo comando sin --modo vpn) y no necesita root.",
     ]
-    if por_chat:
-        lineas.append(ERROR_SIN_PERMISOS)
     return lineas

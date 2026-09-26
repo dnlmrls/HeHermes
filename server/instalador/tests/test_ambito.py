@@ -137,10 +137,10 @@ class ElCortafuegos(unittest.TestCase):
                          ["ufw allow proto tcp from any to any port 61234 comment hehermes"])
         self.assertEqual([r.opcion for r in p.reglas_firewalld("tls", 61234)], ["--add-port=61234/tcp"])
 
-    def test_en_vpn_lo_de_siempre(self):
+    def test_las_de_la_vpn_de_antes_se_siguen_reconociendo(self):
         self.assertEqual([r.puertos for r in cf.permanentes()], ["500,4500", "80"])
-        self.assertEqual(len(p.reglas_ufw()), 2)
-        self.assertEqual(len(p.reglas_firewalld()), 3)
+        self.assertEqual(len(p.reglas_ufw("vpn")), 2)
+        self.assertEqual(len(p.reglas_firewalld("vpn")), 3)
 
     def test_las_del_manifiesto(self):
         self.assertEqual([r.puertos for r in cf.permanentes_de({"modo": "tls", "pasarela": {"puerto": 61234}})],

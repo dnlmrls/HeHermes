@@ -1,13 +1,12 @@
 """Todos los cortafuegos: nftables con sus propias tablas e iptables a pelo, además de ufw y firewalld.
 
-Tres casos (el encargo de Daniel del 2026-09-26): cierra y se sabe dónde, reglas justas con la marca `hehermes`; cierra
-y no se sabe, se para y dice qué abrir; no hay nada, se avisa y no se enciende nada. Las reglas sobreviven a un
-reinicio (`hehermes-cortafuegos.service`) sin tocar lo guardado del usuario, y desinstalar las quita.
+Tres casos (el encargo de Daniel del 2026-09-26): cierra y se sabe dónde, la regla justa de la pasarela con la marca
+`hehermes`; cierra y no se sabe, se para y dice qué abrir; no hay nada, se avisa y no se enciende nada. Las reglas
+sobreviven a un reinicio (`hehermes-cortafuegos.service`) sin tocar lo guardado del usuario, y desinstalar las quita.
 """
 
 import apoyo
 
-import json
 import unittest
 from unittest import mock
 
@@ -16,21 +15,10 @@ from hehermes_servidor import cli
 from hehermes_servidor import cortafuegos as cf
 from hehermes_servidor import piezas as p
 from hehermes_servidor import porchat
-from hehermes_servidor.deteccion import detectar
-from hehermes_servidor.manifiesto import Manifiesto
-
-
-
-def con_modo_vpn(argv):
-    """Estas pruebas son del modo VPN, que desde la pasarela (0.5.0) ya no es el de por defecto."""
-    argv = list(argv)
-    if argv[:1] == ["instalar"] and "--modo" not in argv:
-        argv.append("--modo")
-        argv.append("vpn")
-    return argv
-
 
 ORIGEN = str(apoyo.RAIZ)
+#: La de la pasarela, en el 61234 (el azar de las pruebas).
+LA_SUYA = "tcp dport 61234 accept"
 LLAVE = "KCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEFCQ0RFRkc"
 DROP = [{"counter": {"packets": 0, "bytes": 0}}, {"drop": None}]
 SSH = [{"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": 22}},
@@ -139,16 +127,19 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.sis, self.falso = sf.servidor()
         self.addCleanup(self.sis.limpiar)
+        azar = mock.patch.object(porchat, "_azar", lambda n: 3234)  # la pasarela, en el 61234
+        azar.start()
+        self.addCleanup(azar.stop)
 
     def orden(self, *argv):
         self.texto = []
-        codigo = cli.main(con_modo_vpn(argv), "uso", ORIGEN, sis=self.sis, entrada=lambda _: "n", salida=self.texto.append,
+        codigo = cli.main(list(argv), "uso", ORIGEN, sis=self.sis, entrada=lambda _: "n", salida=self.texto.append,
                           terminal=False, euid=0)
         self.salida = "\n".join(self.texto)
         return codigo
 
     def instalar(self, *extra):
-        self.assertEqual(self.orden("instalar", "--si", "--iphone", "mi-iphone", *extra), 0, self.salida)
+        self.assertEqual(self.orden("instalar", "--si", *extra), 0, self.salida)
 
     def nft_mio(self):
         """El nftables.conf de alguien: SSH, lo ya establecido, y todo lo demás fuera (policy drop)."""
@@ -167,8 +158,7 @@ class ConNftables(Base):
         self.instalar()
         entrada = self.falso.reglas_nft("inet", "mio", "entrada")
         self.assertEqual(entrada[:2], del_usuario, "lo suyo, delante y sin tocar")
-        self.assertEqual([r["texto"] for r in entrada[2:]],
-                         ["udp dport { 500, 4500 } accept", 'iifname "hh-ipsec" ip daddr 10.77.0.1 tcp dport 80 accept'])
+        self.assertEqual([r["texto"] for r in entrada[2:]], [LA_SUYA])
         self.assertEqual({r["comment"] for r in entrada[2:]}, {"hehermes"})
         self.assertEqual(self.falso.reglas_nft("inet", "mio", "salida"), [])
         self.assertIn("nftables inet mio entrada", self.salida)
@@ -178,7 +168,7 @@ class ConNftables(Base):
                            [("inet", "mio", "entrada", SSH), ("inet", "mio", "entrada", DROP)])
         self.instalar()
         entrada = self.falso.reglas_nft("inet", "mio", "entrada")
-        self.assertEqual([r.get("comment") for r in entrada], [None, "hehermes", "hehermes", None])
+        self.assertEqual([r.get("comment") for r in entrada], [None, "hehermes", None])
         self.assertEqual(entrada[-1]["expr"], DROP, "el drop del usuario sigue el último")
 
     def test_repetir_no_cambia_nada(self):
@@ -186,7 +176,7 @@ class ConNftables(Base):
         self.instalar()
         antes = list(self.falso.nft_reglas)
         desde = len(self.sis.ordenes)
-        self.assertEqual(self.orden("instalar", "--si", "--iphone", "mi-iphone"), 0, self.salida)
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
         self.assertIn("Todo al día", self.salida)
         self.assertEqual(self.falso.nft_reglas, antes)
         self.assertFalse([o for o in self.sis.ordenes[desde:] if o[:1] == ["nft"] and o[1:2] != ["-j"]])
@@ -197,9 +187,9 @@ class ConNftables(Base):
         self.falso.reiniciar()
         self.assertEqual(self.nuestras(), [], "el sistema carga su nftables.conf, que no las lleva")
         self.assertEqual(self.orden("cortafuegos", "poner"), 0, self.salida)
-        self.assertEqual(len(self.nuestras()), 2)
+        self.assertEqual([r["texto"] for r in self.nuestras()], [LA_SUYA])
         self.assertEqual(self.orden("cortafuegos", "poner"), 0, "se puede repetir")
-        self.assertEqual(len(self.nuestras()), 2, "sin duplicarlas")
+        self.assertEqual(len(self.nuestras()), 1, "sin duplicarla")
         self.assertIsNone(self.sis.leer_texto("/etc/nftables.conf"), "no se escribe en lo guardado del usuario")
 
     def test_la_unidad_va_despues_del_cortafuegos_del_sistema_y_con_el(self):
@@ -234,17 +224,17 @@ class ConNftables(Base):
         self.assertEqual(self.orden("comprobar"), 1)
         self.assertIn("faltan", self.salida)
 
-    @mock.patch.object(porchat, "_azar", lambda n: 1234)
     def test_el_canje_abre_su_puerto_ahi_y_lo_cierra(self):
         self.nft_mio()
         self.assertEqual(self.orden("instalar", "--por-chat", "--iphone", "mi-iphone", "--llave", LLAVE), 0,
                          self.salida)
         canje = self.nuestras("hehermes-canje")
-        self.assertEqual([r["texto"] for r in canje], ["tcp dport 59234 accept"])
+        # El mismo azar: el 61234 ya lo tiene la pasarela, así que el canje va al siguiente.
+        self.assertEqual([r["texto"] for r in canje], ["tcp dport 61235 accept"])
         self.assertEqual(canje[0]["chain"], "entrada")
         porchat.limpiar(self.sis, {})
         self.assertEqual(self.nuestras("hehermes-canje"), [])
-        self.assertEqual(len(self.nuestras()), 2, "las de siempre se quedan")
+        self.assertEqual([r["texto"] for r in self.nuestras()], [LA_SUYA], "la de la pasarela se queda")
 
 
 class ConIptables(Base):
@@ -259,10 +249,8 @@ class ConIptables(Base):
                 reglas = self.falso.iptables["reglas"]
                 self.assertEqual(reglas[:2], antes[:2])
                 self.assertEqual(reglas[-1], ["-j", "DROP"])
-                self.assertEqual(reglas[2], ["-p", "udp", "-m", "multiport", "--dports", "500,4500", "-m", "comment",
-                                             "--comment", "hehermes", "-j", "ACCEPT"])
-                self.assertEqual(reglas[3], ["-i", "hh-ipsec", "-d", "10.77.0.1/32", "-p", "tcp", "-m", "tcp",
-                                             "--dport", "80", "-m", "comment", "--comment", "hehermes", "-j", "ACCEPT"])
+                self.assertEqual(reglas[2:-1], [["-p", "tcp", "-m", "tcp", "--dport", "61234", "-m", "comment",
+                                                 "--comment", "hehermes", "-j", "ACCEPT"]])
                 self.assertEqual(self.orden("desinstalar", "--si"), 0, self.salida)
                 self.assertEqual(self.falso.iptables["reglas"], antes)
 
@@ -277,7 +265,7 @@ class ConIptables(Base):
     def test_lo_que_el_sistema_guardo_con_las_nuestras_se_dice(self):
         self.falso.con_iptables("DROP")
         self.instalar()
-        self.sis.poner("/etc/iptables/rules.v4", "-A INPUT -p udp -m comment --comment hehermes -j ACCEPT\n")
+        self.sis.poner("/etc/iptables/rules.v4", "-A INPUT -p tcp -m comment --comment hehermes -j ACCEPT\n")
         self.assertEqual(self.orden("desinstalar", "--si"), 0, self.salida)
         self.assertIn("/etc/iptables/rules.v4", self.salida)
 
@@ -288,9 +276,11 @@ class SinSaberComo(Base):
         antes = self.sis.foto()
         self.assertEqual(self.orden("instalar", "--si", "--iphone", "mi-iphone"), 1)
         self.assertEqual(self.sis.foto(), antes)
-        for texto in ("no sé abrirlo sin riesgo", "UDP 500 y 4500", "TCP 80", "hh-ipsec", "58000 al 65500",
+        for texto in ("no sé abrirlo sin riesgo", "el TCP 61234 desde internet (la pasarela)", "58000 al 65500",
                       "--cortafuegos-a-mano"):
             self.assertIn(texto, self.salida)
+        for de_la_vpn in ("UDP 500", "hh-ipsec", "TCP 80"):
+            self.assertNotIn(de_la_vpn, self.salida)
 
     def test_un_gestor_que_no_conozco_tambien(self):
         self.falso.con_iptables("DROP")
@@ -326,25 +316,26 @@ class FirewalldEnDebian(Base):
         self.falso.firewalld = "activo"
         self.falso.activos.add("firewalld")
         self.instalar()
-        self.assertIn("port=500/udp", self.falso.fw_permanente)
-        self.assertIn("port=4500/udp", self.falso.fw_ahora)
+        self.assertIn("port=61234/tcp", self.falso.fw_permanente)
+        self.assertIn("port=61234/tcp", self.falso.fw_ahora)
 
 
 class ElCanjeTrasUnReinicio(Base):
     """Daniel: el puerto del canje se cierra siempre, también si el servidor se reinicia a mitad."""
 
-    @mock.patch.object(porchat, "_azar", lambda n: 7)
     def test_la_regla_de_ufw_que_quedo_se_va_al_arrancar(self):
         self.falso.instalar_paquete("ufw")
         self.falso.ufw = "activo"
         self.assertEqual(self.orden("instalar", "--por-chat", "--iphone", "mi-iphone", "--llave", LLAVE), 0,
                          self.salida)
-        self.assertTrue([r for r in self.falso.reglas_ufw if "58007" in r])
+        # La pasarela en el 61234, y el canje, en el siguiente.
+        self.assertTrue([r for r in self.falso.reglas_ufw if "61235" in r and "hehermes-canje" in r])
         self.falso.reiniciar()
-        self.assertTrue([r for r in self.falso.reglas_ufw if "58007" in r], "ufw guarda sus reglas")
+        self.assertTrue([r for r in self.falso.reglas_ufw if "61235" in r], "ufw guarda sus reglas")
         self.assertEqual(self.orden("cortafuegos", "poner"), 0, self.salida)
         self.assertFalse([r for r in self.falso.reglas_ufw if "hehermes-canje" in r])
-        self.assertTrue([r for r in self.falso.reglas_ufw if "500,4500" in r], "las de siempre se quedan")
+        self.assertTrue([r for r in self.falso.reglas_ufw if "port 61234 comment hehermes" in r],
+                        "la de la pasarela se queda")
 
     def test_sin_manifiesto_poner_no_hace_nada(self):
         self.assertEqual(self.orden("cortafuegos", "poner"), 0, self.salida)

@@ -1,4 +1,8 @@
-"""La sección «Seguridad» de `comprobar`: bien, aviso o mal, y sale con 1 si hay algún mal. Solo lee."""
+"""La sección «Seguridad» de `comprobar`: bien, aviso o mal, y sale con 1 si hay algún mal. Solo lee.
+
+La de la pasarela, en `test_modo_tls`. Aquí, la de un servidor con la VPN de antes de la 0.6.0 y la pasarela a su lado:
+la VPN ya no se instala, pero mientras esté se sigue mirando que no deje nada abierto.
+"""
 
 import apoyo
 
@@ -6,21 +10,11 @@ import re
 import unittest
 
 import servidor_falso as sf
+import vpn_antigua
 from hehermes_servidor import cli
 from hehermes_servidor import piezas as p
 from hehermes_servidor import seguridad
 from hehermes_servidor.manifiesto import Manifiesto
-
-
-
-def con_modo_vpn(argv):
-    """Estas pruebas son del modo VPN, que desde la pasarela (0.5.0) ya no es el de por defecto."""
-    argv = list(argv)
-    if argv[:1] == ["instalar"] and "--modo" not in argv:
-        argv.append("--modo")
-        argv.append("vpn")
-    return argv
-
 
 ORIGEN = str(apoyo.RAIZ)
 
@@ -32,15 +26,17 @@ class Base(unittest.TestCase):
 
     def orden(self, *argv):
         self.texto = []
-        codigo = cli.main(con_modo_vpn(argv), "uso", ORIGEN, sis=self.sis, entrada=lambda _: "n", salida=self.texto.append,
+        codigo = cli.main(list(argv), "uso", ORIGEN, sis=self.sis, entrada=lambda _: "n", salida=self.texto.append,
                           terminal=False, euid=0)
         self.salida = "\n".join(self.texto)
         return codigo
 
     def instalar(self):
+        """La VPN de antes con `mi-iphone`, y la pasarela a su lado."""
         self.falso.instalar_paquete("ufw")
         self.falso.ufw = "activo"
-        self.assertEqual(self.orden("instalar", "--si", "--iphone", "mi-iphone"), 0, self.salida)
+        vpn_antigua.montar(self.sis, self.falso)
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
 
     def revisar(self):
         antes = self.sis.foto()

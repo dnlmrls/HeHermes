@@ -1,8 +1,11 @@
-"""La detección: todo lo que el instalador necesita saber del servidor, sin cambiar nada.
+"""La detección: lo que el instalador necesita saber del servidor, sin cambiar nada. La junta `modo_tls.detectar_tls`.
 
-Solo ejecuta órdenes que leen (`systemctl is-active`, `ss`, `ip -j`, `nginx -t`, `ufw status`…) y dos GET a Hermes en
-127.0.0.1. Lo que impide instalar va a `bloqueos`; lo que hay que saber pero no impide, a `avisos`. La clave de Hermes
-se lee para probarla y para nginx, y no sale nunca en ningún texto.
+Solo ejecuta órdenes que leen (`systemctl is-active`, `ss`, `ip -j`, `ufw status`…) y dos GET a Hermes en 127.0.0.1.
+Lo que impide instalar va a `bloqueos`; lo que hay que saber pero no impide, a `avisos`. La clave de Hermes se lee para
+probarla, y no sale nunca en ningún texto.
+
+De la VPN IKEv2 de antes de la 0.6.0 queda aquí solo lo que hace falta para reconocerla (`leer_swanctl`, `SWANCTL`,
+`CABECERA_DISPOSITIVO`), que usa «Seguridad»: la VPN ya no se instala.
 """
 
 from __future__ import annotations
@@ -13,7 +16,6 @@ import re
 import secrets
 import shlex
 
-from . import piezas as p
 from .entorno import leer_env
 
 SOPORTADAS = {("debian", "12"), ("debian", "13"), ("ubuntu", "22.04"), ("ubuntu", "24.04"), ("ubuntu", "26.04")}
@@ -23,7 +25,7 @@ CODIGOS = {"bookworm": ("debian", "12"), "trixie": ("debian", "13"), "jammy": ("
            "noble": ("ubuntu", "24.04"), "resolute": ("ubuntu", "26.04"), "bullseye": ("debian", "11"),
            "buster": ("debian", "10"), "focal": ("ubuntu", "20.04"), "bionic": ("ubuntu", "18.04")}
 #: La familia Red Hat: RHEL y sus reconstrucciones (Rocky Linux, AlmaLinux, CentOS Stream) 9 y 10, y Fedora desde la
-#: 42. RHEL 8 no: su núcleo es un 4.18 y su python3 un 3.6.
+#: 42. RHEL 8 no: su python3 es un 3.6.
 EL_SOPORTADAS = ("9", "10")
 FEDORA_MINIMA = 42
 LISTA = ("Debian 12 y 13, Ubuntu 22.04, 24.04 y 26.04 y sus derivadas; Rocky Linux, AlmaLinux, RHEL y CentOS Stream 9 "
@@ -31,13 +33,9 @@ LISTA = ("Debian 12 y 13, Ubuntu 22.04, 24.04 y 26.04 y sus derivadas; Rocky Lin
 ARQUITECTURAS = ("amd64", "arm64")
 #: Lo que da `uname -m`, con el nombre de Debian, que es el que se enseña.
 MAQUINAS = {"x86_64": "amd64", "aarch64": "arm64"}
-PAQUETES = ("charon-systemd", "strongswan-swanctl", "libstrongswan-standard-plugins", "qrencode", "nginx", "python3-venv")
-#: Lo que se mira de la familia Red Hat. strongSwan, en RHEL y sus reconstrucciones, viene de EPEL.
-PAQUETES_RPM = ("strongswan", "qrencode", "nginx", "policycoreutils-python-utils", "epel-release")
-#: Lo que se instala para `semanage`, si SELinux está puesto y no está.
-PAQUETE_SEMANAGE = "policycoreutils-python-utils"
-#: Dónde tiene swanctl su configuración: en Fedora y EPEL, dentro de /etc/strongswan.
+#: Dónde tiene swanctl su configuración (la de una VPN de antes): en Fedora y EPEL, dentro de /etc/strongswan.
 SWANCTL = {"debian": "/etc/swanctl", "rhel": "/etc/strongswan/swanctl"}
+#: La primera línea de lo que escribía `hehermes-dispositivo` en swanctl: lo que no la lleva es de una VPN a mano.
 CABECERA_DISPOSITIVO = "# Generado por hehermes-dispositivo."
 ROJO = "\033[31m"
 NORMAL = "\033[0m"
@@ -46,7 +44,6 @@ _CGNAT = ipaddress.ip_network("100.64.0.0/10")
 # Las de documentación (RFC 5737) no son de nadie y ningún servidor de verdad sale por una: cuentan como públicas, para
 # que las pruebas y los ejemplos las usen en vez de la dirección de un servidor que exista.
 _DOCUMENTACION = tuple(ipaddress.ip_network(r) for r in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"))
-_IF_ID = ("0x77", "119", 119)
 
 
 class Hermes:
@@ -83,22 +80,14 @@ class Hermes:
 class Deteccion:
     def __init__(self):
         self.distro = {}
-        #: «debian» (apt, ufw) o «rhel» (dnf, firewalld, SELinux).
+        #: «debian» (apt, ufw) o «rhel» (dnf, firewalld).
         self.familia = "debian"
-        self.swanctl = SWANCTL["debian"]
-        #: «enforcing», «permissive» o None (sin SELinux o apagado).
-        self.selinux = None
-        #: La etiqueta de SELinux del puerto de Hermes, si la tiene uno solo (no un rango): nginx necesita http_port_t.
-        self.selinux_puerto = None
         self.firewalld = None
         self.reglas_firewalld = set()
         self.hermes = None
         self.hermes_encontrados = []
         self.direccion = None
         self.direccion_privada = False
-        self.paquetes_instalados = set()
-        self.nginx = {"instalado": False, "activo": False, "sitios": "sites-enabled", "prueba": None}
-        self.strongswan = {"swanctl": False, "activo": False}
         self.ufw = None
         self.reglas_ufw = []
         #: nftables e iptables a pelo: las cadenas que cierran y donde van las reglas (`cortafuegos.Lugar`).
@@ -106,31 +95,8 @@ class Deteccion:
         #: Si iptables es del usuario (no lo llevan por debajo ufw ni firewalld).
         self.con_iptables = True
         self.cortafuegos_a_mano = False
-        self.a_mano = []
         self.bloqueos = []
         self.avisos = []
-
-    @property
-    def sitio(self):
-        return p.SITIO if self.nginx["sitios"] == "sites-enabled" else p.SITIO_CONF_D
-
-
-def detectar(sis, man, direccion=None, hermes_home=None, activar_api=False, cortafuegos_a_mano=False,
-             corregir_exposicion=False) -> Deteccion:
-    det = Deteccion()
-    if not _distro(sis, det):
-        return det
-    _hermes(sis, det, hermes_home, activar_api, corregir_exposicion)
-    _direccion(sis, det, direccion)
-    _paquetes(sis, det)
-    _nginx(sis, det, man)
-    _puertos(sis, det)
-    _strongswan(sis, det, man)
-    _redes(sis, det, man)
-    _a_mano(sis, det, man)
-    _cortafuegos(sis, det, cortafuegos_a_mano)
-    _selinux(sis, det)
-    return det
 
 
 # MARK: El sistema
@@ -173,7 +139,7 @@ def _nombre_de(base):
     return {"debian": "Debian", "ubuntu": "Ubuntu", "el": "RHEL", "fedora": "Fedora"}[familia] + " " + version
 
 
-def _distro(sis, det, modo="vpn") -> bool:
+def _distro(sis, det) -> bool:
     # En Ubuntu y en Debian /etc/os-release es un enlace a /usr/lib/os-release, y `leer` no sigue enlaces: se lee el de
     # /usr/lib, que es el sitio de verdad (os-release(5)), y /etc solo si no está.
     datos = leer_env(sis.leer_texto("/usr/lib/os-release") or sis.leer_texto("/etc/os-release") or "")
@@ -183,7 +149,7 @@ def _distro(sis, det, modo="vpn") -> bool:
     if familia is None:
         det.bloqueos.append(derivada)
         return False
-    det.familia, det.swanctl = familia, SWANCTL[familia]
+    det.familia = familia
     if base is not None:
         det.distro["base"], det.distro["base_id"] = _nombre_de(base), base[0]
     if derivada and base is None:
@@ -207,16 +173,9 @@ def _distro(sis, det, modo="vpn") -> bool:
     # 3.9 y no 3.10: es el python3 de RHEL 9 y sus reconstrucciones, y el instalador no usa nada más nuevo.
     if tuple(sis.version_python[:2]) < (3, 9):
         det.bloqueos.append("hace falta Python 3.9 o más nuevo, y este es %s" % ".".join(map(str, sis.version_python)))
-    m = re.match(r"(\d+)\.(\d+)", sis.nucleo)
-    if modo == "tls":
-        pass  # la pasarela no usa XFRM: cualquier núcleo con systemd le vale
-    elif not m or (int(m.group(1)), int(m.group(2))) < (4, 19):
-        det.bloqueos.append("el núcleo %s es anterior al 4.19: no tiene las interfaces XFRM" % sis.nucleo)
+    # El núcleo, cualquiera con systemd: la pasarela es un proceso de Python que escucha en un TCP.
     if not sis.es_carpeta("/run/systemd/system"):
         det.bloqueos.append("este sistema no arranca con systemd")
-    gestor = "apt-get" if familia == "debian" else "dnf"
-    if modo != "tls" and not sis.cual(gestor):
-        det.bloqueos.append("no encuentro %s" % gestor)
     det.distro["nucleo"] = sis.nucleo
     det.distro["python"] = ".".join(map(str, sis.version_python[:2]))
     return True
@@ -281,6 +240,12 @@ def _carpetas_de_hermes(sis) -> list:
     return [c + "/.hermes" for c in casas if sis.existe(c + "/.hermes/.env")]
 
 
+def _clave_valida(clave) -> bool:
+    """Una que se puede poner tal cual en la cabecera `Authorization` que añade la pasarela, y en su copia de la clave:
+    ASCII imprimible, sin espacios, comillas ni barras invertidas."""
+    return bool(re.match(r"^[\x21-\x7e]+$", clave)) and '"' not in clave and "\\" not in clave
+
+
 def _hermes(sis, det, hermes_home, activar_api=False, corregir_exposicion=False):
     candidatos = _candidatos(sis)
     det.hermes_encontrados = candidatos
@@ -333,13 +298,12 @@ def _hermes(sis, det, hermes_home, activar_api=False, corregir_exposicion=False)
     if not elegido.clave:
         det.bloqueos.append("Hermes no tiene API_SERVER_KEY en %s: sin clave, la API no se puede proteger" % elegido.env)
         return
-    try:
-        p.bearer(elegido.clave)
-    except ValueError:
-        det.bloqueos.append("la API_SERVER_KEY de %s tiene caracteres que no sé poner en nginx" % elegido.env)
+    if not _clave_valida(elegido.clave):
+        det.bloqueos.append("la API_SERVER_KEY de %s tiene caracteres que no pueden ir en una cabecera HTTP"
+                            % elegido.env)
         return
     if elegido.host not in TODAS and elegido.host not in ("127.0.0.1", "localhost"):
-        det.bloqueos.append("Hermes escucha en %s y no en 127.0.0.1: nginx no lo alcanzaría" % elegido.host)
+        det.bloqueos.append("Hermes escucha en %s y no en 127.0.0.1: la pasarela no lo alcanzaría" % elegido.host)
         return
     _exposicion(sis, det, elegido, env, corregir_exposicion)
     base = "http://127.0.0.1:%d" % elegido.puerto
@@ -377,7 +341,7 @@ def _exposicion(sis, det, elegido, env, corregir):
     if not donde:
         return
     riesgo = ("La API de Hermes escucha en %s, en todas las interfaces: cualquiera que llegue a este servidor puede "
-              "hablar con ella sin pasar por la VPN, y solo la protege su clave. No lo cambio sin que me lo pidas, "
+              "hablar con ella sin pasar por la pasarela, y solo la protege su clave. No lo cambio sin que me lo pidas, "
               "porque puede que otra cosa tuya la use así" % donde)
     if "API_SERVER_HOST" in elegido.entorno:
         como = ("Lo fija el entorno de %s (Environment=API_SERVER_HOST=%s): cámbialo ahí a 127.0.0.1 y reinícialo"
@@ -416,18 +380,16 @@ def _activar_api(det, elegido, env):
         det.bloqueos.append("API_SERVER_HOST de %s es %s: no enciendo una API que no escuche solo en 127.0.0.1"
                             % (elegido.env, elegido.host))
         return
-    if elegido.clave:
-        try:
-            p.bearer(elegido.clave)
-        except ValueError:
-            det.bloqueos.append("la API_SERVER_KEY de %s tiene caracteres que no sé poner en nginx" % elegido.env)
-            return
+    if elegido.clave and not _clave_valida(elegido.clave):
+        det.bloqueos.append("la API_SERVER_KEY de %s tiene caracteres que no pueden ir en una cabecera HTTP"
+                            % elegido.env)
+        return
     if not elegido.habilitada:
         elegido.api_pendiente.append("API_SERVER_ENABLED=true")
     if "API_SERVER_HOST" not in env:
         elegido.api_pendiente.append("API_SERVER_HOST=127.0.0.1")
     if not elegido.clave:
-        # URL-safe: la clave va entre comillas en el bearer de nginx y así no hay nada que escapar.
+        # URL-safe: así no hay nada que escapar ni en el .env ni en la cabecera.
         elegido._clave = secrets.token_urlsafe(32)
         elegido.api_pendiente.append("API_SERVER_KEY=" + elegido.clave)
     elegido.habilitada = True
@@ -464,56 +426,11 @@ def _direccion(sis, det, direccion):
     det.direccion = str(ip)
 
 
-# MARK: Paquetes, nginx y puertos
-
-
-def _paquetes(sis, det):
-    if det.familia == "rhel":
-        # `rpm -q` dice «package x is not installed» de lo que falta; con --qf, de lo que está, solo su nombre.
-        r = sis.ejecutar(["rpm", "-q", "--qf", "%{NAME}\n"] + list(PAQUETES_RPM))
-        det.paquetes_instalados |= {linea.strip() for linea in r.salida.splitlines()} & set(PAQUETES_RPM)
-        if det.distro.get("base_id") == "el" and not {"strongswan", "epel-release"} & det.paquetes_instalados:
-            det.bloqueos.append("strongSwan no está en los repositorios de serie de %s: está en EPEL. Actívalo (en "
-                                "Rocky y AlmaLinux, dnf install epel-release; en RHEL, el epel-release de "
-                                "dl.fedoraproject.org y CodeReady Builder) y vuelve a lanzarme. No lo activo yo: es "
-                                "añadirle un repositorio a tu sistema" % det.distro["nombre"])
-        return
-    r = sis.ejecutar(["dpkg-query", "-W", "-f=${Package}\t${db:Status-Status}\n"] + list(PAQUETES))
-    for linea in r.salida.splitlines():
-        nombre, _, estado = linea.partition("\t")
-        if estado.strip() == "installed":
-            det.paquetes_instalados.add(nombre.strip())
+# MARK: Lo que escucha
 
 
 def _activo(sis, unidad):
     return sis.ejecutar(["systemctl", "is-active", unidad]).bien
-
-
-def _nginx(sis, det, man):
-    n = det.nginx
-    n["instalado"] = "nginx" in det.paquetes_instalados or sis.cual("nginx") is not None
-    if not n["instalado"]:
-        # El que se va a instalar: el de Debian y Ubuntu trae sites-enabled; el de la familia Red Hat, solo conf.d.
-        n["sitios"] = "conf.d" if det.familia == "rhel" else "sites-enabled"
-        return
-    n["activo"] = _activo(sis, "nginx")
-    conf = re.sub(r"#[^\n]*", "", sis.leer_texto("/etc/nginx/nginx.conf") or "")
-    if re.search(r"include\s+/etc/nginx/sites-enabled/\*", conf):
-        n["sitios"] = "sites-enabled"
-    elif re.search(r"include\s+/etc/nginx/conf\.d/\*\.conf", conf):
-        n["sitios"] = "conf.d"
-    else:
-        n["sitios"] = None
-        det.bloqueos.append("/etc/nginx/nginx.conf no incluye ni sites-enabled/* ni conf.d/*.conf: no sé dónde poner "
-                            "el sitio del túnel sin tocarlo")
-    r = sis.ejecutar(["nginx", "-t"])
-    n["prueba"] = r.bien
-    if not r.bien:
-        det.bloqueos.append("«nginx -t» ya fallaba antes de tocar nada; arréglalo primero:\n      "
-                            + (r.error or r.salida).strip().replace("\n", "\n      "))
-    if not n["activo"] and "nginx" not in man.paquetes:
-        det.bloqueos.append("nginx está instalado pero parado. Si sirve para otras cosas, arráncalo tú (no lo hago "
-                            "yo: arrancaría también sus otros sitios) y vuelve a lanzarme")
 
 
 def _escuchan(sis, protocolo):
@@ -527,21 +444,12 @@ def _escuchan(sis, protocolo):
         yield local.rsplit(":", 1)[0], local.rsplit(":", 1)[-1], dueno.group(1) if dueno else "?"
 
 
-def _puertos(sis, det):
-    for host, puerto, dueno in _escuchan(sis, "tcp"):
-        if puerto == "80" and host in ("0.0.0.0", "*", "[::]", "::", p.IP_TUNEL) and dueno != "nginx":
-            det.bloqueos.append("%s tiene el TCP 80 en %s: el túnel necesita 10.77.0.1:80 para nginx. Arreglarlo "
-                                "pide que el QR lleve el puerto, y eso cambia la app" % (dueno, host))
-    for host, puerto, dueno in _escuchan(sis, "udp"):
-        if puerto in ("500", "4500") and dueno not in ("charon", "charon-systemd"):
-            det.bloqueos.append("%s tiene el UDP %s: IKEv2 necesita el 500 y el 4500 para strongSwan" % (dueno, puerto))
-
-
-# MARK: strongSwan
+# MARK: Una VPN de antes
 
 
 def leer_swanctl(texto):
-    """Lo justo del formato de swanctl: secciones anidadas y `clave = valor`, también en una sola línea."""
+    """Lo justo del formato de swanctl: secciones anidadas y `clave = valor`, también en una sola línea. Para mirar las
+    conexiones de una VPN de antes («Seguridad»)."""
     raiz, pila, nombre = {}, [], None
     pila.append(raiz)
     for trozo in re.findall(r"\{|\}|[^{}\n]+", re.sub(r"#[^\n]*", "", texto)):
@@ -561,146 +469,6 @@ def leer_swanctl(texto):
         else:
             nombre = trozo
     return raiz
-
-
-def _ficheros_swanctl(sis, man, carpeta=SWANCTL["debian"]):
-    """Los ficheros de configuración de swanctl que no son de HeHermes (ni del instalador ni de hehermes-dispositivo)."""
-    rutas = [carpeta + "/swanctl.conf"] + [carpeta + "/conf.d/" + f for f in sis.listar(carpeta + "/conf.d")
-                                           if f.endswith(".conf")]
-    for ruta in rutas:
-        texto = sis.leer_texto(ruta)
-        if texto is None or ruta in man.ficheros or texto.startswith(CABECERA_DISPOSITIVO):
-            continue
-        yield ruta, leer_swanctl(texto)
-
-
-def _rangos(valor):
-    for trozo in valor.split(","):
-        trozo = trozo.strip()
-        try:
-            if "-" in trozo:
-                a, b = (ipaddress.ip_address(x.strip()) for x in trozo.split("-", 1))
-                yield ipaddress.ip_network("%s/32" % a) if a == b else ipaddress.summarize_address_range(a, b)
-            else:
-                yield ipaddress.ip_network(trozo, strict=False)
-        except (ValueError, TypeError):
-            continue
-
-
-def _strongswan(sis, det, man):
-    s = det.strongswan
-    s["swanctl"] = sis.cual("swanctl") is not None
-    s["activo"] = _activo(sis, "strongswan")
-    if _activo(sis, "strongswan-starter"):
-        det.bloqueos.append("strongSwan corre con ipsec.conf (strongswan-starter): no puede compartir los UDP 500 y "
-                            "4500 con el charon de swanctl. Pásalo a swanctl o páralo")
-    conf = sis.leer_texto(det.swanctl + "/swanctl.conf")
-    if conf is not None and not re.search(r"^\s*include\s+conf\.d/\*\.conf", conf, re.M):
-        det.bloqueos.append("%s/swanctl.conf no incluye conf.d/*.conf: no cargaría las conexiones de los "
-                            "iPhone, y ese fichero no lo toco" % det.swanctl)
-    red = ipaddress.ip_network(p.RED_HEHERMES)
-    for ruta, conf in _ficheros_swanctl(sis, man, det.swanctl):
-        for nombre, conexion in (conf.get("connections") or {}).items():
-            if not isinstance(conexion, dict):
-                continue
-            if nombre.startswith("hh-"):
-                det.a_mano.append("la conexión %s (%s)" % (nombre, ruta))
-            for clave, remoto in conexion.items():
-                if clave.startswith("remote") and isinstance(remoto, dict) and remoto.get("auth") == "psk" \
-                        and remoto.get("id", "%any") in ("%any", ""):
-                    det.bloqueos.append("la conexión %s de %s contesta a %%any con PSK: se quedaría con los iPhone de "
-                                        "HeHermes. Dale un remote.id" % (nombre, ruta))
-            for hijo in (conexion.get("children") or {}).values():
-                # Una conexión `hh-*` ya sale como señal de una instalación a mano: no se repite aquí.
-                if not nombre.startswith("hh-") and isinstance(hijo, dict) and any(hijo.get(k) in _IF_ID[:2] for k in ("if_id_in", "if_id_out")):
-                    det.bloqueos.append("la conexión %s de %s ya usa el if_id 0x77, que es el de hh-ipsec"
-                                        % (nombre, ruta))
-        for nombre, pool in (conf.get("pools") or {}).items():
-            if isinstance(pool, dict) and any(r.overlaps(red) for r in _redes_de(pool.get("addrs", ""))) \
-                    and not nombre.startswith("hh-"):
-                det.bloqueos.append("el pool %s de %s reparte direcciones de %s, que son de HeHermes"
-                                    % (nombre, ruta, p.RED_HEHERMES))
-
-
-def _redes_de(valor):
-    for r in _rangos(valor):
-        if isinstance(r, ipaddress.IPv4Network) or isinstance(r, ipaddress.IPv6Network):
-            yield r
-        else:
-            yield from r
-
-
-# MARK: Redes e interfaces
-
-
-def _redes(sis, det, man):
-    mia = p.UNIDAD_XFRM in man.ficheros
-    red = ipaddress.ip_network(p.RED_HEHERMES)
-    try:
-        direcciones = json.loads(sis.ejecutar(["ip", "-j", "addr"]).salida or "[]")
-        rutas = json.loads(sis.ejecutar(["ip", "-j", "route"]).salida or "[]")
-        enlaces = json.loads(sis.ejecutar(["ip", "-d", "-j", "link"]).salida or "[]")
-    except ValueError:
-        det.bloqueos.append("no entiendo lo que dice «ip -j»")
-        return
-    ocupan = []
-    for interfaz in direcciones:
-        nombre = interfaz.get("ifname", "?")
-        for a in interfaz.get("addr_info", []):
-            try:
-                ip = ipaddress.ip_address(a.get("local", ""))
-            except ValueError:
-                continue
-            if ip.version == 4 and ip in red:
-                if nombre == p.INTERFAZ and mia:
-                    continue
-                if nombre in ("wg0", p.INTERFAZ) and str(ip) == p.IP_TUNEL:
-                    det.a_mano.append("%s con %s" % (nombre, ip))
-                else:
-                    ocupan.append("%s: %s" % (nombre, ip))
-    for ruta in rutas:
-        try:
-            destino = ipaddress.ip_network(ruta.get("dst", ""), strict=False)
-        except ValueError:
-            continue
-        dev = ruta.get("dev", "?")
-        if destino.version == 4 and destino.overlaps(red) and dev not in ("wg0", p.INTERFAZ) \
-                and not any(o.startswith(dev + ":") for o in ocupan):
-            ocupan.append("%s: ruta a %s" % (dev, destino))
-    if ocupan:
-        det.bloqueos.append("otra red usa ya %s (%s): HeHermes necesita 10.77.0.1 fijo, que va en la app"
-                            % (p.RED_HEHERMES, ", ".join(ocupan)))
-    for enlace in enlaces:
-        info = enlace.get("linkinfo") or {}
-        if info.get("info_kind") != "xfrm" or (info.get("info_data") or {}).get("if_id") not in _IF_ID:
-            continue
-        nombre = enlace.get("ifname", "?")
-        if nombre == p.INTERFAZ:
-            if not mia and not any(s.startswith(p.INTERFAZ) for s in det.a_mano):
-                det.a_mano.append("%s (if_id 0x77)" % p.INTERFAZ)
-        else:
-            det.bloqueos.append("la interfaz %s ya usa el if_id 0x77, que es el de hh-ipsec" % nombre)
-
-
-# MARK: Una instalación hecha a mano
-
-
-def _a_mano(sis, det, man):
-    for ruta in (p.DISPOSITIVO, p.SITIO, p.SITIO_CONF_D):
-        if sis.existe(ruta) and ruta not in man.ficheros:
-            det.a_mano.append(ruta)
-    if sis.existe("/etc/wireguard/hehermes"):
-        det.a_mano.append("/etc/wireguard/hehermes (dispositivos de WireGuard)")
-    if det.a_mano:
-        det.bloqueos.insert(0, "Esto es una instalación hecha a mano. Encuentro:\n" + "\n".join(
-            "      - " + s for s in det.a_mano) + "\n    Sin --adoptar no la toco, y --adoptar todavía no existe")
-    for ruta in (p.SITIO, p.SITIO_CONF_D):
-        texto = sis.leer_texto(ruta)
-        if texto is not None and p.agujero_abierto(texto):
-            det.avisos.append("El sitio %s deja que cualquier proceso de este servidor use la clave de Hermes (el "
-                              "agujero del túnel: su location / no niega a %s). %s" % (
-                                  ruta, p.IP_TUNEL, "Es tuyo y sigue abierto: no lo toco." if ruta not in man.ficheros
-                                  else "Se cierra al repararlo."))
 
 
 # MARK: Cortafuegos
@@ -750,23 +518,17 @@ def regla_ufw_canonica(texto):
     return (accion,) + tuple(sorted(regla.items()))
 
 
-QUE_ABRIR = ("UDP 500 y 4500 desde internet; el TCP 80 que entra por %s hacia %s; y, si vas a conectar el iPhone "
-             "por chat, el TCP del canje (uno al azar del %d al %d, que te diré) solo mientras dure")
-QUE_ABRIR_TLS = ("el TCP %d desde internet (la pasarela) y, si vas a conectar el iPhone por chat, el TCP del canje "
-                 "(uno al azar del %d al %d, que te diré) solo mientras dure")
-SIN_CORTAFUEGOS_TLS = ("No hay ningún cortafuegos que cierre el paso en este servidor: lo que escucha en todas las "
-                       "direcciones está abierto a internet. No enciendo ninguno (podría dejarte fuera del SSH). Lo de "
-                       "HeHermes solo escucha en el TCP %d, y a quien no trae un token le contesta un 404")
+QUE_ABRIR = ("el TCP %d desde internet (la pasarela) y, si vas a conectar el iPhone por chat, el TCP del canje "
+             "(uno al azar del %d al %d, que te diré) solo mientras dure")
 SIN_CORTAFUEGOS = ("No hay ningún cortafuegos que cierre el paso en este servidor: lo que escucha en todas las "
-                   "direcciones está abierto a internet. No enciendo ninguno (podría dejarte fuera del SSH), y mejor "
-                   "que no sea yo quien lo haga: si pones uno, abre UDP 500 y 4500. Lo de HeHermes escucha solo donde "
-                   "hace falta: nginx en %s y strongSwan en UDP 500 y 4500")
+                   "direcciones está abierto a internet. No enciendo ninguno (podría dejarte fuera del SSH). Lo de "
+                   "HeHermes solo escucha en el TCP %d, y a quien no trae un token le contesta un 404")
 
 
-def _cortafuegos(sis, det, a_mano=False, puerto_pasarela=None):
+def _cortafuegos(sis, det, a_mano, puerto_pasarela):
     """Quién lleva el cortafuegos: firewalld (en marcha, o en la familia Red Hat), ufw, o nftables e iptables a pelo
-    (`cortafuegos.analizar`), que se miran siempre que no los lleve ufw o firewalld por debajo. Con `puerto_pasarela`
-    (modo TLS), lo que hay que abrir es ese TCP."""
+    (`cortafuegos.analizar`), que se miran siempre que no los lleve ufw o firewalld por debajo. Lo que hay que abrir
+    es el TCP de la pasarela."""
     from . import cortafuegos as cf
     from .porchat import PUERTO_MAXIMO, PUERTO_MINIMO
     firewalld = sis.cual("firewall-cmd") and (det.familia == "rhel" or _activo(sis, "firewalld"))
@@ -783,10 +545,7 @@ def _cortafuegos(sis, det, a_mano=False, puerto_pasarela=None):
     gestor = det.ufw == "activo" or det.firewalld == "activo"
     det.con_iptables = not gestor
     lugares, dudas = cf.analizar(sis, con_iptables=det.con_iptables)
-    if puerto_pasarela:
-        que_abrir = QUE_ABRIR_TLS % (puerto_pasarela, PUERTO_MINIMO, PUERTO_MAXIMO)
-    else:
-        que_abrir = QUE_ABRIR % (p.INTERFAZ, p.IP_TUNEL, PUERTO_MINIMO, PUERTO_MAXIMO)
+    que_abrir = QUE_ABRIR % (puerto_pasarela, PUERTO_MINIMO, PUERTO_MAXIMO)
     if a_mano:
         det.cortafuegos_a_mano = True
         if lugares or dudas:
@@ -799,13 +558,12 @@ def _cortafuegos(sis, det, a_mano=False, puerto_pasarela=None):
     else:
         det.lugares = lugares
     if not gestor and not lugares and not dudas and det.ufw is None and det.firewalld is None:
-        det.avisos.append(SIN_CORTAFUEGOS_TLS % puerto_pasarela if puerto_pasarela else SIN_CORTAFUEGOS % p.IP_TUNEL)
-    det.avisos.append("Si tu proveedor tiene un cortafuegos propio, en su panel, abre ahí %s"
-                      % ("el TCP %d" % puerto_pasarela if puerto_pasarela else "UDP 500 y 4500"))
+        det.avisos.append(SIN_CORTAFUEGOS % puerto_pasarela)
+    det.avisos.append("Si tu proveedor tiene un cortafuegos propio, en su panel, abre ahí el TCP %d" % puerto_pasarela)
 
 
 def orden_firewalld(det, opcion, permanente=True) -> list:
-    """La orden de firewalld para una opción (`--add-port=500/udp`, `--query-…`): con firewalld en marcha,
+    """La orden de firewalld para una opción (`--add-port=61234/tcp`, `--query-…`): con firewalld en marcha,
     `firewall-cmd` (con `--permanent`, lo que sobrevive a un reinicio); apagado, `firewall-offline-cmd`, que escribe su
     configuración sin encenderlo, como ufw con sus reglas."""
     if det.firewalld == "activo":
@@ -813,57 +571,12 @@ def orden_firewalld(det, opcion, permanente=True) -> list:
     return ["firewall-offline-cmd", opcion]
 
 
-def _firewalld(sis, det, puerto_pasarela=None):
+def _firewalld(sis, det, puerto_pasarela):
     from . import piezas as pz
     det.firewalld = "activo" if sis.ejecutar(["firewall-cmd", "--state"]).bien else "inactivo"
-    reglas = pz.reglas_firewalld("tls", puerto_pasarela) if puerto_pasarela else pz.reglas_firewalld()
-    for regla in reglas:
+    for regla in pz.reglas_firewalld("tls", puerto_pasarela):
         if sis.ejecutar(orden_firewalld(det, regla.con("query"))).bien:
             det.reglas_firewalld.add(regla.opcion)
     if det.firewalld == "inactivo":
         det.avisos.append("firewalld está apagado: añado sus reglas (con firewall-offline-cmd), pero no lo enciendo "
                           "(podría dejarte fuera del SSH). Si un día lo enciendes, ya van dentro")
-
-
-# MARK: SELinux
-
-
-def puertos_selinux(texto: str, puerto: int, protocolo: str = "tcp") -> dict:
-    """De `semanage port -l -n`: la etiqueta de cada tipo que da `puerto` suelto (`exacto`) o dentro de un rango. Los
-    rangos son los genéricos (`unreserved_port_t`, 1024-32767…) y no cuentan: una entrada suelta manda sobre ellos."""
-    exactos, rangos = [], []
-    for linea in texto.splitlines():
-        partes = linea.split(None, 2)
-        if len(partes) < 3 or partes[1] != protocolo:
-            continue
-        for trozo in partes[2].split(","):
-            trozo = trozo.strip()
-            if "-" in trozo:
-                desde, _, hasta = trozo.partition("-")
-                if desde.isdigit() and hasta.isdigit() and int(desde) <= puerto <= int(hasta):
-                    rangos.append(partes[0])
-            elif trozo.isdigit() and int(trozo) == puerto:
-                exactos.append(partes[0])
-    return {"exacto": exactos, "rangos": rangos}
-
-
-def _selinux(sis, det):
-    """Con SELinux puesto, nginx (httpd_t) solo se conecta a los puertos con la etiqueta http_port_t, y el de Hermes
-    (8642) no la tiene: se le pone a ese puerto y a nada más (no el booleano httpd_can_network_connect, que le dejaría
-    conectarse a todos). Los ficheros que escribe, con `restorecon`."""
-    if not sis.cual("getenforce"):
-        return
-    estado = sis.ejecutar(["getenforce"]).salida.strip().lower()
-    if estado not in ("enforcing", "permissive"):
-        return
-    det.selinux = estado
-    if det.hermes is None or not sis.cual("semanage"):
-        return
-    r = sis.ejecutar(["semanage", "port", "-l", "-n"])
-    exactos = puertos_selinux(r.salida, det.hermes.puerto)["exacto"]
-    otros = sorted(set(exactos) - {"http_port_t"})
-    if otros:
-        det.bloqueos.append("SELinux le da el puerto %d de Hermes a %s, y nginx solo puede llegar a los de "
-                            "http_port_t: no le cambio la etiqueta a un puerto que es de otro. Pon otro "
-                            "API_SERVER_PORT en %s" % (det.hermes.puerto, ", ".join(otros), det.hermes.env))
-    det.selinux_puerto = "http_port_t" if "http_port_t" in exactos else None

@@ -1,7 +1,12 @@
-"""Los permisos, lo primero de todo: root, sudo sin contraseña, o parar en seco sin haber tocado nada.
+"""Los permisos, lo primero de todo: root, sudo sin contraseña, la pasarela como el usuario, o parar en seco sin haber
+tocado nada.
 
 Por chat es Hermes quien lanza el instalador, y puede no ser root ni tener sudo. `id -u` es el `euid` que se le pasa a
 `cli.main`; `sudo -n` lo contesta el servidor falso (`ServidorFalso.sudo`). Nunca se pide una contraseña.
+
+Sin root ni sudo, `instalar` pone la pasarela en la casa del usuario (`test_modo_tls.SinRoot`). Aquí, lo que se para:
+un `instalar` cuya casa no se puede usar y las órdenes que no son de una instalación suya. Hasta la 0.6.0, por chat eso
+acababa con `hehermes-error:sin-permisos`, que era de la VPN: ya no sale nunca.
 """
 
 import apoyo
@@ -13,20 +18,11 @@ import unittest
 import servidor_falso as sf
 from hehermes_servidor import VERSION, cli, permisos
 
-
-
-def con_modo_vpn(argv):
-    """Estas pruebas son del modo VPN, que desde la pasarela (0.5.0) ya no es el de por defecto."""
-    argv = list(argv)
-    if argv[:1] == ["instalar"] and "--modo" not in argv:
-        argv.append("--modo")
-        argv.append("vpn")
-    return argv
-
-
 ORIGEN = str(apoyo.RAIZ)
 LLAVE = base64.urlsafe_b64encode(bytes(range(40, 72))).rstrip(b"=").decode()
 LANZADOR = os.path.join(ORIGEN, "hehermes-servidor")
+#: Un usuario cuya casa no se puede poner en una unidad de systemd: sin root, no hay dónde instalar.
+SIN_CASA = ("hermes", "/", 1000)
 
 
 class Base(unittest.TestCase):
@@ -35,10 +31,11 @@ class Base(unittest.TestCase):
         self.addCleanup(self.sis.limpiar)
         self.relanzados = []
 
-    def orden(self, *argv, euid=1000, terminal=False):
+    def orden(self, *argv, euid=1000, terminal=False, cuenta=SIN_CASA):
         self.texto = []
-        codigo = cli.main(con_modo_vpn(argv), "uso", ORIGEN, sis=self.sis, entrada=lambda _: "n", salida=self.texto.append,
-                          terminal=terminal, euid=euid, relanzar=self.relanzados.append, usuario="hermes")
+        codigo = cli.main(list(argv), "uso", ORIGEN, sis=self.sis, entrada=lambda _: "n", salida=self.texto.append,
+                          terminal=terminal, euid=euid, relanzar=self.relanzados.append, usuario="hermes",
+                          cuenta=cuenta)
         self.salida = "\n".join(self.texto)
         return codigo
 
@@ -52,6 +49,9 @@ class Base(unittest.TestCase):
             self.assertNotIn(orden[2:3], (["-S"], ["-v"]), "nunca se pide la contraseña")
         self.assertFalse(self.sis.existe("/etc/hehermes"))
         self.assertFalse(self.sis.existe("/run/hehermes-servidor.lock"))
+
+    def sin_linea_de_error(self):
+        self.assertNotIn("hehermes-error", self.salida)
 
 
 class Decidir(unittest.TestCase):
@@ -75,10 +75,10 @@ class Root(Base):
 class SudoSinContrasena(Base):
     def test_se_relanza_con_sudo_n_y_los_mismos_argumentos(self):
         self.falso.sudo = "sin-contrasena"
-        self.assertEqual(self.por_chat(), 0)
+        self.assertEqual(self.por_chat(cuenta=None), 0)
         self.assertEqual(self.relanzados, [["sudo", "-n", "-u", "root", "--", "/usr/bin/python3", "-I", "-B", LANZADOR,
                                             "instalar", "--por-chat", "--activar-api", "--iphone", "mi-iphone",
-                                            "--llave", LLAVE, "--modo", "vpn"]])
+                                            "--llave", LLAVE]])
         self.assertIn(["sudo", "-n", "true"], self.sis.ordenes)
         self.sin_cambios()
 
@@ -86,10 +86,13 @@ class SudoSinContrasena(Base):
         self.falso.sudo = "sin-contrasena"
         self.orden("comprobar")
         self.assertEqual(self.relanzados[-1][-1:], ["comprobar"])
+        self.orden("desinstalar", "--modo", "vpn")
+        self.assertEqual(self.relanzados[-1][-3:], ["desinstalar", "--modo", "vpn"])
 
     def test_un_error_de_uso_se_dice_antes_de_mirar_permisos(self):
         self.falso.sudo = "sin-contrasena"
         self.assertEqual(self.orden("instalar", "--por-chat", "--iphone", "mi-iphone"), 2)
+        self.assertEqual(self.orden("instalar", "--modo", "vpn"), 2)
         self.assertEqual(self.sis.ordenes, [])
         self.assertEqual(self.relanzados, [])
 
@@ -118,7 +121,7 @@ class SoloElInstaladoPorSudoers(Base):
         self.assertEqual(self.por_chat(), 1)
         self.assertEqual(self.relanzados, [])
         self.assertIn("0.1.0", self.salida)
-        self.assertEqual(self.texto[-1], permisos.ERROR_SIN_PERMISOS)
+        self.sin_linea_de_error()
 
     def test_sin_el_instalado_la_linea_no_sirve_de_nada(self):
         self.falso.sudo = "contrasena"
@@ -128,24 +131,23 @@ class SoloElInstaladoPorSudoers(Base):
 
 
 class SinPermisos(Base):
-    def test_sin_sudo_para_en_seco_y_lo_explica(self):
+    def test_sin_sudo_ni_casa_para_en_seco_y_lo_explica(self):
         self.falso.sudo = "sin-sudo"
         self.assertEqual(self.por_chat(), 1)
         self.assertEqual(self.relanzados, [])
         self.sin_cambios()
+        self.assertIn("la de «hermes» no sé usarla", self.salida)
         self.assertIn("permisos de administrador", self.salida)
         self.assertIn("No he hecho nada", self.salida)
         self.assertIn("no hay sudo", self.salida)
-        # Las tres salidas, en su orden.
-        a = self.salida.index("1. ")
-        b = self.salida.index("2. ")
-        c = self.salida.index("3. ")
-        self.assertLess(a, b)
-        self.assertLess(b, c)
+        # Las dos salidas, en su orden (la tercera era usar la pasarela en vez de la VPN).
+        self.assertLess(self.salida.index("1. "), self.salida.index("2. "))
+        self.assertNotIn("3. ", self.salida)
+        self.assertNotIn("VPN", self.salida)
         self.assertIn("hermes ALL=(root) NOPASSWD: /usr/local/sbin/hehermes-servidor", self.salida)
         self.assertIn("visudo -f /etc/sudoers.d/hehermes-servidor", self.salida)
-        # Por chat, la última línea la reconoce la app.
-        self.assertEqual(self.texto[-1], "hehermes-error:sin-permisos")
+        self.assertIn("en la media hora siguiente a instalar", self.salida)
+        self.sin_linea_de_error()
 
     def test_con_contrasena_ni_se_intenta_y_tiene_su_mensaje(self):
         self.falso.sudo = "contrasena"
@@ -153,13 +155,24 @@ class SinPermisos(Base):
         self.sin_cambios()
         self.assertIn("pide una contraseña", self.salida)
         self.assertNotIn("no hay sudo", self.salida)
-        self.assertEqual(self.texto[-1], "hehermes-error:sin-permisos")
+        self.sin_linea_de_error()
 
     def test_sin_permiso_en_sudoers(self):
         self.falso.sudo = "no-permitido"
         self.assertEqual(self.por_chat(), 1)
         self.sin_cambios()
         self.assertIn("no puede usar sudo", self.salida)
+
+    def test_lo_que_no_es_instalar_sin_una_instalacion_suya_tambien_se_para(self):
+        self.falso.sudo = "sin-sudo"
+        for argv in (("comprobar",), ("desinstalar", "--modo", "vpn", "--si"), ("actualizar", "--paquete", "x",
+                                                                                 "--firma", "y")):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.orden(*argv, cuenta=("hermes", "/home/hermes", 1000)), 1)
+                self.assertIn("permisos de administrador", self.salida)
+                self.assertNotIn("no sé usarla", self.salida)
+                self.sin_linea_de_error()
+        self.sin_cambios()
 
     def test_el_comando_del_administrador_es_el_mismo_con_sudo(self):
         self.falso.sudo = "sin-sudo"
@@ -183,17 +196,20 @@ class SinPermisos(Base):
         self.assertTrue(texto.startswith('d=$(mktemp -d) && cd "$d" && curl -fsSLO https://'), texto)
         self.assertTrue(texto.endswith("instalar --iphone 'mi iphone'"), "los argumentos, citados para la shell")
 
-    def test_sin_chat_no_hay_linea_de_error_para_la_app(self):
-        self.falso.sudo = "sin-sudo"
-        self.assertEqual(self.orden("instalar", "--iphone", "mi-iphone", terminal=True), 1)
-        self.assertNotIn("hehermes-error:", self.salida)
-        self.assertIn("sudo", self.salida)
-
 
 class ElFormato(unittest.TestCase):
-    def test_la_linea_de_error_es_la_del_readme(self):
-        self.assertEqual(permisos.ERROR_SIN_PERMISOS, "hehermes-error:sin-permisos")
-        self.assertIn("`hehermes-error:sin-permisos`", (apoyo.RAIZ / "README.md").read_text())
+    def test_hehermes_error_sin_permisos_ya_no_sale_nunca(self):
+        """Era de `--modo vpn`, que ya no existe. La app aún sabe leerla (de un instalador de antes), pero este no la
+        escribe en ningún caso."""
+        self.assertFalse(hasattr(permisos, "ERROR_SIN_PERMISOS"))
+        for sudo in ("sin-sudo", "contrasena", "no-permitido"):
+            for por_chat in (True, False):
+                with self.subTest(sudo=sudo, por_chat=por_chat):
+                    lineas = permisos.mensaje(sudo, "hermes", ORIGEN, ["instalar"], por_chat, otra_version="0.1.0")
+                    self.assertFalse([l for l in lineas if "hehermes-error" in l])
+        # Ni como texto que se pueda imprimir: solo la nombra la historia de permisos.py.
+        codigo = "".join(p.read_text() for p in (apoyo.RAIZ / "hehermes_servidor").glob("*.py"))
+        self.assertFalse('"hehermes-error' in codigo or "'hehermes-error" in codigo)
 
     def test_la_linea_de_sudoers_solo_para_un_usuario_que_valga(self):
         self.assertEqual(permisos.linea_sudoers("hermes"), "hermes ALL=(root) NOPASSWD: /usr/local/sbin/hehermes-servidor")

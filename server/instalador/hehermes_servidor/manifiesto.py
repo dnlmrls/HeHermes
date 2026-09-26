@@ -29,7 +29,7 @@ BLOQUEAN = (AJENO, MODIFICADO)
 ESCRIBEN = (NUEVO, CAMBIA, REEMPLAZA)
 
 
-#: Los dos modos, en el orden en que se enumeran y se reparan: la VPN y la pasarela.
+#: Los dos modos, en el orden en que se enumeran: la VPN (la de antes de la 0.6.0, que ya solo se quita) y la pasarela.
 MODOS = ("vpn", "tls")
 
 

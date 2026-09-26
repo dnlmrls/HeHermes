@@ -1,13 +1,15 @@
 """El canje de verdad, por TLS en 127.0.0.1: `preparar`, `servir` y un cliente de Python que hace de iPhone.
 
 El cliente hace lo mismo que la app: ancla la huella del SPKI antes de mandar nada, pide el reto, lo abre con su
-privada, canjea y abre `{h, rid, lid, k}`. Hace falta `cryptography` (el venv).
+privada, canjea y abre `{h, p, f, t}`, el acceso a la pasarela. Hace falta `cryptography` (el venv).
 """
 
 import apoyo
 
 import base64
+import contextlib
 import http.client
+import io
 import json
 import os
 import shutil
@@ -29,7 +31,12 @@ from hehermes_servidor import canje
 # El Python de Xcode no sabe TLS 1.3 (LibreSSL 2.8): en el Mac, el canje se prueba con 1.2, y lo de exigir 1.3 donde
 # lo haya (en el servidor, siempre).
 TLS_MINIMO = ssl.TLSVersion.TLSv1_3 if ssl.HAS_TLSv1_3 else ssl.TLSVersion.TLSv1_2
-CARGA = {"h": "203.0.113.7", "rid": "203.0.113.7", "lid": "mi-iphone", "k": "psk-de-prueba-que-no-es-de-nadie-1234"}
+#: Lo que entrega desde la 0.6.0: el acceso a la pasarela (el token es de prueba, no es de nadie).
+CARGA = {"h": "203.0.113.7", "p": 61234, "f": "0GUKsxTavhZWbjkIBTXZmhJX0PMoBKdRcxK1ljakLyc",
+         "t": "dG9rZW4tZGUtcHJ1ZWJhLXF1ZS1uby1lcy1kZS1uYWQ"}
+#: Lo que entregaba con la VPN: ya no sale del canje.
+CARGA_DE_LA_VPN = {"h": "203.0.113.7", "rid": "203.0.113.7", "lid": "mi-iphone",
+                   "k": "psk-de-prueba-que-no-es-de-nadie-1234"}
 
 
 class HuellaDistinta(Exception):
@@ -162,7 +169,7 @@ class DePuntaAPunta(Base):
         hilo.join(5)
         texto = "\n".join(diario)
         self.assertEqual(len(diario), 2, diario)
-        for secreto in (CARGA["k"], self.codigo, canje.b64url(self.llave)):
+        for secreto in (CARGA["t"], self.codigo, canje.b64url(self.llave)):
             self.assertNotIn(secreto, texto)
 
     def test_otra_huella_y_el_iphone_no_manda_nada(self):
@@ -300,8 +307,8 @@ class ComoProceso(Base):
         salida, _ = proceso.communicate(timeout=10)
         self.assertEqual(proceso.returncode, 0, salida)
         self.assertIn("canjeado", salida)
-        for secreto in (CARGA["k"], self.codigo):
-            self.assertNotIn(secreto, salida, "el diario no lleva ni la PSK ni el código")
+        for secreto in (CARGA["t"], self.codigo):
+            self.assertNotIn(secreto, salida, "el diario no lleva ni el token ni el código")
 
     def test_main_lee_las_credenciales(self):
         """Lo mismo por dentro, en un hilo, para el Mac: `main servir` con TLS 1.3 no arrancaría aquí."""
@@ -326,6 +333,25 @@ class ComoProceso(Base):
             self.assertEqual(self.iphone(resultado["puerto"]).canjear(), (200, CARGA))
             hilo.join(5)
         self.assertEqual(resultado["salida"], 0)
+
+    def test_main_no_entrega_nada_que_no_sea_el_acceso_a_la_pasarela(self):
+        """Ni la PSK de una VPN, que ya no existe, ni {h, p, f, t} en otro orden o con algo más: ni arranca."""
+        import unittest.mock
+        credenciales = tempfile.mkdtemp(prefix="hh-cred-")
+        self.addCleanup(shutil.rmtree, credenciales, True)
+        arrancados = []
+        for carga in (CARGA_DE_LA_VPN, dict(CARGA, k="x"), {k: CARGA[k] for k in ("t", "f", "p", "h")}, None):
+            with self.subTest(carga=carga):
+                with open(os.path.join(credenciales, "canje"), "w") as f:
+                    json.dump({"llave": canje.b64url(self.llave), "codigo": self.codigo, "huella": self.huella,
+                               "carga": carga, "puerto": 0, "direccion": "127.0.0.1"}, f)
+                salida = io.StringIO()
+                with unittest.mock.patch.dict(os.environ, {"CREDENTIALS_DIRECTORY": credenciales}), \
+                        unittest.mock.patch.object(canje, "servir", lambda *a, **k: arrancados.append(a) or 0), \
+                        contextlib.redirect_stdout(salida):
+                    self.assertEqual(canje.main(["servir"]), 2)
+                self.assertIn("solo entrega {h, p, f, t}", salida.getvalue())
+        self.assertEqual(arrancados, [])
 
     def test_preparar_imprime_la_huella(self):
         otra = tempfile.mkdtemp(prefix="hh-canje-")

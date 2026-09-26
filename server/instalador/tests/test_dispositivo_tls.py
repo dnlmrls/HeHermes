@@ -124,6 +124,11 @@ class ElAlta(ConPasarela):
     def test_con_opciones_de_la_vpn_no(self):
         codigo, texto = self.orden("alta", "mi-iphone", "--tls", "--ikev2")
         self.assertEqual(codigo, 1)
+        self.assertIn("--ikev2 ya no existe", texto)
+        codigo, texto = self.orden("alta", "mi-iphone", "--pubkey", "A" * 43 + "=")
+        self.assertEqual(codigo, 1)
+        self.assertIn("WireGuard ya no da altas nuevas", texto)
+        self.assertFalse(os.path.exists(self.tokens))
 
     def test_no_importa_codigo_que_otro_puede_cambiar(self):
         os.chmod(self.c("codigo/hehermes_servidor"), 0o777)
@@ -178,8 +183,9 @@ class LaBajaYRotar(ConPasarela):
         self.assertEqual(len(self.qr), 1)
 
 
-class ConLosDos(ConPasarela):
-    """La pasarela y la VPN IKEv2 del instalador (su servidor.ini) en el mismo servidor, como root con sudo."""
+class ConLaVpnDeAntes(ConPasarela):
+    """La pasarela y la VPN IKEv2 que dejaba el instalador hasta la 0.5.1 (su servidor.ini), como root con sudo. Desde
+    la 0.6.0 la VPN ya no da altas: `alta` es siempre de la pasarela."""
 
     def setUp(self):
         super().setUp()
@@ -188,45 +194,41 @@ class ConLosDos(ConPasarela):
             f.write("[servidor]\ndireccion = 203.0.113.7\n")
         self.m.SERVIDOR_INI = self.ini_vpn
         self.m.aplicar_servidor_ini(self.ini_vpn)
-        self.ikev2 = []
-        mock.patch.object(self.m, "alta_ikev2", lambda nombre, servidor: self.ikev2.append((nombre, servidor))).start()
         mock.patch.object(self.m.os, "geteuid", lambda: 0).start()
         mock.patch.dict(os.environ, {"SUDO_USER": "daniel"}).start()
+        self.ordenes = []
+        mock.patch.object(self.m, "correr", lambda *a, **k: self.ordenes.append(list(a))).start()
 
-    def test_sin_decir_cual_no_adivina(self):
+    def test_sin_decir_cual_es_la_pasarela(self):
         codigo, texto = self.orden("alta", "otro")
-        self.assertEqual(codigo, 1)
-        self.assertIn("aquí están la pasarela TLS y la VPN IKEv2: di cuál", texto)
-        self.assertIn("alta otro --tls", texto)
-        self.assertIn("alta otro --ikev2", texto)
-        self.assertFalse(os.path.exists(self.tokens))
-        self.assertEqual(self.ikev2, [])
+        self.assertEqual(codigo, 0, texto)
+        self.assertEqual(pa.Tokens(self.tokens).quien(self.token_del_qr(self.qr[-1])), "otro")
+        self.assertEqual(self.ordenes, [], "nada de swanctl")
 
     def test_con_tls_la_pasarela(self):
         codigo, texto = self.orden("alta", "otro", "--tls")
         self.assertEqual(codigo, 0, texto)
         self.assertEqual(pa.Tokens(self.tokens).quien(self.token_del_qr(self.qr[-1])), "otro")
-        self.assertEqual(self.ikev2, [])
 
-    def test_con_ikev2_la_vpn(self):
-        codigo, texto = self.orden("alta", "otro", "--ikev2")
-        self.assertEqual(codigo, 0, texto)
-        self.assertEqual(self.ikev2, [("otro", "203.0.113.7")])
+    def test_con_ikev2_ya_no(self):
+        for argumentos in (("otro", "--ikev2"), ("otro", "--ikev2", "--servidor", "203.0.113.7"), ("otro", "--vpn")):
+            with self.subTest(argumentos=argumentos):
+                codigo, texto = self.orden("alta", *argumentos)
+                self.assertEqual(codigo, 1)
+                self.assertIn("--ikev2 ya no existe", texto)
+                self.assertIn("sudo hehermes-dispositivo alta <nombre>", texto)
         self.assertFalse(os.path.exists(self.tokens))
+        self.assertFalse(os.path.exists(self.m.REGISTRO))
+        self.assertEqual((self.qr, self.ordenes), ([], []))
 
-    def test_solo_la_vpn_elige_la_vpn(self):
+    def test_sin_pasarela_tampoco_elige_la_vpn(self):
         self.m._pasarela = None
         mock.patch.object(self.m, "ruta_pasarela_ini", lambda: self.c("no-hay.ini")).start()
         codigo, texto = self.orden("alta", "otro")
-        self.assertEqual(codigo, 0, texto)
-        self.assertEqual(self.ikev2, [("otro", "203.0.113.7")])
-
-    def test_solo_la_pasarela_elige_la_pasarela(self):
-        os.unlink(self.ini_vpn)
-        codigo, texto = self.orden("alta", "otro")
-        self.assertEqual(codigo, 0, texto)
-        self.assertEqual(pa.Tokens(self.tokens).quien(self.token_del_qr(self.qr[-1])), "otro")
-        self.assertEqual(self.ikev2, [])
+        self.assertEqual(codigo, 1)
+        self.assertIn("la pasarela TLS no está instalada", texto)
+        self.assertIn("sudo hehermes-servidor instalar", texto)
+        self.assertEqual(self.ordenes, [])
 
     def test_la_lista_dice_el_modo_de_cada_uno(self):
         self.orden("alta", "de-la-pasarela", "--tls")

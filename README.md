@@ -8,22 +8,26 @@ La app no está en este repositorio: aquí solo está lo que corre en el servido
 
 ## Qué hace
 
-En un servidor Linux que ya tiene Hermes, deja lo que hace falta para que el iPhone hable con él por una VPN IKEv2
-que instala la propia app, y acaba pintando en el terminal el código QR del iPhone:
+En un servidor Linux que ya tiene Hermes, deja lo que hace falta para que el iPhone hable con él por una conexión
+directa, y acaba pintando en el terminal el código QR del iPhone:
 
-- strongSwan (IKEv2) con una conexión y una clave por iPhone, una interfaz XFRM `hh-ipsec` y nginx escuchando solo
-  dentro del túnel (`10.77.0.1`), que pone la clave de la API de Hermes para que la app no la lleve nunca;
-- las reglas del cortafuegos (ufw o firewalld), **sin encenderlo** si está apagado;
+- la pasarela (`hehermes-pasarela`): un puerto TCP alto y al azar con TLS 1.3 y un certificado propio cuya huella ancla
+  la app, un token por iPhone (del que el servidor solo guarda el hash) y la clave de la API de Hermes, que pone ella
+  para que la app no la lleve nunca. Sin root, se instala en la casa del usuario de Hermes;
+- la regla del cortafuegos (ufw, firewalld, nftables o iptables), **sin encenderlo** si está apagado;
 - un manifiesto de todo lo que deja (`/etc/hehermes/instalacion.json`): no pisa nada que no sea suyo, repetirlo no
   cambia nada y desinstalarlo deja el servidor como estaba.
 
-Todo con Python 3 del sistema y la biblioteca estándar. El detalle, en
-[`server/instalador/README.md`](server/instalador/README.md).
+Hasta la versión 0.5.1 también instalaba una VPN IKEv2; desde la 0.6.0 ya no, y la de un servidor que la tenga se
+quita con `sudo hehermes-servidor desinstalar --modo vpn`.
+
+Todo con Python 3 del sistema y la biblioteca estándar (y `cryptography`, fijada por hash, para el certificado). El
+detalle, en [`server/instalador/README.md`](server/instalador/README.md).
 
 | Carpeta | Qué hay |
 |---|---|
-| `server/instalador` | `hehermes-servidor` (instalar, comprobar, actualizar, desinstalar), `empaquetar` y sus pruebas |
-| `server/vpn` | `hehermes-dispositivo`, el script de las altas y bajas de cada iPhone, y la instalación a mano |
+| `server/instalador` | `hehermes-servidor` (instalar, comprobar, actualizar, desinstalar), la pasarela, `empaquetar` y sus pruebas |
+| `server/vpn` | `hehermes-dispositivo`, el script de las altas y bajas de cada iPhone (y de las bajas de una VPN de antes), y la historia de la VPN |
 | `server/avisos` | El código de los avisos push (el vigía y el relé) y su instalador. Sus pruebas no están aquí: usan datos de un Hermes de verdad |
 
 ## Cómo se instala

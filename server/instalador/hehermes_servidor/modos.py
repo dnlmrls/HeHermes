@@ -1,8 +1,9 @@
 """De qué modo es cada cosa del manifiesto: lo que quita `desinstalar --modo vpn` o `--modo tls` (quitar un modo sin
 tocar el otro).
 
-Se decide por la ruta, el nombre o el texto de cada cosa, y no por lo que apuntó cada pasada: así vale también para un
-manifiesto de antes de que los dos modos convivieran, como el del VPS de Daniel. Lo que no es de ninguno de los dos es
+Desde la 0.6.0 la VPN ya no se instala, pero lo que dejó una de antes se sigue reconociendo aquí, para quitarlo sin
+tocar la pasarela. Se decide por la ruta, el nombre o el texto de cada cosa, y no por lo que apuntó cada pasada: así
+vale también para un manifiesto de antes de que los dos modos convivieran (0.5.1). Lo que no es de ninguno de los dos es
 común (el instalador en /opt, su orden, `hehermes-dispositivo`, `hehermes-cortafuegos.service`, las líneas del .env de
 Hermes, el venv de `cryptography`) y solo se va con `desinstalar` a secas.
 """
@@ -42,7 +43,7 @@ def de_unidad(unidad: str) -> str | None:
 
 def de_regla(texto: str, puerto) -> str | None:
     """Una regla de ufw o de firewalld del manifiesto. `puerto`, el de la pasarela (sin él, ninguna es suya)."""
-    if texto in {r.texto for r in p.reglas_ufw() + p.reglas_firewalld()}:
+    if texto in {r.texto for r in p.reglas_ufw(VPN) + p.reglas_firewalld(VPN)}:
         return VPN
     try:
         de_la_pasarela = {r.texto for r in p.reglas_ufw(TLS, puerto) + p.reglas_firewalld(TLS, puerto)}

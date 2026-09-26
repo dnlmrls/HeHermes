@@ -1,5 +1,6 @@
 """`instalar --por-chat`: la decisión 7, `--activar-api` y el canje que se lanza al acabar, sobre el servidor falso.
 
+Desde la 0.6.0 el canje entrega solo el acceso a la pasarela, `{h, p, f, t}`: ya no hay PSK de una VPN que entregar.
 Sin `cryptography`: esto es el instalador, con el Python del sistema. El canje de verdad está en `test_canje_*.py`.
 """
 
@@ -13,26 +14,18 @@ import unittest
 from unittest import mock
 
 import servidor_falso as sf
+from hehermes_servidor import ambito as amb
 from hehermes_servidor import cli
+from hehermes_servidor import pasarela as pa
 from hehermes_servidor import porchat
-from hehermes_servidor.deteccion import detectar
 from hehermes_servidor.manifiesto import Manifiesto
-from hehermes_servidor.plan import Opciones, calcular_plan
-
-
-
-def con_modo_vpn(argv):
-    """Estas pruebas son del modo VPN, que desde la pasarela (0.5.0) ya no es el de por defecto."""
-    argv = list(argv)
-    if argv[:1] == ["instalar"] and "--modo" not in argv:
-        argv.append("--modo")
-        argv.append("vpn")
-    return argv
-
+from hehermes_servidor.modo_tls import calcular_plan_tls, detectar_tls
+from hehermes_servidor.plan import Opciones
 
 ORIGEN = str(apoyo.RAIZ)
 LLAVE = base64.urlsafe_b64encode(bytes(range(40, 72))).rstrip(b"=").decode()
 MEDIA_HORA = 30 * 60
+TOKENS = "/etc/hehermes-pasarela/tokens.json"
 
 
 class Base(unittest.TestCase):
@@ -42,7 +35,7 @@ class Base(unittest.TestCase):
 
     def orden(self, *argv, terminal=False):
         self.texto = []
-        codigo = cli.main(con_modo_vpn(argv), "uso", ORIGEN, sis=self.sis, entrada=lambda _: "n", salida=self.texto.append,
+        codigo = cli.main(list(argv), "uso", ORIGEN, sis=self.sis, entrada=lambda _: "n", salida=self.texto.append,
                           terminal=terminal, euid=0)
         self.salida = "\n".join(self.texto)
         return codigo
@@ -55,8 +48,16 @@ class Base(unittest.TestCase):
         opciones.setdefault("por_chat", True)
         opciones.setdefault("llave", LLAVE)
         man = Manifiesto.leer(self.sis)
-        det = detectar(self.sis, man, activar_api=opciones.get("activar_api", False))
-        return calcular_plan(self.sis, det, man, Opciones(ahora=ahora, **opciones), ORIGEN)
+        det = detectar_tls(self.sis, man, amb.de_root(), activar_api=opciones.get("activar_api", False))
+        return calcular_plan_tls(self.sis, det, man, Opciones(ahora=ahora, **opciones), ORIGEN)
+
+    def alta_por_ssh(self, nombre):
+        """Un iPhone dado de alta desde un terminal, con su QR: no por chat."""
+        self.assertEqual(self.orden("instalar", "--si", "--iphone", nombre, terminal=True), 0, self.salida)
+        self.assertIn("▀", self.salida)
+
+    def carga(self):
+        return json.loads(self.sis.leer_texto(porchat.RUN + "/canje.json"))["carga"]
 
     def instalado_hace(self, segundos, **datos):
         man = Manifiesto.leer(self.sis)
@@ -103,25 +104,35 @@ class SoloElPrimero(Base):
         self.assertTrue(self.plan().puede_seguir, self.plan().bloqueos)
 
     def test_con_otro_iphone_ya_dado_de_alta_se_para(self):
-        self.falso._hehermes_dispositivo(["alta", "el-de-antes", "--ikev2"], None)
+        self.alta_por_ssh("el-de-antes")
         plan = self.plan()
         self.assertFalse(plan.puede_seguir)
         self.assertIn("solo se conecta el primer iPhone", "\n".join(plan.bloqueos))
         self.assertIn("el-de-antes", "\n".join(plan.bloqueos))
 
     def test_el_mismo_iphone_dado_de_alta_por_ssh_se_para(self):
-        self.falso._hehermes_dispositivo(["alta", "mi-iphone", "--ikev2"], None)
-        self.assertIn("no se dio de alta por chat", "\n".join(self.plan().bloqueos))
+        self.alta_por_ssh("mi-iphone")
+        texto = "\n".join(self.plan().bloqueos)
+        self.assertIn("no se dio de alta por chat", texto)
+        self.assertIn("Por SSH: hehermes-dispositivo rotar mi-iphone", texto)
 
     def test_ya_canjeado_se_para(self):
+        self.assertEqual(self.por_chat(), 0, self.salida)
         self.instalado_hace(60, por_chat={"iphone": "mi-iphone", "canjeado": time.time()})
-        self.falso._hehermes_dispositivo(["alta", "mi-iphone", "--ikev2"], None)
         self.assertIn("ya se canjeó", "\n".join(self.plan().bloqueos))
 
     def test_repetirlo_sin_canjear_pasa(self):
-        self.instalado_hace(60, por_chat={"iphone": "mi-iphone"})
-        self.falso._hehermes_dispositivo(["alta", "mi-iphone", "--ikev2"], None)
+        self.assertEqual(self.por_chat(), 0, self.salida)
+        self.instalado_hace(60)
         self.assertTrue(self.plan().puede_seguir, self.plan().bloqueos)
+
+    def test_una_alta_de_la_vpn_de_antes_cuenta_como_primer_iphone(self):
+        import vpn_antigua
+        vpn_antigua.montar(self.sis, self.falso, iphones=("el-de-la-vpn",), hace=60)
+        texto = "\n".join(self.plan().bloqueos)
+        self.assertIn("solo se conecta el primer iPhone, y aquí ya hay: el-de-la-vpn", texto)
+        self.assertIn("(hehermes-dispositivo alta <nombre>)", texto)
+        self.assertNotIn("--ikev2", texto)
 
 
 class LaMediaHora(Base):
@@ -143,7 +154,9 @@ class LaMediaHora(Base):
         self.assertEqual(self.orden("instalar", "--si", "--iphone", "otro"), 0, self.salida)
         instalado = Manifiesto.leer(self.sis).datos["instalado"]
         self.assertGreaterEqual(instalado, antes)
-        self.assertEqual(self.orden("instalar", "--si", "--avisos"), 0, self.salida)
+        self.sis.borrar("/etc/hehermes-pasarela/pasarela.ini")
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+        self.assertIn("pasarela.ini", self.salida, "ha reparado algo")
         self.assertEqual(Manifiesto.leer(self.sis).datos["instalado"], instalado)
 
     def test_una_instalacion_de_antes_sin_fecha_no_la_gana_al_repetir(self):
@@ -151,7 +164,8 @@ class LaMediaHora(Base):
         man = Manifiesto.leer(self.sis)
         del man.datos["instalado"]
         man.guardar(self.sis)
-        self.assertEqual(self.orden("instalar", "--si", "--avisos"), 0, self.salida)
+        self.sis.borrar("/etc/hehermes-pasarela/pasarela.ini")
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
         self.assertNotIn("instalado", Manifiesto.leer(self.sis).datos)
 
     def test_sin_por_chat_no_hay_limite(self):
@@ -186,8 +200,8 @@ class ActivarApi(Base):
         # La copia, antes de tocarlo.
         copia = Manifiesto.leer(self.sis).datos["activar_api"]["copia"]
         self.assertEqual(self.sis.leer_texto(copia["ruta"]), self.antes)
-        # nginx lleva la clave que ya había, y el reinicio va a los 90 s, una sola vez.
-        self.assertIn(sf.CLAVE, self.sis.leer_texto("/etc/nginx/hehermes-bearer.conf"))
+        # La pasarela lleva la clave que ya había, y el reinicio va a los 90 s, una sola vez.
+        self.assertEqual(self.sis.leer_texto("/etc/hehermes-pasarela/clave-hermes"), sf.CLAVE + "\n")
         self.assertEqual(len(self.reinicios()), 1)
         self.assertEqual(self.reinicios()[0][-3:], ["systemctl", "restart", "hermes-gateway.service"])
 
@@ -198,8 +212,7 @@ class ActivarApi(Base):
         self.assertEqual([l.split("=")[0] for l in nuevas], ["API_SERVER_ENABLED", "API_SERVER_HOST", "API_SERVER_KEY"])
         clave = nuevas[2].split("=", 1)[1]
         self.assertGreaterEqual(len(clave), 40)
-        self.assertEqual(self.sis.leer_texto("/etc/nginx/hehermes-bearer.conf"),
-                         'proxy_set_header Authorization "Bearer %s";\n' % clave)
+        self.assertEqual(self.sis.leer_texto("/etc/hehermes-pasarela/clave-hermes"), clave + "\n")
         self.assertNotIn(clave, self.salida)
         self.assertFalse([o for o in self.sis.ordenes if any(clave in a for a in o)], "la clave en una orden")
         self.assertIn("API_SERVER_KEY", self.salida, "dice qué añade, sin el valor")
@@ -272,22 +285,28 @@ class ElCanje(Base):
     def lanzamiento(self):
         return next(o for o in self.falso.lanzados if "--unit=hehermes-canje" in o)
 
-    def test_de_punta_a_punta_sin_la_psk_fuera(self):
+    def test_de_punta_a_punta_sin_el_token_fuera(self):
         hallado = self.lanzar()
         self.assertTrue(58000 <= int(hallado.group(1)) <= 65500, hallado.group(1))
-        # La PSK solo está en el fichero que se le pasa al canje, 0600 dentro de una carpeta 0700.
-        self.assertNotIn(sf.PSK, self.salida)
-        self.assertFalse([o for o in self.sis.ordenes if any(sf.PSK in a for a in o)], "la PSK en una orden")
         datos = self.canje_json()
-        self.assertEqual(datos["carga"], {"h": sf.IP_PUBLICA, "rid": sf.IP_PUBLICA, "lid": "mi-iphone", "k": sf.PSK})
+        # Lo único que entrega: el acceso a la pasarela, {h, p, f, t} y en ese orden. Nada de la VPN.
+        carga = datos["carga"]
+        self.assertEqual(list(carga), ["h", "p", "f", "t"])
+        puerto = Manifiesto.leer(self.sis).datos["pasarela"]["puerto"]
+        self.assertEqual((carga["h"], carga["p"], carga["f"]), (sf.IP_PUBLICA, puerto, sf.HUELLA_PASARELA))
+        self.assertEqual(pa.Tokens(self.sis.ruta(TOKENS)).quien(carga["t"]), "mi-iphone")
+        # El token solo está en el fichero que se le pasa al canje, 0600 dentro de una carpeta 0700.
+        self.assertNotIn(carga["t"], self.salida)
+        self.assertFalse([o for o in self.sis.ordenes if any(carga["t"] in a for a in o)], "el token en una orden")
         self.assertEqual(datos["llave"], LLAVE)
         self.assertEqual(datos["codigo"], hallado.group(2))
         self.assertEqual(datos["huella"], sf.HUELLA)
         self.assertEqual(datos["puerto"], int(hallado.group(1)))
         self.assertEqual(self.sis.modo(porchat.RUN + "/canje.json"), 0o600)
         self.assertEqual(self.sis.modo(porchat.RUN), 0o700)
-        # Por chat no se pinta el QR: la guarda de `qr` no lo dejaría, y lo leería el modelo.
-        self.assertFalse([o for o in self.sis.ordenes if o[:2] == ["/usr/local/sbin/hehermes-dispositivo", "qr"]])
+        # Por chat no se pinta el QR: lo leería el modelo.
+        self.assertNotIn("▀", self.salida)
+        self.assertFalse([o for o in self.sis.ordenes if o[:1] == ["/usr/local/sbin/hehermes-dispositivo"]])
         self.assertEqual(Manifiesto.leer(self.sis).datos["por_chat"]["iphone"], "mi-iphone")
 
     def test_la_unidad_es_de_usar_y_tirar_y_se_limpia_como_root(self):
@@ -318,12 +337,14 @@ class ElCanje(Base):
             self.assertIn(opcion, pip)
         self.assertEqual(self.sis.leer_texto(sf.VENV_CANJE + "/lib/python3.11/site-packages/hehermes-servidor.pth"),
                          "/opt/hehermes-servidor\n")
-        self.assertIn("python3-venv", Manifiesto.leer(self.sis).paquetes)
         self.falso.activos.discard("hehermes-canje")
         self.lanzar()
         self.assertEqual(len(self.falso.pip), 1, "el venv ya estaba")
 
     def test_el_puerto_sale_al_azar_y_se_salta_los_ocupados(self):
+        # La pasarela, antes y en el 58000, para que no se cruce con el del canje.
+        with mock.patch.object(porchat, "_azar", lambda n: 0):
+            self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
         # Al azar: el primero que se prueba es el 61234; está escuchando otro y el siguiente lo usa una conexión.
         self.falso.tcp += [("0.0.0.0:61234", "otro")]
         self.falso.tcp_conexiones += ["198.51.100.23:61235"]
@@ -333,6 +354,7 @@ class ElCanje(Base):
         self.assertIn(["ss", "-H", "-tan"], self.sis.ordenes, "también las conexiones, no solo lo que escucha")
 
     def test_sin_puerto_libre_se_para(self):
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
         with mock.patch.object(porchat, "elegir_puerto", lambda ocupados: None):
             self.assertEqual(self.por_chat(), 1)
         self.assertIn("no hay ningún puerto libre", self.salida)
@@ -354,14 +376,17 @@ class ElCanje(Base):
         self.lanzar()
         self.assertFalse([r for r in self.falso.reglas_ufw if "hehermes-canje" in r])
 
-    def test_repetirlo_da_otro_enlace_para_el_mismo_iphone(self):
+    def test_repetirlo_da_otro_enlace_y_otro_token_para_el_mismo_iphone(self):
         primero = self.lanzar()
-        altas = len(self.falso.altas)
+        token = self.carga()["t"]
         segundo = self.lanzar()
         self.assertNotEqual(primero.group(2), segundo.group(2))
-        self.assertEqual(len(self.falso.altas), altas, "sin alta nueva")
         self.assertIn(["systemctl", "stop", "hehermes-canje"], self.sis.ordenes)
-        self.assertEqual(self.canje_json()["carga"]["k"], sf.PSK, "la misma PSK, que nunca salió del servidor")
+        # Del token solo queda el hash: va uno nuevo, y el de antes deja de valer.
+        tokens = pa.Tokens(self.sis.ruta(TOKENS))
+        self.assertIsNone(tokens.quien(token))
+        self.assertEqual(tokens.quien(self.carga()["t"]), "mi-iphone")
+        self.assertEqual([t["nombre"] for t in json.loads(self.sis.leer(TOKENS))["tokens"]], ["mi-iphone"])
 
     def test_con_qr_png_deja_el_enlace_y_nada_mas(self):
         self.sis.carpeta("/tmp", 0o1777)
@@ -414,10 +439,10 @@ class ElCanje(Base):
 
 class SinSecretos(Base):
     """Daniel: nada de secretos en la salida (que por chat lee el modelo), en una orden (que ve `ps` y puede acabar en
-    el diario) ni en lo que se deja escrito fuera de su sitio. Lo único que lleva una clave es el QR, y solo a un
-    terminal (`hehermes-dispositivo qr`)."""
+    el diario) ni en lo que se deja escrito fuera de su sitio. Lo único que lleva el token es el QR, y solo a un
+    terminal."""
 
-    def test_ni_la_psk_ni_la_clave_de_hermes_salen_de_su_sitio(self):
+    def test_ni_el_token_ni_la_clave_de_hermes_salen_de_su_sitio(self):
         self.sis, self.falso = sf.servidor(habilitada=None, clave=None)
         self.addCleanup(self.sis.limpiar)
         self.falso.instalar_paquete("ufw")
@@ -425,10 +450,11 @@ class SinSecretos(Base):
         self.assertEqual(self.por_chat("--activar-api"), 0, self.salida)
         clave = [l for l in self.sis.leer_texto("/root/.hermes/.env").splitlines()
                  if l.startswith("API_SERVER_KEY=")][0].split("=", 1)[1]
+        token = self.carga()["t"]
         salidas = self.salida
         self.orden("comprobar")
         salidas += self.salida
-        for secreto in (sf.PSK, clave):
+        for secreto in (token, clave):
             with self.subTest(secreto=secreto[:6]):
                 self.assertNotIn(secreto, salidas)
                 self.assertFalse([o for o in self.sis.ordenes if any(secreto in a for a in o)], "en una orden")
@@ -437,9 +463,8 @@ class SinSecretos(Base):
                         continue
                     # Donde sí tiene que estar: su sitio, 0600, y las copias de /etc/hehermes y /run, también 0600.
                     self.assertEqual(datos[1], "0o600", ruta)
-                    self.assertTrue(ruta.startswith(("/etc/swanctl/conf.d/hehermes-", "/run/hehermes-canje/",
-                                                     "/root/.hermes/", "/etc/nginx/hehermes-bearer.conf",
-                                                     "/etc/hehermes/")), ruta)
+                    self.assertTrue(ruta.startswith(("/run/hehermes-canje/", "/root/.hermes/",
+                                                     "/etc/hehermes-pasarela/clave-hermes", "/etc/hehermes/")), ruta)
 
 
 class Limpiar(Base):
@@ -520,22 +545,17 @@ class ElegirPuerto(unittest.TestCase):
         self.assertGreater(len(vistos), 250, "al azar, casi nunca repite")
 
 
-class LaPsk(unittest.TestCase):
-    def test_la_lee_como_la_escribe_hehermes_dispositivo(self):
-        import importlib.machinery
-        import importlib.util
-        ruta = str(apoyo.REPO / "server" / "vpn" / "hehermes-dispositivo")
-        cargador = importlib.machinery.SourceFileLoader("hehermes_dispositivo", ruta)
-        modulo = importlib.util.module_from_spec(importlib.util.spec_from_loader("hehermes_dispositivo", cargador))
-        cargador.exec_module(modulo)
-        psk = modulo.nueva_psk()
-        texto = modulo.conf_swanctl({"nombre": "mi-iphone", "ip": "10.77.1.3", "servidor": "203.0.113.7",
-                                     "conexion": "hh-mi-iphone", "alta": "2026-09-24T00:00:00Z"}, psk)
-        self.assertEqual(porchat.leer_psk(texto), psk)
+class LaCarga(unittest.TestCase):
+    def test_es_la_del_qr_de_la_pasarela_y_en_su_orden(self):
+        carga = porchat.carga_tls("198.51.100.23", 61234, sf.HUELLA_PASARELA, LLAVE)
+        self.assertEqual(list(carga), ["h", "p", "f", "t"])
+        self.assertEqual(carga["p"], 61234, "el puerto, como número")
 
-    def test_sin_secret_no_hay_psk(self):
-        with self.assertRaises(ValueError):
-            porchat.leer_psk("connections {}\n")
+    def test_lo_que_no_valdria_en_el_qr_tampoco_vale_aqui(self):
+        for malo in (("a b", 61234, sf.HUELLA_PASARELA, LLAVE), ("198.51.100.23", "61234", sf.HUELLA_PASARELA, LLAVE),
+                     ("198.51.100.23", 61234, "corta", LLAVE), ("198.51.100.23", 61234, sf.HUELLA_PASARELA, "x")):
+            with self.subTest(malo=malo), self.assertRaises(ValueError):
+                porchat.carga_tls(*malo)
 
 
 if __name__ == "__main__":

@@ -34,39 +34,33 @@ def llave_valida(texto) -> bool:
     return len(datos) == 32 and base64.urlsafe_b64encode(datos).rstrip(b"=").decode() == texto
 
 
-def activos_de_los_dos(sis, man, modo, ambito=None) -> list:
-    """Los iPhone del servidor, de la VPN y de la pasarela si están los dos: «el primer iPhone» es el primero del
-    servidor, no el del modo que se instala ahora. Si no, con una VPN dada por chat, un correo que leyera Hermes
-    podría pedir otra alta por la pasarela."""
+def activos_del_servidor(sis, man, ambito=None) -> list:
+    """Los iPhone del servidor: los de la pasarela y, si queda la VPN de antes de la 0.6.0, sus altas. «El primer
+    iPhone» es el primero del servidor, no el de la pasarela: si no, con una VPN dada por chat, un correo que leyera
+    Hermes podría pedir otra alta por la pasarela."""
     from . import ambito as amb
     from .modo_tls import nombres_de_la_pasarela
     ambito = ambito or amb.de_root()
-    modos = set(man.modos) | {modo}
-    lista = list(registro_de_dispositivos(sis)) if "vpn" in modos and ambito.root else []
-    if "tls" in modos:
-        lista += [{"nombre": n} for n in nombres_de_la_pasarela(sis, ambito)]
-    return lista
+    lista = list(registro_de_dispositivos(sis)) if "vpn" in man.modos and ambito.root else []
+    return lista + [{"nombre": n} for n in nombres_de_la_pasarela(sis, ambito)]
 
 
 def bloqueos(sis, man, op, ahora=None, activos=None) -> list:
     """Lo que impide un alta por chat (decisión 7). Una web o un correo que lea Hermes pueden llevar escondida la orden
-    de dar un alta con la llave de otro: por eso solo vale para el primer iPhone, una vez, y recién instalado. En modo
-    TLS, `activos` son los iPhone de la pasarela."""
+    de dar un alta con la llave de otro: por eso solo vale para el primer iPhone, una vez, y recién instalado.
+    `activos`, los iPhone del servidor (`activos_del_servidor`)."""
     ahora = time.time() if ahora is None else ahora
     salida = []
     por_chat = man.datos.get("por_chat") or {}
-    activos = list(registro_de_dispositivos(sis) if activos is None else activos)
+    activos = list(activos or [])
     otros = sorted(d["nombre"] for d in activos if d.get("nombre") != op.iphone)
-    tls = getattr(op, "modo", "vpn") == "tls"
-    # Con los dos modos, `alta` sin más no sabe cuál: se dice.
-    alta = "hehermes-dispositivo alta <nombre>" + ((" --tls" if "vpn" in man.modos else "") if tls else " --ikev2")
+    alta = "hehermes-dispositivo alta <nombre>"
     if otros:
         salida.append("Por chat solo se conecta el primer iPhone, y aquí ya hay: %s. El siguiente, desde la app o "
                       "por SSH (%s)" % (", ".join(otros), alta))
     elif any(d.get("nombre") == op.iphone for d in activos) and por_chat.get("iphone") != op.iphone:
         salida.append("«%s» ya está dado de alta y no se dio de alta por chat: por chat solo se conecta el primer "
-                      "iPhone. Por SSH: %s" % (op.iphone, "hehermes-dispositivo rotar %s" % op.iphone if tls
-                                              else "sudo hehermes-dispositivo qr %s" % op.iphone))
+                      "iPhone. Por SSH: hehermes-dispositivo rotar %s" % (op.iphone, op.iphone))
     if por_chat.get("canjeado"):
         salida.append("El alta por chat de «%s» ya se canjeó: por chat solo se conecta una vez. Otro iPhone, desde la "
                       "app o por SSH" % por_chat.get("iphone", "?"))
@@ -171,17 +165,8 @@ class ParadaDelCanje(Exception):
 
 
 def enlace(direccion: str, puerto: int, codigo: str, huella: str) -> str:
-    """Lo único que sale por el chat. Ni la PSK ni nada que sirva sin la clave privada del iPhone."""
+    """Lo único que sale por el chat. Ni el token ni nada que sirva sin la clave privada del iPhone."""
     return "hehermes-canje:1?h=%s&p=%d&c=%s&f=%s" % (direccion, puerto, codigo, huella)
-
-
-def leer_psk(texto: str) -> str:
-    """El `secret` del fichero de swanctl del iPhone, como lo escribe `hehermes-dispositivo` (entre comillas)."""
-    for linea in texto.splitlines():
-        hallado = re.match(r'^\s*secret\s*=\s*"([^"]+)"\s*$', linea)
-        if hallado:
-            return hallado.group(1)
-    raise ValueError("no hay ningún secret entre comillas")
 
 
 def carga_tls(direccion: str, puerto: int, huella: str, token: str) -> dict:
@@ -191,11 +176,10 @@ def carga_tls(direccion: str, puerto: int, huella: str, token: str) -> dict:
     return {"h": direccion, "p": puerto, "f": huella, "t": token}
 
 
-def lanzar(sis, man, det, op, salida, carga=None, ambito=None) -> str:
-    """Prepara y lanza el canje del iPhone de `op.iphone`. Devuelve el enlace; no lo imprime (va el último).
-
-    En modo VPN la carga es la PSK del iPhone, que se lee de su conexión; en modo TLS se da hecha (`carga_tls`). Sin
-    root (`ambito` de un usuario), el canje es una unidad de usuario y no se toca el cortafuegos."""
+def lanzar(sis, man, det, op, salida, carga, ambito=None) -> str:
+    """Prepara y lanza el canje del iPhone de `op.iphone`, que entrega `carga` (`carga_tls`: lo único que entrega desde
+    la 0.6.0). Devuelve el enlace; no lo imprime (va el último). Sin root (`ambito` de un usuario), el canje es una
+    unidad de usuario y no se toca el cortafuegos."""
     import json
     import secrets as azar
     from . import ambito as amb
@@ -213,16 +197,6 @@ def lanzar(sis, man, det, op, salida, carga=None, ambito=None) -> str:
         if not r.bien:
             raise ParadaDelCanje("no he podido crear el certificado del canje: %s" % (r.error or r.salida).strip())
         huella = json.loads(r.salida)["huella"]
-        if carga is None:
-            registro = next(d for d in registro_de_dispositivos(sis) if d.get("nombre") == op.iphone)
-            servidor = registro.get("servidor") or det.direccion
-            texto = sis.leer_texto("%s/conf.d/hehermes-%s.conf" % (det.swanctl, op.iphone))
-            try:
-                psk = leer_psk(texto or "")
-            except ValueError:
-                raise ParadaDelCanje("no encuentro la clave de «%s» en su conexión de strongSwan" % op.iphone) from None
-            carga = {"h": servidor, "rid": servidor, "lid": op.iphone, "k": psk}
-            del psk
         servidor = carga["h"]
         puerto = _puerto_libre(sis)
         codigo = base64.urlsafe_b64encode(azar.token_bytes(16)).rstrip(b"=").decode()

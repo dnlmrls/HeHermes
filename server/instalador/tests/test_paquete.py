@@ -15,10 +15,11 @@ import unittest.mock
 
 import servidor_falso as sf
 from hehermes_servidor import VERSION
+from hehermes_servidor import ambito
 from hehermes_servidor import firma
-from hehermes_servidor.deteccion import detectar
 from hehermes_servidor.manifiesto import Manifiesto
-from hehermes_servidor.plan import Opciones, calcular_plan
+from hehermes_servidor.modo_tls import calcular_plan_tls, detectar_tls
+from hehermes_servidor.plan import Opciones
 from hehermes_servidor.sistema import Resultado, Sistema
 
 PRIVADA = apoyo.DATOS / "clave-de-prueba-NO-ES-DE-DANIEL.pem"
@@ -69,20 +70,21 @@ class Paquete(unittest.TestCase):
                 self.assertEqual((m.uid, m.gid, m.uname, m.gname), (0, 0, "root", "root"))
         for nombre, modo in (("hehermes-servidor", 0o755), ("hehermes-pasarela", 0o755),
                              ("hehermes_servidor/pasarela.py", 0o644), ("hehermes_servidor/qr.py", 0o644),
-                             ("hehermes_servidor/cli.py", 0o644),
+                             ("hehermes_servidor/cli.py", 0o644), ("hehermes_servidor/desinstalar.py", 0o644),
+                             ("hehermes_servidor/modos.py", 0o644),
                              ("hehermes_servidor/plan.py", 0o644), ("clave-publica.pem", 0o644),
-                             ("hehermes-dispositivo", 0o755), ("avisos/despliegue/instalar.sh", 0o755),
-                             ("avisos/despliegue/hehermes-leer-media", 0o755),
-                             ("avisos/despliegue/hehermes-leer-media.socket", 0o644),
-                             ("avisos/despliegue/hehermes-leer-media@.service", 0o644),
-                             ("avisos/hehermes_avisos/vigia/fichero.py", 0o644),
-                             ("avisos/requirements.txt", 0o644), ("avisos/hehermes_avisos/__init__.py", 0o644),
-                             ("avisos/despliegue/hehermes-vigia.service", 0o644), ("README.md", 0o644),
+                             ("hehermes-dispositivo", 0o755), ("README.md", 0o644),
                              ("requirements-canje.txt", 0o644), ("hehermes_servidor/canje.py", 0o644),
                              ("hehermes_servidor/porchat.py", 0o644)):
             with self.subTest(fichero=nombre):
                 self.assertIn(prefijo + nombre, miembros)
                 self.assertEqual(miembros[prefijo + nombre].mode, modo)
+        # Los avisos solo los instalaba --avisos, que iba con la VPN: ya no van.
+        self.assertFalse([n for n in miembros if n.startswith(prefijo + "avisos")])
+        ficheros = sorted(n[len(prefijo):] for n, m in miembros.items() if m.isfile())
+        modulos = sorted("hehermes_servidor/" + p.name for p in (apoyo.RAIZ / "hehermes_servidor").glob("*.py"))
+        self.assertEqual(ficheros, sorted(["README.md", "clave-publica.pem", "hehermes-dispositivo", "hehermes-pasarela",
+                                           "hehermes-servidor", "requirements-canje.txt"] + modulos))
         # El dispositivo es el de server/vpn, byte a byte.
         with tarfile.open(ruta) as tar:
             dentro = tar.extractfile(prefijo + "hehermes-dispositivo").read()
@@ -97,10 +99,12 @@ class Paquete(unittest.TestCase):
         sis, falso = sf.servidor()
         self.addCleanup(sis.limpiar)
         man = Manifiesto()
-        plan = calcular_plan(sis, detectar(sis, man), man, Opciones(iphone="mi-iphone", avisos=True), origen)
+        plan = calcular_plan_tls(sis, detectar_tls(sis, man, ambito.de_root()), man, Opciones(iphone="mi-iphone"),
+                                 origen)
         self.assertTrue(plan.puede_seguir, plan.bloqueos)
-        avisos = next(a for a in plan.acciones if a.tipo == "avisos")
-        self.assertEqual(avisos.datos, os.path.join(origen, "avisos/despliegue/instalar.sh"))
+        dispositivo = next(a for a in plan.acciones if a.objeto == "/usr/local/sbin/hehermes-dispositivo")
+        with open(os.path.join(origen, "hehermes-dispositivo"), "rb") as f:
+            self.assertEqual(dispositivo.datos, f.read())
 
     def test_el_comando_de_la_app(self):
         comando = self.e.comando("https://ejemplo.org/hehermes", "0.1.0", "ab" * 32, "mi-iphone")
