@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""hehermes-dispositivo: altas y bajas de dispositivos en los túneles de HeHermes, WireGuard e IKEv2.
+"""hehermes-dispositivo: altas y bajas de dispositivos en los túneles de HeHermes, WireGuard e IKEv2, y en la pasarela TLS.
 
-Uso (siempre como root):
-  hehermes-dispositivo alta <nombre> [--pubkey <clave pública>] [--servidor <dirección>]
+Uso (como root; los de la pasarela, sin root también si la instaló ese usuario):
+  hehermes-dispositivo alta <nombre> --tls    # la pasarela TLS: el token nuevo y su QR, en un terminal
   hehermes-dispositivo alta <nombre> --ikev2 [--servidor <dirección>]   # la VPN nativa de la app
-  hehermes-dispositivo lista
-  hehermes-dispositivo baja <nombre>
-  hehermes-dispositivo rotar <nombre>       # IKEv2: una clave nueva, si el QR ha podido verse (corta la sesión)
-  hehermes-dispositivo qr <nombre>          # solo una persona, con sudo y en un terminal
+  hehermes-dispositivo alta <nombre>          # el modo que haya; con los dos, pide --tls o --ikev2
+  hehermes-dispositivo alta <nombre> [--pubkey <clave pública>] [--servidor <dirección>]   # WireGuard, lo de antes
+  hehermes-dispositivo lista                # todos, con su modo: tls, ikev2 o wireguard
+  hehermes-dispositivo baja <nombre> [--tls|--ikev2]   # la pasarela: su token deja de valer y su conexión se corta
+  hehermes-dispositivo rotar <nombre> [--tls|--ikev2]  # una clave (o un token) nueva, si el QR ha podido verse
+  hehermes-dispositivo qr <nombre>          # solo una persona, con sudo y en un terminal (en la pasarela, no: rotar)
   hehermes-dispositivo limpiar <nombre>     # borra del VPS el .conf con la clave privada
   hehermes-dispositivo clave                # recarga en nginx (y en el vigía de avisos) la clave del api_server
   hehermes-dispositivo clave --solo-vigia   # solo la copia del vigía, sin tocar nginx (el instalador de avisos)
@@ -26,6 +28,11 @@ alta IKEv2 anterior) o del `Endpoint` de un .conf de WireGuard ya dado; sin ning
 El script nunca escribe una clave privada, una clave compartida ni la API_SERVER_KEY en
 la salida, salvo `qr`, que pinta la del dispositivo como QR y se niega a hacerlo si no
 lo lanza una persona con sudo desde un terminal.
+
+La pasarela TLS (`server/instalador`, `--modo tls`) tiene su propio `pasarela.ini`: el de root en
+`/etc/hehermes-pasarela`, o el de un usuario en `~/.config/hehermes-pasarela`. Sus iPhone van en su `tokens.json`, que
+solo guarda el SHA-256 de cada token: el QR (`hehermes-tls:1?…`) sale una vez, al dar el alta o al rotar, y en un
+terminal. El código de los tokens y del QR es el del instalador (`[instalador] codigo`), el mismo que usa la pasarela.
 """
 
 import base64
@@ -673,6 +680,161 @@ def rotar_ikev2(d):
               % ((t.stderr or t.stdout).strip(), d["conexion"]))
 
 
+# MARK: La pasarela TLS
+
+PASARELA_INI_ROOT = "/etc/hehermes-pasarela/pasarela.ini"
+_pasarela = None
+
+
+def ruta_pasarela_ini():
+    if os.geteuid() == 0:
+        return PASARELA_INI_ROOT
+    return os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".config", "hehermes-pasarela", "pasarela.ini")
+
+
+def de_fiar(ruta):
+    """Lo que el script lee para importar código tiene que ser de quien lo ejecuta (o de root) y que nadie más pueda
+    escribirlo: como root, importar de una carpeta que otro puede tocar sería darle root."""
+    datos = os.lstat(ruta)
+    if stat.S_ISLNK(datos.st_mode):
+        fallar("%s es un enlace: no lo sigo" % ruta)
+    if datos.st_uid not in (0, os.geteuid()) or datos.st_mode & 0o022:
+        fallar("%s lo puede cambiar otro usuario: no me fío de él" % ruta)
+
+
+def pasarela():
+    """La pasarela de este servidor (o de este usuario), o None si no está instalada."""
+    global _pasarela
+    if _pasarela is not None:
+        return _pasarela
+    ruta = ruta_pasarela_ini()
+    if not os.path.exists(ruta):
+        return None
+    de_fiar(ruta)
+    ini = configparser.ConfigParser(interpolation=None)
+    try:
+        ini.read(ruta)
+        codigo = ini.get("instalador", "codigo")
+        datos = {"ini": ruta, "tokens": ini.get("pasarela", "tokens"), "cert": ini.get("pasarela", "certificado"),
+                 "puerto": ini.getint("pasarela", "puerto"), "direccion": ini.get("qr", "direccion")}
+    except (configparser.Error, ValueError) as error:
+        fallar("%s no se puede leer: %s" % (ruta, error))
+    for camino in (codigo, os.path.join(codigo, "hehermes_servidor")):
+        de_fiar(camino)
+    if codigo not in sys.path:
+        sys.path.insert(0, codigo)
+    from hehermes_servidor import pasarela as modulo_pasarela, qr as modulo_qr, tokens as modulo_tokens
+    datos.update(modulo_tokens=modulo_tokens, modulo_qr=modulo_qr, modulo_pasarela=modulo_pasarela)
+    _pasarela = datos
+    return datos
+
+
+def en_la_pasarela(nombre):
+    p = pasarela()
+    if p is None:
+        return False
+    try:
+        return any(t["nombre"] == nombre for t in p["modulo_tokens"].lista(p["tokens"]))
+    except ValueError as error:
+        fallar(str(error))
+
+
+def una_persona_en_un_terminal():
+    """Lo mismo que pide `qr`: el QR de la pasarela lleva el token. Sin root no hay sudo que mirar."""
+    return sys.stdout.isatty() and (os.geteuid() != 0 or bool(os.environ.get("SUDO_USER")))
+
+
+def huella_de_la_pasarela(p):
+    import ssl
+    try:
+        with open(p["cert"]) as f:
+            return p["modulo_pasarela"].huella_de_der(ssl.PEM_cert_to_DER_cert(f.read()))
+    except (OSError, ValueError) as error:
+        fallar("no puedo leer el certificado de la pasarela (%s): %s" % (p["cert"], error))
+
+
+def pintar_qr_tls(p, nombre, token, huella):
+    texto = p["modulo_tokens"].texto_qr(p["direccion"], p["puerto"], huella, token)
+    sys.stdout.write(p["modulo_qr"].terminal(texto))
+    print("Escanéalo desde la app HeHermes Mensajes. Lleva el token de «%s»: ni lo compartas ni le hagas captura. "
+          "No se puede volver a pintar: si hace falta otro, hehermes-dispositivo rotar %s (y el de antes deja de "
+          "valer)." % (nombre, nombre))
+
+
+def exigir_terminal(que):
+    if not una_persona_en_un_terminal():
+        fallar("%s pinta el QR, que lleva el token del iPhone: solo %s desde un terminal interactivo, y no he cambiado "
+               "nada" % (que, "con sudo" if os.geteuid() == 0 else "tú"))
+
+
+def alta_tls(nombre):
+    p = pasarela()
+    if p is None:
+        fallar("la pasarela TLS no está instalada (no está %s)" % ruta_pasarela_ini())
+    exigir_terminal("El alta de la pasarela")
+    huella = huella_de_la_pasarela(p)
+    try:
+        token = p["modulo_tokens"].alta(p["tokens"], nombre)
+    except ValueError as error:
+        fallar(str(error))
+    print("Alta de «%s» en la pasarela TLS (puerto %d)." % (nombre, p["puerto"]))
+    pintar_qr_tls(p, nombre, token, huella)
+
+
+def baja_tls(nombre):
+    p = pasarela()
+    try:
+        quitado = p["modulo_tokens"].baja(p["tokens"], nombre)
+    except ValueError as error:
+        fallar(str(error))
+    if not quitado:
+        fallar("no hay ningún iPhone «%s» en la pasarela" % nombre)
+    print("Baja de «%s» en la pasarela. Su token ya no vale, y si tenía una conexión abierta, la pasarela la corta en "
+          "un segundo." % nombre)
+
+
+def rotar_tls(nombre):
+    p = pasarela()
+    exigir_terminal("Rotar en la pasarela")
+    huella = huella_de_la_pasarela(p)
+    try:
+        token = p["modulo_tokens"].rotar(p["tokens"], nombre)
+    except ValueError as error:
+        fallar(str(error))
+    print("Token de «%s» cambiado: el de antes ya no vale, y su conexión se ha cortado." % nombre)
+    pintar_qr_tls(p, nombre, token, huella)
+
+
+def hay_vpn():
+    """Si aquí está la VPN IKEv2 de HeHermes: la del instalador (que deja servidor.ini) o una con altas IKEv2 en el
+    registro. Una hecha a mano sin ninguna, como la de antes con WireGuard, no cuenta: ahí `alta` sigue siendo de
+    WireGuard, como siempre."""
+    if os.geteuid() != 0:
+        return False
+    if os.path.exists(SERVIDOR_INI):
+        return True
+    try:
+        return any(tipo(d) == "ikev2" for d in activos(leer_registro()))
+    except (OSError, ValueError, KeyError):
+        return False
+
+
+def modo_de(args, nombre):
+    """«tls» o «vpn» para una baja o una rotación: lo que se pida, o donde esté. Si está en los dos, que se diga."""
+    vpn_pedida = "--vpn" in args or "--ikev2" in args
+    if "--tls" in args and vpn_pedida:
+        fallar("--tls o --ikev2, no los dos")
+    if "--tls" in args:
+        return "tls"
+    if vpn_pedida:
+        return "vpn"
+    tls = en_la_pasarela(nombre)
+    vpn = os.geteuid() == 0 and buscar(leer_registro(), nombre) is not None
+    if tls and vpn:
+        fallar("«%s» está en la pasarela y en la VPN: di cuál con --tls o --ikev2" % nombre)
+    return "tls" if tls else "vpn"
+
+
 # MARK: Órdenes
 
 
@@ -686,19 +848,34 @@ def cmd_alta(args):
     nombre = args[0]
     if not NOMBRE_VALIDO.match(nombre):
         fallar("nombre no válido (minúsculas, números y guiones, hasta 31)")
-    uso = ("uso: alta <nombre> [--pubkey <clave pública>] [--servidor <dirección>] | "
-           "alta <nombre> --ikev2 [--servidor <dirección>]")
+    uso = ("uso: alta <nombre> [--tls] | alta <nombre> --ikev2 [--servidor <dirección>] | "
+           "alta <nombre> [--pubkey <clave pública>] [--servidor <dirección>]")
     opciones, resto = {}, list(args[1:])
     while resto:
         opcion = resto.pop(0)
         if opcion in opciones:
             fallar(uso)
-        if opcion == "--ikev2":
+        if opcion in ("--ikev2", "--tls"):
             opciones[opcion] = True
         elif opcion in ("--pubkey", "--servidor") and resto:
             opciones[opcion] = resto.pop(0)
         else:
             fallar(uso)
+    if not opciones:
+        # Sin decir cuál: el modo que haya. Con los dos, no se adivina: un QR del modo que no es no le sirve a nadie.
+        tls, vpn = pasarela() is not None, hay_vpn()
+        if tls and vpn:
+            fallar("aquí están la pasarela TLS y la VPN IKEv2: di cuál. La pasarela (el modo por defecto): alta %s "
+                   "--tls; la VPN: alta %s --ikev2" % (nombre, nombre))
+        if vpn:
+            opciones["--ikev2"] = True
+        elif tls or os.geteuid() != 0:
+            opciones["--tls"] = True
+    if "--tls" in opciones or os.geteuid() != 0:
+        if len(opciones) > ("--tls" in opciones):
+            fallar(uso)
+        alta_tls(nombre)
+        return
     if "--ikev2" in opciones:
         if "--pubkey" in opciones:
             fallar(uso)
@@ -737,6 +914,23 @@ def cmd_alta(args):
 
 
 def cmd_lista(_args):
+    """Todos, los de la pasarela y los de la VPN, cada uno con su modo (tls, ikev2 o wireguard) en la segunda
+    columna: con los dos modos, es lo que dice por dónde entra cada iPhone."""
+    p = pasarela()
+    de_la_pasarela = []
+    if p is not None:
+        try:
+            de_la_pasarela = p["modulo_tokens"].lista(p["tokens"])
+        except ValueError as error:
+            fallar(str(error))
+        for t in de_la_pasarela:
+            rotado = ("  rotado " + t["rotado"]) if t.get("rotado") else ""
+            print("%-20s %-9s %-12s alta %s  puerto %d%s" % (t["nombre"], "tls", "-", t.get("alta", "?"), p["puerto"],
+                                                             rotado))
+        if os.geteuid() != 0 or not os.path.exists(REGISTRO):
+            if not de_la_pasarela:
+                print("Sin dispositivos.")
+            return
     registro = leer_registro()
     handshakes = {}
     if subprocess.run(["ip", "link", "show", INTERFAZ], capture_output=True).returncode == 0:
@@ -744,7 +938,8 @@ def cmd_lista(_args):
             clave, _, t = linea.partition("\t")
             handshakes[clave] = int(t or 0)
     if not registro["dispositivos"]:
-        print("Sin dispositivos.")
+        if not de_la_pasarela:
+            print("Sin dispositivos.")
         return
     sas = sas_ikev2() if any(tipo(d) == "ikev2" for d in activos(registro)) else {}
     for d in registro["dispositivos"]:
@@ -764,8 +959,17 @@ def cmd_lista(_args):
 
 
 def cmd_baja(args):
-    if len(args) != 1:
-        fallar("uso: baja <nombre>")
+    if not 1 <= len(args) <= 2 or any(a not in ("--tls", "--ikev2", "--vpn") for a in args[1:]):
+        fallar("uso: baja <nombre> [--tls|--ikev2]")
+    if modo_de(args[1:], args[0]) == "tls":
+        if pasarela() is None:
+            fallar("la pasarela TLS no está instalada")
+        baja_tls(args[0])
+        return
+    if os.geteuid() != 0 and pasarela() is not None:
+        # Sin root, solo lo de la pasarela de este usuario (main ya ha dejado fuera lo demás).
+        fallar("lo de la VPN hay que ejecutarlo como root (sudo)")
+    args = args[:1]
     registro = leer_registro()
     d = buscar(registro, args[0])
     if not d:
@@ -782,8 +986,17 @@ def cmd_baja(args):
 
 
 def cmd_rotar(args):
-    if len(args) != 1:
-        fallar("uso: rotar <nombre>")
+    if not 1 <= len(args) <= 2 or any(a not in ("--tls", "--ikev2", "--vpn") for a in args[1:]):
+        fallar("uso: rotar <nombre> [--tls|--ikev2]")
+    if modo_de(args[1:], args[0]) == "tls":
+        if pasarela() is None:
+            fallar("la pasarela TLS no está instalada")
+        rotar_tls(args[0])
+        return
+    if os.geteuid() != 0 and pasarela() is not None:
+        # Sin root, solo lo de la pasarela de este usuario (main ya ha dejado fuera lo demás).
+        fallar("lo de la VPN hay que ejecutarlo como root (sudo)")
+    args = args[:1]
     registro = leer_registro()
     d = buscar(registro, args[0])
     if not d:
@@ -801,6 +1014,9 @@ def cmd_rotar(args):
 def cmd_qr(args):
     if len(args) != 1:
         fallar("uso: qr <nombre>")
+    if en_la_pasarela(args[0]) and not (os.geteuid() == 0 and buscar(leer_registro(), args[0])):
+        fallar("«%s» es de la pasarela: de su token solo se guarda el hash, así que su QR no se puede volver a pintar. "
+               "Para uno nuevo (y que el de antes deje de valer): hehermes-dispositivo rotar %s" % (args[0], args[0]))
     if not os.environ.get("SUDO_USER") or not sys.stdout.isatty():
         fallar("qr solo se ejecuta con sudo desde un terminal interactivo: el QR contiene la clave del dispositivo")
     d = buscar(leer_registro(), args[0])
@@ -950,15 +1166,24 @@ COMANDOS = {"alta": cmd_alta, "lista": cmd_lista, "baja": cmd_baja, "rotar": cmd
             "iniciar": cmd_iniciar}
 
 
+#: Lo que se puede hacer sin root: lo de la pasarela de ese usuario.
+SIN_ROOT = ("alta", "baja", "rotar", "lista", "qr")
+
+
 def main():
-    if os.geteuid() != 0:
-        fallar("hay que ejecutarlo como root (sudo)")
     if len(sys.argv) < 2 or sys.argv[1] not in COMANDOS:
         print(__doc__.strip().split("\n\n")[1])
         sys.exit(2)
     os.umask(0o077)
+    if os.geteuid() != 0:
+        if sys.argv[1] not in SIN_ROOT or pasarela() is None:
+            fallar("hay que ejecutarlo como root (sudo)")
+        COMANDOS[sys.argv[1]](sys.argv[2:])
+        return
     aplicar_servidor_ini()
-    os.makedirs(DIR_HH, mode=0o700, exist_ok=True)
+    # Un servidor con solo la pasarela no tiene VPN: nada de crear /etc/wireguard/hehermes.
+    if os.path.exists(SERVIDOR_INI) or os.path.exists(DIR_HH) or pasarela() is None:
+        os.makedirs(DIR_HH, mode=0o700, exist_ok=True)
     COMANDOS[sys.argv[1]](sys.argv[2:])
 
 

@@ -10,6 +10,9 @@ instalador pudiera explicar nada), y el instalador mira primero qué puede hacer
   con ese, si es de esta misma versión;
 - nada de eso: para sin tocar nada, explica las salidas y, por chat, acaba con `hehermes-error:sin-permisos`.
 
+Esto es solo para `--modo vpn`: en modo TLS (el de por defecto), sin root ni sudo se instala como el usuario
+(`cli._sin_root`).
+
 Nunca se pide ni se prueba una contraseña: `-n` hace que sudo falle en vez de preguntar.
 """
 
@@ -126,8 +129,8 @@ def mensaje(sudo: str, usuario: str, aqui: str, argv: list, por_chat: bool, otra
         "       " + linea_sudoers(usuario),
         "     Después, en la media hora siguiente a instalar, vuelve a lanzarme." if por_chat else
         "     Después, vuelve a lanzarme.",
-        "  3. Si nadie puede ser administrador de este servidor, por ahora no hay forma de conectar la app: la "
-        "conexión sin VPN, que no lo necesita, llegará más adelante.",
+        "  3. Si nadie puede ser administrador de este servidor, usa la conexión directa en vez de la VPN: es la de "
+        "por defecto (el mismo comando sin --modo vpn) y no necesita root.",
     ]
     if por_chat:
         lineas.append(ERROR_SIN_PERMISOS)

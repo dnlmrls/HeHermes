@@ -19,6 +19,17 @@ from hehermes_servidor import porchat
 from hehermes_servidor.deteccion import detectar
 from hehermes_servidor.manifiesto import Manifiesto
 
+
+
+def con_modo_vpn(argv):
+    """Estas pruebas son del modo VPN, que desde la pasarela (0.5.0) ya no es el de por defecto."""
+    argv = list(argv)
+    if argv[:1] == ["instalar"] and "--modo" not in argv:
+        argv.append("--modo")
+        argv.append("vpn")
+    return argv
+
+
 ORIGEN = str(apoyo.RAIZ)
 LLAVE = "KCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEFCQ0RFRkc"
 DROP = [{"counter": {"packets": 0, "bytes": 0}}, {"drop": None}]
@@ -131,7 +142,7 @@ class Base(unittest.TestCase):
 
     def orden(self, *argv):
         self.texto = []
-        codigo = cli.main(list(argv), "uso", ORIGEN, sis=self.sis, entrada=lambda _: "n", salida=self.texto.append,
+        codigo = cli.main(con_modo_vpn(argv), "uso", ORIGEN, sis=self.sis, entrada=lambda _: "n", salida=self.texto.append,
                           terminal=False, euid=0)
         self.salida = "\n".join(self.texto)
         return codigo

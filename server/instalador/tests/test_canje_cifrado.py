@@ -141,3 +141,71 @@ class Dependencias(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+VECTOR_TLS = json.loads((apoyo.DATOS / "canje-tls.json").read_text())
+
+
+class VectorTLS(unittest.TestCase):
+    """El vector del modo TLS (server/API-CONTRACT.md, §12.2): el mismo sobre, con {h, p, f, t} dentro."""
+
+    def setUp(self):
+        self.v = VECTOR_TLS
+        self.caso = self.v["sobres"][0]
+
+    def test_sale_byte_a_byte_como_en_el_vector(self):
+        sobre = canje.sellar_para(b(self.v["publica_del_iphone"]), "psk", canje.de_b64url(self.v["huella"], 32),
+                                  self.v["codigo"], b(self.caso["claro"]), efimera=b(self.caso["efimera_privada"]),
+                                  nonce=b(self.caso["nonce"]))
+        self.assertEqual(sobre, self.caso["sobre"])
+
+    def test_la_carga_es_json_compacto_con_h_p_f_t_en_ese_orden(self):
+        claro = b(self.caso["claro"]).decode()
+        self.assertEqual(claro, json.dumps(self.v["carga"], separators=(",", ":")))
+        self.assertEqual(list(json.loads(claro)), ["h", "p", "f", "t"])
+        self.assertIsInstance(self.v["carga"]["p"], int)
+        for campo in ("f", "t"):
+            self.assertEqual(len(canje.de_b64url(self.v["carga"][campo], 32)), 32)
+
+    def test_la_privada_del_iphone_lo_abre(self):
+        claro = canje.abrir_con(b(self.v["privada_del_iphone"]), "psk", canje.de_b64url(self.v["huella"], 32),
+                                self.v["codigo"], self.caso["sobre"])
+        self.assertEqual(claro, b(self.caso["claro"]))
+
+
+class ElCertificadoDeLaPasarela(unittest.TestCase):
+    """La pasarela usa el `preparar` del canje con diez años; su huella la saca también `pasarela.huella_de_der`, sin
+    cryptography, que es lo que miran `comprobar` y `hehermes-dispositivo`."""
+
+    def test_diez_anos_ecdsa_p256_sin_datos_y_la_misma_huella(self):
+        import datetime
+        import os
+        import ssl
+        import stat
+        import tempfile
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from hehermes_servidor import pasarela
+        with tempfile.TemporaryDirectory() as carpeta:
+            huella = canje.preparar(carpeta, dias=3650)
+            texto = open(os.path.join(carpeta, "cert.pem")).read()
+            self.assertEqual(stat.S_IMODE(os.stat(os.path.join(carpeta, "clave.pem")).st_mode), 0o600)
+        cert = x509.load_pem_x509_certificate(texto.encode())
+        self.assertIsInstance(cert.public_key(), ec.EllipticCurvePublicKey)
+        self.assertEqual(cert.public_key().curve.name, "secp256r1")
+        dias = (cert.not_valid_after_utc - cert.not_valid_before_utc) / datetime.timedelta(days=1)
+        self.assertGreater(dias, 3649)
+        self.assertNotIn("hehermes", cert.subject.rfc4514_string().lower())
+        self.assertEqual(pasarela.huella_de_der(ssl.PEM_cert_to_DER_cert(texto)), huella)
+
+    def test_la_orden_con_dias(self):
+        import contextlib
+        import io
+        import tempfile
+        with tempfile.TemporaryDirectory() as carpeta:
+            salida = io.StringIO()
+            with contextlib.redirect_stdout(salida):
+                self.assertEqual(canje.main(["preparar", carpeta, "--dias", "3650"]), 0)
+            self.assertRegex(json.loads(salida.getvalue())["huella"], r"^[A-Za-z0-9_-]{43}$")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(canje.main(["preparar", carpeta, "--dias", "0"]), 2)
+                self.assertEqual(canje.main(["preparar", carpeta, "--años", "3"]), 2)

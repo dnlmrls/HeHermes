@@ -173,7 +173,7 @@ def _nombre_de(base):
     return {"debian": "Debian", "ubuntu": "Ubuntu", "el": "RHEL", "fedora": "Fedora"}[familia] + " " + version
 
 
-def _distro(sis, det) -> bool:
+def _distro(sis, det, modo="vpn") -> bool:
     # En Ubuntu y en Debian /etc/os-release es un enlace a /usr/lib/os-release, y `leer` no sigue enlaces: se lee el de
     # /usr/lib, que es el sitio de verdad (os-release(5)), y /etc solo si no está.
     datos = leer_env(sis.leer_texto("/usr/lib/os-release") or sis.leer_texto("/etc/os-release") or "")
@@ -208,12 +208,14 @@ def _distro(sis, det) -> bool:
     if tuple(sis.version_python[:2]) < (3, 9):
         det.bloqueos.append("hace falta Python 3.9 o más nuevo, y este es %s" % ".".join(map(str, sis.version_python)))
     m = re.match(r"(\d+)\.(\d+)", sis.nucleo)
-    if not m or (int(m.group(1)), int(m.group(2))) < (4, 19):
+    if modo == "tls":
+        pass  # la pasarela no usa XFRM: cualquier núcleo con systemd le vale
+    elif not m or (int(m.group(1)), int(m.group(2))) < (4, 19):
         det.bloqueos.append("el núcleo %s es anterior al 4.19: no tiene las interfaces XFRM" % sis.nucleo)
     if not sis.es_carpeta("/run/systemd/system"):
         det.bloqueos.append("este sistema no arranca con systemd")
     gestor = "apt-get" if familia == "debian" else "dnf"
-    if not sis.cual(gestor):
+    if modo != "tls" and not sis.cual(gestor):
         det.bloqueos.append("no encuentro %s" % gestor)
     det.distro["nucleo"] = sis.nucleo
     det.distro["python"] = ".".join(map(str, sis.version_python[:2]))
@@ -750,20 +752,26 @@ def regla_ufw_canonica(texto):
 
 QUE_ABRIR = ("UDP 500 y 4500 desde internet; el TCP 80 que entra por %s hacia %s; y, si vas a conectar el iPhone "
              "por chat, el TCP del canje (uno al azar del %d al %d, que te diré) solo mientras dure")
+QUE_ABRIR_TLS = ("el TCP %d desde internet (la pasarela) y, si vas a conectar el iPhone por chat, el TCP del canje "
+                 "(uno al azar del %d al %d, que te diré) solo mientras dure")
+SIN_CORTAFUEGOS_TLS = ("No hay ningún cortafuegos que cierre el paso en este servidor: lo que escucha en todas las "
+                       "direcciones está abierto a internet. No enciendo ninguno (podría dejarte fuera del SSH). Lo de "
+                       "HeHermes solo escucha en el TCP %d, y a quien no trae un token le contesta un 404")
 SIN_CORTAFUEGOS = ("No hay ningún cortafuegos que cierre el paso en este servidor: lo que escucha en todas las "
                    "direcciones está abierto a internet. No enciendo ninguno (podría dejarte fuera del SSH), y mejor "
                    "que no sea yo quien lo haga: si pones uno, abre UDP 500 y 4500. Lo de HeHermes escucha solo donde "
                    "hace falta: nginx en %s y strongSwan en UDP 500 y 4500")
 
 
-def _cortafuegos(sis, det, a_mano=False):
+def _cortafuegos(sis, det, a_mano=False, puerto_pasarela=None):
     """Quién lleva el cortafuegos: firewalld (en marcha, o en la familia Red Hat), ufw, o nftables e iptables a pelo
-    (`cortafuegos.analizar`), que se miran siempre que no los lleve ufw o firewalld por debajo."""
+    (`cortafuegos.analizar`), que se miran siempre que no los lleve ufw o firewalld por debajo. Con `puerto_pasarela`
+    (modo TLS), lo que hay que abrir es ese TCP."""
     from . import cortafuegos as cf
     from .porchat import PUERTO_MAXIMO, PUERTO_MINIMO
     firewalld = sis.cual("firewall-cmd") and (det.familia == "rhel" or _activo(sis, "firewalld"))
     if firewalld:
-        _firewalld(sis, det)
+        _firewalld(sis, det, puerto_pasarela)
     elif sis.cual("ufw"):
         r = sis.ejecutar(["ufw", "status"])
         det.ufw = "activo" if re.search(r"^Status: active", r.salida, re.M) else "inactivo"
@@ -775,7 +783,10 @@ def _cortafuegos(sis, det, a_mano=False):
     gestor = det.ufw == "activo" or det.firewalld == "activo"
     det.con_iptables = not gestor
     lugares, dudas = cf.analizar(sis, con_iptables=det.con_iptables)
-    que_abrir = QUE_ABRIR % (p.INTERFAZ, p.IP_TUNEL, PUERTO_MINIMO, PUERTO_MAXIMO)
+    if puerto_pasarela:
+        que_abrir = QUE_ABRIR_TLS % (puerto_pasarela, PUERTO_MINIMO, PUERTO_MAXIMO)
+    else:
+        que_abrir = QUE_ABRIR % (p.INTERFAZ, p.IP_TUNEL, PUERTO_MINIMO, PUERTO_MAXIMO)
     if a_mano:
         det.cortafuegos_a_mano = True
         if lugares or dudas:
@@ -788,8 +799,9 @@ def _cortafuegos(sis, det, a_mano=False):
     else:
         det.lugares = lugares
     if not gestor and not lugares and not dudas and det.ufw is None and det.firewalld is None:
-        det.avisos.append(SIN_CORTAFUEGOS % p.IP_TUNEL)
-    det.avisos.append("Si tu proveedor tiene un cortafuegos propio, en su panel, abre ahí UDP 500 y 4500")
+        det.avisos.append(SIN_CORTAFUEGOS_TLS % puerto_pasarela if puerto_pasarela else SIN_CORTAFUEGOS % p.IP_TUNEL)
+    det.avisos.append("Si tu proveedor tiene un cortafuegos propio, en su panel, abre ahí %s"
+                      % ("el TCP %d" % puerto_pasarela if puerto_pasarela else "UDP 500 y 4500"))
 
 
 def orden_firewalld(det, opcion, permanente=True) -> list:
@@ -801,10 +813,11 @@ def orden_firewalld(det, opcion, permanente=True) -> list:
     return ["firewall-offline-cmd", opcion]
 
 
-def _firewalld(sis, det):
+def _firewalld(sis, det, puerto_pasarela=None):
     from . import piezas as pz
     det.firewalld = "activo" if sis.ejecutar(["firewall-cmd", "--state"]).bien else "inactivo"
-    for regla in pz.reglas_firewalld():
+    reglas = pz.reglas_firewalld("tls", puerto_pasarela) if puerto_pasarela else pz.reglas_firewalld()
+    for regla in reglas:
         if sis.ejecutar(orden_firewalld(det, regla.con("query"))).bien:
             det.reglas_firewalld.add(regla.opcion)
     if det.firewalld == "inactivo":

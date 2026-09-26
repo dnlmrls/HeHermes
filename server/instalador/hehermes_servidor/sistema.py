@@ -66,11 +66,40 @@ def _http_de_verdad(url, cabeceras, plazo=5):
         return None, b""
 
 
+def _sondear_de_verdad(puerto, maxima=None, plazo=5):
+    """Lo que ve un cliente sin token en 127.0.0.1:<puerto>: la versión de TLS, la huella del certificado y los bytes
+    de la respuesta a un GET. None si no hay apretón (o no con esa versión como máximo)."""
+    import socket
+    import ssl
+    from .pasarela import huella_de_der
+    contexto = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    contexto.check_hostname = False
+    contexto.verify_mode = ssl.CERT_NONE
+    if maxima:
+        contexto.maximum_version = maxima
+    try:
+        with socket.create_connection(("127.0.0.1", int(puerto)), timeout=plazo) as crudo:
+            with contexto.wrap_socket(crudo) as tls:
+                datos = {"tls": tls.version(), "huella": huella_de_der(tls.getpeercert(binary_form=True))}
+                tls.sendall(b"GET / HTTP/1.1\r\nHost: comprobar\r\n\r\n")
+                partes = []
+                while sum(map(len, partes)) < 65536:
+                    trozo = tls.recv(4096)
+                    if not trozo:
+                        break
+                    partes.append(trozo)
+                datos["respuesta"] = b"".join(partes)
+                return datos
+    except (OSError, ssl.SSLError, ValueError):
+        return None
+
+
 class Sistema:
-    def __init__(self, raiz: str = "/", ejecutor=None, http=None, version_python=None, nucleo=None):
+    def __init__(self, raiz: str = "/", ejecutor=None, http=None, version_python=None, nucleo=None, sonda=None):
         self.raiz = os.path.realpath(raiz)
         self._ejecutor = ejecutor or _ejecutar_de_verdad
         self._http = http or _http_de_verdad
+        self._sonda = sonda or _sondear_de_verdad
         self.version_python = tuple(version_python or sys.version_info[:3])
         self.nucleo = nucleo or os.uname().release
 
@@ -222,3 +251,6 @@ class Sistema:
 
     def http_get(self, url: str, cabeceras: dict | None = None):
         return self._http(url, cabeceras or {})
+
+    def sondear_pasarela(self, puerto, maxima=None):
+        return self._sonda(puerto, maxima)

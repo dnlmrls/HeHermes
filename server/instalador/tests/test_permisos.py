@@ -13,6 +13,17 @@ import unittest
 import servidor_falso as sf
 from hehermes_servidor import VERSION, cli, permisos
 
+
+
+def con_modo_vpn(argv):
+    """Estas pruebas son del modo VPN, que desde la pasarela (0.5.0) ya no es el de por defecto."""
+    argv = list(argv)
+    if argv[:1] == ["instalar"] and "--modo" not in argv:
+        argv.append("--modo")
+        argv.append("vpn")
+    return argv
+
+
 ORIGEN = str(apoyo.RAIZ)
 LLAVE = base64.urlsafe_b64encode(bytes(range(40, 72))).rstrip(b"=").decode()
 LANZADOR = os.path.join(ORIGEN, "hehermes-servidor")
@@ -26,7 +37,7 @@ class Base(unittest.TestCase):
 
     def orden(self, *argv, euid=1000, terminal=False):
         self.texto = []
-        codigo = cli.main(list(argv), "uso", ORIGEN, sis=self.sis, entrada=lambda _: "n", salida=self.texto.append,
+        codigo = cli.main(con_modo_vpn(argv), "uso", ORIGEN, sis=self.sis, entrada=lambda _: "n", salida=self.texto.append,
                           terminal=terminal, euid=euid, relanzar=self.relanzados.append, usuario="hermes")
         self.salida = "\n".join(self.texto)
         return codigo
@@ -67,7 +78,7 @@ class SudoSinContrasena(Base):
         self.assertEqual(self.por_chat(), 0)
         self.assertEqual(self.relanzados, [["sudo", "-n", "-u", "root", "--", "/usr/bin/python3", "-I", "-B", LANZADOR,
                                             "instalar", "--por-chat", "--activar-api", "--iphone", "mi-iphone",
-                                            "--llave", LLAVE]])
+                                            "--llave", LLAVE, "--modo", "vpn"]])
         self.assertIn(["sudo", "-n", "true"], self.sis.ordenes)
         self.sin_cambios()
 

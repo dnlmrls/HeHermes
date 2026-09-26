@@ -233,7 +233,7 @@ def script_xfrm() -> str:
 
 
 def _ruta_segura(ruta: str) -> str:
-    if not _RUTA_VALIDA.match(ruta):
+    if not _RUTA_VALIDA.fullmatch(ruta):
         raise ValueError("ruta que no sé poner en una unidad de systemd: %r" % ruta)
     return ruta
 
@@ -304,7 +304,7 @@ def unidad_cortafuegos() -> str:
 
 
 def servidor_ini(direccion: str, env: str, puerto: int, swanctl: str = "/etc/swanctl") -> str:
-    if not _DIRECCION_VALIDA.match(direccion or ""):
+    if not _DIRECCION_VALIDA.fullmatch(direccion or ""):
         raise ValueError("dirección del servidor no válida: %r" % direccion)
     return (
         CABECERA
@@ -343,8 +343,13 @@ class ReglaUfw:
         return "ReglaUfw(%r)" % self.texto
 
 
-def reglas_ufw() -> list:
-    """Solo el UDP de IKE queda abierto a internet; el TCP 80, solo por hh-ipsec y hacia 10.77.0.1."""
+def reglas_ufw(modo: str = "vpn", puerto: int | None = None) -> list:
+    """VPN: solo el UDP de IKE queda abierto a internet; el TCP 80, solo por hh-ipsec y hacia 10.77.0.1. TLS: solo el
+    TCP de la pasarela."""
+    if modo == "tls":
+        return [ReglaUfw("TCP %d (la pasarela)" % _puerto_pasarela(puerto),
+                         ["allow", "proto", "tcp", "from", "any", "to", "any", "port", str(puerto), "comment",
+                          "hehermes"])]
     return [
         ReglaUfw("UDP 500 y 4500 (IKEv2)",
                  ["allow", "proto", "udp", "from", "any", "to", "any", "port", "500,4500", "comment", "hehermes"]),
@@ -377,9 +382,11 @@ class ReglaFirewalld:
         return "ReglaFirewalld(%r)" % self.opcion
 
 
-def reglas_firewalld() -> list:
+def reglas_firewalld(modo: str = "vpn", puerto: int | None = None) -> list:
     """Lo mismo que las de ufw. firewalld no sabe de «entra por hh-ipsec»: el TCP 80 solo desde los iPhone y hacia
     10.77.0.1. Uno de fuera no puede hacerse pasar por un iPhone: la respuesta volvería por el túnel."""
+    if modo == "tls":
+        return [ReglaFirewalld("TCP %d (la pasarela)" % _puerto_pasarela(puerto), "--add-port=%d/tcp" % puerto)]
     return [
         ReglaFirewalld("UDP 500 (IKEv2)", "--add-port=500/udp"),
         ReglaFirewalld("UDP 4500 (IKEv2 tras un NAT)", "--add-port=4500/udp"),
@@ -394,3 +401,162 @@ def regla_firewalld_de(texto: str):
     if not texto.startswith("firewall-cmd --add-"):
         return None
     return ReglaFirewalld(texto, texto[len("firewall-cmd "):])
+
+
+# MARK: La pasarela TLS (spec 2026-09-26)
+
+#: El puerto de la pasarela, al azar en este rango (los dos entran): el mismo que el del canje.
+PUERTO_MINIMO, PUERTO_MAXIMO = 58000, 65500
+USUARIO_PASARELA = "hh-pasarela"
+UNIDAD_PASARELA = "hehermes-pasarela.service"
+UNIDAD_PASARELA_CLAVE_PATH = "/etc/systemd/system/hehermes-pasarela-clave.path"
+UNIDAD_PASARELA_CLAVE_SERVICE = "/etc/systemd/system/hehermes-pasarela-clave.service"
+SECRETO_VIGIA = "/etc/hehermes-avisos/vigia/secreto-tunel"
+VIGIA = "127.0.0.1:8790"
+
+
+def _puerto_pasarela(puerto) -> int:
+    if not isinstance(puerto, int) or isinstance(puerto, bool) or not PUERTO_MINIMO <= puerto <= PUERTO_MAXIMO:
+        raise ValueError("puerto de la pasarela fuera de %d-%d: %r" % (PUERTO_MINIMO, PUERTO_MAXIMO, puerto))
+    return puerto
+
+
+def unidad_pasarela(ambito, con_vigia: bool) -> str:
+    """Con root: un usuario propio sin ningún privilegio (el puerto es alto), el sistema de ficheros de solo lectura, y
+    los secretos (la clave del certificado, la de Hermes y el del vigía) como credenciales de systemd, que los copia
+    desde ficheros de root. Sin root: una unidad de usuario, con lo que un usuario puede ponerse (sin espacios de
+    nombres: un gestor de usuario puede no tenerlos)."""
+    orden = "%s -I -B %s/hehermes-pasarela --config %s" % (_ruta_segura(ambito_python()), _ruta_segura(ambito.prefijo),
+                                                           _ruta_segura(ambito.pasarela_ini))
+    comun = (
+        "NoNewPrivileges=yes\n"
+        "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX\n"
+        "RestrictRealtime=yes\n"
+        "RestrictSUIDSGID=yes\n"
+        "LockPersonality=yes\n"
+        "MemoryDenyWriteExecute=yes\n"
+        "SystemCallArchitectures=native\n"
+        "SystemCallFilter=@system-service\n"
+        "SystemCallFilter=~@privileged @resources\n"
+        "UMask=0077\n"
+    )
+    if not ambito.root:
+        return (
+            CABECERA
+            + "# La pasarela TLS de HeHermes (server/API-CONTRACT.md, §12), como el usuario de Hermes: lee su .env.\n"
+            "[Unit]\n"
+            "Description=HeHermes: la pasarela TLS hacia Hermes\n"
+            "\n"
+            "[Service]\n"
+            "Type=simple\n"
+            "ExecStart=%s\n"
+            "Restart=on-failure\n"
+            "RestartSec=2\n"
+            "%s"
+            "\n"
+            "[Install]\n"
+            "WantedBy=default.target\n"
+        ) % (orden, comun)
+    credenciales = ("LoadCredential=clave:%s\nLoadCredential=hermes:%s\n" % (ambito.clave, ambito.clave_hermes)
+                    + ("LoadCredential=vigia:%s\n" % SECRETO_VIGIA if con_vigia else ""))
+    return (
+        CABECERA
+        + "# La pasarela TLS de HeHermes (server/API-CONTRACT.md, §12). Corre como %s, sin ningún privilegio: el\n"
+        "# puerto es alto, y la clave del certificado y la de Hermes le llegan como credenciales de systemd.\n"
+        "[Unit]\n"
+        "Description=HeHermes: la pasarela TLS hacia Hermes\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "User=%s\n"
+        "Group=%s\n"
+        "ExecStart=%s\n"
+        "%s"
+        "Restart=on-failure\n"
+        "RestartSec=2\n"
+        "CapabilityBoundingSet=\n"
+        "AmbientCapabilities=\n"
+        "ProtectSystem=strict\n"
+        "ProtectHome=yes\n"
+        "PrivateTmp=yes\n"
+        "PrivateDevices=yes\n"
+        "ProtectKernelTunables=yes\n"
+        "ProtectKernelModules=yes\n"
+        "ProtectKernelLogs=yes\n"
+        "ProtectControlGroups=yes\n"
+        "ProtectClock=yes\n"
+        "ProtectHostname=yes\n"
+        "ProtectProc=invisible\n"
+        "RestrictNamespaces=yes\n"
+        "%s"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    ) % (USUARIO_PASARELA, USUARIO_PASARELA, USUARIO_PASARELA, orden, credenciales, comun)
+
+
+def ambito_python() -> str:
+    from .ambito import PYTHON
+    return PYTHON
+
+
+def unidad_pasarela_clave_path(env: str) -> str:
+    return (
+        CABECERA
+        + "# Si cambia la clave del api_server en el .env de Hermes, se copia a la pasarela y se reinicia.\n"
+        "[Unit]\n"
+        "Description=HeHermes: vigila la clave del api_server de Hermes, para la pasarela\n"
+        "\n"
+        "[Path]\n"
+        "PathChanged=%s\n"
+        "Unit=hehermes-pasarela-clave.service\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+    ) % _ruta_segura(env)
+
+
+def unidad_pasarela_clave_service() -> str:
+    return (
+        CABECERA
+        + "[Unit]\n"
+        "Description=HeHermes: copia la clave del api_server a la pasarela\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        "ExecStart=%s pasarela-clave\n"
+    ) % _ORDEN_PYTHON
+
+
+def pasarela_ini(ambito, puerto: int, puerto_hermes: int, env: str, direccion: str, vigia: bool) -> str:
+    """Lo que lee la pasarela (`pasarela.Configuracion`) y `hehermes-dispositivo` (la dirección del QR y dónde está el
+    código). Con root, la clave de Hermes es una copia suya (`clave-hermes`, 0600); sin root, el .env mismo."""
+    _puerto_pasarela(puerto)
+    if not isinstance(puerto_hermes, int) or not 0 < puerto_hermes < 65536:
+        raise ValueError("puerto de Hermes no válido: %r" % (puerto_hermes,))
+    if not _DIRECCION_VALIDA.fullmatch(direccion or ""):
+        raise ValueError("dirección del servidor no válida: %r" % direccion)
+    texto = (
+        CABECERA
+        + "# Lo leen hehermes-pasarela y hehermes-dispositivo.\n"
+        "[pasarela]\n"
+        "puerto = %d\n"
+        "# Vacío: todas las direcciones (IPv4 e IPv6).\n"
+        "escucha =\n"
+        "certificado = %s\n"
+        "clave = %s\n"
+        "tokens = %s\n"
+        "\n"
+        "[hermes]\n"
+        "puerto = %d\n"
+        "clave = %s\n"
+        "env = %s\n"
+    ) % (puerto, _ruta_segura(ambito.cert), _ruta_segura(ambito.clave), _ruta_segura(ambito.tokens), puerto_hermes,
+         _ruta_segura(ambito.clave_hermes if ambito.root else env), _ruta_segura(env))
+    if vigia:
+        texto += "\n[avisos]\nvigia = %s\nsecreto = %s\n" % (VIGIA, SECRETO_VIGIA)
+    texto += ("\n[qr]\n# La que va en el QR de cada iPhone.\ndireccion = %s\n\n[instalador]\ncodigo = %s\n"
+              % (direccion, _ruta_segura(ambito.prefijo)))
+    return texto

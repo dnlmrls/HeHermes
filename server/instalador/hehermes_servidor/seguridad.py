@@ -23,12 +23,22 @@ PROPUESTA_ESP = "aes256gcm16-ecp384"
 LARGO_PSK = 44
 
 
-def revisar(sis, man) -> list:
+def revisar(sis, man, ambito=None) -> list:
+    """La de la VPN, la de la pasarela o, con los dos modos, las dos juntas (lo común, una vez). Sin manifiesto, la de
+    una VPN hecha a mano."""
+    from . import ambito as amb
+    ambito = ambito or amb.de_root()
+    modos = man.modos or ["vpn"]
+    if "vpn" not in modos:
+        return revisar_tls(sis, man, ambito)
     resultados = []
     ini = _ini(sis)
     env, puerto = _hermes(sis, ini)
     resultados.append(_api_de_hermes(sis, env, puerto))
     resultados += _nginx(sis)
+    if "tls" in modos:
+        # El .env de Hermes ya lo mira `_secretos`, más abajo.
+        resultados += _pasarela(sis, man, ambito) + _secretos_tls(sis, ambito, None) + _unidad_tls(sis, ambito)
     resultados += _cortafuegos(sis, man)
     resultados.append(_canje(sis))
     resultados += _secretos(sis, ini, env)
@@ -104,6 +114,109 @@ def _nginx(sis):
     return salida
 
 
+def revisar_tls(sis, man, ambito) -> list:
+    """«Seguridad» de una instalación de la pasarela: lo mismo de la API de Hermes, la pasarela vista desde fuera, sus
+    secretos y su unidad, y (con root) el cortafuegos, el canje y la firma."""
+    import configparser
+    resultados = []
+    ini = configparser.ConfigParser(interpolation=None)
+    try:
+        ini.read_string(sis.leer_texto(ambito.pasarela_ini) or "")
+        env = ini.get("hermes", "env", fallback=None)
+        puerto_hermes = ini.getint("hermes", "puerto", fallback=8642)
+    except (configparser.Error, ValueError):
+        env, puerto_hermes = None, 8642
+    resultados.append(_api_de_hermes(sis, env, puerto_hermes))
+    resultados += _pasarela(sis, man, ambito)
+    resultados += _secretos_tls(sis, ambito, env)
+    if ambito.root:
+        resultados += _unidad_tls(sis, ambito)
+        resultados += _cortafuegos(sis, man)
+        resultados.append(_canje(sis))
+        resultados += _avisos(sis, man)
+        resultados.append(_firma(sis))
+    return resultados
+
+
+def _pasarela(sis, man, ambito):
+    import ssl
+    from .modo_tls import huella
+    from .pasarela import NO_ENCONTRADO
+    puerto = (man.datos.get("pasarela") or {}).get("puerto")
+    sonda = sis.sondear_pasarela(puerto) if puerto else None
+    if sonda is None:
+        return [(AVISO, "pasarela: no contesta en 127.0.0.1:%s; no puedo mirarla desde fuera" % puerto)]
+    salida = []
+    if sonda.get("tls") == "TLSv1.3" and sis.sondear_pasarela(puerto, ssl.TLSVersion.TLSv1_2) is None:
+        salida.append((BIEN, "pasarela: solo TLS 1.3"))
+    else:
+        salida.append((MAL, "pasarela: acepta algo más viejo que TLS 1.3 (%s)" % sonda.get("tls")))
+    if sonda.get("huella") != huella(sis, ambito):
+        salida.append((MAL, "pasarela: sirve otro certificado que el suyo (%s)" % ambito.cert))
+    respuesta = sonda.get("respuesta") or b""
+    if respuesta == NO_ENCONTRADO:
+        salida.append((BIEN, "pasarela: a quien no trae token, el 404 de siempre, sin Server ni nada más"))
+    elif b"\nserver:" in respuesta.lower():
+        salida.append((MAL, "pasarela: sin token contesta con una cabecera Server"))
+    else:
+        salida.append((MAL, "pasarela: sin token contesta otra cosa que el 404 de siempre"))
+    fuera = [h for h, puerto_, _ in _escuchan(sis, "tcp") if puerto_ == str(puerto) and h not in TODAS]
+    if fuera:
+        salida.append((AVISO, "pasarela: escucha solo en %s, no en todas las direcciones" % ", ".join(fuera)))
+    return salida
+
+
+def _secretos_tls(sis, ambito, env):
+    import json
+    mal, aviso = [], []
+    for ruta in (ambito.clave, ambito.clave_hermes, man_ruta(ambito)):
+        problema = _abierto(sis, ruta)
+        if problema:
+            mal.append("%s (%s)" % (ruta, problema))
+    for ruta in (ambito.tokens, ambito.pasarela_ini):
+        modo = sis.modo(ruta)
+        if modo is not None and (modo & 0o007 or sis.enlace(ruta) is not None):
+            mal.append("%s (%04o)" % (ruta, modo))
+    try:
+        datos = json.loads(sis.leer(ambito.tokens) or b'{"tokens": []}')
+        raros = [t.get("nombre", "?") for t in datos.get("tokens", [])
+                 if set(t) - {"nombre", "sha256", "alta", "rotado"} or not re.fullmatch(r"[0-9a-f]{64}",
+                                                                                          str(t.get("sha256")))]
+    except ValueError:
+        raros = ["(no se entiende)"]
+    if raros:
+        mal.append("%s lleva algo que no es un hash (%s)" % (ambito.tokens, ", ".join(raros)))
+    if env:
+        modo = sis.modo(env)
+        if modo is not None and modo & 0o007:
+            mal.append("%s (%04o)" % (env, modo))
+        elif modo is not None and modo & 0o070:
+            aviso.append("%s se puede leer desde su grupo (%04o): lleva la clave de Hermes" % (env, modo))
+    salida = []
+    if mal:
+        salida.append((MAL, "secretos que se pueden leer sin ser su dueño: %s. Déjalos en 0600 (tokens.json y "
+                            "pasarela.ini, 0640 con root)" % ", ".join(mal)))
+    else:
+        salida.append((BIEN, "secretos: la clave del certificado, la de Hermes y el manifiesto, solo para su dueño; "
+                             "de cada token, solo su hash"))
+    salida += [(AVISO, "secretos: " + a) for a in aviso]
+    return salida
+
+
+def man_ruta(ambito):
+    return ambito.manifiesto
+
+
+def _unidad_tls(sis, ambito):
+    texto = sis.leer_texto(ambito.unidad) or ""
+    faltan = [linea for linea in ("User=%s" % p.USUARIO_PASARELA, "NoNewPrivileges=yes", "ProtectSystem=strict",
+                                  "ProtectHome=yes", "PrivateTmp=yes", "CapabilityBoundingSet=")
+              if not re.search(r"^%s\s*$" % re.escape(linea), texto, re.M)]
+    if faltan:
+        return [(MAL, "pasarela: a su unidad le falta %s" % ", ".join(faltan))]
+    return [(BIEN, "pasarela: como %s, sin privilegios y con el sistema de solo lectura" % p.USUARIO_PASARELA)]
+
+
 def _cortafuegos(sis, man):
     salida = []
     gestor = None
@@ -118,7 +231,7 @@ def _cortafuegos(sis, man):
             salida.append((AVISO, "cortafuegos: ufw está apagado (no lo enciendo: podría dejarte fuera del SSH)"))
     propio = man.datos.get("cortafuegos_propio") or {}
     lugares, dudas = cf.analizar(sis, propio.get("iptables", gestor is None))
-    faltan = [l.nombre for l in lugares if l.marcadas < len(cf.permanentes())]
+    faltan = [l.nombre for l in lugares if l.marcadas < len(cf.permanentes_de(man.datos))]
     if faltan:
         salida.append((MAL, "cortafuegos: %s cierra el paso y le faltan las reglas de HeHermes (sudo hehermes-servidor "
                             "instalar las pone)" % ", ".join(faltan)))

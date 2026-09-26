@@ -11,6 +11,7 @@ import tarfile
 import tempfile
 
 from . import VERSION, firma, permisos
+from . import ambito as amb
 from . import piezas as p
 from .aplicar import Parada, aplicar, comprobar
 from .desinstalar import desinstalar, resumen
@@ -35,6 +36,8 @@ def _analizador():
     a = Analizador(prog="hehermes-servidor", add_help=True)
     ordenes = a.add_subparsers(dest="orden")
     i = ordenes.add_parser("instalar")
+    i.add_argument("--modo", choices=("tls", "vpn"),
+                   help="tls (por defecto): la pasarela, que no necesita root; vpn: la VPN IKEv2 de siempre")
     i.add_argument("--plan", action="store_true", help="enseña lo que haría, sin cambiar nada")
     i.add_argument("--iphone", help="da de alta este iPhone y pinta su QR")
     i.add_argument("--direccion", help="la dirección pública del servidor (la del QR)")
@@ -60,17 +63,26 @@ def _analizador():
     c.add_argument("accion", choices=("poner", "quitar"))
     # La limpieza del canje, que lanza systemd como root al pararse la unidad (ExecStopPost). No es para personas.
     ordenes.add_parser("canje-limpiar")
+    # Lo que lanza hehermes-pasarela-clave.path cuando cambia el .env de Hermes. No es para personas.
+    ordenes.add_parser("pasarela-clave")
     u = ordenes.add_parser("actualizar")
     u.add_argument("--paquete", required=True)
     u.add_argument("--firma", required=True)
     d = ordenes.add_parser("desinstalar")
+    d.add_argument("--modo", choices=("tls", "vpn"),
+                   help="quita solo ese modo y deja el otro como está (sin --modo, todo)")
     d.add_argument("--si", action="store_true")
     d.add_argument("--quitar-paquetes", action="store_true")
     return a
 
 
+ORDENES = ("instalar", "comprobar", "actualizar", "desinstalar", "canje-limpiar", "cortafuegos", "pasarela-clave")
+#: Lo que se puede hacer sin root en una instalación de la pasarela de un usuario.
+DEL_USUARIO = ("instalar", "comprobar", "desinstalar", "canje-limpiar")
+
+
 def main(argv, doc, aqui, sis=None, entrada=input, salida=print, terminal=None, euid=None, relanzar=None,
-         usuario=None) -> int:
+         usuario=None, cuenta=None) -> int:
     try:
         op = _analizador().parse_args(argv)
     except SalirConUso as error:
@@ -89,27 +101,43 @@ def main(argv, doc, aqui, sis=None, entrada=input, salida=print, terminal=None, 
         return 2
     sis = sis or Sistema()
     euid = os.geteuid() if euid is None else euid
-    if euid != 0:
-        return _sin_root(op, argv, sis, aqui, salida, relanzar or _relanzar_de_verdad, usuario or _usuario())
     terminal = sys.stdin.isatty() and sys.stdout.isatty() if terminal is None else terminal
+    if euid != 0:
+        return _sin_root(op, argv, sis, aqui, entrada, salida, terminal, relanzar or _relanzar_de_verdad,
+                         usuario or _usuario(), cuenta)
     os.umask(0o022)
+    return _con_ambito(op, sis, amb.de_root(), aqui, entrada, salida, terminal)
+
+
+def _con_ambito(op, sis, ambito, aqui, entrada, salida, terminal) -> int:
     try:
-        man = Manifiesto.leer(sis)
+        man = Manifiesto.leer(sis, ambito.manifiesto)
     except ManifiestoRoto as error:
         salida("error: %s" % error)
         return 1
     orden = {"instalar": _instalar, "comprobar": _comprobar, "actualizar": _actualizar,
-             "desinstalar": _desinstalar, "canje-limpiar": _canje_limpiar, "cortafuegos": _cortafuegos}[op.orden]
-    if op.orden in ("comprobar", "canje-limpiar", "cortafuegos") or getattr(op, "plan", False):
+             "desinstalar": _desinstalar, "canje-limpiar": _canje_limpiar, "cortafuegos": _cortafuegos,
+             "pasarela-clave": _pasarela_clave}[op.orden]
+    if op.orden in ("comprobar", "canje-limpiar", "cortafuegos", "pasarela-clave") or getattr(op, "plan", False):
         # canje-limpiar tampoco: corre dentro del `systemctl stop` de un instalar que ya tiene el cerrojo.
         # Lo que solo lee no toma el cerrojo: --plan no deja ni un fichero en /run.
-        return orden(op, sis, man, aqui, entrada, salida, terminal)
-    with _cerrojo(sis):
-        return orden(op, sis, man, aqui, entrada, salida, terminal)
+        return orden(op, sis, man, aqui, entrada, salida, terminal, ambito)
+    with _cerrojo(sis, ambito.cerrojo):
+        return orden(op, sis, man, aqui, entrada, salida, terminal, ambito)
 
 
-def _sin_root(op, argv, sis, aqui, salida, relanzar, usuario) -> int:
-    """Lo primero de todo, antes de detectar nada: sin root, o se relanza con `sudo -n` o se para sin tocar nada."""
+def _sin_root(op, argv, sis, aqui, entrada, salida, terminal, relanzar, usuario, cuenta) -> int:
+    """Lo primero de todo, antes de detectar nada. Sin root: una pasarela ya instalada por este usuario sigue siendo
+    suya; si no, se relanza con `sudo -n` si se puede; y si no, en modo TLS se instala como el usuario, y en modo VPN
+    se para sin tocar nada."""
+    ambito = _ambito_del_usuario(cuenta)
+    try:
+        suya = ambito is not None and Manifiesto.leer(sis, ambito.manifiesto).en_disco
+    except ManifiestoRoto:
+        suya = True  # que lo diga _con_ambito
+    modo = getattr(op, "modo", None)
+    if suya and op.orden in DEL_USUARIO and (modo != "vpn" or op.orden != "instalar"):
+        return _como_usuario(op, sis, ambito, aqui, entrada, salida, terminal)
     sudo = permisos.sondear_sudo(sis)
     permitido = sudo != "sin-contrasena" and permisos.instalado_permitido(sis)
     instalada = permisos.version_instalada(sis) if permitido else None
@@ -119,10 +147,36 @@ def _sin_root(op, argv, sis, aqui, salida, relanzar, usuario) -> int:
                  permisos.orden_relanzada(permisos.INSTALADO, argv, python=False))
         codigo = relanzar(orden)
         return 0 if codigo is None else codigo
+    if op.orden == "instalar" and modo != "vpn" and ambito is not None:
+        # La pasarela no necesita root (spec 2026-09-26, «Sin root»).
+        return _como_usuario(op, sis, ambito, aqui, entrada, salida, terminal)
     for linea in permisos.mensaje(sudo, usuario, aqui, argv, bool(getattr(op, "por_chat", False)),
                                   otra_version=instalada if permitido else None):
         salida(linea)
     return 1
+
+
+def _como_usuario(op, sis, ambito, aqui, entrada, salida, terminal) -> int:
+    os.umask(0o077)
+    # systemctl --user necesita saber dónde está su gestor; lanzado desde Hermes (una unidad del sistema) puede no
+    # tenerlo en el entorno.
+    if "XDG_RUNTIME_DIR" not in os.environ and os.path.isdir("/run/user/%d" % ambito.uid):
+        os.environ["XDG_RUNTIME_DIR"] = "/run/user/%d" % ambito.uid
+    return _con_ambito(op, sis, ambito, aqui, entrada, salida, terminal)
+
+
+def _ambito_del_usuario(cuenta):
+    import pwd
+    if cuenta is None:
+        try:
+            yo = pwd.getpwuid(os.getuid())
+        except KeyError:
+            return None
+        cuenta = (yo.pw_name, yo.pw_dir, yo.pw_uid)
+    try:
+        return amb.de_usuario(*cuenta)
+    except ValueError:
+        return None
 
 
 def _relanzar_de_verdad(orden) -> int:
@@ -159,8 +213,8 @@ class _cerrojo:
 
     RUTA = "/run/hehermes-servidor.lock"
 
-    def __init__(self, sis):
-        self.sis, self.fichero = sis, None
+    def __init__(self, sis, ruta=RUTA):
+        self.sis, self.fichero, self.RUTA = sis, None, ruta
 
     def __enter__(self):
         try:
@@ -194,7 +248,50 @@ def _pregunta_si(entrada, salida, terminal, si, texto="¿Sigo? [s/N] "):
         return False
 
 
-def _instalar(op, sis, man, aqui, entrada, salida, terminal):
+def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
+    """Sin --modo: el de la instalación que hay, o TLS en una nueva. Con los dos modos instalados, un iPhone (por SSH
+    o por chat) va a la pasarela, que es el modo por defecto: no pide root ni el permiso de VPN del iPhone, y no choca
+    con otra VPN que lleve (iOS solo deja una). Sin iPhone, repetir es repararlo todo: la VPN y luego la pasarela."""
+    modos = man.modos if man.en_disco else []
+    if op.modo:
+        modo = op.modo
+    elif len(modos) < 2:
+        modo = modos[0] if modos else "tls"
+    elif op.iphone or op.por_chat:
+        modo = "tls"
+        salida("Aquí están los dos modos, la VPN y la pasarela. «%s» va a la pasarela (TLS), el modo por defecto; "
+               "para darlo de alta en la VPN: --modo vpn." % op.iphone)
+    else:
+        return _instalar_los_dos(op, sis, man, aqui, entrada, salida, terminal, ambito)
+    if modo == "tls":
+        return _instalar_tls(op, sis, man, aqui, entrada, salida, terminal, ambito)
+    return _instalar_vpn(op, sis, man, aqui, entrada, salida, terminal, ambito)
+
+
+def _instalar_los_dos(op, sis, man, aqui, entrada, salida, terminal, ambito):
+    """Cada uno con su plan y su pregunta, sobre el mismo manifiesto. Con --plan se enseñan los dos; si no, una
+    reparación que falla para ahí, como la de un modo solo."""
+    import copy
+    peor = 0
+    for modo in man.modos:
+        uno = copy.copy(op)
+        uno.modo = modo
+        # Los avisos, de momento, solo con la VPN (su instalador necesita nginx).
+        uno.avisos = op.avisos and modo == "vpn"
+        if modo != man.modos[0]:
+            salida("")
+        codigo = (_instalar_vpn if modo == "vpn" else _instalar_tls)(uno, sis, man, aqui, entrada, salida, terminal,
+                                                                     ambito)
+        peor = max(peor, codigo)
+        if codigo and not op.plan:
+            break
+    return peor
+
+
+def _instalar_vpn(op, sis, man, aqui, entrada, salida, terminal, ambito):
+    if not ambito.root:
+        salida("error: el modo VPN necesita root")
+        return 1
     opciones = Opciones(iphone=op.iphone, direccion=op.direccion, avisos=op.avisos, hermes_home=op.hermes_home,
                         reemplazar=op.reemplazar, si=op.si or op.por_chat, solo_plan=op.plan, por_chat=op.por_chat,
                         llave=op.llave, activar_api=op.activar_api, qr_png=op.qr_png,
@@ -246,26 +343,106 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal):
     return 0
 
 
-def _comprobar(op, sis, man, aqui, entrada, salida, terminal):
-    from . import seguridad
-    resultados = comprobar(sis, man)
+def _instalar_tls(op, sis, man, aqui, entrada, salida, terminal, ambito):
+    from . import modo_tls, porchat
+    opciones = Opciones(iphone=op.iphone, direccion=op.direccion, avisos=op.avisos, hermes_home=op.hermes_home,
+                        reemplazar=op.reemplazar, si=op.si or op.por_chat, solo_plan=op.plan, por_chat=op.por_chat,
+                        llave=op.llave, activar_api=op.activar_api, qr_png=op.qr_png,
+                        cortafuegos_a_mano=op.cortafuegos_a_mano, corregir_exposicion=op.corregir_exposicion,
+                        modo="tls")
+    if op.por_chat:
+        terminal = False
+    opciones.terminal = terminal
+
+    def detectar_ya():
+        return modo_tls.detectar_tls(sis, man, ambito, direccion=opciones.direccion, hermes_home=opciones.hermes_home,
+                                     activar_api=opciones.activar_api, cortafuegos_a_mano=opciones.cortafuegos_a_mano,
+                                     corregir_exposicion=opciones.corregir_exposicion)
+
+    det = detectar_ya()
+    if det.direccion_privada and terminal and not op.plan:
+        try:
+            dada = entrada("Este servidor sale por una dirección privada. ¿Cuál es su dirección pública (IP o nombre)? ")
+        except EOFError:
+            dada = ""
+        if DIRECCION_VALIDA.match(dada.strip()):
+            opciones.direccion = dada.strip()
+            det = detectar_ya()
+    plan = modo_tls.calcular_plan_tls(sis, det, man, opciones, aqui)
+    salida(pintar(plan, color=terminal).rstrip("\n"))
+    if op.plan or not plan.puede_seguir:
+        return 0 if plan.puede_seguir else 1
+    if not plan.cambios:
+        if opciones.iphone:
+            salida("«%s» ya está en la pasarela. Su QR no se puede volver a pintar; para uno nuevo (y que el de antes "
+                   "deje de valer), desde tu terminal: %shehermes-dispositivo rotar %s"
+                   % (opciones.iphone, "sudo " if ambito.root else "", opciones.iphone))
+        return 0
+    if not _pregunta_si(entrada, salida, terminal, opciones.si):
+        salida("No he cambiado nada.")
+        return 1
+    try:
+        hecho = modo_tls.aplicar_tls(sis, plan, man, aqui, salida=salida, terminal=terminal)
+        el_enlace = None
+        if opciones.por_chat:
+            token = hecho.get("token")
+            if token is None:
+                # Repetido en la media hora, sin canjear: del token solo queda el hash, así que va uno nuevo.
+                from . import tokens
+                token = tokens.rotar(sis.ruta(ambito.tokens), opciones.iphone)
+            carga = porchat.carga_tls(det.direccion, det.puerto_pasarela, modo_tls.huella(sis, ambito), token)
+            del token
+            el_enlace = porchat.lanzar(sis, man, det, opciones, salida, carga=carga, ambito=ambito)
+            del carga
+    except (Parada, porchat.ParadaDelCanje) as parada:
+        salida("\nerror: %s\nLo que ya estaba hecho se queda apuntado: arréglalo y vuelve a lanzar el mismo comando."
+               % parada)
+        return 1
+    salida("\nHecho. «%s comprobar» lo repasa cuando quieras." % ("sudo hehermes-servidor" if ambito.root
+                                                                       else ambito.orden))
+    if any(a.tipo in ("env", "exposicion") and a.cambia for a in plan.acciones):
+        porchat.reiniciar_hermes_luego(sis, salida)
+    if el_enlace:
+        salida("\nEl enlace para la app (caduca en 10 minutos y no lleva ninguna clave):")
+        salida(el_enlace)
+    return 0
+
+
+def _comprobar(op, sis, man, aqui, entrada, salida, terminal, ambito):
+    """Lo de cada modo instalado, uno detrás de otro (lo que salga igual en los dos, una vez), y «Seguridad». Sin
+    manifiesto, lo de una VPN hecha a mano."""
+    from . import modo_tls, seguridad
+    modos = man.modos or ["vpn"]
+    resultados = []
+    for bien, texto in (comprobar(sis, man) if "vpn" in modos else []) + (
+            modo_tls.comprobar_tls(sis, man, ambito) if "tls" in modos else []):
+        if (bien, texto) not in resultados:
+            resultados.append((bien, texto))
     for bien, texto in resultados:
         salida("  %-5s %s" % ("bien" if bien else "MAL", texto))
     salida("")
     salida("Seguridad")
-    revision = seguridad.revisar(sis, man)
+    revision = seguridad.revisar(sis, man, ambito)
     for estado, texto in revision:
         salida("  %-5s %s" % ("MAL" if estado == seguridad.MAL else estado, texto))
     return 0 if all(bien for bien, _ in resultados) and all(e != seguridad.MAL for e, _ in revision) else 1
 
 
-def _canje_limpiar(op, sis, man, aqui, entrada, salida, terminal):
+def _canje_limpiar(op, sis, man, aqui, entrada, salida, terminal, ambito):
     from .porchat import limpiar
-    limpiar(sis, os.environ)
+    limpiar(sis, os.environ, ambito)
     return 0
 
 
-def _cortafuegos(op, sis, man, aqui, entrada, salida, terminal):
+def _pasarela_clave(op, sis, man, aqui, entrada, salida, terminal, ambito):
+    from . import modo_tls
+    if not ambito.root:
+        salida("error: sin root la pasarela lee el .env de Hermes directamente: no hay copia que poner al día")
+        return 1
+    return modo_tls.poner_al_dia_la_clave(sis, salida)
+
+
+def _cortafuegos(op, sis, man, aqui, entrada, salida, terminal, ambito):
     """`hehermes-cortafuegos.service`. Al arrancar (y si el cortafuegos del sistema se recarga): quita lo que un
     reinicio dejó del canje y vuelve a poner las reglas de HeHermes en nftables o iptables. Al pararse, las quita."""
     from . import cortafuegos as cf
@@ -277,7 +454,7 @@ def _cortafuegos(op, sis, man, aqui, entrada, salida, terminal):
     propio = man.datos.get("cortafuegos_propio")
     try:
         if propio:
-            lugares = cf.poner(sis, cf.MARCA, cf.permanentes(), propio.get("iptables", True))
+            lugares = cf.poner(sis, cf.MARCA, cf.permanentes_de(man.datos), propio.get("iptables", True))
             salida("reglas de HeHermes en: %s" % (", ".join(l.nombre for l in lugares) or "ninguna cadena cierra"))
         porchat.volver_a_abrir(sis, propio)
     except cf.NoSe as error:
@@ -286,7 +463,10 @@ def _cortafuegos(op, sis, man, aqui, entrada, salida, terminal):
     return 0
 
 
-def _actualizar(op, sis, man, aqui, entrada, salida, terminal):
+def _actualizar(op, sis, man, aqui, entrada, salida, terminal, ambito):
+    if not ambito.root:
+        salida("error: sin root, actualizar todavía no: vuelve a lanzar el comando de la app, que repara")
+        return 1
     ruta_clave = sis.ruta(p.PREFIJO + "/clave-publica.pem")
     clave = sis.leer_texto(p.PREFIJO + "/clave-publica.pem") or ""
     if firma.pendiente(clave):
@@ -313,8 +493,14 @@ def _actualizar(op, sis, man, aqui, entrada, salida, terminal):
                    "firmada (una versión vieja puede tener un fallo ya arreglado)" % (op.paquete, version, VERSION))
             return 1
         lanzador = _desempaquetar(paquete, carpeta)
-        orden = ["python3", "-I", lanzador, "instalar", "--si"] + (["--avisos"] if man.datos.get("avisos") else [])
-        return sis.ejecutar(orden, heredar=True).codigo
+        # Cada modo instalado, con su pasada (los avisos, con la VPN).
+        for modo in man.modos or ["vpn"]:
+            orden = (["python3", "-I", lanzador, "instalar", "--si", "--modo", modo]
+                     + (["--avisos"] if man.datos.get("avisos") and modo == "vpn" else []))
+            codigo = sis.ejecutar(orden, heredar=True).codigo
+            if codigo:
+                return codigo
+        return 0
     except ValueError as error:
         salida("error: %s" % error)
         return 1
@@ -350,13 +536,29 @@ def _desempaquetar(paquete, carpeta):
     return os.path.join(carpeta, next(iter(raices)), "hehermes-servidor")
 
 
-def _desinstalar(op, sis, man, aqui, entrada, salida, terminal):
-    salida(resumen(sis, man).rstrip("\n"))
+def _desinstalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
+    """Sin --modo, todo. Con --modo, solo lo de ese modo: el otro se queda byte a byte como estaba. Si es el único que
+    hay, es lo mismo que todo."""
+    from .modos import NOMBRES
+    modo = getattr(op, "modo", None)
+    if modo and man.en_disco and modo not in man.modos:
+        salida("En este servidor no instalé %s (lo que hay es %s): no hay nada suyo que quitar."
+               % (NOMBRES[modo], " y ".join(NOMBRES[m] for m in man.modos) or "nada"))
+        return 0
+    if modo and man.modos == [modo]:
+        salida("%s%s es lo único que instalé aquí: lo quito todo." % (NOMBRES[modo][0].upper(), NOMBRES[modo][1:]))
+        modo = None
+    salida(resumen(sis, man, ambito, modo=modo).rstrip("\n"))
     if not man.en_disco:
         return 0
     if not _pregunta_si(entrada, salida, terminal, op.si):
         salida("No he quitado nada.")
         return 1
-    quedan = desinstalar(sis, man, quitar_paquetes=op.quitar_paquetes, salida=salida)
-    salida("\nHecho." + (" Lo que se queda está arriba." if quedan else " El servidor está como antes de instalar."))
+    quedan = desinstalar(sis, man, quitar_paquetes=op.quitar_paquetes, salida=salida, ambito=ambito, modo=modo)
+    if modo:
+        otro = [m for m in man.modos if m != modo]
+        salida("\nHecho. Queda %s, como estaba%s." % (" y ".join(NOMBRES[m] for m in otro),
+                                                     ", y lo de arriba" if quedan else ""))
+    else:
+        salida("\nHecho." + (" Lo que se queda está arriba." if quedan else " El servidor está como antes de instalar."))
     return 0

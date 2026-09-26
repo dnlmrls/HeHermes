@@ -101,6 +101,8 @@ def aplicar(sis, plan, man, origen, salida=print):
     etiquetar = bool(det.selinux)
     if det.familia != "debian" and man.datos.get("familia") != det.familia:
         man.datos["familia"] = det.familia
+    # Antes que nada: las reglas de nftables o iptables (`_propio`) van con las de la pasarela, si está al lado.
+    man.anadir_modo("vpn")
 
     for a in acciones:
         if a.tipo == "env" and a.cambia:
@@ -221,12 +223,13 @@ def _propio(sis, man, det, acciones, salida):
         return
     man.datos["cortafuegos_propio"] = {"iptables": det.con_iptables}
     man.guardar(sis)
+    reglas = cf.permanentes_de(man.datos)
     try:
-        lugares = cf.poner(sis, cf.MARCA, cf.permanentes(), det.con_iptables)
+        lugares = cf.poner(sis, cf.MARCA, reglas, det.con_iptables)
     except cf.NoSe as error:
         raise Parada("no he podido poner las reglas en tu cortafuegos, y no he dejado ninguna: %s" % error)
     for lugar in lugares:
-        salida("==> %s: UDP 500 y 4500, y TCP 80 por %s (%s)" % (lugar.nombre, p.INTERFAZ, lugar.donde))
+        salida("==> %s: %s (%s)" % (lugar.nombre, " y ".join(r.nombre for r in reglas), lugar.donde))
 
 
 def _ficheros(sis, man, acciones, que, salida, etiquetar=False):
@@ -242,22 +245,27 @@ def _ficheros(sis, man, acciones, que, salida, etiquetar=False):
     return escritos
 
 
-def _con_unidad(sis, man, acciones, unidad, salida, etiquetar=False):
-    ficheros = [a for a in acciones if a.tipo == "fichero"]
+def _con_unidad(sis, man, acciones, unidad, salida, etiquetar=False, systemctl=("systemctl",), despues=None):
+    """Sus ficheros, `daemon-reload` y la unidad en marcha. `despues` (la pasarela: los permisos de sus ficheros) va
+    entre escribir y arrancar. Sin root, `systemctl --user`."""
+    systemctl = list(systemctl)
+    ficheros = [a for a in acciones if a.tipo in ("fichero", "gestionado")]
     accion = next(a for a in acciones if a.tipo == "unidad")
     tx = Transaccion(sis, man, etiquetar)
     try:
         escritos = [a for a in ficheros if _escribir(sis, man, tx, a)]
+        if despues:
+            despues(escritos)
         if escritos:
-            _orden(sis, ["systemctl", "daemon-reload"], "systemctl daemon-reload")
+            _orden(sis, systemctl + ["daemon-reload"], "systemctl daemon-reload")
         if accion.estado == m.NUEVO:
-            _orden(sis, ["systemctl", "enable", "--now", unidad], "arrancar %s" % unidad)
+            _orden(sis, systemctl + ["enable", "--now", unidad], "arrancar %s" % unidad)
         elif accion.estado == m.CAMBIA:
-            _orden(sis, ["systemctl", accion.datos, unidad], "%s %s" % (accion.datos, unidad))
+            _orden(sis, systemctl + [accion.datos, unidad], "%s %s" % (accion.datos, unidad))
     except Parada:
         tx.deshacer()
         man.guardar(sis)
-        sis.ejecutar(["systemctl", "daemon-reload"])
+        sis.ejecutar(systemctl + ["daemon-reload"])
         raise
     if unidad not in man.unidades:
         man.unidades.append(unidad)
@@ -363,7 +371,7 @@ def comprobar(sis, man, hermes_pendiente=False) -> list:
     if propio:
         from . import cortafuegos as cf
         lugares, dudas = cf.analizar(sis, propio.get("iptables", True))
-        faltan = [l.nombre for l in lugares if l.marcadas < len(cf.permanentes())]
+        faltan = [l.nombre for l in lugares if l.marcadas < len(cf.permanentes_de(man.datos))]
         mira(not faltan and not dudas,
              "cortafuegos: las reglas de HeHermes están (%s)" % (", ".join(l.nombre for l in lugares) or
                                                                   "ninguna cadena cierra el paso"),

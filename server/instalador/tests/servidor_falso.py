@@ -26,6 +26,11 @@ PSK = "UFNLLWRlLWxhcy1wcnVlYmFzLXF1ZS1ubyBlcy1kZS1u"
 # La huella que da el `preparar` falso del canje.
 HUELLA = "Uhfo7S7DmMr3sd399-EUvTg6Z9_hDbthSzm01q1Womo"
 VENV_CANJE = "/opt/hehermes-canje/venv"
+#: El certificado de prueba de la pasarela (el que deja el `preparar --dias` falso) y su huella.
+CERT_PASARELA = apoyo.DATOS / "pasarela-NO-ES-DE-DANIEL.cert.pem"
+CLAVE_PASARELA = apoyo.DATOS / "pasarela-NO-ES-DE-DANIEL.clave.pem"
+HUELLA_PASARELA = "0GUKsxTavhZWbjkIBTXZmhJX0PMoBKdRcxK1ljakLyc"
+NO_ENCONTRADO = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 IP_PUBLICA = "198.51.100.23"
 
 SWANCTL_CONF = "# swanctl.conf de Debian\ninclude conf.d/*.conf\n"
@@ -139,6 +144,17 @@ class ServidorFalso:
         self.iptables = None
         self.iptables_guardado = None
         self.iptables_variante = "nf_tables"
+        #: La pasarela: los usuarios del sistema que se crean, los chown, el systemd de usuario y su linger, si el
+        #: python3 trae ensurepip, y los venv que ya tienen cryptography.
+        self.usuarios_sistema: set = set()
+        self.dueños: dict = {}
+        self.activos_usuario: set = set()
+        self.habilitados_usuario: set = set()
+        self.gestor_usuario = True
+        self.linger = True
+        self.ensurepip = True
+        self.venvs_listos: set = set()
+        self.sondas: list = []
         self._montar_base()
 
     # Montaje
@@ -237,6 +253,8 @@ class ServidorFalso:
 
     def __call__(self, args, entrada=None, heredar=False):
         nombre = args[0].rsplit("/", 1)[-1]
+        if nombre == "python" and args[0].endswith("/bin/python"):
+            return self._python_de(args[0][:-len("/bin/python")], args[1:], entrada)
         metodo = getattr(self, "_" + nombre.replace("-", "_"), None)
         if metodo is None:
             return Resultado(127, "", "%s: orden que el servidor falso no conoce" % args[0])
@@ -274,6 +292,8 @@ class ServidorFalso:
 
     def _systemctl(self, args, entrada):
         args = [a for a in args if a not in ("--quiet", "-q", "--no-pager")]
+        if args[:1] == ["--user"]:
+            return self._systemctl_usuario(args[1:])
         orden, resto = args[0], args[1:]
         ahora = "--now" in resto
         unidades = [u for u in resto if not u.startswith("-")]
@@ -293,6 +313,9 @@ class ServidorFalso:
             return Resultado(0, "LoadState=loaded\nActiveState=%s\nUser=%s\nEnvironment=%s\n" % (
                 activo, datos["User"], datos["Environment"]))
         if orden in ("daemon-reload",):
+            return Resultado(0)
+        if orden == "try-restart":
+            self.reinicios += [base(u) for u in unidades if base(u) in self.activos]
             return Resultado(0)
         if orden in ("enable", "disable", "start", "stop", "reload", "restart", "try-reload-or-restart"):
             for unidad in unidades:
@@ -316,10 +339,73 @@ class ServidorFalso:
             return Resultado(0)
         return Resultado(127, "", "systemctl %s" % args)
 
+    def _systemctl_usuario(self, args):
+        """El systemd de usuario: solo si hay uno en marcha (linger o una sesión)."""
+        if not self.gestor_usuario:
+            return Resultado(1, "", "Failed to connect to bus: No medium found")
+        orden, unidades = args[0], [u[:-len(".service")] if u.endswith(".service") else u
+                                    for u in args[1:] if not u.startswith("-")]
+        if orden == "is-system-running":
+            return Resultado(0, "running\n")
+        if orden == "is-active":
+            activo = all(u in self.activos_usuario for u in unidades)
+            return Resultado(0 if activo else 3, "active\n" if activo else "inactive\n")
+        if orden == "is-enabled":
+            return Resultado(0 if all(u in self.habilitados_usuario for u in unidades) else 1)
+        if orden == "daemon-reload":
+            return Resultado(0)
+        for u in unidades:
+            if orden == "enable":
+                self.habilitados_usuario.add(u)
+            if orden == "disable":
+                self.habilitados_usuario.discard(u)
+            if orden in ("start", "restart") or (orden == "enable" and "--now" in args):
+                self.activos_usuario.add(u)
+                self._escucha_la_pasarela(u, True)
+            if orden == "stop" or (orden == "disable" and "--now" in args):
+                self.activos_usuario.discard(u)
+                self._escucha_la_pasarela(u, False)
+            if orden == "restart":
+                self.reinicios.append("usuario:" + u)
+        return Resultado(0) if orden in ("enable", "disable", "start", "stop", "restart", "try-restart") else \
+            Resultado(127, "", "systemctl --user %s" % args)
+
+    def puerto_pasarela(self):
+        import configparser
+        for ruta in ["/etc/hehermes-pasarela/pasarela.ini"] + ["%s/.config/hehermes-pasarela/pasarela.ini" % casa
+                                                               for casa in self.usuarios.values()]:
+            texto = self.sis.leer_texto(ruta)
+            if texto:
+                ini = configparser.ConfigParser(interpolation=None)
+                ini.read_string(texto)
+                return ini.getint("pasarela", "puerto")
+        return None
+
+    def _escucha_la_pasarela(self, unidad, si):
+        if unidad != "hehermes-pasarela":
+            return
+        puerto = self.puerto_pasarela()
+        fila = ("*:%s" % puerto, "python3")
+        if si and fila not in self.tcp:
+            self.tcp.append(fila)
+        elif not si and fila in self.tcp:
+            self.tcp.remove(fila)
+
+    def pasarela_en_marcha(self):
+        return "hehermes-pasarela" in self.activos or "hehermes-pasarela" in self.activos_usuario
+
+    def sonda(self, puerto, maxima=None):
+        """Lo que ve `comprobar` al asomarse a la pasarela sin token: TLS 1.3, su huella y el 404 de siempre."""
+        self.sondas.append((puerto, maxima))
+        if not self.pasarela_en_marcha() or puerto != self.puerto_pasarela() or maxima is not None:
+            return None
+        return {"tls": "TLSv1.3", "huella": HUELLA_PASARELA, "respuesta": NO_ENCONTRADO}
+
     def _arrancar(self, unidad):
         if unidad == "firewalld":
             raise AssertionError("el instalador no puede encender firewalld")
         self.activos.add(unidad)
+        self._escucha_la_pasarela(unidad, True)
         if self.familia == "rhel":
             self.tcp += [p for p in AL_ARRANCAR.get(unidad, {}).get("tcp", []) if p not in self.tcp]
             self.udp += [p for p in AL_ARRANCAR.get(unidad, {}).get("udp", []) if p not in self.udp]
@@ -328,6 +414,7 @@ class ServidorFalso:
 
     def _parar(self, unidad):
         self.activos.discard(unidad)
+        self._escucha_la_pasarela(unidad, False)
         if unidad == "hehermes-xfrm":
             self._xfrm(["bajar"], None)
 
@@ -542,24 +629,39 @@ class ServidorFalso:
 
     def _python3(self, args, entrada):
         if args[:3] == ["-I", "-m", "venv"]:
+            if not self.ensurepip:
+                return Resultado(1, "", "The virtual environment was not created successfully because ensurepip is "
+                                        "not available.")
             self.programa(args[3] + "/bin/python")
             return Resultado(0)
+        if args[:2] == ["-I", "-c"] and "ensurepip" in args[2]:
+            return Resultado(0) if self.ensurepip else Resultado(1, "", "ModuleNotFoundError: No module named 'ensurepip'")
         return Resultado(127, "", "python3 %s" % args)
 
     def _python(self, args, entrada):
-        """El Python del venv del canje."""
-        if not self.sis.existe(VENV_CANJE + "/bin/python"):
+        """El Python del venv del canje (el de root, si se llama sin ruta)."""
+        return self._python_de(VENV_CANJE, args, entrada)
+
+    def _python_de(self, venv, args, entrada):
+        """El Python de un venv de cryptography: el del canje, con root, o el de la casa del usuario."""
+        if not self.sis.existe(venv + "/bin/python"):
             return Resultado(127, "", "no existe el venv")
         if args[:4] == ["-I", "-m", "pip", "install"]:
             self.pip.append(args)
+            self.venvs_listos.add(venv)
             self.canje_con_dependencias = True
             return Resultado(0)
         if args[:2] == ["-I", "-c"] and "sysconfig" in args[2]:
-            return Resultado(0, VENV_CANJE + "/lib/python3.11/site-packages\n")
+            return Resultado(0, venv + "/lib/python3.11/site-packages\n")
         if args[:3] == ["-I", "-B", "-c"] and "import" in args[3]:
-            listo = getattr(self, "canje_con_dependencias", False) and self.sis.existe(
-                VENV_CANJE + "/lib/python3.11/site-packages/hehermes-servidor.pth")
+            listo = venv in self.venvs_listos and self.sis.existe(
+                venv + "/lib/python3.11/site-packages/hehermes-servidor.pth")
             return Resultado(0 if listo else 1, "", "" if listo else "ModuleNotFoundError: cryptography")
+        if args[:5] == ["-I", "-B", "-m", "hehermes_servidor.canje", "preparar"] and args[6:7] == ["--dias"]:
+            # El certificado de la pasarela: el de prueba, para que su huella sea una conocida.
+            self.sis.poner(args[5] + "/cert.pem", CERT_PASARELA.read_bytes(), modo=0o600)
+            self.sis.poner(args[5] + "/clave.pem", CLAVE_PASARELA.read_bytes(), modo=0o600)
+            return Resultado(0, json.dumps({"huella": HUELLA_PASARELA}) + "\n")
         if args[:5] == ["-I", "-B", "-m", "hehermes_servidor.canje", "preparar"]:
             self.sis.poner(args[5] + "/cert.pem", "-----BEGIN CERTIFICATE-----\nfalso\n", modo=0o600)
             self.sis.poner(args[5] + "/clave.pem", "-----BEGIN PRIVATE KEY-----\nfalsa\n", modo=0o600)
@@ -568,6 +670,11 @@ class ServidorFalso:
 
     def _systemd_run(self, args, entrada):
         self.lanzados.append(args)
+        if "--user" in args and "--unit=hehermes-canje" in args:
+            if not self.gestor_usuario:
+                return Resultado(1, "", "Failed to connect to bus")
+            self.activos_usuario.add("hehermes-canje")
+            return Resultado(0)
         if "--unit=hehermes-canje" in args:
             if "hehermes-canje" in self.activos:
                 return Resultado(1, "", "Unit hehermes-canje.service already exists.")
@@ -699,7 +806,30 @@ class ServidorFalso:
         return Resultado(127, "", "sudo %s" % args)
 
     def _id(self, args, entrada):
+        if args[:1] == ["-u"] and args[1:2] and args[1] in self.usuarios_sistema:
+            return Resultado(0, "998\n")
         return Resultado(1, "", "no such user")
+
+    def _useradd(self, args, entrada):
+        if "--system" not in args or "--shell" not in args:
+            raise AssertionError("un usuario de la pasarela es de sistema y sin shell: %s" % args)
+        self.usuarios_sistema.add(args[-1])
+        return Resultado(0)
+
+    def _userdel(self, args, entrada):
+        if args[-1] not in self.usuarios_sistema:
+            return Resultado(6, "", "userdel: user %s does not exist" % args[-1])
+        self.usuarios_sistema.discard(args[-1])
+        return Resultado(0)
+
+    def _chown(self, args, entrada):
+        self.dueños[args[-1]] = args[-2]
+        return Resultado(0)
+
+    def _loginctl(self, args, entrada):
+        if args[:1] == ["show-user"] and args[2:] == ["-p", "Linger"]:
+            return Resultado(0, "Linger=%s\n" % ("yes" if self.linger else "no"))
+        return Resultado(127, "", "loginctl %s" % args)
 
     def http(self, url, cabeceras):
         m = re.match(r"^http://127\.0\.0\.1:(\d+)(/.*)$", url)
@@ -725,6 +855,7 @@ def servidor(distro=("debian", "12"), **hermes) -> "tuple":
         sis.version_python = (3, 9, 21)
     falso = ServidorFalso(sis, distro=distro)
     sis.http_falso = falso.http
+    sis._sonda = falso.sonda
     falso.con_hermes(**hermes)
     return sis, falso
 

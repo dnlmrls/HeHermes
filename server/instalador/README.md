@@ -1,23 +1,201 @@
 # hehermes-servidor: el instalador de un solo comando
 
-En un Linux que ya tiene Hermes (Debian, Ubuntu y sus derivadas, o la familia Red Hat: [más abajo](#los-sistemas)), deja lo que necesita la app HeHermes Mensajes para hablar con él por la
-VPN IKEv2 que instala ella misma, y acaba pintando el QR del iPhone en el terminal. Es la pieza A de
-`docs/superpowers/specs/2026-09-24-instalador-servidor-design.md`; el plan con el que se hizo está en
-`docs/superpowers/plans/2026-09-24-instalador-servidor.md`.
+En un Linux que ya tiene Hermes (Debian, Ubuntu y sus derivadas, o la familia Red Hat: [más abajo](#los-sistemas)), deja lo que necesita la app HeHermes Mensajes para hablar con él y acaba pintando el QR
+del iPhone en el terminal. Desde la 0.5.0 hay dos modos:
+
+- **`--modo tls`, el de por defecto: la pasarela** (`hehermes-pasarela`). Un puerto TCP alto con TLS 1.3, un
+  certificado propio cuya huella ancla la app y un token por iPhone. **No necesita root**: sin él se instala en la
+  casa del usuario de Hermes. Es `docs/superpowers/specs/2026-09-26-pasarela-tls-design.md`, con su plan en
+  `docs/superpowers/plans/2026-09-26-pasarela-servidor.md`; está [aquí abajo](#el-modo-tls-la-pasarela).
+- **`--modo vpn`: la VPN IKEv2** que instala la propia app, como hasta la 0.4.0. Necesita root. Es la pieza A de
+  `docs/superpowers/specs/2026-09-24-instalador-servidor-design.md` (su plan, `docs/superpowers/plans/2026-09-24-instalador-servidor.md`),
+  y es todo lo que hay en este README desde [«El comando de la app»](#el-comando-de-la-app) salvo donde se diga.
+
+Desde la 0.5.1 **los dos modos pueden convivir** en una misma instalación: `instalar --modo tls` sobre una VPN añade la
+pasarela, y `instalar --modo vpn` sobre una pasarela añade la VPN, sin tocar lo del otro. `desinstalar --modo vpn` (o
+`--modo tls`) quita solo ese modo. Así se pasa de la VPN a la pasarela sin dejar restos: [abajo](#los-dos-modos-a-la-vez),
+paso a paso. Una instalación de antes (VPN) sigue en VPN al repetir `instalar` sin `--modo`.
 
 ```bash
 sudo ./hehermes-servidor instalar --plan --iphone mi-iphone   # enseña lo que haría, sin cambiar nada
 sudo ./hehermes-servidor instalar --iphone mi-iphone          # lo mismo, pregunta «¿Sigo? [s/N]» y lo hace
+./hehermes-servidor instalar --iphone mi-iphone               # sin root: la pasarela, en la casa de este usuario
 sudo hehermes-servidor instalar                               # repetirlo: «Todo al día: 0 cambios», o repara
-sudo hehermes-servidor comprobar                              # nginx, strongSwan, hh-ipsec, el cortafuegos, Hermes, el túnel y «Seguridad»
+sudo hehermes-servidor comprobar                              # lo que tiene que estar en marcha, y «Seguridad»
 sudo hehermes-servidor desinstalar [--quitar-paquetes]        # enseña lo que quita, pregunta y lo quita
+sudo ./hehermes-servidor instalar --modo vpn --iphone mi-iphone   # la VPN IKEv2 de siempre
+sudo hehermes-servidor desinstalar --modo vpn                 # solo la VPN: la pasarela se queda como está
 ```
 
 Más opciones de `instalar`: `--direccion <IP o nombre>` (la del QR, si el servidor está detrás de un NAT),
-`--hermes-home <carpeta>` (si hay varios Hermes), `--avisos`, `--reemplazar <fichero>` (repetible), `--si` (sin
-preguntar; sin un terminal es obligatorio), `--activar-api`, `--corregir-exposicion` (la API de Hermes, solo en
+`--hermes-home <carpeta>` (si hay varios Hermes), `--avisos` (solo VPN), `--reemplazar <fichero>` (repetible), `--si`
+(sin preguntar; sin un terminal es obligatorio), `--activar-api`, `--corregir-exposicion` (la API de Hermes, solo en
 127.0.0.1: [abajo](#la-api-de-hermes-sin-exponer)), `--cortafuegos-a-mano` (el cortafuegos lo llevas tú:
 [abajo](#los-cortafuegos)) y, para el alta por chat, `--por-chat --llave <llave> [--qr-png <fichero>]` (abajo).
+
+## El modo TLS: la pasarela
+
+La app habla con `https://<dirección>:<puerto>` y la pasarela reenvía a Hermes en `127.0.0.1`, poniéndole la
+`API_SERVER_KEY` (la app no la conoce), o al vigía de avisos si la ruta es `/avisos/…` y está instalado. El contrato
+con la app, entero, está en `server/API-CONTRACT.md`, §12: el QR, lo que entrega el canje, la cabecera del token, las
+rutas y los errores.
+
+| | |
+|---|---|
+| Qué es | `hehermes_servidor/pasarela.py` y su lanzador `hehermes-pasarela`: `asyncio` y `ssl` de la biblioteca estándar, con el `python3` del sistema. `cryptography` solo hace falta para el certificado, en el venv del canje |
+| Dónde escucha | Un TCP al azar del **58000 al 65500** (los dos entran), de `secrets.randbelow`, libre en `ss -tan`, elegido la primera vez y **fijo** desde entonces (va en el manifiesto) |
+| TLS | Solo 1.3. ECDSA P-256 autofirmado, con un nombre al azar, sin SAN y diez años (`canje.preparar --dias 3650`). La app ancla el SHA-256 de su SPKI y no mira nada más |
+| Cada iPhone | Un token de 256 bits (`Authorization: Bearer`). En `tokens.json` solo va su SHA-256, y se compara con `hmac.compare_digest` contra **todas** las entradas. Una baja o una rotación valen al momento: la pasarela vuelve a leer el fichero en cuanto cambia y corta en un segundo las conexiones abiertas con ese token, también un SSE |
+| A quien no trae token | Siempre los mismos bytes (`404`, `Content-Length: 0`, `Connection: close`), un segundo después, y sin cabecera `Server` (la de Hermes también se quita) |
+| Límites | 10 intentos fallidos desde una IP en 10 minutos la bloquean 15 (ni llega al apretón TLS); 16 conexiones por IP y 128 en total; 10 s para las cabeceras (slowloris); 75 s de conexión parada; 16 KiB y 100 líneas de cabeceras; cuerpos de 25 MiB (64 KiB en `/avisos/`); 4096 IP recordadas. Lo que llega de 127.0.0.1 no cuenta como intento: `comprobar` se asoma sin token |
+| SSE | Sin búfer: cada trozo sale en cuanto llega, y sin plazo mientras siga abierto |
+| Registro | La IP, el método, el estado y los bytes. **Nunca** el token, la ruta con su consulta (llevan tokens de avisos y rutas de ficheros) ni ningún cuerpo |
+
+### Con root
+
+| Pieza | Qué deja |
+|---|---|
+| El usuario | `hh-pasarela`, de sistema, sin casa ni shell |
+| Código | `/opt/hehermes-servidor/` (con `hehermes-pasarela`), `/usr/local/sbin/hehermes-servidor` y `/usr/local/sbin/hehermes-dispositivo` (si no hay ya uno ajeno) |
+| La pasarela | `/etc/hehermes-pasarela/` (0750, `root:hh-pasarela`): `pasarela.ini` y `tokens.json` (0640, del grupo), `cert.pem` (0644), `clave.pem` y `clave-hermes` (0600, de root). **No** escribe `/etc/hehermes/servidor.ini`, que es de la VPN |
+| La unidad | `hehermes-pasarela.service`: `User=hh-pasarela`, sin capacidades, `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `ProtectKernel*`, `ProtectProc=invisible`, `RestrictNamespaces`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, `MemoryDenyWriteExecute`, `SystemCallFilter=@system-service` sin `@privileged` ni `@resources` y `UMask=0077`. La clave del certificado, la de Hermes y (si están los avisos) el secreto del vigía le llegan con `LoadCredential` |
+| La clave de Hermes | `hehermes-pasarela-clave.path` vigila el `.env` y, si cambia, `hehermes-servidor pasarela-clave` pone al día `clave-hermes` y reinicia la pasarela |
+| Cortafuegos | Solo el TCP de la pasarela: `ufw allow proto tcp … port P comment hehermes`, `--add-port=P/tcp` en firewalld, o su regla en las cadenas de nftables o iptables, con `hehermes-cortafuegos.service` para después de un reinicio (lo mismo que en la VPN, [abajo](#los-cortafuegos)) |
+| Paquetes | Ninguno, salvo `python3-venv` en Debian si a su Python le falta `ensurepip` |
+
+### Sin root
+
+Si no hay root, ni `sudo` sin contraseña (con él, se relanza como root, como en la VPN), el instalador **sigue** como
+el usuario que lo lanza, que tiene que ser el de Hermes (lee su `.env`):
+
+- **Nada de paquetes** (le basta Python 3.9 y `cryptography` en su venv) y **nada de cortafuegos**: no lo mira
+  (sin root no se puede) y dice qué hay que abrir, el TCP de la pasarela, en el suyo y en el del proveedor.
+- **Todo en su casa**: el código en `~/.local/share/hehermes-servidor` (y sus órdenes en `~/.local/bin`), el venv en
+  `~/.local/share/hehermes-venv`, la pasarela en `~/.config/hehermes-pasarela` (todo 0600) y el manifiesto en
+  `~/.config/hehermes/instalacion.json`. La pasarela lee la clave del `.env` de Hermes y la vuelve a leer si cambia.
+- **El arranque**, una unidad de `systemctl --user`. Con `loginctl enable-linger` puesto, sigue siempre. Sin linger
+  pero con una sesión abierta, arranca y **avisa** de que se parará al cerrar la última sesión (lo arregla un
+  administrador con `sudo loginctl enable-linger <usuario>`). Sin ningún gestor de usuario, **se para y lo dice**: no
+  se inventa otro arranque.
+- Sin `ensurepip` (Debian sin `python3-venv`), se para y dice qué pedirle al administrador.
+- `comprobar` y `desinstalar` (sin `sudo`) son de esa instalación; `actualizar`, todavía no (el comando de la app
+  repara).
+
+### Los iPhone, con `hehermes-dispositivo`
+
+```bash
+sudo hehermes-dispositivo alta <nombre> --tls   # el token nuevo y su QR hehermes-tls:1?…, solo en un terminal (y con sudo)
+sudo hehermes-dispositivo baja <nombre>    # su token deja de valer, y su conexión se corta en un segundo
+sudo hehermes-dispositivo rotar <nombre>   # otro token, y su QR; el de antes deja de valer
+sudo hehermes-dispositivo lista            # todos, con su modo: tls, ikev2 o wireguard
+```
+
+`alta <nombre>` sin más da el alta en el modo que haya: la pasarela, o la VPN IKEv2 si es la VPN del instalador (la
+que deja `/etc/hehermes/servidor.ini`). **Con los dos, no adivina:** se para y pide `--tls` o `--ikev2`. `baja` y
+`rotar` lo buscan donde esté, y si el mismo nombre está en los dos, piden también cuál (`--tls` o `--ikev2`).
+
+Sin root, lo mismo sin `sudo` (`~/.local/bin/hehermes-dispositivo`). El QR lleva el token, así que tiene las mismas
+reglas que el de la VPN: se pinta solo en un terminal (como root, además, lanzado con `sudo`), y **no se puede volver
+a pintar**, porque del token solo queda el hash: `qr <nombre>` de uno de la pasarela dice que se use `rotar`. Si ya
+había un `/usr/local/sbin/hehermes-dispositivo` ajeno (el de una VPN hecha a mano), no se toca: el de la pasarela es
+`/opt/hehermes-servidor/hehermes-dispositivo`. El QR no depende de `qrencode`: lo dibuja `hehermes_servidor/qr.py`
+(modo byte, versiones 1 a 40), que las pruebas comparan módulo a módulo con `segno`.
+
+### Por chat, en modo TLS
+
+El canje de siempre ([abajo](#el-alta-por-chat---por-chat)), con la misma frase, el mismo enlace y el mismo sobre.
+Lo que va dentro del sobre es `{"h", "p", "f", "t"}` (la dirección, el puerto de la pasarela como número, su huella y el
+token), en vez de la PSK; lo fija `tests/datos/canje-tls.json`, que comparte la app. Sin root **sí** sigue: el canje es
+una unidad de usuario (`systemd-run --user`, sin `DynamicUser` ni cortafuegos) con sus secretos en
+`/run/user/<uid>/hehermes-canje`, y `hehermes-error:sin-permisos` solo sale en `--modo vpn`. Repetirlo en la media hora,
+sin canjear, da un token nuevo (el de antes no se puede recuperar) y deja sin valor el anterior.
+
+### Los dos modos a la vez
+
+En el mismo manifiesto (`/etc/hehermes/instalacion.json`, con `"modos": ["vpn", "tls"]`), cada uno con lo suyo. Qué es
+de cada modo lo decide `hehermes_servidor/modos.py` por la ruta, el nombre o el texto de cada cosa, no por lo que
+apuntó cada pasada, así que vale también para un manifiesto de antes de la 0.5.1, que no dice de qué modo es (y es de
+la VPN):
+
+| | La VPN | La pasarela | Común (se va solo con `desinstalar` a secas) |
+|---|---|---|---|
+| Ficheros | `servidor.ini`, la XFRM, el sitio de nginx y su clave, el drop-in de nginx, `hehermes-clave.*` | `/etc/hehermes-pasarela/`, `hehermes-pasarela.service`, `hehermes-pasarela-clave.*` | `/opt/hehermes-servidor/`, `hehermes-servidor`, `hehermes-dispositivo`, `hehermes-cortafuegos.service` |
+| Otras cosas | Las reglas de ufw o firewalld de IKEv2 y el TCP 80, SELinux, los paquetes (menos `python3-venv`), el `default` de nginx que apagó, las altas IKEv2 | La regla del TCP de la pasarela, el usuario `hh-pasarela`, sus tokens, el venv de `cryptography` | Las líneas de `--activar-api`, `python3-venv` |
+
+- **`instalar`**, con `--modo`, instala o repara ese modo, y el otro no se toca (se ve en el plan: «Modo VPN IKEv2, al
+  lado de la pasarela TLS (no la toco)»). Sin `--modo` y con los dos: sin `--iphone`, repasa los dos, primero la VPN y
+  luego la pasarela, cada uno con su plan; con `--iphone`, el iPhone va a la pasarela, y lo dice.
+- **Por chat, con los dos, el modo es la pasarela.** Es el de por defecto: no pide root ni el permiso de VPN del iPhone,
+  y no choca con otra VPN que lleve (iOS solo deja una). La frase de la app no lleva `--modo`, y no hace falta. Y «el
+  primer iPhone» (decisión 7) es el primero del servidor, de cualquiera de los dos: con un iPhone en la VPN, un alta por
+  chat en la pasarela sería un segundo iPhone, y se para.
+- **Las reglas de nftables o iptables** de los dos llevan la misma marca (`hehermes`) y se ponen juntas; quitar un modo
+  vuelve a dejar solo las del otro.
+- **`comprobar`** mira lo de los dos, y su «Seguridad» también (lo común, una vez).
+- **`desinstalar --modo vpn`** quita solo la VPN: da de baja las altas IKEv2 (y corta sus sesiones), quita el sitio de
+  nginx (y lo recarga), la XFRM, `hehermes-clave.path`, `servidor.ini`, el registro, las reglas de UDP 500 y 4500 y del
+  TCP 80, y la etiqueta de SELinux. **`desinstalar --modo tls`**, solo la pasarela: su unidad, sus tokens, su
+  certificado, su usuario, su regla y el venv (la VPN lo vuelve a crear si un día da un alta por chat). Lo del otro modo
+  se queda byte a byte como estaba, y el manifiesto sigue, sin el modo quitado. Si es el único modo que hay, es lo mismo
+  que `desinstalar`.
+- **Los avisos** (`--avisos`) los instala la VPN, pero la pasarela también los sirve: `desinstalar --modo vpn` no se los
+  lleva, y lo dice. `desinstalar` a secas, sí.
+
+Lo prueba `tests/test_dos_modos.py`, con el doble de servidor: la pasarela sobre la VPN y la VPN sobre la pasarela,
+repetir y reparar los dos, `comprobar` con los dos, y quitar cada uno dejando el otro **byte a byte** como estaría si
+se hubiera instalado solo (con ufw y con nftables). Catorce fallos reintroducidos a propósito en `desinstalar.py` y
+`modos.py` (un fichero, una unidad, una regla, el venv, nginx, el registro, las carpetas, el usuario o los avisos del
+otro modo; las reglas de nftables del otro sin volver a poner; lo quitado sin olvidar) los caza alguna de esas pruebas.
+
+#### De la VPN a la pasarela, paso a paso
+
+Para un servidor con la VPN del instalador, como el VPS de Daniel (`mi-iphone` por IKEv2):
+
+1. **Añadir la pasarela, sin tocar la VPN.** Primero el plan, que no cambia nada:
+   `sudo ./hehermes-servidor-0.5.1/hehermes-servidor instalar --plan --modo tls --iphone iphone-tls`. Tiene que decir
+   «Aquí ya está la VPN IKEv2 que instalé… las dos conviven», el TCP elegido y ningún «No puedo seguir».
+2. **Instalarla:** lo mismo sin `--plan`, en un terminal (pinta el QR del token, que no se puede volver a pintar).
+3. **Abrir el TCP de la pasarela en el cortafuegos del proveedor**, si tiene uno en su panel (el plan lo dice con su
+   número): el del servidor ya lo abre el instalador.
+4. **Comprobar:** `sudo hehermes-servidor comprobar`. Salen las líneas de los dos modos, y todo `bien`.
+5. **En el iPhone,** escanear el QR con la app HeHermes Mensajes. La VPN sigue en el servidor: si algo falla, se vuelve
+   a ella.
+6. **Probarla unos días.** `sudo hehermes-dispositivo lista` dice por dónde entra cada iPhone (`tls` o `ikev2`).
+7. **Cuando todo vaya por la pasarela, quitar la VPN:** `sudo hehermes-servidor desinstalar --modo vpn`. Enseña lo que
+   quita (solo lo de la VPN, y `mi-iphone`), pregunta y lo quita. Con `--quitar-paquetes`, también strongSwan, nginx y
+   qrencode, si los instaló él.
+8. **Comprobar otra vez:** `sudo hehermes-servidor comprobar` ya solo habla de la pasarela, y `sudo hehermes-servidor
+   instalar` dice «Todo al día: 0 cambios».
+
+Lo que no está probado de verdad: todo esto en un servidor real (solo con el doble), y en particular que strongSwan y
+nginx se queden bien al quitar solo la VPN en uno que los tenga también para otras cosas.
+
+### Al lado de una VPN hecha a mano
+
+El modo TLS no toca nada de la VPN: ni strongSwan, ni nginx, ni XFRM, ni `servidor.ini`, ni el registro de
+`hehermes-dispositivo`. En un servidor con una VPN de HeHermes hecha a mano, como el VPS de Daniel, lo dice y sigue;
+desinstalar la pasarela no la toca tampoco. Lo compara `tests/test_modo_tls.py` con el doble de su VPS. Esto es lo que
+avisa el plan allí (`sudo hehermes-servidor instalar --plan --iphone mi-iphone`; lo compara
+`tests/test_documentacion.py`):
+
+<!-- pasarela-de-daniel -->
+```
+Hay que saber:
+  - Si tu proveedor tiene un cortafuegos propio, en su panel, abre ahí el TCP 61234
+  - Aquí hay una VPN de HeHermes (/etc/nginx/sites-available/hehermes-tunel, /etc/swanctl/conf.d/hehermes-poc.conf, /etc/wireguard/hehermes). No la toco: la pasarela va aparte, en su puerto, y las dos conviven
+  - /usr/local/sbin/hehermes-dispositivo no es mío: no lo toco. Para los iPhone de la pasarela usa el mío: sudo /opt/hehermes-servidor/hehermes-dispositivo alta <nombre>
+
+43 cambios.
+```
+<!-- /pasarela-de-daniel -->
+
+### «Seguridad», en modo TLS
+
+`comprobar` se asoma a la pasarela como lo haría cualquiera, sin token (`Sistema.sondear_pasarela`), y mira: que
+negocie TLS 1.3 y no acepte 1.2, que sirva el certificado cuya huella va en los QR, que conteste el 404 de siempre y
+sin `Server`; que la API de Hermes solo escuche en 127.0.0.1; que la clave del certificado, la de Hermes y el manifiesto
+solo los lea su dueño, que `tokens.json` y `pasarela.ini` no los lea cualquiera y que en `tokens.json` no haya más que
+hashes; con root, que la unidad lleve su usuario y su sandbox, el cortafuegos, el canje y la firma, como en la VPN.
 
 ## El comando de la app
 
@@ -32,7 +210,7 @@ d=$(mktemp -d) && cd "$d" && curl -fsSLO {url-base}/v{versión}/hehermes-servido
 `server/instalador/empaquetar` genera el paquete, su `.sha256` y esa línea ya rellena:
 
 ```bash
-server/instalador/empaquetar                                   # dist/hehermes-servidor-0.4.0.tar.gz y .sha256
+server/instalador/empaquetar                                   # dist/hehermes-servidor-0.5.1.tar.gz y .sha256
 server/instalador/empaquetar --url-base https://ejemplo.org/hehermes --iphone mi-iphone
 server/instalador/empaquetar --firmar hehermes-firma.pem       # y el .sig (hace falta OpenSSL 3)
 ```
@@ -44,7 +222,7 @@ server/instalador/empaquetar --firmar hehermes-firma.pem       # y el .sig (hace
   el de la redirección de GitHub, así que la suma se comprueba sobre el nombre de siempre.
 - **Es reproducible:** la misma versión da siempre el mismo fichero y la misma suma (orden fijo, dueño root, hora fija
   y gzip sin nombre ni hora). Si se cambia algo, hay que subir la versión.
-- **Lleva:** `hehermes-servidor` y `hehermes_servidor/`, `hehermes-dispositivo` (de `server/vpn`), `clave-publica.pem`,
+- **Lleva:** `hehermes-servidor`, `hehermes-pasarela` y `hehermes_servidor/`, `hehermes-dispositivo` (de `server/vpn`), `clave-publica.pem`,
   este README y `avisos/` (el código, `despliegue/` y `requirements.txt` de `server/avisos`). Ni pruebas ni `__pycache__`.
 
 ### La firma de las actualizaciones
@@ -113,7 +291,9 @@ salidas, en este orden:
    sin `--iphone`), con `sudo visudo -f /etc/sudoers.d/hehermes-servidor` y la línea
    `<usuario> ALL=(root) NOPASSWD: /usr/local/sbin/hehermes-servidor`. Por chat, dentro de la media hora siguiente a
    instalar (decisión 7).
-3. «No tengo forma de ser administrador»: por ahora no hay manera; queda para la conexión sin VPN, que está por diseñar.
+3. «No tengo forma de ser administrador»: la conexión directa, el modo por defecto (sin `--modo vpn`), no lo necesita.
+
+Todo esto es del modo VPN: en modo TLS, sin root ni sudo, se instala como el usuario ([arriba](#sin-root)).
 
 **Por chat, la última línea es `hehermes-error:sin-permisos`**, en lugar del enlace del canje, para que la app la
 reconozca. El formato es `hehermes-error:<código>`, una sola línea, sola y la última, sin nada secreto; hoy el único
@@ -375,11 +555,20 @@ en el VPS ya se ha cerrado a mano (`deny 10.77.0.1;` al principio de su `locatio
 ```bash
 # Con un venv que tenga cryptography (el de los avisos vale: server/avisos/README.md, «Pruebas»):
 /tmp/hh-avisos/bin/python -I -B -m unittest discover -s server/instalador/tests -t server/instalador/tests
-# En el sandbox de Claude Code, las del canje por TLS necesitan poder escuchar en 127.0.0.1 (allowLocalBinding).
+# En el sandbox de Claude Code, las del canje y las de la pasarela necesitan poder escuchar en 127.0.0.1
+# (allowLocalBinding).
 ```
 
 Las del canje (`tests/test_canje_*.py`) necesitan `cryptography` y no importan sin ella; las demás corren también con el
-`python3` del sistema (`-p "test_[!c]*"`). El canje se prueba de verdad: un servidor TLS en `127.0.0.1` y un cliente de
+`python3` del sistema (`-p "test_[!c]*"`). Las del QR (`tests/test_qr.py`) se comparan con `segno` si está en el venv
+(`pip install segno`, solo para las pruebas: al servidor no va); sin él, esas se saltan.
+
+La pasarela también se prueba de verdad (`tests/test_pasarela_red.py`): TLS en 127.0.0.1 con el certificado de prueba
+(`tests/datos/pasarela-NO-ES-DE-DANIEL.*`), un Hermes y un vigía de mentira detrás y un cliente que hace de iPhone: el
+token, el 404 idéntico y su segundo de espera, la clave que se añade, el SSE evento a evento, las bajas que cortan un
+SSE abierto, los límites y que el registro no lleva nada de la petición. Las de la lógica (tokens, límites, huella,
+configuración), sin red, en `tests/test_pasarela_logica.py`; el modo TLS del instalador, con root, sin root, al lado de
+la VPN de Daniel y por chat, en `tests/test_modo_tls.py`. El canje se prueba de verdad: un servidor TLS en `127.0.0.1` y un cliente de
 Python que hace de iPhone (ancla la huella, abre el reto, canjea y abre la PSK). **En el Mac va con TLS 1.2:** el Python
 de Xcode trae LibreSSL 2.8, que no sabe 1.3, así que las dos pruebas que lo exigen se saltan aquí y corren donde haya
 OpenSSL 3 (en el servidor, siempre).
@@ -403,3 +592,10 @@ correr al canje), `ufw delete` con el comentario, `nft -j list ruleset` y `nft -
 de iptables-legacy, que `hehermes-cortafuegos.service` corra detrás de nftables, netfilter-persistent e iptables al arrancar
 y al recargarlos (`ReloadPropagatedFrom=`), `sudo -n` y sus mensajes en cada distribución, crear el PNG con `seteuid`, el reinicio a los 90 s con `systemd-run --on-active`, `pip` desde el servidor, el canje con TLS 1.3 de
 verdad y un Hermes de verdad ejecutando la frase.
+
+De la pasarela, además: la unidad de sistema con su sandbox de verdad (que `MemoryDenyWriteExecute`,
+`SystemCallFilter` sin `@resources`, `ProtectProc` y `LoadCredential` dejen correr al `python3` de cada distribución),
+`useradd` y `userdel`, `systemctl --user` y `loginctl` de verdad (con y sin linger, y lanzado desde Hermes, sin
+`XDG_RUNTIME_DIR`), `systemd-run --user` para el canje, la pasarela con TLS 1.3 de OpenSSL 3 (en el Mac, 1.2) y contra un
+iPhone de verdad fuera de localhost, y el QR leído por la cámara (el dibujo es el de `segno` módulo a módulo, pero ninguna
+cámara lo ha visto).

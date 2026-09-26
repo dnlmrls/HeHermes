@@ -66,10 +66,24 @@ class Regla:
         return args + ["-m", "comment", "--comment", marca, "-j", "ACCEPT"]
 
 
-def permanentes() -> list:
-    """Lo mismo que las de ufw: solo el UDP de IKE queda abierto a internet; el TCP 80, solo por hh-ipsec."""
+def permanentes(modo: str = "vpn", puerto: int | None = None) -> list:
+    """Lo mismo que las de ufw: solo el UDP de IKE queda abierto a internet; el TCP 80, solo por hh-ipsec. En modo
+    TLS, solo el TCP de la pasarela."""
+    if modo == "tls":
+        return [Regla("TCP %d (la pasarela)" % int(puerto), "tcp", str(int(puerto)))]
     return [Regla("UDP 500 y 4500 (IKEv2)", "udp", "500,4500"),
             Regla("TCP 80 solo por %s hacia %s" % (p.INTERFAZ, p.IP_TUNEL), "tcp", "80", p.INTERFAZ, p.IP_TUNEL)]
+
+
+def permanentes_de(datos: dict, modos=None, puerto=None) -> list:
+    """Las de una instalación, por los modos de su manifiesto: las de la VPN, las de la pasarela o las de los dos (van
+    todas con la misma marca, y `poner` las pone de una vez). `modos` y `puerto`, los que tendrá al acabar de
+    instalar, si no son aún los del manifiesto."""
+    from .manifiesto import modos_de
+    modos = modos_de(datos) if modos is None else modos
+    puerto = puerto or (datos.get("pasarela") or {}).get("puerto")
+    return ((permanentes() if "vpn" in modos else [])
+            + (permanentes("tls", puerto) if "tls" in modos and puerto else []))
 
 
 def del_canje(puerto: int) -> list:
