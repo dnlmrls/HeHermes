@@ -118,6 +118,9 @@ class Paquete(unittest.TestCase):
     def test_la_url_por_defecto_es_la_de_las_releases_de_github(self):
         # Decisión 1, por ahora: una Release `v<versión>` del repositorio público, con el paquete como asset.
         self.assertEqual(self.e.URL_BASE, "https://github.com/dnlmrls/HeHermes/releases/download")
+        # La misma que usa el instalador para el comando del administrador (`permisos`).
+        from hehermes_servidor import URL_BASE
+        self.assertEqual(URL_BASE, self.e.URL_BASE)
         self.assertEqual(self.e.url_del_paquete(self.e.URL_BASE, "0.3.0"),
                          "https://github.com/dnlmrls/HeHermes/releases/download/v0.3.0/hehermes-servidor-0.3.0.tar.gz")
         self.assertIn(" curl -fsSLO https://github.com/dnlmrls/HeHermes/releases/download/v0.3.0/"
@@ -180,6 +183,15 @@ class LaApp(unittest.TestCase):
         _, suma = self.e.construir(VERSION, self.carpeta)
         datos = json.loads(self.FIXTURE.read_text())
         self.assertEqual(datos["frase"], self.e.frase(self.e.URL_BASE, VERSION, suma, "mi-iphone", "{llave}"))
+
+    def test_el_comando_por_ssh_de_la_app_es_el_del_instalador(self):
+        """«Conecta tu servidor» enseña el instalador, no el alta de `hehermes-dispositivo`, que sin él no existe.
+        `BienvenidaTests` compara el de la app con este fichero; aquí, el fichero con `empaquetar`."""
+        import json
+        _, suma = self.e.construir(VERSION, self.carpeta)
+        datos = json.loads(self.FIXTURE.read_text())
+        self.assertEqual(datos["comando"], self.e.comando(self.e.URL_BASE, VERSION, suma, "mi-iphone"))
+        self.assertNotIn("hehermes-dispositivo", datos["comando"])
 
 
 class Firma(unittest.TestCase):

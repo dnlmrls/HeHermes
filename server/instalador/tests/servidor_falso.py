@@ -105,6 +105,8 @@ class ServidorFalso:
         self.unidades_hermes: dict = {}
         self.procesos: list = []  # (pid, usuario, orden)
         self.tcp: list = [("0.0.0.0:22", "sshd")]
+        #: Las direcciones locales de las conexiones TCP que no escuchan (las de salida, las establecidas).
+        self.tcp_conexiones: list = []
         self.udp: list = []
         self.enlaces_ip: dict = {"eth0": {"ifname": "eth0", "addr": [IP_PUBLICA + "/24"]}}
         self.rutas: list = []
@@ -123,6 +125,20 @@ class ServidorFalso:
         self.lanzados: list = []  # las órdenes de systemd-run
         self.pip: list = []
         self.pngs: dict = {}
+        #: Lo que contesta `sudo -n true` a quien no es root: «sin-sudo» (no hay sudo), «sin-contrasena»,
+        #: «contrasena» (lo pide) o «no-permitido» (no está en sudoers). Y si sudoers le deja lanzar el instalado.
+        self.sudo = "sin-sudo"
+        self.sudo_instalador = False
+        #: nftables a pelo (`con_nft`): sus cadenas y sus reglas, como las da `nft -j list ruleset`. Y lo guardado,
+        #: que es lo que vuelve a cargar el sistema al arrancar (`reiniciar`).
+        self.nft_cadenas: list = []
+        self.nft_reglas: list = []
+        self.nft_guardado = None
+        self._handle = 100
+        #: iptables a pelo (`con_iptables`): la política y las reglas de INPUT (cada una, sus argumentos tras -A INPUT).
+        self.iptables = None
+        self.iptables_guardado = None
+        self.iptables_variante = "nf_tables"
         self._montar_base()
 
     # Montaje
@@ -273,7 +289,9 @@ class ServidorFalso:
             datos = self.unidades_hermes.get(unidad)
             if datos is None:
                 return Resultado(0, "LoadState=not-found\nUser=\nEnvironment=\n")
-            return Resultado(0, "LoadState=loaded\nUser=%s\nEnvironment=%s\n" % (datos["User"], datos["Environment"]))
+            activo = "active" if base(unidad) in self.activos else "inactive"
+            return Resultado(0, "LoadState=loaded\nActiveState=%s\nUser=%s\nEnvironment=%s\n" % (
+                activo, datos["User"], datos["Environment"]))
         if orden in ("daemon-reload",):
             return Resultado(0)
         if orden in ("enable", "disable", "start", "stop", "reload", "restart", "try-reload-or-restart"):
@@ -330,6 +348,11 @@ class ServidorFalso:
         return Resultado(0, "".join("%d %s %s\n" % p for p in self.procesos))
 
     def _ss(self, args, entrada):
+        if args == ["-H", "-tan"]:
+            # Todas las de TCP, escuchen o no: el estado va primero y la dirección local en la cuarta columna.
+            filas = ["LISTEN 0 511 %s 0.0.0.0:*" % local for local, _ in self.tcp]
+            filas += ["ESTAB 0 0 %s 203.0.113.99:443" % local for local in self.tcp_conexiones]
+            return Resultado(0, "".join(f + "\n" for f in filas))
         lista = self.tcp if "-ltnp" in args else self.udp
         estado = "LISTEN" if "-ltnp" in args else "UNCONN"
         return Resultado(0, "".join('%s 0 511 %s 0.0.0.0:* users:(("%s",pid=100,fd=6))\n' % (estado, local, dueño)
@@ -407,8 +430,12 @@ class ServidorFalso:
             # Como el de verdad (`conf_swanctl`): la PSK del iPhone vive en su conexión de strongSwan, entre comillas.
             self.sis.poner(self.swanctl + "/conf.d/hehermes-%s.conf" % args[1],
                            '# Generado por hehermes-dispositivo. No editar a mano: usa el script.\n'
-                           'connections {\n}\nsecrets {\n    ike-hehermes-%s {\n        id = %s\n'
-                           '        secret = "%s"\n    }\n}\n' % (args[1], args[1], PSK), modo=0o600)
+                           'connections {\n    hh-%s {\n        version = 2\n'
+                           '        proposals = aes256gcm16-prfsha384-ecp384\n        children {\n'
+                           '            hh-%s {\n                local_ts = 10.77.0.1/32\n'
+                           '                esp_proposals = aes256gcm16-ecp384\n            }\n        }\n    }\n}\n'
+                           'secrets {\n    ike-hehermes-%s {\n        id = %s\n'
+                           '        secret = "%s"\n    }\n}\n' % (args[1], args[1], args[1], args[1], PSK), modo=0o600)
             self.sis.poner(self.dispositivos_json, json.dumps(registro), modo=0o600)
             self.conexiones.add("hh-" + args[1])
             return Resultado(0, "Alta IKEv2 de «%s»\n" % args[1])
@@ -554,6 +581,122 @@ class ServidorFalso:
             self.sis.poner(ruta, b"\x89PNG falso de " + entrada.encode())
             return Resultado(0)
         return Resultado(0, "QR\n")
+
+    # nftables e iptables, a pelo
+
+    def con_nft(self, cadenas, reglas=()):
+        """`cadenas`: (familia, tabla, nombre, hook, policy); `reglas`: (familia, tabla, cadena, expr[, comentario]).
+        Lo que hay queda como lo guardado en /etc/nftables.conf."""
+        self.programa("/usr/sbin/nft")
+        for familia, tabla, nombre, hook, politica in cadenas:
+            cadena = {"family": familia, "table": tabla, "name": nombre, "handle": self._nuevo_handle()}
+            if hook:
+                cadena.update(type="filter", hook=hook, prio=0, policy=politica)
+            self.nft_cadenas.append(cadena)
+        for regla in reglas:
+            familia, tabla, cadena, expr = regla[:4]
+            self.nft_reglas.append({"family": familia, "table": tabla, "chain": cadena, "handle": self._nuevo_handle(),
+                                    "expr": expr, **({"comment": regla[4]} if len(regla) > 4 else {})})
+        self.activos.add("nftables")
+        self.nft_guardado = json.dumps([self.nft_cadenas, self.nft_reglas])
+
+    def con_iptables(self, politica="ACCEPT", reglas=(), variante="nf_tables"):
+        self.programa("/usr/sbin/iptables")
+        self.iptables = {"politica": politica, "reglas": [shlex.split(r) for r in reglas]}
+        self.iptables_variante = variante
+        self.iptables_guardado = json.dumps(self.iptables)
+
+    def reiniciar(self):
+        """Un reinicio: el sistema carga su cortafuegos guardado (sin lo que se puso a mano), firewalld vuelve a su
+        configuración permanente, ufw conserva sus reglas, /run se vacía y el canje ya no existe."""
+        if self.nft_guardado is not None:
+            self.nft_cadenas, self.nft_reglas = json.loads(self.nft_guardado)
+        if self.iptables_guardado is not None:
+            self.iptables = json.loads(self.iptables_guardado)
+        self.fw_ahora = set(self.fw_permanente)
+        self.activos.discard("hehermes-canje")
+        if self.sis.existe("/run/hehermes-canje"):
+            self.sis.borrar_arbol("/run/hehermes-canje")
+
+    def _nuevo_handle(self):
+        self._handle += 1
+        return self._handle
+
+    def reglas_nft(self, familia, tabla, cadena):
+        return [r for r in self.nft_reglas if (r["family"], r["table"], r["chain"]) == (familia, tabla, cadena)]
+
+    def _nft(self, args, entrada):
+        if args == ["-j", "list", "ruleset"]:
+            tablas = sorted({(c["family"], c["table"]) for c in self.nft_cadenas})
+            objetos = [{"metainfo": {"json_schema_version": 1}}]
+            objetos += [{"table": {"family": f, "name": t, "handle": 1}} for f, t in tablas]
+            objetos += [{"chain": c} for c in self.nft_cadenas] + [{"rule": r} for r in self.nft_reglas]
+            return Resultado(0, json.dumps({"nftables": objetos}))
+        if args == ["-f", "-"]:
+            for linea in (entrada or "").splitlines():
+                m = re.match(r'^(add|insert) rule (\S+) (\S+) (\S+)(?: position (\d+))? (.*) comment "([^"]+)"$', linea)
+                if not m:
+                    return Resultado(1, "", "Error: syntax error: %s" % linea)
+                verbo, familia, tabla, cadena, antes, resto, comentario = m.groups()
+                if not any((c["family"], c["table"], c["name"]) == (familia, tabla, cadena) for c in self.nft_cadenas):
+                    return Resultado(1, "", "Error: No such file or directory: %s" % cadena)
+                regla = {"family": familia, "table": tabla, "chain": cadena, "handle": self._nuevo_handle(),
+                         "expr": [{"match": resto}, {"accept": None}], "comment": comentario, "texto": resto}
+                if verbo == "insert" and antes:
+                    indice = next(i for i, r in enumerate(self.nft_reglas) if r["handle"] == int(antes))
+                    self.nft_reglas.insert(indice, regla)
+                else:
+                    self.nft_reglas.append(regla)
+            return Resultado(0)
+        if args[:2] == ["delete", "rule"] and args[5:6] == ["handle"]:
+            antes = len(self.nft_reglas)
+            self.nft_reglas = [r for r in self.nft_reglas if not (
+                (r["family"], r["table"], r["chain"]) == tuple(args[2:5]) and str(r["handle"]) == args[6])]
+            return Resultado(0) if len(self.nft_reglas) < antes else Resultado(1, "", "Error: Could not process rule")
+        if args[:1] in (["flush"], ["add"], ["insert"], ["delete"], ["-f"]):
+            raise AssertionError("el instalador no toca el cortafuegos del usuario más que con sus reglas: %s" % args)
+        return Resultado(127, "", "nft %s" % args)
+
+    def _iptables(self, args, entrada):
+        if self.iptables is None:
+            return Resultado(127, "", "no está iptables")
+        if args == ["-V"]:
+            return Resultado(0, "iptables v1.8.9 (%s)\n" % self.iptables_variante)
+        if args == ["-S", "INPUT"]:
+            return Resultado(0, "-P INPUT %s\n" % self.iptables["politica"] + "".join(
+                "-A INPUT %s\n" % " ".join(shlex.quote(t) for t in r) for r in self.iptables["reglas"]))
+        reglas = self.iptables["reglas"]
+        if args[:2] == ["-A", "INPUT"]:
+            reglas.append(args[2:])
+            return Resultado(0)
+        if args[:2] == ["-I", "INPUT"] and args[2].isdigit():
+            reglas.insert(int(args[2]) - 1, args[3:])
+            return Resultado(0)
+        if args[:2] == ["-D", "INPUT"]:
+            if args[2:] not in reglas:
+                return Resultado(1, "", "iptables: Bad rule (does a matching rule exist in that chain?).")
+            reglas.remove(args[2:])
+            return Resultado(0)
+        if args[:1] in (["-P"], ["-F"], ["-X"]):
+            raise AssertionError("el instalador no cambia la política ni vacía cadenas: %s" % args)
+        return Resultado(127, "", "iptables %s" % args)
+
+    def _sudo(self, args, entrada):
+        """Solo lo que pregunta el instalador, y siempre con -n: un sudo que fuera a pedir contraseña es un fallo."""
+        if args[:1] != ["-n"]:
+            raise AssertionError("sudo sin -n: pediría una contraseña (%s)" % args)
+        if self.sudo == "sin-sudo":
+            return Resultado(127, "", "no existe sudo")
+        if args == ["-n", "-l", "/usr/local/sbin/hehermes-servidor"]:
+            permitido = self.sudo == "sin-contrasena" or self.sudo_instalador
+            return Resultado(0, "/usr/local/sbin/hehermes-servidor\n") if permitido else Resultado(1, "", "")
+        if args == ["-n", "true"]:
+            if self.sudo == "sin-contrasena":
+                return Resultado(0)
+            if self.sudo == "contrasena":
+                return Resultado(1, "", "sudo: a password is required\n")
+            return Resultado(1, "", "Sorry, user hermes may not run sudo on vps.\n")
+        return Resultado(127, "", "sudo %s" % args)
 
     def _id(self, args, entrada):
         return Resultado(1, "", "no such user")

@@ -147,6 +147,10 @@ DURACION = 600.0
 MAX_FALLOS = 5
 MAX_FALLOS_POR_IP = 3
 PAUSA_POR_IP = 1.0
+#: Conexiones por IP en todo el canje: el iPhone hace dos (y alguna más si reintenta). Pasado el tope, ni el apretón.
+MAX_CONEXIONES_POR_IP = 20
+#: IP distintas que recuerda: la memoria del canje no crece sin fin con un barrido desde muchas direcciones.
+MAX_IPS = 1024
 RUTA_RETO = "/canje/v1/reto"
 RUTA_CANJEAR = "/canje/v1/canjear"
 #: Cómo sale el proceso al cerrarse: la limpieza (root, en `ExecStopPost`) solo apunta el canje con un 0.
@@ -172,6 +176,7 @@ class Canje:
         self.fallos = 0
         self.fallos_por_ip = {}
         self.ultima_por_ip = {}
+        self.conexiones_por_ip = {}
         self.motivo = None
 
     @property
@@ -189,13 +194,25 @@ class Canje:
             self.carga = b""
         return _CERRADO[self.motivo]
 
+    def admitir(self, ip: str) -> bool:
+        """Antes del apretón TLS: si esta IP puede abrir otra conexión. No es un fallo del protocolo: no cierra el
+        canje, solo deja fuera a quien insiste."""
+        vistas = self.conexiones_por_ip.get(ip)
+        if vistas is None and len(self.conexiones_por_ip) >= MAX_IPS:
+            return False
+        if (vistas or 0) >= MAX_CONEXIONES_POR_IP:
+            return False
+        self.conexiones_por_ip[ip] = (vistas or 0) + 1
+        return True
+
     def atender(self, ruta: str, ip: str, cuerpo: bytes):
         if self.cerrado:
             return _CERRADO[self.motivo]
         if self.vencido():
             return self.cerrar("caducado")
         if ruta not in (RUTA_RETO, RUTA_CANJEAR):
-            return 404, {"error": "no_existe"}
+            # Lo mismo que a un escáner: un 404 sin nada dentro.
+            return 404, None
         ahora = self.reloj()
         anterior = self.ultima_por_ip.get(ip)
         self.ultima_por_ip[ip] = ahora
@@ -245,7 +262,8 @@ def preparar(carpeta: str) -> str:
     from cryptography.x509.oid import NameOID
 
     clave = ec.generate_private_key(ec.SECP256R1())
-    nombre = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "hehermes-canje")])
+    # Un nombre al azar: ni «hehermes» ni nada que diga a un escáner qué hay detrás. La app no lo mira: ancla la SPKI.
+    nombre = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, secrets.token_hex(8))])
     ahora = datetime.datetime.now(datetime.timezone.utc)
     cert = (x509.CertificateBuilder().subject_name(nombre).issuer_name(nombre).public_key(clave.public_key())
             .serial_number(x509.random_serial_number())
@@ -311,6 +329,8 @@ def servir(el_canje: Canje, cert: str, clave: str, puerto: int, direccion: str =
             except OSError:
                 continue
             with conexion:
+                if not el_canje.admitir(_ip(origen)):
+                    continue
                 conexion.settimeout(plazo_saludo)
                 try:
                     with contexto.wrap_socket(conexion, server_side=True) as tls:
@@ -329,8 +349,9 @@ def _ip(origen) -> str:
 def _atender(el_canje, tls, ip):
     f = tls.makefile("rb")
     linea = f.readline(1024).decode("latin-1").split()
+    # Todo lo que no es una petición del protocolo recibe el mismo 404 sin nada: ni qué servidor es, ni qué rutas hay.
     if len(linea) != 3:
-        return _responder(tls, 400, {"error": "peticion"})
+        return _responder(tls, 404, None)
     metodo, ruta, _ = linea
     largo = 0
     for _ in range(50):
@@ -342,18 +363,21 @@ def _atender(el_canje, tls, ip):
             try:
                 largo = int(valor.strip())
             except ValueError:
-                return _responder(tls, 400, {"error": "peticion"})
-    if not 0 <= largo <= MAX_CUERPO:
-        return _responder(tls, 400, {"error": "peticion"})
-    cuerpo = f.read(largo) if largo else b""
-    if metodo != "POST":
+                return _responder(tls, 404, None)
+    if metodo != "POST" or not 0 <= largo <= MAX_CUERPO:
         # Lo que no es del protocolo (un escáner con su GET) no cuenta como intento: no puede cerrar el canje.
-        return _responder(tls, 404, {"error": "no_existe"})
+        return _responder(tls, 404, None)
+    cuerpo = f.read(largo) if largo else b""
     estado, respuesta = el_canje.atender(ruta, ip, cuerpo)
     _responder(tls, estado, respuesta)
 
 
 def _responder(tls, estado, datos):
+    """Sin cabecera `Server` (esto no es un servidor web que se anuncie). `None`: sin cuerpo y sin tipo."""
+    if datos is None:
+        tls.sendall(b"HTTP/1.1 %d %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    % (estado, _TEXTOS.get(estado, "Error").encode()))
+        return
     cuerpo = json.dumps(datos, separators=(",", ":")).encode()
     tls.sendall(("HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nCache-Control: no-store"
                  "\r\nConnection: close\r\n\r\n" % (estado, _TEXTOS.get(estado, "Error"), len(cuerpo))).encode()

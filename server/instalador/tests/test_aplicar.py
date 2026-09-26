@@ -68,7 +68,7 @@ class Instalar(Base):
         self.assertEqual(man.ficheros[p.BEARER]["tipo"], "gestionado")
         self.assertEqual(sorted(man.paquetes), sorted(["charon-systemd", "strongswan-swanctl", "nginx", "qrencode",
                                                         "libstrongswan-standard-plugins"]))
-        self.assertEqual(man.unidades, ["hehermes-xfrm.service", "hehermes-clave.path"])
+        self.assertEqual(man.unidades, ["hehermes-xfrm.service", "hehermes-cortafuegos.service", "hehermes-clave.path"])
         self.assertEqual(len(man.reglas), 2)
         self.assertEqual(man.dispositivos, ["mi-iphone"])
         # El sitio default de nginx, fuera, y apuntado para volver a ponerlo.

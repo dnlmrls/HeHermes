@@ -28,7 +28,8 @@ PAQUETES_POR_CHAT = ("python3-venv",)
 
 class Opciones:
     def __init__(self, iphone=None, direccion=None, avisos=False, hermes_home=None, reemplazar=(), si=False,
-                 solo_plan=False, por_chat=False, llave=None, activar_api=False, qr_png=None, ahora=None):
+                 solo_plan=False, por_chat=False, llave=None, activar_api=False, qr_png=None, ahora=None,
+                 cortafuegos_a_mano=False, corregir_exposicion=False):
         self.iphone = iphone
         self.direccion = direccion
         self.avisos = avisos
@@ -43,6 +44,10 @@ class Opciones:
         self.qr_png = qr_png
         #: La hora con la que se mide la media hora de la decisión 7; las pruebas la fijan.
         self.ahora = ahora
+        #: El cortafuegos lo lleva el usuario: no se toca, aunque cierre (y no se sepa dónde abrirlo).
+        self.cortafuegos_a_mano = cortafuegos_a_mano
+        #: Permiso para cerrar a 127.0.0.1 una API de Hermes que escucha en todas las interfaces.
+        self.corregir_exposicion = corregir_exposicion
 
 
 class Accion:
@@ -167,6 +172,12 @@ def calcular_plan(sis, det, man, op: Opciones, origen: str) -> Plan:
         acciones.append(Accion("env", det.hermes.env, m.NUEVO, "añade %s (con una copia antes); reinicia Hermes 90 s "
                                                                "después de acabar" % nombres, det.hermes.api_pendiente))
 
+    # --corregir-exposicion: la API de Hermes, solo en 127.0.0.1.
+    if det.hermes.exposicion_pendiente:
+        acciones.append(Accion("exposicion", det.hermes.env, m.NUEVO, "añade %s (con una copia antes), para que la API "
+                               "de Hermes solo escuche en 127.0.0.1; reinicia Hermes 90 s después de acabar"
+                               % det.hermes.exposicion_pendiente, [det.hermes.exposicion_pendiente]))
+
     # Dispositivos
     fichero(p.SERVIDOR_INI, p.servidor_ini(det.direccion or "PENDIENTE", det.hermes.env, det.hermes.puerto,
                                            det.swanctl))
@@ -225,6 +236,18 @@ def calcular_plan(sis, det, man, op: Opciones, origen: str) -> Plan:
                 estado = m.NUEVO
             acciones.append(Accion("firewalld", regla.nombre, estado, regla.opcion, regla))
 
+    # nftables e iptables a pelo: en cada cadena que cierra, las reglas justas y con la marca (`cortafuegos`)
+    from . import cortafuegos as cf
+    reglas = cf.permanentes()
+    for lugar in det.lugares:
+        estado = m.YA_ESTA if lugar.marcadas >= len(reglas) else m.NUEVO
+        acciones.append(Accion("propio", lugar.nombre, estado, "%s, %s (con el comentario %s)" % (
+            " y ".join(r.nombre for r in reglas), lugar.donde, cf.MARCA), lugar))
+    # La unidad que las vuelve a poner tras un reinicio, y que quita la del canje si un reinicio la dejó en ufw.
+    _unidad(sis, acciones, "hehermes-cortafuegos.service",
+            [fichero(p.UNIDAD_CORTAFUEGOS, p.unidad_cortafuegos())],
+            "al arrancar, vuelve a poner sus reglas y quita las del canje", "reload")
+
     # SELinux: el puerto de Hermes, para nginx
     if det.selinux:
         puerto = str(det.hermes.puerto)
@@ -270,8 +293,8 @@ def calcular_plan(sis, det, man, op: Opciones, origen: str) -> Plan:
         from . import porchat
         bloqueos.extend(porchat.bloqueos(sis, man, op, op.ahora))
         acciones.append(Accion("canje", "hehermes-canje", m.NUEVO,
-                               "10 minutos en el TCP 443 (o el primero libre de 8443 a 8453), de un solo uso; al "
-                               "acabar, la línea del enlace"))
+                               "10 minutos en un TCP al azar del 58000 al 65500, abierto solo "
+                               "mientras dura y de un solo uso; al acabar, la línea del enlace"))
 
     # Lo que no se pisa
     for a in acciones:
@@ -303,9 +326,9 @@ def _unidad(sis, acciones, unidad, ficheros, detalle, como_recargar):
 # MARK: Pintar
 
 
-SECCIONES = (("Hermes", ("env",)), ("Paquetes", ("paquete",)), ("Ficheros", ("fichero", "gestionado", "enlace", "quitar")),
+SECCIONES = (("Hermes", ("env", "exposicion")), ("Paquetes", ("paquete",)), ("Ficheros", ("fichero", "gestionado", "enlace", "quitar")),
              ("Servicios", ("unidad", "recarga")), ("Cortafuegos (ufw)", ("regla",)),
-             ("Cortafuegos (firewalld)", ("firewalld",)), ("SELinux", ("selinux",)), ("Avisos push", ("avisos",)),
+             ("Cortafuegos (firewalld)", ("firewalld",)), ("Cortafuegos (nftables e iptables)", ("propio",)), ("SELinux", ("selinux",)), ("Avisos push", ("avisos",)),
              ("iPhone", ("dispositivo",)), ("Canje por chat", ("canje",)))
 ETIQUETAS = {m.NUEVO: "nuevo", m.YA_ESTA: "ya está", m.CAMBIA: "cambia", m.AJENO: "ajeno", m.MODIFICADO: "cambiado",
              m.AJENO_IGUAL: "ya está*", m.REEMPLAZA: "reemplaza"}

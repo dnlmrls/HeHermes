@@ -10,7 +10,7 @@ import sys
 import tarfile
 import tempfile
 
-from . import firma
+from . import VERSION, firma, permisos
 from . import piezas as p
 from .aplicar import Parada, aplicar, comprobar
 from .desinstalar import desinstalar, resumen
@@ -50,7 +50,14 @@ def _analizador():
     i.add_argument("--activar-api", action="store_true",
                    help="enciende la API de Hermes si está apagada (solo las líneas que faltan en su .env)")
     i.add_argument("--qr-png", metavar="FICHERO", help="con --por-chat: deja además el enlace en un PNG con su QR")
+    i.add_argument("--corregir-exposicion", action="store_true",
+                   help="si la API de Hermes escucha en todas las interfaces, la cierro a 127.0.0.1 (en su .env)")
+    i.add_argument("--cortafuegos-a-mano", action="store_true",
+                   help="el cortafuegos lo llevas tú: no lo toco aunque cierre el paso")
     ordenes.add_parser("comprobar")
+    # Lo que lanza hehermes-cortafuegos.service al arrancar (poner) y al pararse (quitar). No es para personas.
+    c = ordenes.add_parser("cortafuegos")
+    c.add_argument("accion", choices=("poner", "quitar"))
     # La limpieza del canje, que lanza systemd como root al pararse la unidad (ExecStopPost). No es para personas.
     ordenes.add_parser("canje-limpiar")
     u = ordenes.add_parser("actualizar")
@@ -62,7 +69,8 @@ def _analizador():
     return a
 
 
-def main(argv, doc, aqui, sis=None, entrada=input, salida=print, terminal=None, euid=None) -> int:
+def main(argv, doc, aqui, sis=None, entrada=input, salida=print, terminal=None, euid=None, relanzar=None,
+         usuario=None) -> int:
     try:
         op = _analizador().parse_args(argv)
     except SalirConUso as error:
@@ -79,10 +87,10 @@ def main(argv, doc, aqui, sis=None, entrada=input, salida=print, terminal=None, 
     if getattr(op, "adoptar", False):
         salida("error: --adoptar todavía no existe: una instalación hecha a mano no se toca (spec, «Lo que queda fuera»)")
         return 2
-    if (os.geteuid() if euid is None else euid) != 0:
-        salida("error: hay que ejecutarlo como root (sudo)")
-        return 1
     sis = sis or Sistema()
+    euid = os.geteuid() if euid is None else euid
+    if euid != 0:
+        return _sin_root(op, argv, sis, aqui, salida, relanzar or _relanzar_de_verdad, usuario or _usuario())
     terminal = sys.stdin.isatty() and sys.stdout.isatty() if terminal is None else terminal
     os.umask(0o022)
     try:
@@ -91,13 +99,44 @@ def main(argv, doc, aqui, sis=None, entrada=input, salida=print, terminal=None, 
         salida("error: %s" % error)
         return 1
     orden = {"instalar": _instalar, "comprobar": _comprobar, "actualizar": _actualizar,
-             "desinstalar": _desinstalar, "canje-limpiar": _canje_limpiar}[op.orden]
-    if op.orden in ("comprobar", "canje-limpiar") or getattr(op, "plan", False):
+             "desinstalar": _desinstalar, "canje-limpiar": _canje_limpiar, "cortafuegos": _cortafuegos}[op.orden]
+    if op.orden in ("comprobar", "canje-limpiar", "cortafuegos") or getattr(op, "plan", False):
         # canje-limpiar tampoco: corre dentro del `systemctl stop` de un instalar que ya tiene el cerrojo.
         # Lo que solo lee no toma el cerrojo: --plan no deja ni un fichero en /run.
         return orden(op, sis, man, aqui, entrada, salida, terminal)
     with _cerrojo(sis):
         return orden(op, sis, man, aqui, entrada, salida, terminal)
+
+
+def _sin_root(op, argv, sis, aqui, salida, relanzar, usuario) -> int:
+    """Lo primero de todo, antes de detectar nada: sin root, o se relanza con `sudo -n` o se para sin tocar nada."""
+    sudo = permisos.sondear_sudo(sis)
+    permitido = sudo != "sin-contrasena" and permisos.instalado_permitido(sis)
+    instalada = permisos.version_instalada(sis) if permitido else None
+    como = permisos.decidir(1, sudo, permitido and instalada == VERSION)
+    if como in ("sudo", "instalado"):
+        orden = (permisos.orden_relanzada(os.path.join(aqui, "hehermes-servidor"), argv) if como == "sudo" else
+                 permisos.orden_relanzada(permisos.INSTALADO, argv, python=False))
+        codigo = relanzar(orden)
+        return 0 if codigo is None else codigo
+    for linea in permisos.mensaje(sudo, usuario, aqui, argv, bool(getattr(op, "por_chat", False)),
+                                  otra_version=instalada if permitido else None):
+        salida(linea)
+    return 1
+
+
+def _relanzar_de_verdad(orden) -> int:
+    sys.stdout.flush()
+    os.execvp(orden[0], orden)
+    return 1  # execvp no vuelve
+
+
+def _usuario() -> str:
+    import pwd
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        return "<tu-usuario>"
 
 
 def _uso_por_chat(op):
@@ -158,12 +197,14 @@ def _pregunta_si(entrada, salida, terminal, si, texto="¿Sigo? [s/N] "):
 def _instalar(op, sis, man, aqui, entrada, salida, terminal):
     opciones = Opciones(iphone=op.iphone, direccion=op.direccion, avisos=op.avisos, hermes_home=op.hermes_home,
                         reemplazar=op.reemplazar, si=op.si or op.por_chat, solo_plan=op.plan, por_chat=op.por_chat,
-                        llave=op.llave, activar_api=op.activar_api, qr_png=op.qr_png)
+                        llave=op.llave, activar_api=op.activar_api, qr_png=op.qr_png,
+                        cortafuegos_a_mano=op.cortafuegos_a_mano, corregir_exposicion=op.corregir_exposicion)
     if op.por_chat:
         # Lo lanza Hermes: no hay nadie a quien preguntar.
         terminal = False
     det = detectar(sis, man, direccion=opciones.direccion, hermes_home=opciones.hermes_home,
-                   activar_api=opciones.activar_api)
+                   activar_api=opciones.activar_api, cortafuegos_a_mano=opciones.cortafuegos_a_mano,
+                   corregir_exposicion=opciones.corregir_exposicion)
     if det.direccion_privada and terminal and not op.plan:
         # Detrás de un NAT: la de salida no es la que va en el QR. Solo se pregunta en un terminal.
         try:
@@ -173,7 +214,8 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal):
         if DIRECCION_VALIDA.match(dada.strip()):
             opciones.direccion = dada.strip()
             det = detectar(sis, man, direccion=opciones.direccion, hermes_home=opciones.hermes_home,
-                           activar_api=opciones.activar_api)
+                           activar_api=opciones.activar_api, cortafuegos_a_mano=opciones.cortafuegos_a_mano,
+                           corregir_exposicion=opciones.corregir_exposicion)
     plan = calcular_plan(sis, det, man, opciones, aqui)
     salida(pintar(plan, color=terminal).rstrip("\n"))
     if op.plan or not plan.puede_seguir:
@@ -195,7 +237,7 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal):
                % parada)
         return 1
     salida("\nHecho. «sudo hehermes-servidor comprobar» lo repasa cuando quieras.")
-    if any(a.tipo == "env" and a.cambia for a in plan.acciones):
+    if any(a.tipo in ("env", "exposicion") and a.cambia for a in plan.acciones):
         # Lo último: reiniciar Hermes antes de acabar le cortaría el turno en el que contesta con el enlace.
         porchat.reiniciar_hermes_luego(sis, salida)
     if el_enlace:
@@ -205,15 +247,42 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal):
 
 
 def _comprobar(op, sis, man, aqui, entrada, salida, terminal):
+    from . import seguridad
     resultados = comprobar(sis, man)
     for bien, texto in resultados:
         salida("  %-5s %s" % ("bien" if bien else "MAL", texto))
-    return 0 if all(bien for bien, _ in resultados) else 1
+    salida("")
+    salida("Seguridad")
+    revision = seguridad.revisar(sis, man)
+    for estado, texto in revision:
+        salida("  %-5s %s" % ("MAL" if estado == seguridad.MAL else estado, texto))
+    return 0 if all(bien for bien, _ in resultados) and all(e != seguridad.MAL for e, _ in revision) else 1
 
 
 def _canje_limpiar(op, sis, man, aqui, entrada, salida, terminal):
     from .porchat import limpiar
     limpiar(sis, os.environ)
+    return 0
+
+
+def _cortafuegos(op, sis, man, aqui, entrada, salida, terminal):
+    """`hehermes-cortafuegos.service`. Al arrancar (y si el cortafuegos del sistema se recarga): quita lo que un
+    reinicio dejó del canje y vuelve a poner las reglas de HeHermes en nftables o iptables. Al pararse, las quita."""
+    from . import cortafuegos as cf
+    from . import porchat
+    if op.accion == "quitar":
+        cf.quitar(sis, cf.MARCA)
+        return 0
+    porchat.limpiar_restos(sis)
+    propio = man.datos.get("cortafuegos_propio")
+    try:
+        if propio:
+            lugares = cf.poner(sis, cf.MARCA, cf.permanentes(), propio.get("iptables", True))
+            salida("reglas de HeHermes en: %s" % (", ".join(l.nombre for l in lugares) or "ninguna cadena cierra"))
+        porchat.volver_a_abrir(sis, propio)
+    except cf.NoSe as error:
+        salida("error: no pongo las reglas de HeHermes: %s" % error)
+        return 1
     return 0
 
 
@@ -224,12 +293,26 @@ def _actualizar(op, sis, man, aqui, entrada, salida, terminal):
         salida("error: la clave pública de este paquete es el marcador (%s): no hay firma que comprobar, así que no "
                "actualizo. Mientras tanto, vuelve a lanzar el comando de la app." % firma.MARCADOR)
         return 1
-    if not firma.verificar(sis, op.paquete, op.firma, ruta_clave):
-        salida("error: la firma de %s no es buena: no lo instalo" % op.paquete)
-        return 1
+    # Todo sobre una copia en una carpeta 0700 de root: si se comprobara y se abriera el fichero que se da, quien
+    # pudiera escribir donde está lo podría cambiar entre la firma y el tar.
     carpeta = tempfile.mkdtemp(prefix="hehermes-servidor-")
     try:
-        lanzador = _desempaquetar(op.paquete, carpeta)
+        paquete, sello = os.path.join(carpeta, "paquete.tar.gz"), os.path.join(carpeta, "paquete.tar.gz.sig")
+        try:
+            shutil.copyfile(op.paquete, paquete)
+            shutil.copyfile(op.firma, sello)
+        except OSError as error:
+            salida("error: no puedo leer el paquete o su firma (%s)" % error)
+            return 1
+        if not firma.verificar(sis, paquete, sello, ruta_clave):
+            salida("error: la firma de %s no es buena: no lo instalo" % op.paquete)
+            return 1
+        version = _version_del_paquete(paquete)
+        if version is not None and _tupla(version) < _tupla(VERSION):
+            salida("error: %s es la versión %s, más vieja que la instalada (%s): no vuelvo atrás, aunque esté "
+                   "firmada (una versión vieja puede tener un fallo ya arreglado)" % (op.paquete, version, VERSION))
+            return 1
+        lanzador = _desempaquetar(paquete, carpeta)
         orden = ["python3", "-I", lanzador, "instalar", "--si"] + (["--avisos"] if man.datos.get("avisos") else [])
         return sis.ejecutar(orden, heredar=True).codigo
     except ValueError as error:
@@ -237,6 +320,20 @@ def _actualizar(op, sis, man, aqui, entrada, salida, terminal):
         return 1
     finally:
         shutil.rmtree(carpeta, ignore_errors=True)
+
+
+def _tupla(version):
+    return tuple(int(x) for x in version.split("."))
+
+
+def _version_del_paquete(paquete):
+    try:
+        with tarfile.open(paquete, "r:gz") as tar:
+            raiz = tar.getmembers()[0].name.split("/", 1)[0]
+    except (tarfile.TarError, OSError, IndexError):
+        return None
+    hallado = re.match(r"^hehermes-servidor-(\d+\.\d+\.\d+)$", raiz)
+    return hallado.group(1) if hallado else None
 
 
 def _desempaquetar(paquete, carpeta):

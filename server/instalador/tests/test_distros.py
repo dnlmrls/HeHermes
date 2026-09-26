@@ -5,6 +5,7 @@ import apoyo
 
 import json
 import unittest
+from unittest import mock
 
 import servidor_falso as sf
 from hehermes_servidor import cli
@@ -256,7 +257,7 @@ class FamiliaRedHat(Base):
         sis.borrar("/usr/bin/firewall-cmd")
         det = self.detectar()
         self.assertIsNone(det.firewalld)
-        self.assertTrue(any("No hay ufw ni firewalld" in a for a in det.avisos))
+        self.assertTrue(any("No hay ningún cortafuegos" in a for a in det.avisos))
 
     def test_selinux_con_el_puerto_ya_etiquetado(self):
         sis, falso = self.rocky()
@@ -294,6 +295,7 @@ class FamiliaRedHat(Base):
         plan = self.plan(avisos=True)
         self.assertTrue(any("solo en Debian y Ubuntu" in b for b in plan.bloqueos), plan.bloqueos)
 
+    @mock.patch.object(porchat, "_azar", lambda n: 443)
     def test_el_canje_por_chat_abre_su_puerto_solo_mientras_dura(self):
         sis, falso = self.rocky()
         texto = []
@@ -301,25 +303,26 @@ class FamiliaRedHat(Base):
                            "KCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEFCQ0RFRkc"], "uso", ORIGEN, sis=sis,
                           entrada=lambda _: "n", salida=texto.append, terminal=False, euid=0)
         self.assertEqual(codigo, 0, "\n".join(texto))
-        self.assertTrue(texto[-1].startswith("hehermes-canje:1?h=%s&p=443&" % sf.IP_PUBLICA), texto[-1])
-        self.assertIn("port=443/tcp", falso.fw_ahora)
-        self.assertNotIn("port=443/tcp", falso.fw_permanente, "solo en la de ahora: no sobrevive a un reinicio")
+        self.assertTrue(texto[-1].startswith("hehermes-canje:1?h=%s&p=58443&" % sf.IP_PUBLICA), texto[-1])
+        self.assertIn("port=58443/tcp", falso.fw_ahora)
+        self.assertNotIn("port=58443/tcp", falso.fw_permanente, "solo en la de ahora: no sobrevive a un reinicio")
         estado = json.loads(sis.leer_texto(porchat.RUN + "/estado.json"))
         self.assertEqual(estado["cortafuegos"], "firewalld")
         carga = json.loads(sis.leer_texto(porchat.RUN + "/canje.json"))["carga"]
         self.assertEqual(carga["k"], sf.PSK, "la PSK, de la conexión en /etc/strongswan/swanctl")
         porchat.limpiar(sis, {})
-        self.assertNotIn("port=443/tcp", falso.fw_ahora)
+        self.assertNotIn("port=58443/tcp", falso.fw_ahora)
 
+    @mock.patch.object(porchat, "_azar", lambda n: 443)
     def test_el_canje_no_cierra_un_puerto_que_ya_estaba_abierto(self):
         sis, falso = self.rocky()
-        falso.fw_ahora.add("port=443/tcp")
+        falso.fw_ahora.add("port=58443/tcp")
         texto = []
         cli.main(["instalar", "--por-chat", "--iphone", "mi-iphone", "--llave",
                   "KCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEFCQ0RFRkc"], "uso", ORIGEN, sis=sis, entrada=lambda _: "n",
                  salida=texto.append, terminal=False, euid=0)
         porchat.limpiar(sis, {})
-        self.assertIn("port=443/tcp", falso.fw_ahora)
+        self.assertIn("port=58443/tcp", falso.fw_ahora)
 
 
 if __name__ == "__main__":

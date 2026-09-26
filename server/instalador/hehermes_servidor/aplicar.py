@@ -85,6 +85,7 @@ def _orden(sis, args, que, entrada=None):
 NGINX = {p.BEARER, p.SITIO, p.SITIO_ENLACE, p.SITIO_CONF_D, p.DROP_IN_NGINX, p.DEFAULT_NGINX, "recargar nginx"}
 XFRM = {p.SCRIPT_XFRM, p.UNIDAD_XFRM, "hehermes-xfrm.service"}
 CLAVE = {p.UNIDAD_CLAVE_PATH, p.UNIDAD_CLAVE_SERVICE, "hehermes-clave.path"}
+CORTAFUEGOS = {p.UNIDAD_CORTAFUEGOS, "hehermes-cortafuegos.service"}
 
 
 def aplicar(sis, plan, man, origen, salida=print):
@@ -105,16 +106,21 @@ def aplicar(sis, plan, man, origen, salida=print):
         if a.tipo == "env" and a.cambia:
             from .porchat import activar_api
             activar_api(sis, man, a, salida)
+        if a.tipo == "exposicion" and a.cambia:
+            from .porchat import corregir_exposicion
+            corregir_exposicion(sis, man, a, salida)
     _paquetes(sis, man, [a for a in acciones if a.tipo == "paquete"], salida, det.familia)
     _strongswan(sis, man, [a for a in acciones if a.objeto == "strongswan.service"], salida)
     _selinux(sis, man, [a for a in acciones if a.tipo == "selinux"], salida)
     # Los ficheros sueltos: el instalador en /opt, su orden, servidor.ini y hehermes-dispositivo.
-    sueltos = [a for a in acciones if a.tipo in ("fichero", "enlace") and a.objeto not in NGINX | XFRM | CLAVE]
+    sueltos = [a for a in acciones if a.tipo in ("fichero", "enlace") and a.objeto not in NGINX | XFRM | CLAVE | CORTAFUEGOS]
     _ficheros(sis, man, sueltos, "ficheros", salida, etiquetar)
     _con_unidad(sis, man, de(XFRM), "hehermes-xfrm.service", salida, etiquetar)
     _nginx(sis, man, de(NGINX), salida, etiquetar)
     _ufw(sis, man, [a for a in acciones if a.tipo == "regla"], salida)
     _firewalld(sis, man, det, [a for a in acciones if a.tipo == "firewalld"], salida)
+    _propio(sis, man, det, [a for a in acciones if a.tipo == "propio"], salida)
+    _con_unidad(sis, man, de(CORTAFUEGOS), "hehermes-cortafuegos.service", salida, etiquetar)
     _con_unidad(sis, man, de(CLAVE), "hehermes-clave.path", salida, etiquetar)
     for a in acciones:
         if a.tipo == "avisos" and a.cambia:
@@ -124,7 +130,7 @@ def aplicar(sis, plan, man, origen, salida=print):
                 raise Parada("el instalador de los avisos ha fallado (arriba dice por qué)")
             man.datos["avisos"] = True
             man.guardar(sis)
-    pendiente = any(a.tipo == "env" and a.cambia for a in acciones)
+    pendiente = any(a.tipo in ("env", "exposicion") and a.cambia for a in acciones)
     fallos = [texto for bien, texto in comprobar(sis, man, hermes_pendiente=pendiente) if not bien]
     if fallos:
         raise Parada("la comprobación no pasa:\n  - " + "\n  - ".join(fallos))
@@ -205,6 +211,22 @@ def _firewalld(sis, man, det, acciones, salida):
         man.datos["cortafuegos"] = "firewalld"
         man.guardar(sis)
         salida("==> firewalld: %s" % a.objeto)
+
+
+def _propio(sis, man, det, acciones, salida):
+    """nftables o iptables a pelo: se apunta antes de poner nada (lo lee `hehermes-cortafuegos` al arrancar) y se
+    ponen todas de una vez, quitando antes las que hubiera (`cortafuegos.poner`)."""
+    from . import cortafuegos as cf
+    if not any(a.cambia for a in acciones):
+        return
+    man.datos["cortafuegos_propio"] = {"iptables": det.con_iptables}
+    man.guardar(sis)
+    try:
+        lugares = cf.poner(sis, cf.MARCA, cf.permanentes(), det.con_iptables)
+    except cf.NoSe as error:
+        raise Parada("no he podido poner las reglas en tu cortafuegos, y no he dejado ninguna: %s" % error)
+    for lugar in lugares:
+        salida("==> %s: UDP 500 y 4500, y TCP 80 por %s (%s)" % (lugar.nombre, p.INTERFAZ, lugar.donde))
 
 
 def _ficheros(sis, man, acciones, que, salida, etiquetar=False):
@@ -337,6 +359,15 @@ def comprobar(sis, man, hermes_pendiente=False) -> list:
         hay = {regla_ufw_canonica(linea.strip()) for linea in added.splitlines()}
         faltan = [r.nombre for r in p.reglas_ufw() if regla_ufw_canonica(r.texto) not in hay]
         mira(not faltan, "ufw: las reglas de HeHermes están", "ufw: faltan reglas (%s)" % ", ".join(faltan))
+    propio = man.datos.get("cortafuegos_propio")
+    if propio:
+        from . import cortafuegos as cf
+        lugares, dudas = cf.analizar(sis, propio.get("iptables", True))
+        faltan = [l.nombre for l in lugares if l.marcadas < len(cf.permanentes())]
+        mira(not faltan and not dudas,
+             "cortafuegos: las reglas de HeHermes están (%s)" % (", ".join(l.nombre for l in lugares) or
+                                                                  "ninguna cadena cierra el paso"),
+             "cortafuegos: faltan reglas en %s" % ", ".join(faltan + dudas))
     # Hermes, directo y con su clave; el túnel, desde el propio servidor, tiene que decir que no.
     env, puerto = _hermes_del_ini(sis)
     clave = leer_env(sis.leer_texto(env) or "").get("API_SERVER_KEY") if env else None
