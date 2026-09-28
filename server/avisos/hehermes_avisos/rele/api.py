@@ -1,6 +1,8 @@
 """La API del relé.
 
-- ``POST /v1/avisos`` con ``Authorization: Bearer <credencial del vigía>``: manda un aviso ya cifrado.
+- ``POST /v1/avisos`` con ``Authorization: Bearer <credencial del vigía>``: manda un aviso ya cifrado. O, desde la 1.3.0,
+  con ``Authorization: Permiso hhp1.…``: el permiso de ese iPhone (``permisos``), que solo vale para su token y su
+  entorno.
 - ``GET /v1/credencial`` con la misma cabecera: para que el vigía compruebe su credencial sin mandar nada.
 - ``GET /v1/salud``: si el relé está vivo. No dice nada más.
 
@@ -16,6 +18,8 @@ Lo que contesta a un aviso, para que el vigía sepa qué hacer sin conocer los m
 503   el relé está en marcha pero sin la clave de APNs                   reintentar más tarde
 400   la petición no es válida (y por qué)                                nada (es un fallo suyo)
 401   credencial desconocida                                              nada
+401   ``{"resultado": "permiso", "motivo": "permiso_invalido|…"}``        olvidar el permiso
+403   ``{"resultado": "permiso", "motivo": "permiso_de_otro_token"}``     olvidar el permiso
 ====  ================================================================  ==========================
 """
 
@@ -24,8 +28,11 @@ from __future__ import annotations
 import logging
 import time
 
+from dataclasses import dataclass
+
 from ..comun import ErrorHTTP, ManejadorJSON, cola
 from . import credenciales as modulo_credenciales
+from . import permisos as modulo_permisos
 from .apns import ClienteAPNs
 from .limites import Limitador, huella_de_token
 from .validacion import validar
@@ -40,6 +47,26 @@ MOTIVOS_DE_CONFIGURACION = frozenset({
     "UnrelatedKeyIdInToken", "BadEnvironmentKeyIdInToken", "BadPath", "MethodNotAllowed"})
 
 
+class RechazoDePermiso(Exception):
+    """Un aviso con un permiso que no vale: el vigía lo olvida y se lo vuelve a pedir a la app."""
+
+    def __init__(self, estado: int, motivo: str):
+        super().__init__(motivo)
+        self.estado, self.motivo = estado, motivo
+
+
+@dataclass(frozen=True)
+class PermisoPresentado:
+    """Lo que hace las veces de credencial en un aviso con permiso: su nombre en el registro y en los límites (la
+    clave de App Attest, recortada) y el tope por minuto de un solo iPhone."""
+    carga: modulo_permisos.Carga
+    por_minuto: int = modulo_permisos.POR_MINUTO_PERMISO
+
+    @property
+    def nombre(self) -> str:
+        return self.carga.nombre
+
+
 class AppRele:
     """``credenciales``: un ``credenciales.Almacen`` (el de verdad, que sigue al fichero) o un dict fijo de huellas.
 
@@ -47,14 +74,25 @@ class AppRele:
     (``sin_clave_apns``), y su salud lo dice."""
 
     def __init__(self, credenciales: dict, apns: ClienteAPNs | None, limitador: Limitador, reservas: list,
-                 reloj=time.time):
+                 reloj=time.time, permisos: modulo_permisos.Verificador | None = None):
         self.credenciales = credenciales
+        # Sin verificador (o sin su clave pública), ningún permiso vale: solo las credenciales.
+        self.permisos = permisos
         self.apns = apns
         self.limitador = limitador
         self.reservas = reservas
         self.reloj = reloj
 
     def autenticar(self, cabecera: str | None):
+        permiso = modulo_permisos.permiso_de(cabecera)
+        if permiso is not None:
+            if self.permisos is None:
+                raise RechazoDePermiso(401, "permiso_invalido")
+            try:
+                return PermisoPresentado(self.permisos.comprobar(permiso))
+            except modulo_permisos.ErrorDePermiso as error:
+                registro.warning("aviso con un permiso que no vale: %s", error.motivo)
+                raise RechazoDePermiso(401, error.motivo) from None
         tipo, _, secreto = (cabecera or "").partition(" ")
         credencial = None
         if tipo.lower() == "bearer" and secreto.strip():
@@ -75,6 +113,12 @@ class AppRele:
         aviso = validar(peticion, self.reservas)
         clave_token = huella_de_token(aviso.token, aviso.entorno)
         destino = f"{cola(aviso.token)} ({aviso.entorno})"
+        if isinstance(credencial, PermisoPresentado) and (
+                modulo_permisos.huella(aviso.token) != credencial.carga.token
+                or aviso.entorno != credencial.carga.entorno):
+            registro.warning("aviso → %s con «%s»: el permiso es de otro token o de otro entorno", destino,
+                             credencial.nombre)
+            raise RechazoDePermiso(403, "permiso_de_otro_token")
         if self.limitador.de_baja(clave_token):
             registro.info("aviso → %s de «%s»: ya dado de baja, no se pregunta a Apple", destino, credencial.nombre)
             return 410, {"resultado": "baja", "motivo": "Unregistered", "baja": True}, {}
@@ -123,6 +167,12 @@ class ManejadorRele(ManejadorJSON):
         return "rele.api"
 
     def atender(self) -> None:
+        try:
+            self._atender()
+        except RechazoDePermiso as rechazo:
+            self.enviar_json(rechazo.estado, {"resultado": "permiso", "motivo": rechazo.motivo})
+
+    def _atender(self) -> None:
         app: AppRele = self.server.app
         ruta, metodo = self.ruta, self.command
         if ruta == "/v1/salud" and metodo == "GET":
@@ -131,6 +181,8 @@ class ManejadorRele(ManejadorJSON):
             return self.enviar_json(200, {"estado": "ok", "servicio": "rele"})
         if ruta == "/v1/credencial" and metodo == "GET":
             credencial = app.autenticar(self.headers.get("Authorization"))
+            if isinstance(credencial, PermisoPresentado):
+                raise ErrorHTTP(401, "credencial_invalida", "Credencial desconocida", {"WWW-Authenticate": "Bearer"})
             return self.enviar_json(200, {"credencial": credencial.nombre})
         if ruta == "/v1/avisos":
             if metodo != "POST":

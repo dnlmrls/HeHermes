@@ -361,7 +361,7 @@ def pasarela_ini(ambito, puerto: int, puerto_hermes: int, env: str, direccion: s
     return texto
 
 
-# MARK: Los avisos: el vigía (spec 2026-09-28, «El relé para los probadores»)
+# MARK: Los avisos: el vigía (spec 2026-09-28, «El relé para los probadores»; y desde la 0.8.0, «Avisos sin comandos»)
 
 USUARIO_VIGIA = "hh-vigia"
 UNIDAD_VIGIA = "hehermes-vigia.service"
@@ -384,14 +384,29 @@ def _ip_del_rele(direccion: str) -> str | None:
         return None
 
 
-def vigia_ini(ambito, puerto_hermes: int, env: str, casa_hermes: str, direccion: str, puerto: int,
-              huella: str) -> str:
-    """Lo que lee el vigía (`hehermes_avisos.vigia.configuracion`). Sin secretos: dice dónde están. El relé es el de
-    otra máquina (el de Daniel), por HTTPS y con la huella de su certificado anclada; la credencial, en su fichero."""
+def vigia_ini(ambito, puerto_hermes: int, env: str, casa_hermes: str, direccion: str | None = None,
+              puerto: int | None = None, huella: str | None = None, lector: str | None = None) -> str:
+    """Lo que lee el vigía (`hehermes_avisos.vigia.configuracion`). Sin secretos: dice dónde están.
+
+    Con un código de avisos (`direccion`, `puerto`, `huella`), el relé es el de otra máquina (el de Daniel), por HTTPS
+    y con la huella de su certificado anclada, y la credencial va en su fichero. Sin código (`direccion` None), sin
+    credencial ni relé fijo: `[rele] url` vacía, y cada aviso va con el permiso que la app le da en el alta de cada
+    iPhone, con la dirección y la huella del relé que trae con él. `lector`: el socket del lector de ficheros."""
     if not isinstance(puerto_hermes, int) or not 0 < puerto_hermes < 65536:
         raise ValueError("puerto de Hermes no válido: %r" % (puerto_hermes,))
-    if not re.fullmatch(r"[A-Za-z0-9_-]{43}", huella or ""):
-        raise ValueError("huella del relé no válida")
+    if direccion is None:
+        rele = ("# Sin credencial: cada aviso va a la entrada pública del relé con el permiso que la app le da al vigía\n"
+                "# en el alta de cada iPhone (App Attest), anclado a la huella que trae con él. Con un código de\n"
+                "# avisos (hehermes-servidor avisos), la credencial.\n"
+                "url =\n")
+    else:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{43}", huella or ""):
+            raise ValueError("huella del relé no válida")
+        rele = "url = %s\nhuella = %s\ncredencial = %s\n" % (url_del_rele(direccion, puerto), huella,
+                                                              _ruta_segura(ambito.credencial_rele))
+    ficheros = ("# El lector de ficheros (GET /avisos/v1/fichero): sin él, esa ruta contesta 503.\nlector = %s\n"
+                % _ruta_segura(lector) if lector else
+                "# Sin el lector de ficheros (GET /avisos/v1/fichero): esa ruta contesta 503.\nlector =\n")
     return (
         CABECERA
         + "# El vigía de avisos de HeHermes (server/avisos/README.md): lee a Hermes, cifra cada aviso para cada iPhone y\n"
@@ -406,17 +421,13 @@ def vigia_ini(ambito, puerto_hermes: int, env: str, casa_hermes: str, direccion:
         "clave = %s\n"
         "\n"
         "[rele]\n"
-        "url = %s\n"
-        "huella = %s\n"
-        "credencial = %s\n"
+        "%s"
         "\n"
         "[ficheros]\n"
-        "# El lector de ficheros (GET /avisos/v1/fichero) no lo pone el instalador: esa ruta contesta 503.\n"
-        "lector =\n"
+        "%s"
         "casa = %s\n"
     ) % (VIGIA, _ruta_segura(ambito.base_vigia), _ruta_segura(ambito.secreto_vigia), puerto_hermes,
-         _ruta_segura(ambito.clave_hermes_vigia if ambito.root else env), url_del_rele(direccion, puerto), huella,
-         _ruta_segura(ambito.credencial_rele), _ruta_segura(casa_hermes))
+         _ruta_segura(ambito.clave_hermes_vigia if ambito.root else env), rele, ficheros, _ruta_segura(casa_hermes))
 
 
 def unidad_vigia_socket() -> str:
@@ -437,11 +448,20 @@ def unidad_vigia_socket() -> str:
     ) % VIGIA
 
 
-def unidad_vigia(ambito, direccion_rele: str) -> str:
+#: Sin credencial, el relé no se sabe al instalar (la dirección del VPS de Daniel no puede ir en el espejo público): el
+#: vigía sale a internet, pero no a la red de dentro (spec 2026-09-28, «El instalador 0.8.0»). Esta máquina sí
+#: (Hermes, la pasarela): `IPAddressAllow=localhost` gana a esto.
+REDES_DE_DENTRO = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10", "fc00::/7",
+                   "fe80::/10")
+
+
+def unidad_vigia(ambito, direccion_rele: str | None) -> str:
     """Con root, como `hh-vigia`, con el socket de systemd y la jaula de la del VPS de Daniel
     (`server/avisos/despliegue/hehermes-vigia.service`); la red, solo hacia esta máquina y hacia el relé si su dirección
-    es una IP. Sin root, una unidad de usuario que abre su propio puerto. Sin `MemoryDenyWriteExecute`: cffi (de
-    cryptography) puede necesitar memoria ejecutable, y un vigía que no arranca no avisa de nada."""
+    es una IP. Sin código de avisos (`direccion_rele` None), hacia esta máquina y hacia internet, pero no hacia las
+    redes de dentro (`REDES_DE_DENTRO`). Sin root, una unidad de usuario que abre su propio puerto. Sin
+    `MemoryDenyWriteExecute`: cffi (de cryptography) puede necesitar memoria ejecutable, y un vigía que no arranca no
+    avisa de nada. Los dos quieren el socket del lector de ficheros, si está (`Wants=`: sin él, el vigía va igual)."""
     orden = "%s -I -B -m hehermes_avisos.vigia --config %s servir" % (_ruta_segura(ambito.python_venv),
                                                                       _ruta_segura(ambito.vigia_ini))
     comun = (
@@ -457,11 +477,17 @@ def unidad_vigia(ambito, direccion_rele: str) -> str:
         "LimitCORE=0\n"
     )
     if not ambito.root:
+        red = ("" if direccion_rele is not None else
+               "# Sin credencial, a internet. Una unidad de usuario no puede filtrar direcciones (IPAddressDeny necesita\n"
+               "# privilegios que un gestor de usuario no tiene): lo que impide ir a la red de dentro es el propio vigía,\n"
+               "# que se niega a conectar a una dirección que no sea pública, y la huella anclada del relé.\n")
         return (
             CABECERA
             + "# El vigía de avisos de HeHermes, como el usuario de Hermes: lee su .env.\n"
             "[Unit]\n"
             "Description=HeHermes: vigía de avisos\n"
+            "Wants=%s\n"
+            "After=%s\n"
             "\n"
             "[Service]\n"
             "Type=simple\n"
@@ -469,21 +495,27 @@ def unidad_vigia(ambito, direccion_rele: str) -> str:
             "Restart=always\n"
             "RestartSec=5\n"
             "%s"
+            "%s"
             "\n"
             "[Install]\n"
             "WantedBy=default.target\n"
-        ) % (orden, comun)
-    ip = _ip_del_rele(direccion_rele)
-    red = ("# Solo esta máquina (Hermes, la pasarela) y el relé.\nIPAddressDeny=any\nIPAddressAllow=localhost %s\n" % ip
-           if ip else "# El relé va por nombre (%s): sin filtro de direcciones.\n" % direccion_rele)
+        ) % (SOCKET_LECTOR, SOCKET_LECTOR, orden, red, comun)
+    if direccion_rele is None:
+        red = ("# Sin credencial: el relé de cada permiso lo dice la app, y no se sabe al instalar. Esta máquina (Hermes,\n"
+               "# la pasarela) e internet, sí; las redes de dentro, no. La huella anclada cierra el paso a cualquier otro.\n"
+               "IPAddressAllow=localhost\nIPAddressDeny=%s\n" % " ".join(REDES_DE_DENTRO))
+    else:
+        ip = _ip_del_rele(direccion_rele)
+        red = ("# Solo esta máquina (Hermes, la pasarela) y el relé.\nIPAddressDeny=any\nIPAddressAllow=localhost %s\n"
+               % ip if ip else "# El relé va por nombre (%s): sin filtro de direcciones.\n" % direccion_rele)
     return (
         CABECERA
         + "# El vigía de avisos de HeHermes: lee a Hermes (sin tocarlo) y pide los avisos al relé.\n"
         "[Unit]\n"
         "Description=HeHermes: vigía de avisos\n"
-        "Wants=network-online.target\n"
+        "Wants=network-online.target %s\n"
         "Requires=%s\n"
-        "After=network-online.target %s\n"
+        "After=network-online.target %s %s\n"
         "\n"
         "[Service]\n"
         "Type=simple\n"
@@ -515,5 +547,159 @@ def unidad_vigia(ambito, direccion_rele: str) -> str:
         "[Install]\n"
         "WantedBy=multi-user.target\n"
         "Also=%s\n"
-    ) % (SOCKET_VIGIA, SOCKET_VIGIA, USUARIO_VIGIA, USUARIO_VIGIA, orden, red, ambito.carpeta_pasarela,
-         ambito.carpeta_config, comun, SOCKET_VIGIA)
+    ) % (SOCKET_LECTOR, SOCKET_VIGIA, SOCKET_VIGIA, SOCKET_LECTOR, USUARIO_VIGIA, USUARIO_VIGIA, orden, red,
+         ambito.carpeta_pasarela, ambito.carpeta_config, comun, SOCKET_VIGIA)
+
+
+# MARK: El lector de ficheros (spec 2026-09-28, «El instalador 0.8.0»)
+
+SOCKET_LECTOR = "hehermes-leer-media.socket"
+#: Lo que se sabe que hay en la carpeta de Hermes, fuera de sus caches: la jaula lo tapa además de que el lector lo
+#: prohíba (lo mismo que `server/avisos/despliegue/instalar.sh`, SECRETOS_HERMES).
+SECRETOS_HERMES = (".env", "auth.json", "config.yaml", "state.db", "state.db-wal", "state.db-shm", "SOUL.md",
+                   "backups", "cron", "hooks", "engagements")
+
+
+def unidad_lector_socket(ambito) -> str:
+    """Con root, `/run/hehermes-leer-media.sock`, de root y del grupo `hh-vigia` (0660), como en el VPS de Daniel
+    (`server/avisos/despliegue/hehermes-leer-media.socket`). Sin root, en el `/run/user` del usuario de Hermes (`%t`),
+    0600: solo él (y su vigía, que es él) se conecta."""
+    if ambito.root:
+        dueno = ("ListenStream=/run/hehermes-leer-media.sock\nSocketUser=root\nSocketGroup=%s\nSocketMode=0660\n"
+                 % USUARIO_VIGIA)
+        que = ("# Solo root y el grupo hh-vigia pueden conectarse (0660), y el lector lo vuelve a mirar con SO_PEERCRED.\n"
+               "# Por cada conexión, systemd lanza un lector de root con su jaula (hehermes-leer-media@.service).\n")
+    else:
+        dueno = "ListenStream=%t/hehermes-leer-media.sock\nSocketMode=0600\n"
+        que = ("# En el /run/user del usuario de Hermes, 0600, y el lector solo atiende a su propio uid (--usuario).\n"
+               "# Por cada conexión, systemd lanza un lector como este usuario (hehermes-leer-media@.service).\n")
+    return (
+        CABECERA
+        + "# La puerta del lector de los ficheros que Hermes marca con MEDIA: (GET /avisos/v1/fichero del vigía).\n"
+        + que
+        + "[Unit]\n"
+        "Description=HeHermes: el socket del lector de ficheros de Hermes\n"
+        "\n"
+        "[Socket]\n"
+        + dueno
+        + "Accept=yes\n"
+        "# El vigía no pasa de dos a la vez; esto es el tope por si algo va mal.\n"
+        "MaxConnections=4\n"
+        "RemoveOnStop=yes\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=sockets.target\n"
+    )
+
+
+#: La jaula del lector de root, la misma que la de `server/avisos/despliegue/hehermes-leer-media@.service` (una prueba
+#: las compara): leer, y solo leer.
+_JAULA_LECTOR = (
+    "CapabilityBoundingSet=CAP_DAC_READ_SEARCH\n"
+    "NoNewPrivileges=yes\n"
+    "ProtectSystem=strict\n"
+    "ProtectHome=read-only\n"
+    "PrivateNetwork=yes\n"
+    "IPAddressDeny=any\n"
+    "RestrictAddressFamilies=AF_UNIX\n"
+    "PrivateDevices=yes\n"
+    "PrivateIPC=yes\n"
+    "ProtectKernelTunables=yes\n"
+    "ProtectKernelModules=yes\n"
+    "ProtectKernelLogs=yes\n"
+    "ProtectControlGroups=yes\n"
+    "ProtectClock=yes\n"
+    "ProtectHostname=yes\n"
+    "ProtectProc=invisible\n"
+    "ProcSubset=pid\n"
+    "KeyringMode=private\n"
+    "RestrictNamespaces=yes\n"
+    "RestrictRealtime=yes\n"
+    "RestrictSUIDSGID=yes\n"
+    "LockPersonality=yes\n"
+    "MemoryDenyWriteExecute=yes\n"
+    "SystemCallArchitectures=native\n"
+    "SystemCallFilter=@system-service\n"
+    "SystemCallErrorNumber=EPERM\n"
+)
+#: Lo que una unidad de usuario sí puede ponerse (seccomp y límites, con NoNewPrivileges): nada de espacios de nombres
+#: ni de capacidades, que un gestor de usuario no siempre tiene.
+_JAULA_LECTOR_USUARIO = (
+    "NoNewPrivileges=yes\n"
+    "RestrictAddressFamilies=AF_UNIX\n"
+    "RestrictNamespaces=yes\n"
+    "RestrictRealtime=yes\n"
+    "RestrictSUIDSGID=yes\n"
+    "LockPersonality=yes\n"
+    "MemoryDenyWriteExecute=yes\n"
+    "SystemCallArchitectures=native\n"
+    "SystemCallFilter=@system-service\n"
+    "SystemCallErrorNumber=EPERM\n"
+)
+
+
+def unidad_lector(ambito, hermes_home: str) -> str:
+    """Un lector por conexión (`Accept=yes`): lee una línea con la ruta y contesta con el fichero por el mismo socket.
+
+    Con root, de root y con la jaula del VPS de Daniel, y la carpeta de Hermes (`--hermes-home`) prohibida salvo sus
+    caches, también tapada en la jaula, igual que los secretos del instalador. Sin root, como el usuario de Hermes, que
+    ya puede leer lo que Hermes escribe, con `--usuario` (solo atiende a su propio uid) y con lo que una unidad de
+    usuario se puede poner. Lo que no puede (ProtectSystem, ProtectHome, InaccessiblePaths, PrivateNetwork…) lo dice
+    ella misma: ahí, lo que no se lee lo decide solo el lector, con su lista de prohibidas."""
+    casa = _ruta_segura(hermes_home.rstrip("/"))
+    if not ambito.root:
+        return (
+            CABECERA
+            + "# Un lector por conexión a %%t/hehermes-leer-media.sock, como el usuario de Hermes: lee lo que él puede\n"
+            "# leer y nada de lo que el lector prohíbe (la carpeta de Hermes salvo sus caches, ~/.ssh, cualquier .env,\n"
+            "# lo de hehermes en ~/.config y ~/.local…).\n"
+            "# Lo que una unidad de usuario NO puede ponerse (necesita espacios de nombres o privilegios que un gestor\n"
+            "# de usuario no tiene): ProtectSystem, ProtectHome, InaccessiblePaths, PrivateNetwork, PrivateDevices,\n"
+            "# IPAddressDeny ni CapabilityBoundingSet. Aquí el núcleo no tapa nada: la lista de prohibidas la hace\n"
+            "# cumplir solo el lector, y sin red lo deja RestrictAddressFamilies=AF_UNIX.\n"
+            "[Unit]\n"
+            "Description=HeHermes: lector de un fichero que Hermes marcó\n"
+            "CollectMode=inactive-or-failed\n"
+            "\n"
+            "[Service]\n"
+            "Type=simple\n"
+            "ExecStart=/usr/bin/python3 -I -S -B %s --usuario --hermes-home=%s --conexion\n"
+            "StandardInput=socket\n"
+            "StandardOutput=socket\n"
+            "StandardError=journal\n"
+            "SuccessExitStatus=2 3 4 5 6\n"
+            "RuntimeMaxSec=900\n"
+            "UMask=0077\n"
+            "LimitCORE=0\n"
+            "%s"
+        ) % (_ruta_segura(ambito.lector), casa, _JAULA_LECTOR_USUARIO)
+    tapadas = " ".join("-%s/%s" % (casa, secreto) for secreto in SECRETOS_HERMES)
+    return (
+        CABECERA
+        + "# Un lector por conexión a /run/hehermes-leer-media.sock (hehermes-leer-media.socket, Accept=yes). Es root,\n"
+        "# porque Hermes puede serlo y deja sus ficheros donde quiere, pero con lo justo para leer y nada más.\n"
+        "[Unit]\n"
+        "Description=HeHermes: lector de un fichero que Hermes marcó\n"
+        "CollectMode=inactive-or-failed\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "ExecStart=/usr/bin/python3 -I -S -B %s --hermes-home=%s --conexion\n"
+        "StandardInput=socket\n"
+        "StandardOutput=socket\n"
+        "StandardError=journal\n"
+        "# Los rechazos de siempre no son un fallo; una carrera (7), un error (8) o alguien que no es el vigía (9), sí.\n"
+        "SuccessExitStatus=2 3 4 5 6\n"
+        "RuntimeMaxSec=900\n"
+        "UMask=0077\n"
+        "LimitCORE=0\n"
+        "%s"
+        "# Sin PrivateTmp a propósito: Hermes deja ficheros en /tmp, y el lector tiene que ver el /tmp de verdad.\n"
+        "# Lo que el lector prohíbe, otra vez, pero ahora lo hace cumplir el núcleo.\n"
+        "InaccessiblePaths=-/etc/shadow -/etc/shadow- -/etc/gshadow -/etc/gshadow- -/etc/sudoers -/etc/sudoers.d\n"
+        "InaccessiblePaths=-/etc/ssh -/etc/ssl/private -/etc/letsencrypt\n"
+        "InaccessiblePaths=-/etc/hehermes -/etc/hehermes-avisos -/etc/hehermes-pasarela -/var/lib/hehermes-vigia\n"
+        "InaccessiblePaths=-/etc/nginx -/etc/swanctl -/etc/strongswan -/etc/ipsec.secrets -/etc/ipsec.d -/etc/wireguard\n"
+        "InaccessiblePaths=-/root/.ssh -/root/.gnupg\n"
+        "InaccessiblePaths=%s\n"
+    ) % (_ruta_segura(ambito.lector), casa, _JAULA_LECTOR, tapadas)

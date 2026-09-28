@@ -1,4 +1,9 @@
-"""Los avisos push en el servidor de cada uno (spec 2026-09-28, «El relé para los probadores»): el vigía.
+"""Los avisos push en el servidor de cada uno: el vigía y el lector de ficheros.
+
+Desde la 0.8.0 (spec 2026-09-28, «Avisos sin comandos», «El instalador 0.8.0») `instalar` pone **siempre** el vigía y
+el lector, sin preguntar y se pueda repetir. Sin código de avisos, el vigía va **sin credencial**: cada aviso sale con
+el permiso que la app le da en el alta de cada iPhone (App Attest), hacia la entrada pública del relé que trae con él.
+Con un código (lo de abajo, la 0.7.0), como antes.
 
 El vigía (`server/avisos`, `hehermes_avisos.vigia`) vive al lado de Hermes: lo lee como la app, cifra cada aviso con la
 clave de cada iPhone y se lo pasa al relé de Daniel, que es el único con la clave de Apple. Aquí el relé es **el de otra
@@ -14,8 +19,12 @@ vigía; la dirección, el puerto y la huella van en `vigia.ini` y en el manifies
 Lo que se instala, con root: el usuario `hh-vigia`, el código (`hehermes_avisos`, junto al del instalador), su
 configuración y sus secretos en `/etc/hehermes-avisos/`, su base de datos en `/var/lib/hehermes-vigia` (la crea systemd)
 y dos unidades, el socket (el puerto 127.0.0.1:8790 es de systemd) y el servicio. La pasarela le pasa `/avisos/` con su
-secreto. Sin root, lo mismo en la casa del usuario de Hermes, con una unidad de usuario. El lector de ficheros (`GET
-/avisos/v1/fichero`) no: es de root y va aparte; sin él esa ruta contesta 503.
+secreto. Sin root, lo mismo en la casa del usuario de Hermes, con una unidad de usuario.
+
+El lector de ficheros (`GET /avisos/v1/fichero`, `server/avisos/despliegue/hehermes-leer-media`): con root, como en el
+VPS de Daniel (el script en /usr/local/libexec, un socket de systemd `root:hh-vigia` 0660 y un lector de root enjaulado
+por conexión); sin root, una unidad de usuario del usuario de Hermes, con su socket en su /run/user, que solo atiende a
+su propio uid.
 """
 
 from __future__ import annotations
@@ -27,7 +36,7 @@ import urllib.parse
 
 from . import manifiesto as m
 from . import piezas as p
-from .plan import Accion, _unidad, buscar_en_origen
+from .plan import Accion, _unidad, buscar_en_origen, fuente_del_lector
 
 ESQUEMA = "hehermes-avisos:1"
 _HUELLA = re.compile(r"[A-Za-z0-9_-]{43}")
@@ -89,16 +98,31 @@ def ficheros_del_codigo(origen: str, prefijo: str) -> list:
     return salida
 
 
-def datos_del_vigia(op, man) -> dict | None:
-    """Lo que se quiere: el código de esta pasada, o (sin código) el que ya se dio, para repararlo sin pedirlo otra vez.
-    None: aquí no hay avisos."""
+#: El vigía sin código de avisos: sin credencial ni relé fijo (lo que va en el manifiesto, `{"modo": "permisos"}`).
+SIN_CODIGO = {"direccion": None, "puerto": None, "huella": None, "credencial": None}
+
+
+def datos_del_vigia(op, man) -> dict:
+    """Lo que se quiere: el código de esta pasada, o (sin código) el que ya se dio, para repararlo sin pedirlo otra vez;
+    y si nunca se dio ninguno, el vigía sin credencial (`SIN_CODIGO`)."""
     if getattr(op, "avisos", None):
         return dict(op.avisos)
     guardado = man.datos.get("vigia")
     if isinstance(guardado, dict) and {"direccion", "puerto", "huella"} <= set(guardado):
         return {"direccion": guardado["direccion"], "puerto": guardado["puerto"], "huella": guardado["huella"],
                 "credencial": None}
-    return None
+    return dict(SIN_CODIGO)
+
+
+def con_codigo(vigia) -> bool:
+    return bool(vigia) and vigia.get("direccion") is not None
+
+
+def para_el_manifiesto(vigia) -> dict:
+    """Lo que no es secreto del vigía: con ello se repara sin pedir nada. La credencial, nunca."""
+    if con_codigo(vigia):
+        return {"direccion": vigia["direccion"], "puerto": vigia["puerto"], "huella": vigia["huella"]}
+    return {"modo": "permisos"}
 
 
 def _gestionado(sis, man, ruta, deseado, reemplazar) -> str:
@@ -113,22 +137,28 @@ def _gestionado(sis, man, ruta, deseado, reemplazar) -> str:
     return m.CAMBIA
 
 
-def planear(sis, det, man, op, origen, acciones, bloqueos, fichero) -> dict | None:
-    """Las acciones del vigía, si aquí hay avisos (un código ahora, o uno de antes). Devuelve sus datos, o None."""
-    vigia = datos_del_vigia(op, man)
-    if vigia is None:
-        return None
+def planear(sis, det, man, op, origen, acciones, bloqueos, fichero, avisos=None) -> dict | None:
+    """Las acciones del vigía y del lector: siempre, con un código (ahora, o uno de antes) o sin él. Devuelve los datos
+    del vigía, o None si aquí no se pone (unos avisos puestos a mano, o algo que lo impide y ya está en `bloqueos`)."""
     ambito = det.ambito
-    if sis.existe(A_MANO) and not man.datos.get("vigia"):
-        bloqueos.append("Aquí ya hay unos avisos puestos a mano (%s, los de server/avisos/despliegue/instalar.sh): no "
-                        "los toco. Su vigía se configura en %s" % (A_MANO, ambito.vigia_ini))
+    # Los de instalar.sh: los del VPS de Daniel, o los que ponía la VPN de antes de la 0.6.0 (`avisos` en el manifiesto,
+    # con instalar.sh por debajo).
+    if (sis.existe(A_MANO) or man.datos.get("avisos")) and not man.datos.get("vigia"):
+        if getattr(op, "avisos", None):
+            bloqueos.append("Aquí ya hay unos avisos puestos a mano (%s, los de server/avisos/despliegue/instalar.sh): "
+                            "no los toco. Su vigía se configura en %s" % (A_MANO, ambito.vigia_ini))
+        elif avisos is not None:
+            avisos.append("Aquí ya hay unos avisos puestos a mano (%s, los de server/avisos/despliegue/instalar.sh): ni "
+                          "el vigía ni el lector de ficheros los pongo yo, y lo suyo no lo toco" % A_MANO)
         return None
-    if vigia["credencial"] is None and not sis.existe(ambito.credencial_rele):
+    vigia = datos_del_vigia(op, man)
+    if con_codigo(vigia) and vigia["credencial"] is None and not sis.existe(ambito.credencial_rele):
         bloqueos.append("Al vigía le falta su credencial (%s): vuelve a darle el código de avisos: %s avisos"
                         % (ambito.credencial_rele, "sudo hehermes-servidor" if ambito.root else ambito.orden))
         return None
     det.con_vigia = True
-    detalle = "el relé de %s:%d, con su huella anclada" % (vigia["direccion"], vigia["puerto"])
+    detalle = ("el relé de %s:%d, con su huella anclada" % (vigia["direccion"], vigia["puerto"]) if con_codigo(vigia)
+               else "sin credencial: cada aviso, con el permiso de su iPhone")
     if ambito.root:
         acciones.append(Accion("usuario", p.USUARIO_VIGIA, m.YA_ESTA if sis.ejecutar(["id", "-u", p.USUARIO_VIGIA]).bien
                                else m.NUEVO, "sin casa ni shell, solo para el vigía de avisos"))
@@ -139,19 +169,22 @@ def planear(sis, det, man, op, origen, acciones, bloqueos, fichero) -> dict | No
     for ruta, datos in codigo:
         fichero(ruta, datos, 0o644, grupo=ambito.prefijo + "/hehermes_avisos/")
     reemplazar = getattr(op, "reemplazar", frozenset())
+    lector = planear_lector(sis, det, origen, acciones, bloqueos, avisos, fichero)
     credencial = (vigia["credencial"] + "\n").encode() if vigia["credencial"] else None
     secreto = sis.leer(ambito.secreto_vigia)
     propias = [
         fichero(ambito.vigia_ini, p.vigia_ini(ambito, det.hermes.puerto, det.hermes.env,
                                               os.path.dirname(det.hermes.home.rstrip("/")) or "/",
-                                              vigia["direccion"], vigia["puerto"], vigia["huella"]),
+                                              vigia["direccion"], vigia["puerto"], vigia["huella"],
+                                              lector=ambito.socket_lector if lector else None),
                 0o640 if ambito.root else 0o600, detalle=detalle),
         _secreto(sis, man, acciones, ambito.secreto_vigia,
                  (secrets.token_urlsafe(32) + "\n").encode() if secreto is None else None, reemplazar,
                  "el secreto entre la pasarela y el vigía, 0600 (no se imprime)"),
-        _secreto(sis, man, acciones, ambito.credencial_rele, credencial, reemplazar,
-                 "la credencial del vigía ante el relé, 0600 (no se imprime)"),
     ]
+    if con_codigo(vigia):
+        propias.append(_secreto(sis, man, acciones, ambito.credencial_rele, credencial, reemplazar,
+                                "la credencial del vigía ante el relé, 0600 (no se imprime)"))
     if ambito.root:
         propias.append(_secreto(sis, man, acciones, ambito.clave_hermes_vigia, (det.hermes.clave + "\n").encode(),
                                 reemplazar, "la clave de Hermes del vigía, 0600 (no se imprime)"))
@@ -163,6 +196,33 @@ def planear(sis, det, man, op, origen, acciones, bloqueos, fichero) -> dict | No
     return vigia
 
 
+def planear_lector(sis, det, origen, acciones, bloqueos, avisos, fichero) -> bool:
+    """El lector de ficheros: el script (con root, en /usr/local/libexec; sin root, el que ya va en su casa con el
+    instalador), su socket y su plantilla. Devuelve si se pone: sin él, el vigía va igual y la ruta contesta 503."""
+    ambito = det.ambito
+    casa = det.hermes.home.rstrip("/")
+    if not p._RUTA_VALIDA.fullmatch(casa):
+        if avisos is not None:
+            avisos.append("La carpeta de Hermes (%r) no la sé poner en una unidad de systemd: no pongo el lector de "
+                          "ficheros, y las descargas de la app (GET /avisos/v1/fichero) contestan 503" % casa)
+        return False
+    fuente = fuente_del_lector(origen)
+    if fuente is None:
+        bloqueos.append("el paquete no trae el lector de ficheros (hehermes-leer-media)")
+        return False
+    if ambito.root:
+        # Suelto (lo escribe `aplicar_tls` con los demás ficheros): cambiarlo no pide reiniciar nada, cada conexión
+        # lanza el que haya.
+        with open(fuente, "rb") as f:
+            fichero(ambito.lector, f.read(), 0o755)
+    unidades = [fichero(ambito.unidad_lector_socket, p.unidad_lector_socket(ambito)),
+                fichero(ambito.unidad_lector, p.unidad_lector(ambito, casa))]
+    _unidad(sis, acciones, p.SOCKET_LECTOR, unidades, "el lector de ficheros de Hermes (GET /avisos/v1/fichero), %s"
+            % ("de root, enjaulado, uno por conexión" if ambito.root else "como %s, uno por conexión" % ambito.usuario),
+            "restart", ambito.systemctl)
+    return True
+
+
 def _secreto(sis, man, acciones, ruta, deseado, reemplazar, detalle):
     estado = _gestionado(sis, man, ruta, deseado, reemplazar)
     datos = deseado if deseado is not None else sis.leer(ruta)
@@ -171,9 +231,9 @@ def _secreto(sis, man, acciones, ruta, deseado, reemplazar, detalle):
 
 
 def rutas(ambito) -> set:
-    """Lo del vigía que `aplicar_tls` deja para su propio paso (y no con los ficheros sueltos)."""
+    """Lo del vigía y del lector que `aplicar_tls` deja para su propio paso (y no con los ficheros sueltos)."""
     return {ambito.vigia_ini, ambito.secreto_vigia, ambito.credencial_rele, ambito.clave_hermes_vigia,
-            ambito.unidad_vigia, ambito.socket_vigia}
+            ambito.unidad_vigia, ambito.socket_vigia, ambito.unidad_lector_socket, ambito.unidad_lector}
 
 
 # MARK: Aplicar
@@ -213,7 +273,12 @@ def aplicar_secretos(sis, man, acciones, ambito, salida, orden) -> None:
 
 
 def aplicar_unidades(sis, man, acciones, ambito, salida) -> None:
+    """El lector primero (el vigía lo quiere, `Wants=`), luego el puerto del vigía y el vigía."""
     from .aplicar import _con_unidad
+    del_lector = [a for a in acciones if a.objeto in (ambito.unidad_lector_socket, ambito.unidad_lector,
+                                                        p.SOCKET_LECTOR)]
+    if del_lector:
+        _con_unidad(sis, man, del_lector, p.SOCKET_LECTOR, salida, systemctl=ambito.systemctl)
     if ambito.root:
         _con_unidad(sis, man, [a for a in acciones if a.objeto in (ambito.socket_vigia, p.SOCKET_VIGIA)],
                     p.SOCKET_VIGIA, salida)
@@ -229,13 +294,21 @@ ESPERA_AL_COMPROBAR = 2.0
 
 
 def comprobar(sis, man, ambito, mira, hermes_pendiente=False, intentos=3, espera=None) -> None:
-    """El vigía en marcha, y su propio `comprobar` (Hermes, su puerto, el relé con la credencial, sin mandar nada).
-    Recién arrancado puede no contestar todavía: si algo sale mal, se repite un par de veces. Con la API de Hermes
-    encendiéndose (se reinicia al acabar), su comprobación no dice nada útil: solo si está en marcha."""
+    """El vigía en marcha, y su propio `comprobar` (Hermes, su puerto, el lector de ficheros y, con credencial, el
+    relé, sin mandar nada). Recién arrancado puede no contestar todavía: si algo sale mal, se repite un par de veces.
+    Con la API de Hermes encendiéndose (se reinicia al acabar), su comprobación no dice nada útil: solo si está en
+    marcha."""
     import time
     en_marcha = sis.ejecutar(ambito.systemctl + ["is-active", p.UNIDAD_VIGIA]).bien
     mira(en_marcha, "vigía: en marcha", "vigía: parado (%sjournalctl %s-u hehermes-vigia)"
          % ("sudo " if ambito.root else "", "" if ambito.root else "--user "))
+    if not con_codigo(man.datos.get("vigia")):
+        mira(True, "vigía: sin credencial; los avisos van con el permiso que la app le da al darse de alta", "")
+    if ambito.unidad_lector_socket in man.ficheros:
+        lector = sis.ejecutar(ambito.systemctl + ["is-active", p.SOCKET_LECTOR]).bien
+        mira(lector, "lector de ficheros: su socket está en marcha (%s)" % ambito.socket_lector,
+             "lector de ficheros: su socket está parado (%ssystemctl %sstart %s)"
+             % ("sudo " if ambito.root else "", "" if ambito.root else "--user ", p.SOCKET_LECTOR))
     if hermes_pendiente:
         return
     orden = [ambito.python_venv, "-I", "-B", "-m", "hehermes_avisos.vigia", "--config", ambito.vigia_ini, "comprobar"]

@@ -463,8 +463,10 @@ class SinSecretos(Base):
                         continue
                     # Donde sí tiene que estar: su sitio, 0600, y las copias de /etc/hehermes y /run, también 0600.
                     self.assertEqual(datos[1], "0o600", ruta)
+                    # Y desde la 0.8.0, que el vigía va siempre, su copia (la de la pasarela, para el vigía).
                     self.assertTrue(ruta.startswith(("/run/hehermes-canje/", "/root/.hermes/",
-                                                     "/etc/hehermes-pasarela/clave-hermes", "/etc/hehermes/")), ruta)
+                                                     "/etc/hehermes-pasarela/clave-hermes", "/etc/hehermes/",
+                                                     "/etc/hehermes-avisos/vigia/clave-hermes")), ruta)
 
 
 class Limpiar(Base):

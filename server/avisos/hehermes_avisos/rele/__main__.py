@@ -8,6 +8,8 @@
   llega por la entrada pública (``publico``). Pinta su código de avisos, solo en un terminal, o lo deja en ``RUTA``
   (0600, un fichero nuevo). El secreto no queda en ningún otro sitio.
 - ``credencial baja NOMBRE``: deja de valer al momento. ``credencial lista``: los nombres, sin huellas.
+- ``permiso revocar|readmitir <keyId|token|k:…|t:…>``: los permisos de avisos de una clave de App Attest o de un token
+  dejan de valer al momento (o vuelven a valer). ``permiso lista``: cuántas claves hay atestadas y las revocadas.
 
 Es lo que hay detrás de ``sudo hehermes-rele …`` (``despliegue/hehermes-rele``).
 """
@@ -29,6 +31,7 @@ from .apns import ClienteAPNs
 from .configuracion import ConfigRele
 from .firmante import FirmanteAPNs
 from .limites import Limitador
+from . import permisos as modulo_permisos
 
 registro = logging.getLogger("rele")
 
@@ -70,8 +73,12 @@ def servir(config: ConfigRele) -> int:
         firmante = None
     apns = ClienteAPNs(firmante, config.tema, config.bases, plazo=config.plazo_apns) if firmante else None
     limitador = Limitador(config.por_credencial, config.por_token, config.recordar_bajas)
-    servidor = ServidorHTTP(config.escucha, ManejadorRele, AppRele(credenciales, apns, limitador, config.reservas),
-                            heredado=heredado)
+    verificador = modulo_permisos.Verificador(config.permisos_publica,
+                                              modulo_permisos.Revocados(config.permisos_revocados))
+    if not verificador.disponible:
+        registro.info("sin la clave pública de los permisos (%s): solo valen las credenciales", config.permisos_publica)
+    servidor = ServidorHTTP(config.escucha, ManejadorRele, AppRele(credenciales, apns, limitador, config.reservas,
+                                                                   permisos=verificador), heredado=heredado)
     if heredado is not None and tuple(heredado.getsockname()[:2]) != tuple(config.escucha):
         registro.warning("el socket de systemd es %s:%d y la configuración dice %s:%d: se atiende en el de systemd",
                          *heredado.getsockname()[:2], *config.escucha)
@@ -200,12 +207,56 @@ def credencial(argumentos, salida=print, terminal=None) -> int:
         return 1
 
 
+PERMISOS_BASE = "/var/lib/hehermes-rele-publico/permisos.db"
+
+
+def permiso(argumentos, config: ConfigRele, salida=print) -> int:
+    """``permiso revocar|readmitir|lista``: los permisos de avisos por dispositivo (App Attest)."""
+    ruta = config.permisos_revocados
+    try:
+        if argumentos.accion == "lista":
+            claves, tokens = modulo_permisos.Revocados(ruta).cuantos()
+            try:
+                import sqlite3
+                con = sqlite3.connect("file:%s?mode=ro" % argumentos.permisos_base, uri=True)
+                cuantas = dict(con.execute("SELECT entorno, COUNT(*) FROM claves GROUP BY entorno").fetchall())
+                con.close()
+                salida("claves de App Attest atestadas: %d de desarrollo, %d de producción" % (
+                    cuantas.get("desarrollo", 0), cuantas.get("produccion", 0)))
+            except Exception as error:  # noqa: BLE001 — sin la base, se dice y se sigue
+                salida("claves atestadas: no puedo leer %s (%s)" % (argumentos.permisos_base, type(error).__name__))
+            salida("revocadas: %d claves y %d tokens (%s)" % (claves, tokens, ruta))
+            return 0
+        if not argumentos.quien:
+            salida("error: permiso %s necesita un keyId (base64), un token de APNs o una entrada k:/t:"
+                   % argumentos.accion)
+            return 2
+        entrada = modulo_permisos.entrada_de_revocacion(argumentos.quien)
+        if argumentos.accion == "revocar":
+            nuevo = modulo_permisos.revocar(ruta, entrada)
+            salida("%s: %s" % (entrada[:10] + "…", "revocado; sus permisos dejan de valer ya" if nuevo
+                               else "ya estaba revocado"))
+            return 0
+        if modulo_permisos.readmitir(ruta, entrada):
+            salida("%s: readmitido" % (entrada[:10] + "…"))
+            return 0
+        salida("%s: no estaba revocado" % (entrada[:10] + "…"))
+        return 1
+    except ValueError as error:
+        salida("error: %s" % error)
+        return 1
+    except PermissionError:
+        salida("error: no puedo escribir %s: hace falta root (sudo hehermes-rele …)" % ruta)
+        return 1
+
+
 def main(argv: list | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m hehermes_avisos.rele", description=__doc__.splitlines()[0])
     parser.add_argument("--config", default="/etc/hehermes-avisos/rele.ini")
-    parser.add_argument("orden", nargs="?", default="servir", choices=("servir", "comprobar", "credencial"))
-    parser.add_argument("accion", nargs="?", choices=("alta", "baja", "lista"),
-                        help="credencial: alta, baja o lista (las de los vigías de otros servidores)")
+    parser.add_argument("orden", nargs="?", default="servir", choices=("servir", "comprobar", "credencial", "permiso"))
+    parser.add_argument("accion", nargs="?", choices=("alta", "baja", "lista", "revocar", "readmitir"),
+                        help="credencial: alta, baja o lista (las de los vigías de otros servidores); permiso: revocar, "
+                             "readmitir o lista")
     parser.add_argument("quien", nargs="?", metavar="NOMBRE", help="credencial alta|baja: el nombre de su servidor")
     parser.add_argument("--nombre", help="credencial: el nombre del servidor del vigía de esta máquina")
     parser.add_argument("--secreto", help="credencial: dónde dejar el secreto del vigía de esta máquina (0600)")
@@ -213,9 +264,16 @@ def main(argv: list | None = None) -> int:
     parser.add_argument("--a-fichero", help="credencial alta: deja el código en este fichero nuevo (0600)")
     parser.add_argument("--por-minuto", type=int, help="credencial alta: su propio tope de avisos por minuto")
     parser.add_argument("--publico", default=PUBLICO, help="credencial alta: la configuración de la entrada pública")
+    parser.add_argument("--permisos-base", default=PERMISOS_BASE, help="permiso lista: la base de la oficina")
     argumentos = parser.parse_args(argv)
-    if argumentos.orden != "credencial" and (argumentos.accion or argumentos.quien):
-        parser.error("alta, baja y lista son de credencial")
+    if argumentos.orden not in ("credencial", "permiso") and (argumentos.accion or argumentos.quien):
+        parser.error("alta, baja, lista, revocar y readmitir son de credencial o de permiso")
+    if argumentos.orden == "permiso":
+        if argumentos.accion not in ("revocar", "readmitir", "lista"):
+            parser.error("permiso necesita revocar, readmitir o lista")
+        return permiso(argumentos, ConfigRele.leer(argumentos.config))
+    if argumentos.orden == "credencial" and argumentos.accion in ("revocar", "readmitir"):
+        parser.error("revocar y readmitir son de permiso")
     if argumentos.orden == "credencial" and argumentos.accion:
         return credencial(argumentos)
     if argumentos.orden == "credencial":

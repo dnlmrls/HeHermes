@@ -2,8 +2,9 @@
 
 Guarda tres cosas, y ninguna es texto de una conversación:
 
-- los **dispositivos**: token, entorno, clave, ajustes y si la app está delante. La clave es la que cifra los avisos de
-  ese iPhone, así que el fichero se crea 0600 y el directorio es del usuario del vigía y de nadie más;
+- los **dispositivos**: token, entorno, clave, ajustes, si la app está delante y, si la app lo trae, su **permiso** para
+  el relé (spec 2026-09-28, «Avisos sin comandos»). La clave es la que cifra los avisos de ese iPhone, y el permiso deja
+  pedir avisos para él: el fichero se crea 0600 y el directorio es del usuario del vigía y de nadie más;
 - hasta dónde se ha leído cada **sesión** (el id de la última fila vista), para no avisar dos veces tras un reinicio ni
   de todo el historial la primera vez;
 - los **turnos** que la app dejó en marcha al irse, si los manda (ampliación propuesta del contrato: ver el README).
@@ -16,7 +17,7 @@ import logging
 import os
 import sqlite3
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .ajustes import Ajustes
 
@@ -24,8 +25,8 @@ registro = logging.getLogger("vigia.almacen")
 
 # La versión de la base de datos (`PRAGMA user_version`). Cada cambio sube uno, con su paso en `_migrar`, y una base de
 # una versión anterior se pone al día al abrirla. La 2 añadió el latido del primer plano (`delante_latido`,
-# `delante_caduca`).
-ESQUEMA = 2
+# `delante_caduca`); la 3, el permiso de cada iPhone para el relé (`permiso*`).
+ESQUEMA = 3
 
 # Lo que se da por visto antes de que la app dijera «estoy delante»: el aviso de «delante» llega un momento después de
 # que la app ya esté en pantalla. Por arriba no hace falta margen: el «ya no estoy delante» se apunta al llegar, que es
@@ -37,6 +38,26 @@ MARGEN_AL_PONERSE_DELANTE = 2.0
 VISTO_TRAS_EL_LATIDO = 35.0
 # Turnos que se vigilan a la vez, sumando los de todos los iPhone.
 MAX_TURNOS = 20
+
+
+@dataclass(frozen=True)
+class Permiso:
+    """El permiso firmado por el relé para avisar a un iPhone (``hhp1.…``), y a qué entrada del relé llevarlo.
+
+    El valor es un secreto a medias: no dice a qué iPhone avisar (lleva el SHA-256 del token), pero con el token deja
+    pedir avisos para él hasta que caduque. Por eso no sale en el ``repr`` (un registro con un dispositivo dentro no lo
+    lleva) ni en ningún registro."""
+
+    valor: str = field(repr=False)
+    caduca: int
+    direccion: str
+    puerto: int
+    huella: str
+    # Cuándo lo rechazó el relé (401/403 con `resultado: "permiso"`): ya no se usa, y la app tiene que traer otro.
+    rechazado: float | None = None
+
+    def vigente(self, ahora: float) -> bool:
+        return self.rechazado is None and ahora < self.caduca
 
 
 @dataclass(frozen=True)
@@ -54,6 +75,7 @@ class Dispositivo:
     delante_caduca: float | None = None
     delante_hasta: float | None = None
     conversacion: str | None = None
+    permiso: Permiso | None = None
 
     def delante(self, ahora: float) -> bool:
         """Si la app está en pantalla ahora, por lo que ha dicho: entonces no se manda nada, que ya avisa ella (spec).
@@ -123,7 +145,13 @@ _CREAR = f"""
         delante_latido REAL,
         delante_caduca REAL,
         delante_hasta REAL,
-        conversacion TEXT
+        conversacion TEXT,
+        permiso TEXT,
+        permiso_caduca INTEGER,
+        permiso_direccion TEXT,
+        permiso_puerto INTEGER,
+        permiso_huella TEXT,
+        permiso_rechazado REAL
     );
     CREATE TABLE IF NOT EXISTS sesiones (
         id TEXT PRIMARY KEY,
@@ -189,25 +217,49 @@ class Almacen:
                     PRAGMA user_version = 2;
                     COMMIT;
                 """)
+            if version < 3:
+                registro.info("base de datos de la versión %d: se pone al día (el permiso de cada iPhone)",
+                              max(version, 2))
+                self._con.executescript("""
+                    BEGIN;
+                    ALTER TABLE dispositivos ADD COLUMN permiso TEXT;
+                    ALTER TABLE dispositivos ADD COLUMN permiso_caduca INTEGER;
+                    ALTER TABLE dispositivos ADD COLUMN permiso_direccion TEXT;
+                    ALTER TABLE dispositivos ADD COLUMN permiso_puerto INTEGER;
+                    ALTER TABLE dispositivos ADD COLUMN permiso_huella TEXT;
+                    ALTER TABLE dispositivos ADD COLUMN permiso_rechazado REAL;
+                    PRAGMA user_version = 3;
+                    COMMIT;
+                """)
 
     # -- Dispositivos
 
     @staticmethod
     def _dispositivo(fila) -> Dispositivo:
+        permiso = None
+        if fila[11] is not None:
+            permiso = Permiso(valor=fila[11], caduca=fila[12], direccion=fila[13], puerto=fila[14], huella=fila[15],
+                              rechazado=fila[16])
         return Dispositivo(token=fila[0], entorno=fila[1], clave=bytes(fila[2]),
                            ajustes=Ajustes.desde_json(json.loads(fila[3])), alta=fila[4], actualizado=fila[5],
                            delante_desde=fila[6], delante_latido=fila[7], delante_caduca=fila[8],
-                           delante_hasta=fila[9], conversacion=fila[10])
+                           delante_hasta=fila[9], conversacion=fila[10], permiso=permiso)
 
     _COLUMNAS = ("token, entorno, clave, ajustes, alta, actualizado, delante_desde, delante_latido, delante_caduca, "
-                 "delante_hasta, conversacion")
+                 "delante_hasta, conversacion, permiso, permiso_caduca, permiso_direccion, permiso_puerto, "
+                 "permiso_huella, permiso_rechazado")
 
-    def guardar_dispositivo(self, token: str, entorno: str, clave: bytes, ajustes: Ajustes, ahora: float) -> bool:
+    def guardar_dispositivo(self, token: str, entorno: str, clave: bytes, ajustes: Ajustes, ahora: float,
+                            permiso: Permiso | None = None) -> bool:
         """Da de alta el dispositivo o, si el token ya estaba, lo actualiza (el alta es idempotente por token).
 
         Devuelve si es nuevo. Por encima de ``max_dispositivos`` se olvida el que lleva más tiempo sin darse de alta:
         la app se da de alta en cada arranque, así que ese es el de una instalación que ya no existe, y su token habría
         muerto igual en cuanto Apple lo dijera.
+
+        ``permiso``, si lo trae el alta, sustituye al que hubiera (y olvida que el relé rechazó el de antes). Sin él,
+        el que había se queda: un alta sin permiso es la de una app que no ha podido pedir otro (App Attest falla, o
+        es el Simulador), y el de antes puede seguir valiendo (Contrato C).
         """
         with self._cerrojo:
             existia = self._con.execute("SELECT 1 FROM dispositivos WHERE token = ?", (token,)).fetchone() is not None
@@ -221,6 +273,12 @@ class Almacen:
                     self._con.execute(
                         "INSERT INTO dispositivos (token, entorno, clave, ajustes, alta, actualizado) "
                         "VALUES (?, ?, ?, ?, ?, ?)", (token, entorno, clave, json.dumps(ajustes.a_json()), ahora, ahora))
+                if permiso is not None:
+                    self._con.execute(
+                        "UPDATE dispositivos SET permiso = ?, permiso_caduca = ?, permiso_direccion = ?, "
+                        "permiso_puerto = ?, permiso_huella = ?, permiso_rechazado = NULL WHERE token = ?",
+                        (permiso.valor, int(permiso.caduca), permiso.direccion, int(permiso.puerto), permiso.huella,
+                         token))
                 sobran = self._con.execute("SELECT COUNT(*) FROM dispositivos").fetchone()[0] - self.max_dispositivos
                 if sobran > 0:
                     self._con.execute(
@@ -276,6 +334,15 @@ class Almacen:
                 "conversacion = ? WHERE token = ?", (desde, latido, plazo, hasta, conversacion if activa else None,
                                                      token))
         return True
+
+    def rechazar_permiso(self, token: str, valor: str, ahora: float) -> bool:
+        """El relé ha rechazado este permiso: no se vuelve a usar, y el siguiente primer plano le pide otro a la app.
+        Solo si sigue siendo el guardado: si entretanto llegó uno nuevo en un alta, ese no se toca."""
+        with self._cerrojo:
+            cursor = self._con.execute(
+                "UPDATE dispositivos SET permiso_rechazado = ? WHERE token = ? AND permiso = ? "
+                "AND permiso_rechazado IS NULL", (ahora, token, valor))
+        return cursor.rowcount > 0
 
     def borrar_dispositivo(self, token: str) -> bool:
         with self._cerrojo:

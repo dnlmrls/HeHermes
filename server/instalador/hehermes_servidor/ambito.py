@@ -64,6 +64,16 @@ class Ambito:
         self.base_vigia = self.carpeta_estado_vigia + "/vigia.db"
         self.unidad_vigia = self.unidades + "/hehermes-vigia.service"
         self.socket_vigia = self.unidades + "/hehermes-vigia.socket"
+        # El lector de ficheros (`GET /avisos/v1/fichero`, desde la 0.8.0): con root, donde lo deja también instalar.sh
+        # en el VPS de Daniel; sin root, la copia del paquete que ya va en su casa, y su socket en su /run/user.
+        if root:
+            self.lector = "/usr/local/libexec/hehermes-leer-media"
+            self.socket_lector = "/run/hehermes-leer-media.sock"
+        else:
+            self.lector = self.prefijo + "/hehermes-leer-media"
+            self.socket_lector = "/run/user/%d/hehermes-leer-media.sock" % uid
+        self.unidad_lector_socket = self.unidades + "/hehermes-leer-media.socket"
+        self.unidad_lector = self.unidades + "/hehermes-leer-media@.service"
         self.manifiesto = self.carpeta_config + "/instalacion.json"
         self.pasarela_ini = self.carpeta_pasarela + "/pasarela.ini"
         self.cert = self.carpeta_pasarela + "/cert.pem"

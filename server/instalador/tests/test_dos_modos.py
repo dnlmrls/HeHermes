@@ -288,7 +288,10 @@ class ConLasDos(Ayudas):
         for suyo in ("/etc/hehermes-pasarela/tokens.json", "iphone-tls", REGLA_TLS, "hehermes-pasarela.service",
                      "el usuario hh-pasarela", "/opt/hehermes-canje"):
             self.assertIn(suyo, texto)
-        for del_otro in ("nginx", "hh-ipsec", "mi-iphone", "500,4500", "/opt/hehermes-servidor", "servidor.ini"):
+        # El código de los avisos, que va con la pasarela (/opt/hehermes-servidor/hehermes_avisos), sí; lo demás de
+        # /opt/hehermes-servidor, que es de los dos, no.
+        for del_otro in ("nginx", "hh-ipsec", "mi-iphone", "500,4500", "/opt/hehermes-servidor/hehermes-servidor",
+                         "/opt/hehermes-servidor/hehermes_servidor/", "servidor.ini"):
             self.assertNotIn(del_otro, texto)
 
 

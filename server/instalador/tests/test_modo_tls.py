@@ -120,7 +120,7 @@ class ConRoot(Base):
         self.falso.instalar_paquete("ufw")
         self.falso.ufw = "activo"
         self.assertEqual(self.orden("instalar", "--iphone", "mi-iphone"), 0, self.salida)
-        self.assertEqual(self.falso.usuarios_sistema, {"hh-pasarela"})
+        self.assertEqual(self.falso.usuarios_sistema, {"hh-pasarela", "hh-vigia"})
         self.assertIn("hehermes-pasarela", self.falso.activos)
         self.assertIn("hehermes-pasarela-clave.path", self.falso.activos)
         self.assertIn("ufw allow proto tcp from any to any port 61234 comment hehermes", self.falso.reglas_ufw)
@@ -167,6 +167,8 @@ class ConRoot(Base):
         self.assertIn("sudo hehermes-dispositivo alta mi-iphone", self.salida)
 
     def test_la_unidad_lleva_el_secreto_del_vigia_si_estan_los_avisos(self):
+        """Los avisos puestos a mano (el VPS de Daniel, instalar.sh): no los toco, pero la pasarela les pasa /avisos/."""
+        self.sis.carpeta("/opt/hehermes-avisos/src")
         self.sis.poner("/etc/hehermes-avisos/vigia/secreto-tunel", "s" * 43 + "\n", modo=0o600)
         self.assertEqual(self.orden("instalar", "--si", terminal=False), 0, self.salida)
         unidad = self.sis.leer_texto("/etc/systemd/system/hehermes-pasarela.service")

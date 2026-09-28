@@ -106,12 +106,17 @@ class Limpio(Base):
                 self.assertFalse(plan.puede_seguir)
                 self.assertTrue(any("nombre del iPhone" in b for b in plan.bloqueos))
 
-    def test_los_avisos_no_se_instalan_pero_se_sirven_si_estan(self):
+    def test_los_avisos_se_instalan_siempre_y_se_sirven_si_estan_a_mano(self):
+        """Desde la 0.8.0, el vigía (sin credencial) y el lector van siempre; los puestos a mano no se tocan."""
         self.montar(sf.servidor())
-        self.assertIn("sin código de avisos. Con el de quien te dé los avisos: sudo hehermes-servidor avisos",
-                      pintar(self.plan()))
+        self.assertIn("el vigía, sin credencial: cada iPhone le da su permiso para el relé al darse de alta (App "
+                      "Attest), y el lector de ficheros; la pasarela le pasa /avisos/", pintar(self.plan()))
+        self.sis.carpeta("/opt/hehermes-avisos/src")
         self.sis.poner(p.SECRETO_VIGIA, "s" * 43 + "\n", modo=0o600)
-        self.assertIn("el vigía ya está (puesto a mano): la pasarela le pasa /avisos/", pintar(self.plan()))
+        texto = pintar(self.plan())
+        self.assertIn("el vigía ya está (puesto a mano): la pasarela le pasa /avisos/", texto)
+        self.assertIn("ni el vigía ni el lector de ficheros los pongo yo", texto)
+        self.assertNotIn("hehermes-leer-media", texto.split("Hay que saber:")[0])
 
 
 class NoPisar(Base):

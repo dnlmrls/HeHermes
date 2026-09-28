@@ -93,12 +93,23 @@ def ficheros_propios(origen: str, prefijo: str = p.PREFIJO) -> list:
     if fuente is not None:
         with open(fuente, "rb") as f:
             salida.append((prefijo + "/hehermes-dispositivo", f.read(), 0o755))
+    # Y el lector de ficheros (desde la 0.8.0): sin root, es el que lanza su unidad; con root, de aquí se copia a
+    # /usr/local/libexec (`avisos.planear_lector`).
+    fuente = fuente_del_lector(origen)
+    if fuente is not None:
+        with open(fuente, "rb") as f:
+            salida.append((prefijo + "/hehermes-leer-media", f.read(), 0o755))
     carpeta = os.path.join(origen, "hehermes_servidor")
     for nombre in sorted(os.listdir(carpeta)):
         if nombre.endswith(".py"):
             with open(os.path.join(carpeta, nombre), "rb") as f:
                 salida.append((prefijo + "/hehermes_servidor/" + nombre, f.read(), 0o644))
     return salida
+
+
+def fuente_del_lector(origen: str) -> str | None:
+    """`hehermes-leer-media`: en el paquete, junto al instalador; en el repositorio, en `server/avisos/despliegue`."""
+    return buscar_en_origen(origen, "hehermes-leer-media", "../avisos/despliegue/hehermes-leer-media")
 
 
 def buscar_en_origen(origen: str, *candidatas: str) -> str | None:
@@ -178,14 +189,17 @@ def pintar(plan: Plan, color: bool = False) -> str:
         de_aqui = [a for a in plan.acciones if a.tipo in tipos]
         if titulo == "Avisos push" and h is not None:
             vigia = getattr(det, "vigia", None)
-            if vigia:
-                texto = "el vigía, con el relé de %s:%d (su huella, anclada); la pasarela le pasa /avisos/" % (
-                    vigia["direccion"], vigia["puerto"])
+            lector = any(a.objeto == p.SOCKET_LECTOR for a in plan.acciones)
+            if vigia and vigia.get("direccion") is not None:
+                texto = "el vigía, con el relé de %s:%d (su huella, anclada)%s; la pasarela le pasa /avisos/" % (
+                    vigia["direccion"], vigia["puerto"], ", y el lector de ficheros" if lector else "")
+            elif vigia:
+                texto = ("el vigía, sin credencial: cada iPhone le da su permiso para el relé al darse de alta (App "
+                         "Attest)%s; la pasarela le pasa /avisos/" % (", y el lector de ficheros" if lector else ""))
             elif det.con_vigia:
                 texto = "el vigía ya está (puesto a mano): la pasarela le pasa /avisos/"
             else:
-                texto = "sin código de avisos. Con el de quien te dé los avisos: %s avisos" % (
-                    "sudo hehermes-servidor" if ambito.root else ambito.orden)
+                texto = "no pongo el vigía (abajo, por qué)"
             lineas += ["", titulo, "  %-10s %s" % ("sí" if (vigia or det.con_vigia) else "no", texto)]
             continue
         if titulo == "iPhone" and not de_aqui and h is not None and plan.opciones.iphone is None:

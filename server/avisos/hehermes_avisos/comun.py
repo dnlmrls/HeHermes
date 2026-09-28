@@ -11,6 +11,7 @@ from __future__ import annotations
 import configparser
 import http.client
 import http.server
+import ipaddress
 import json
 import logging
 import os
@@ -308,12 +309,15 @@ class _SinRedirecciones(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def abridor(huella: str | None = None, tls_minimo=None) -> urllib.request.OpenerDirector:
+def abridor(huella: str | None = None, tls_minimo=None, solo_publicas: bool = False) -> urllib.request.OpenerDirector:
     """El cliente HTTP de los dos servicios: sin proxies del entorno (hablan con su propia máquina, o con el relé) y sin
-    seguir redirecciones. Con ``huella``, además, el HTTPS anclado a ella (``abridor_anclado``)."""
+    seguir redirecciones. Con ``huella``, además, el HTTPS anclado a ella (``_ManejadorAnclado``); y con
+    ``solo_publicas``, solo hacia direcciones de internet (``conectar_solo_a_publicas``): la del relé de un permiso."""
     manejadores = [urllib.request.ProxyHandler({}), _SinRedirecciones()]
     if huella is not None:
-        manejadores.append(_ManejadorAnclado(huella, tls_minimo))
+        manejadores.append(_ManejadorAnclado(huella, tls_minimo, solo_publicas))
+    elif solo_publicas:
+        raise ValueError("solo_publicas va con una huella: el relé de un permiso es HTTPS anclado")
     return urllib.request.build_opener(*manejadores)
 
 
@@ -327,6 +331,79 @@ TLS_MINIMO = None
 
 class ErrorDeHuella(OSError):
     """El servidor no es el del código de avisos: su certificado no tiene la huella que se ancló. No se ha mandado nada."""
+
+
+class ErrorDeRedPrivada(OSError):
+    """El relé de un permiso lleva a una dirección que no es pública: no se conecta. No se ha mandado nada."""
+
+
+# NAT64 (RFC 6052): una IPv6 de aquí dentro lleva una IPv4, y la pasarela NAT64 la sacaría a esa, pública o no.
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+
+
+def es_ip_publica(texto: str) -> bool:
+    """Si ``texto`` es una IP a la que el vigía puede conectarse por el permiso de un iPhone: una de internet.
+
+    La dirección del relé la trae la app en el alta, y el alta la puede mandar cualquiera que tenga el token de la
+    pasarela: sin esto, el vigía se dejaría llevar a la red de dentro del servidor (el 10.x del proveedor, el
+    169.254.169.254 de sus metadatos, un 127.0.0.1 con otro servicio). ``is_global`` sola no basta: en Python 3.9 da
+    por global una multidifusión, y una IPv6 puede llevar dentro una IPv4 (``::ffff:10.0.0.1``, ``64:ff9b::a00:1``) que
+    es la que cuenta."""
+    try:
+        ip = ipaddress.ip_address(texto)
+    except ValueError:
+        return False
+    if ip.version == 6:
+        if ip.ipv4_mapped is not None:
+            return es_ip_publica(str(ip.ipv4_mapped))
+        if ip in _NAT64:
+            return es_ip_publica(str(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)))
+    return bool(ip.is_global and not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
+                                      or ip.is_unspecified or ip.is_reserved))
+
+
+_ETIQUETA_DNS = re.compile(r"(?!-)[A-Za-z0-9-]{1,63}(?<!-)")
+
+
+def es_nombre_dns(texto: str) -> bool:
+    """Un nombre de máquina bien formado (RFC 1123), con al menos un punto y un dominio de primer nivel que no es un
+    número: «localhost» o «10.0.0» no son nombres de un relé. Que resuelva a una dirección pública se mira al
+    conectar (``conectar_solo_a_publicas``), no aquí."""
+    if not isinstance(texto, str) or not 3 <= len(texto.rstrip(".")) <= 253:
+        return False
+    etiquetas = texto.rstrip(".").split(".")
+    return (len(etiquetas) >= 2 and all(_ETIQUETA_DNS.fullmatch(e) for e in etiquetas)
+            and not etiquetas[-1].isdigit())
+
+
+def conectar_solo_a_publicas(direccion: tuple, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+    """``socket.create_connection``, pero solo hacia direcciones públicas: resuelve el nombre una vez, se niega si
+    **alguna** de sus direcciones no es pública (``ErrorDeRedPrivada``), y se conecta a las que ya ha mirado, sin
+    volver a preguntar al DNS (que un nombre no pueda contestar una pública al mirarlo y una privada al conectar)."""
+    anfitrion, puerto = direccion[0], direccion[1]
+    try:
+        resueltas = socket.getaddrinfo(anfitrion, puerto, 0, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+    except socket.gaierror as error:
+        raise OSError("no se resuelve la dirección del relé: %s" % error.strerror) from None
+    if not resueltas:
+        raise OSError("la dirección del relé no resuelve a nada")
+    for *_, sockaddr in resueltas:
+        if not es_ip_publica(sockaddr[0].split("%", 1)[0]):
+            raise ErrorDeRedPrivada("la dirección del relé no es pública: no me conecto a la red de dentro")
+    ultimo = None
+    for familia, tipo, protocolo, _, sockaddr in resueltas:
+        enchufe = socket.socket(familia, tipo, protocolo)
+        try:
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                enchufe.settimeout(timeout)
+            if source_address:
+                enchufe.bind(source_address)
+            enchufe.connect(sockaddr)
+            return enchufe
+        except OSError as error:
+            ultimo = error
+            enchufe.close()
+    raise ultimo
 
 
 def huella_spki(der: bytes) -> str:
@@ -354,9 +431,12 @@ def _contexto_anclado(tls_minimo=None):
 
 
 class _ConexionAnclada(http.client.HTTPSConnection):
-    def __init__(self, *argumentos, huella: str, **opciones):
+    def __init__(self, *argumentos, huella: str, solo_publicas: bool = False, **opciones):
         super().__init__(*argumentos, **opciones)
         self._huella = huella
+        if solo_publicas:
+            # `HTTPConnection.connect` abre el socket con esto: así la dirección se mira antes del primer paquete.
+            self._create_connection = conectar_solo_a_publicas
 
     def connect(self):
         import hmac
@@ -374,12 +454,14 @@ class _ConexionAnclada(http.client.HTTPSConnection):
 
 
 class _ManejadorAnclado(urllib.request.HTTPSHandler):
-    def __init__(self, huella: str, tls_minimo=None):
+    def __init__(self, huella: str, tls_minimo=None, solo_publicas: bool = False):
         self._huella_anclada = huella
+        self._solo_publicas = solo_publicas
         super().__init__(context=_contexto_anclado(tls_minimo))
 
     def https_open(self, req):
-        return self.do_open(_ConexionAnclada, req, context=self._context, huella=self._huella_anclada)
+        return self.do_open(_ConexionAnclada, req, context=self._context, huella=self._huella_anclada,
+                            solo_publicas=self._solo_publicas)
 
 
 # ---------------------------------------------------------------------------------------------------------------------

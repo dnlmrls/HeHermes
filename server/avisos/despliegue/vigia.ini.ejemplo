@@ -41,7 +41,9 @@ plazo = 15
 # El relé de esta misma máquina, en claro por 127.0.0.1. El de otra (la entrada pública del de Daniel, para el vigía de
 # un probador) va por https://<dirección>:<puerto>/v1/avisos con «huella = <la del código de avisos>», que se ancla: sin
 # huella no se habla HTTPS con nadie, y en claro solo con 127.0.0.1 (la credencial va en cada aviso). Eso lo escribe el
-# instalador (hehermes-servidor avisos).
+# instalador (hehermes-servidor avisos). Vacía («url =», o sin ponerla), el vigía va sin credencial: cada aviso sale
+# con el permiso que la app le da en el alta de cada iPhone (App Attest), hacia la entrada pública del relé que trae
+# con él; es lo que pone el instalador 0.8.0 sin código de avisos.
 url = http://127.0.0.1:8791/v1/avisos
 # La credencial de este vigía ante el relé (fichero 0600 de hh-vigia). La crea el instalador.
 credencial = /etc/hehermes-avisos/vigia/credencial-rele

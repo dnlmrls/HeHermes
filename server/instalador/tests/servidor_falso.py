@@ -899,6 +899,9 @@ def servidor_de_daniel():
     falso.enlaces_ip["hh-ipsec"] = dict(XFRM_LINK, addr=["10.77.0.1/32"])
     falso.rutas += [("10.77.0.0/24", "wg0"), ("10.77.1.0/24", "hh-ipsec")]
     falso.activos |= {"wg-quick@wg0", "hehermes-vigia", "hehermes-rele"}
+    # Sus avisos, puestos a mano con server/avisos/despliegue/instalar.sh: el instalador no los toca (desde la 0.8.0,
+    # que pone el vigía siempre, es lo que lo para).
+    sis.carpeta("/opt/hehermes-avisos/src")
     falso.tcp = [("0.0.0.0:22", "sshd"), ("10.77.0.1:80", "nginx"), ("127.0.0.1:8642", "python3"),
                  ("127.0.0.1:8790", "systemd"), ("127.0.0.1:8791", "systemd")]
     falso.udp = [("0.0.0.0:500", "charon-systemd"), ("0.0.0.0:4500", "charon-systemd"), ("0.0.0.0:51820", "-")]
