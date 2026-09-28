@@ -194,10 +194,11 @@ def calcular_plan_tls(sis, det, man, op, origen) -> Plan:
                            (m.AJENO if hay_cert else m.NUEVO),
                            "ECDSA P-256, autofirmado y sin datos, diez años; la app ancla su huella"))
 
-    # Los avisos (el vigía), si hay un código ahora o uno de antes: antes que la pasarela, que así ya sabe que le pasa
-    # /avisos/ (y con root, lleva su secreto por credencial).
+    # Los avisos (el vigía y el lector de ficheros), siempre desde la 0.8.0: con un código de avisos (ahora o uno de
+    # antes), con su credencial; sin él, con el permiso de cada iPhone. Antes que la pasarela, que así ya sabe que le
+    # pasa /avisos/ (y con root, lleva su secreto por credencial).
     from . import avisos as vigias
-    det.vigia = vigias.planear(sis, det, man, op, origen, acciones, bloqueos, fichero)
+    det.vigia = vigias.planear(sis, det, man, op, origen, acciones, bloqueos, fichero, avisos)
 
     # La pasarela
     pasarela = [
@@ -312,9 +313,11 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
     man.anadir_modo("tls")
     man.datos["pasarela"] = {"puerto": det.puerto_pasarela, "root": ambito.root}
     vigia = getattr(det, "vigia", None)
+    from . import avisos as vigias
     if vigia:
-        # Lo que no es secreto del código de avisos: con ello se repara sin pedirlo otra vez. La credencial, no.
-        man.datos["vigia"] = {"direccion": vigia["direccion"], "puerto": vigia["puerto"], "huella": vigia["huella"]}
+        # Lo que no es secreto del código de avisos: con ello se repara sin pedirlo otra vez. La credencial, no. Sin
+        # código, solo que el vigía va sin credencial.
+        man.datos["vigia"] = vigias.para_el_manifiesto(vigia)
     if det.familia != "debian":
         man.datos["familia"] = det.familia
     man.guardar(sis)
@@ -337,7 +340,6 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
             man.guardar(sis)
             salida("==> el usuario %s" % a.objeto)
 
-    from . import avisos as vigias
     pasarela = {ambito.pasarela_ini, ambito.tokens, ambito.clave_hermes, ambito.unidad}
     unidades = {p.UNIDAD_PASARELA_CLAVE_PATH, p.UNIDAD_PASARELA_CLAVE_SERVICE, p.UNIDAD_CORTAFUEGOS}
     sueltos = [a for a in acciones if a.tipo in ("fichero", "enlace")
@@ -402,8 +404,8 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
     if fallos:
         raise Parada("la comprobación no pasa:\n  - " + "\n  - ".join(fallos))
     if vigia:
-        # Lo del vigía se dice, pero no para: la pasarela ya funciona, y el relé es de otra máquina (su cortafuegos, su
-        # credencial) y no se arregla repitiendo esto. `comprobar` lo vuelve a mirar cuando se quiera.
+        # Lo del vigía y el lector se dice, pero no para: la pasarela ya funciona, y el relé es de otra máquina (su
+        # cortafuegos, su credencial) y no se arregla repitiendo esto. `comprobar` lo vuelve a mirar cuando se quiera.
         resultados = []
         vigias.comprobar(sis, man, ambito, lambda bien, si, no: resultados.append((bool(bien), si if bien else no)),
                          hermes_pendiente=pendiente)

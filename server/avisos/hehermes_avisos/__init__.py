@@ -18,4 +18,7 @@ máquina se lleva este paquete entero y arranca solo su mitad.
 # 1.2.0: el relé para los probadores. El relé tiene una entrada pública (`rele.publico`: TLS 1.3 con la huella anclada,
 #        la maquinaria de la pasarela) y credenciales que se dan y se quitan en caliente (`hehermes-rele credencial
 #        alta|baja|lista`, con su «código de avisos»); el vigía habla con un relé de otra máquina por HTTPS anclado.
-VERSION = "1.2.0"
+# 1.3.0: avisos sin comandos. Permisos por dispositivo avalados con App Attest: la oficina de permisos en la entrada
+#        pública del relé (`rele.permisos`, `rele.appattest`, `rele.cbor`), el relé acepta `Authorization: Permiso`, y
+#        el vigía sin credencial manda los avisos con el permiso que le da la app en el alta.
+VERSION = "1.3.0"

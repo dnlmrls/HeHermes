@@ -642,14 +642,16 @@ class Pasarela:
         except _Rechazo:
             # Sin cabeza entera no se sabe si traía token: cuenta.
             return await self._rechazar(escritor, ip)
-        self.tokens.recargar_si_cambia()
-        token = token_de(peticion)
-        if self.tokens.quien(token) is None:
+        aparte = await self.atender_aparte(peticion, lector, escritor, ip)
+        if aparte is not None:
+            return aparte
+        huella = self.autorizar(peticion)
+        if huella is None:
             return await self._rechazar(escritor, ip)
         tarea = asyncio.current_task()
         if tarea in self._conexiones:
-            self._conexiones[tarea] = hash_token(token)
-        del token
+            # Una autorización que no es un token (`""`) no se sigue: no hay baja que la corte a media conexión.
+            self._conexiones[tarea] = huella or None
         try:
             return await self._reenviar(peticion, lector, escritor, ip)
         except _Error as error:
@@ -657,6 +659,20 @@ class Pasarela:
             await escritor.drain()
             self.diario("%s %s %d" % (ip, peticion.metodo, error.estado))
             return False
+
+    async def atender_aparte(self, peticion, lector, escritor, ip):
+        """Lo que se atiende antes de mirar el token: aquí nada (None). La entrada pública del relé atiende así las
+        rutas de los permisos de avisos, que no llevan credencial. Devuelve si la conexión sigue, como `_una`."""
+        return None
+
+    def autorizar(self, peticion):
+        """El hash del token de la petición si es uno dado de alta (el que se sigue por si se da de baja), `""` si la
+        petición vale por otra cosa que no se sigue, o None: el 404 idéntico."""
+        self.tokens.recargar_si_cambia()
+        token = token_de(peticion)
+        if self.tokens.quien(token) is None:
+            return None
+        return hash_token(token)
 
     def tope(self, peticion) -> int:
         """El cuerpo más grande que se deja pasar a esa ruta."""

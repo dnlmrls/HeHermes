@@ -1,6 +1,6 @@
 # /etc/systemd/system/hehermes-rele-publico.service
 # La entrada pública del relé de avisos (hehermes_avisos.rele.publico): por donde llegan los avisos de los vigías de
-# otros servidores. TLS 1.3 en el puerto alto de rele-publico.ini, con la maquinaria de la pasarela (el mismo 404, los
+# otros servidores y, desde la 1.3.0, la oficina de permisos de App Attest (las apps, sin credencial). TLS 1.3 en el puerto alto de rele-publico.ini, con la maquinaria de la pasarela (el mismo 404, los
 # mismos límites), y detrás, el relé en 127.0.0.1:8791 con la misma credencial. La instala `instalar.sh --rele-publico`.
 [Unit]
 Description=HeHermes: la entrada pública del relé de avisos (TLS)
@@ -18,6 +18,11 @@ SupplementaryGroups=hh-rele
 ExecStart=/opt/hehermes-avisos/venv/bin/python -I -B -m hehermes_avisos.rele.publico servir --config /etc/hehermes-avisos/rele-publico.ini
 # La clave del certificado es de root (0600): le llega como credencial de systemd, y manda sobre la ruta del ini.
 LoadCredential=clave:/etc/hehermes-avisos/rele-publico/clave.pem
+# La clave con la que la oficina firma los permisos de avisos (App Attest), también de root.
+LoadCredential=permisos:/etc/hehermes-avisos/rele-publico/permisos.pem
+# Las claves de App Attest atestadas (permisos.db): lo único que escribe.
+StateDirectory=hehermes-rele-publico
+StateDirectoryMode=0700
 Restart=on-failure
 RestartSec=2
 UMask=0077

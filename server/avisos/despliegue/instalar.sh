@@ -34,7 +34,10 @@
 #                                                   credenciales se quedan (volver a ponerla no invalida los códigos)
 #
 #   /etc/hehermes-avisos/rele-publico.ini           su puerto y su dirección (root:hh-rele-publico 0640)
-#   /etc/hehermes-avisos/rele-publico/              cert.pem (0644) y clave.pem (root 0600, le llega por LoadCredential)
+#   /etc/hehermes-avisos/rele-publico/              cert.pem (0644), clave.pem y permisos.pem (root 0600, le llegan por
+#                                                   LoadCredential); la pública de los permisos en rele/permisos.pub.pem
+#   /var/lib/hehermes-rele-publico/permisos.db      las claves de App Attest atestadas (la crea systemd)
+#   /etc/hehermes-avisos/rele/permisos-revocados.txt   los permisos revocados (root:hh-rele 0640)
 #   /etc/systemd/system/hehermes-rele-publico.service   como hh-rele-publico, que no puede leer la .p8
 #   /usr/local/sbin/hehermes-rele                   `sudo hehermes-rele credencial alta|baja|lista`
 #   /opt/hehermes-avisos/src/hehermes_servidor      la maquinaria de la pasarela, copiada de server/instalador
@@ -534,9 +537,19 @@ if [[ $RELE_PUBLICO -eq 1 ]]; then
   [[ "$PUERTO_PUBLICO" =~ ^[0-9]+$ ]] || fallar "$PUBLICO_INI no dice su puerto"
   chown "root:$PUBLICO_USUARIO" "$PUBLICO_INI"
   chmod 0640 "$PUBLICO_INI"
-  chown root:root "$PUBLICO_CARPETA/cert.pem" "$PUBLICO_CARPETA/clave.pem"
+  chown root:root "$PUBLICO_CARPETA/cert.pem" "$PUBLICO_CARPETA/clave.pem" "$PUBLICO_CARPETA/permisos.pem"
   chmod 0644 "$PUBLICO_CARPETA/cert.pem"
-  chmod 0600 "$PUBLICO_CARPETA/clave.pem"
+  chmod 0600 "$PUBLICO_CARPETA/clave.pem" "$PUBLICO_CARPETA/permisos.pem"
+  # La oficina de permisos (App Attest): la privada, de root (le llega por LoadCredential); la pública, para el relé;
+  # la lista de revocados, que leen los dos y escribe `hehermes-rele permiso revocar`.
+  chown root:root "$CONF/rele/permisos.pub.pem"
+  chmod 0644 "$CONF/rele/permisos.pub.pem"
+  if [[ ! -f "$CONF/rele/permisos-revocados.txt" ]]; then
+    printf '%s\n' "# Permisos de avisos revocados: k:<SHA-256 del keyId> o t:<SHA-256 del token>, uno por línea." \
+      "# Lo escribe \`hehermes-rele permiso revocar|readmitir\`." > "$CONF/rele/permisos-revocados.txt"
+  fi
+  chown root:hh-rele "$CONF/rele/permisos-revocados.txt"
+  chmod 0640 "$CONF/rele/permisos-revocados.txt"
   install -m 0644 -o root -g root "$AQUI/$PUBLICO_UNIDAD" "$SYSTEMD/$PUBLICO_UNIDAD"
   systemctl daemon-reload
   systemctl enable --quiet "$PUBLICO_UNIDAD"

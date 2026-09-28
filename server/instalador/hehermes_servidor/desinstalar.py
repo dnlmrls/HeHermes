@@ -161,9 +161,13 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
     # 0. La pasarela, lo primero: sin ella, ningún token vale ya.
     if que.tls:
         salida("==> la pasarela")
-        for unidad in (p.UNIDAD_PASARELA, "hehermes-pasarela-clave.path", p.UNIDAD_VIGIA, p.SOCKET_VIGIA):
+        for unidad in (p.UNIDAD_PASARELA, "hehermes-pasarela-clave.path", p.UNIDAD_VIGIA, p.SOCKET_VIGIA,
+                       p.SOCKET_LECTOR):
             if unidad in man.unidades:
                 sis.ejecutar(ambito.systemctl + ["disable", "--now", unidad])
+        if p.SOCKET_LECTOR in man.unidades:
+            # Los lectores en marcha (uno por conexión): la plantilla no se deshabilita, se paran sus instancias.
+            sis.ejecutar(ambito.systemctl + ["stop", "hehermes-leer-media@*.service"])
     # 1. Los iPhone: sin esto, las sesiones vivas siguen aunque se borre su conexión.
     if sis.existe(p.DISPOSITIVO) and que.vpn:
         for nombre in de_la_vpn:
@@ -270,8 +274,8 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
     for unidad in reversed(list(man.unidades)):
         if not que.de(md.de_unidad(unidad)):
             continue
-        sis.ejecutar((ambito.systemctl if unidad in (p.UNIDAD_PASARELA, p.UNIDAD_VIGIA) else ["systemctl"])
-                     + ["disable", "--now", unidad])
+        sis.ejecutar((ambito.systemctl if unidad in (p.UNIDAD_PASARELA, p.UNIDAD_VIGIA, p.SOCKET_LECTOR)
+                      else ["systemctl"]) + ["disable", "--now", unidad])
         if not que.todo:
             man.unidades.remove(unidad)
     # 6. Las líneas de --activar-api (que son de los dos), y el resto de ficheros.

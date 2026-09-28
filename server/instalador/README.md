@@ -6,8 +6,10 @@ un certificado propio cuya huella ancla la app y un token por iPhone. **No neces
 del usuario de Hermes. Es `docs/superpowers/specs/2026-09-26-pasarela-tls-design.md`, con su plan en
 `docs/superpowers/plans/2026-09-26-pasarela-servidor.md`.
 
-**Desde la 0.7.0, también los avisos push**, si te han dado un código de avisos: el vigía, que habla con el relé de
-Daniel ([abajo](#los-avisos-push-avisos-desde-la-070)).
+**Desde la 0.8.0, también los avisos push y el lector de ficheros, siempre y sin ningún comando más**: `instalar` pone
+el vigía sin credencial, y la app le da en cada alta el permiso de su iPhone para el relé de Daniel (App Attest); y el
+lector de los ficheros que Hermes marca con `MEDIA:`. Con un código de avisos (la 0.7.0), el vigía va con su credencial,
+como antes ([abajo](#los-avisos-push-y-el-lector-de-ficheros-siempre-desde-la-080)).
 
 **Desde la 0.6.0 la pasarela es lo único que instala para conectar.** La VPN IKEv2 de las versiones anteriores ya no se instala, ni se repara,
 ni se actualiza, y la app ya no la usa: `instalar --modo vpn` se para y dice que ya no existe. La de un servidor que la
@@ -22,7 +24,7 @@ sudo hehermes-servidor comprobar                              # lo que tiene que
 sudo hehermes-servidor desinstalar [--quitar-paquetes]        # enseña lo que quita, pregunta y lo quita
 sudo hehermes-servidor desinstalar --modo vpn                 # solo la VPN de una versión anterior
 sudo hehermes-dispositivo alta otro-iphone                    # otro iPhone, con el instalador ya puesto
-sudo hehermes-servidor avisos                                 # los avisos push, con el código de avisos (se pega)
+sudo hehermes-servidor avisos                                 # los avisos con un código de avisos (se pega), si te lo dan
 ```
 
 Más opciones de `instalar`: `--direccion <IP o nombre>` (la del QR, si el servidor está detrás de un NAT),
@@ -110,11 +112,36 @@ sin `Server`; que la API de Hermes solo escuche en 127.0.0.1; que la clave del c
 solo los lea su dueño, que `tokens.json` y `pasarela.ini` no los lea cualquiera y que en `tokens.json` no haya más que
 hashes; con root, que la unidad lleve su usuario y su sandbox, el cortafuegos, el canje y la firma.
 
-## Los avisos push (`avisos`, desde la 0.7.0)
+## Los avisos push y el lector de ficheros, siempre (desde la 0.8.0)
 
 Con la app cerrada, los avisos los pide el **vigía** (`server/avisos`), que vive al lado de Hermes, y los manda el
-**relé de Daniel**, el único con la clave de Apple. El relé está en la máquina de Daniel; a su entrada pública se llega
-con un **código de avisos**, que da él (`sudo hehermes-rele credencial alta <nombre>`, en su VPS):
+**relé de Daniel**, el único con la clave de Apple, por su entrada pública (HTTPS, con la huella de su certificado
+anclada). Desde la 0.8.0 (spec `docs/superpowers/specs/2026-09-28-avisos-con-app-attest-design.md`), `instalar` pone el
+vigía **siempre**, sin preguntar y se pueda repetir, por cualquiera de sus caminos (la frase del chat, `--por-chat`, o
+el comando por SSH; con root o sin él):
+
+- **Sin código de avisos, sin credencial.** `vigia.ini` lleva `[rele] url =` vacía y no hay ningún secreto del relé.
+  La app, al darse de alta (la bienvenida, y cada registro después), le da al vigía **el permiso de su iPhone**: firmado
+  por el relé tras comprobar con App Attest que es la app de verdad en un iPhone de verdad, atado a ese token y con
+  caducidad, con la dirección, el puerto y la huella de la entrada pública. Cada aviso va con él
+  (`Authorization: Permiso …`). Si el relé lo rechaza, el vigía lo olvida y, en el siguiente primer plano, le pide otro a
+  la app. El probador no hace nada más.
+- **Con un código de avisos** (el camino de la 0.7.0), el vigía va con la credencial de este servidor, como antes: lo
+  de abajo.
+
+Y **el lector de ficheros** (`hehermes-leer-media`, de `server/avisos/despliegue`), para que la app descargue lo que
+Hermes marca con `MEDIA:` (`GET /avisos/v1/fichero`; sin él, 503).
+
+| | Con root | Sin root |
+|---|---|---|
+| El lector | `/usr/local/libexec/hehermes-leer-media` (root 0755), el mismo que pone `instalar.sh` en el VPS de Daniel | La copia que va con el instalador en su casa (`~/.local/share/hehermes-servidor/hehermes-leer-media`) |
+| Su socket | `hehermes-leer-media.socket`: `/run/hehermes-leer-media.sock`, `root:hh-vigia` 0660, `Accept=yes` | Una unidad de usuario: `%t/hehermes-leer-media.sock` (en `/run/user/<uid>`), 0600 |
+| Cada lectura | `hehermes-leer-media@.service`: un lector **de root** por conexión, con la jaula del VPS de Daniel (solo `CAP_DAC_READ_SEARCH`, todo de solo lectura, sin red), la carpeta de Hermes (`--hermes-home`) prohibida salvo sus caches y tapada, y también `/etc/hehermes-pasarela` | Un lector **como el usuario de Hermes** por conexión, con `--usuario`: solo atiende a su propio uid (`SO_PEERCRED`). Lo que una unidad de usuario no puede ponerse (`ProtectSystem`, `ProtectHome`, `InaccessiblePaths`, `PrivateNetwork`, `IPAddressDeny`, capacidades), no lo lleva, y la unidad lo dice: ahí lo que no se lee lo decide solo el lector (su lista de prohibidas, que incluye lo de `hehermes` en `~/.config` y `~/.local`); sin red lo deja `RestrictAddressFamilies=AF_UNIX` |
+| El vigía | `[ficheros] lector = /run/hehermes-leer-media.sock` y su unidad lo quiere (`Wants=`) | `lector = /run/user/<uid>/hehermes-leer-media.sock` |
+| La red del vigía sin credencial | Esta máquina e internet; las redes de dentro, no: `IPAddressDeny=` 10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10, fc00::/7 y fe80::/10 (el relé no se sabe al instalar) | Una unidad de usuario no puede filtrar direcciones: se lo impide el propio vigía, que resuelve la dirección del relé de cada permiso y no se conecta si no es pública |
+
+Lo del código de avisos (la 0.7.0), que sigue valiendo: el código lo da Daniel (`sudo hehermes-rele credencial alta
+<nombre>`, en su VPS):
 
 ```bash
 sudo hehermes-servidor avisos                  # lo pide: se pega sin eco (no queda ni en la pantalla ni en el historial)
@@ -134,18 +161,23 @@ Contrato: `server/API-CONTRACT.md` §13; spec: `docs/superpowers/specs/2026-09-2
 | Configuración | `/etc/hehermes-avisos/vigia.ini` (`root:hh-vigia` 0640): Hermes, el relé (`https://…` y su huella) y dónde está cada secreto | `~/.config/hehermes-avisos/vigia.ini` (0600) |
 | Secretos | En `/etc/hehermes-avisos/vigia/` (`hh-vigia` 0600): la credencial, el secreto con la pasarela y su copia de la clave de Hermes, que `pasarela-clave` pone al día cuando cambia el `.env` | La credencial y el secreto, 0600; la clave la lee del `.env` de Hermes (si cambia, `systemctl --user restart hehermes-vigia`) |
 | Base de datos | `/var/lib/hehermes-vigia` (la crea systemd, 0700): los iPhone dados de alta, con su clave | `~/.local/state/hehermes-vigia` |
-| Unidades | `hehermes-vigia.socket` (el 127.0.0.1:8790 es de systemd) y `hehermes-vigia.service`, con la jaula de la del VPS de Daniel y la red solo hacia esta máquina y la IP del relé | `hehermes-vigia.service` de usuario, que abre su puerto |
+| Unidades | `hehermes-vigia.socket` (el 127.0.0.1:8790 es de systemd) y `hehermes-vigia.service`, con la jaula de la del VPS de Daniel y la red solo hacia esta máquina y la IP del relé (sin código, la de arriba) | `hehermes-vigia.service` de usuario, que abre su puerto |
 | La pasarela | Le pasa `/avisos/` con el secreto del vigía (por `LoadCredential`); se reinicia una vez | Lo mismo, leyendo el secreto |
 
 - **Se puede repetir.** Sin código, `instalar` repara el vigía con el de antes (la dirección, el puerto y la huella van
-  en el manifiesto; la credencial, en su fichero). Con otro código, cambia la credencial y reinicia el vigía.
-- **Se comprueba** al instalar (`vigia comprobar`: Hermes, su puerto, el relé con la credencial, sin mandar nada) y en
-  `comprobar`. Si el relé no contesta, se dice, **pero no para**: la pasarela ya funciona, y el relé es de otra máquina.
-- **No pone** el lector de ficheros (`GET /avisos/v1/fichero`, que es de root y va aparte): esa ruta contesta 503.
-- **No toca** unos avisos puestos a mano (`/opt/hehermes-avisos`, los del VPS de Daniel): el plan lo dice y para.
+  en el manifiesto; la credencial, en su fichero), o lo deja sin credencial si nunca se dio ninguno (el manifiesto dice
+  `"vigia": {"modo": "permisos"}`). Con otro código, cambia la credencial y reinicia el vigía.
+- **Se pone al día.** Una instalación de la 0.6.0 (sin vigía) o de la 0.7.0 (sin avisos, o con su código) pasa a la
+  0.8.0 con otro `instalar`, sin perder nada: los iPhone, el certificado y, si lo había, el código de avisos.
+- **Se comprueba** al instalar (`vigia comprobar`: Hermes, su puerto, el lector de ficheros y, con credencial, el relé,
+  sin mandar nada) y en `comprobar`, con el socket del lector. Si algo del vigía falla, se dice, **pero no para**: la
+  pasarela ya funciona, y el relé es de otra máquina.
+- **No toca** unos avisos puestos a mano (`/opt/hehermes-avisos`, los del VPS de Daniel, o los de la VPN de antes): ni
+  su vigía, ni su lector, ni sus secretos. Sin código, el plan lo dice y sigue con la pasarela (que les pasa `/avisos/`);
+  con un código, para.
 - El vigía **contesta las entregas de los subagentes** con el turno de continuación de la app, como en el Hermes de
   Daniel (`[entregas]` de `vigia.ini`): es la única escritura que hace en Hermes.
-- `desinstalar` (y `desinstalar --modo tls`) se lo lleva todo, base de datos incluida.
+- `desinstalar` (y `desinstalar --modo tls`) se lo lleva todo, base de datos y lector incluidos.
 
 ## La VPN de antes
 
@@ -189,7 +221,7 @@ VPN montada como la dejaba la 0.5.1 (`tests/vpn_antigua.py`): la pasarela sobre 
 Para un servidor con la VPN del instalador (`mi-iphone` por IKEv2):
 
 1. **Añadir la pasarela, sin tocar la VPN.** Primero el plan, que no cambia nada:
-   `sudo ./hehermes-servidor-0.7.0/hehermes-servidor instalar --plan --iphone iphone-tls`. Tiene que decir «Aquí sigue
+   `sudo ./hehermes-servidor-0.8.0/hehermes-servidor instalar --plan --iphone iphone-tls`. Tiene que decir «Aquí sigue
    la VPN IKEv2 que instaló una versión anterior», el TCP elegido y ningún «No puedo seguir».
 2. **Instalarla:** lo mismo sin `--plan`, en un terminal (pinta el QR del token, que no se puede volver a pintar).
 3. **Abrir el TCP de la pasarela en el cortafuegos del proveedor**, si tiene uno en su panel (el plan lo dice con su
@@ -218,8 +250,9 @@ Hay que saber:
   - Si tu proveedor tiene un cortafuegos propio, en su panel, abre ahí el TCP 61234
   - Aquí hay una VPN de HeHermes (/etc/nginx/sites-available/hehermes-tunel, /etc/swanctl/conf.d/hehermes-poc.conf, /etc/wireguard/hehermes). No la toco: la pasarela va aparte, en su puerto, y las dos conviven
   - /usr/local/sbin/hehermes-dispositivo no es mío: no lo toco. Para los iPhone de la pasarela usa el mío: sudo /opt/hehermes-servidor/hehermes-dispositivo alta <nombre>
+  - Aquí ya hay unos avisos puestos a mano (/opt/hehermes-avisos, los de server/avisos/despliegue/instalar.sh): ni el vigía ni el lector de ficheros los pongo yo, y lo suyo no lo toco
 
-44 cambios.
+45 cambios.
 ```
 <!-- /pasarela-de-daniel -->
 
@@ -239,7 +272,7 @@ Con el instalador ya puesto, otro iPhone no necesita el comando entero: `sudo he
 `server/instalador/empaquetar` genera el paquete, su `.sha256` y esa línea ya rellena:
 
 ```bash
-server/instalador/empaquetar                                   # dist/hehermes-servidor-0.7.0.tar.gz y .sha256
+server/instalador/empaquetar                                   # dist/hehermes-servidor-0.8.0.tar.gz y .sha256
 server/instalador/empaquetar --url-base https://ejemplo.org/hehermes --iphone mi-iphone
 server/instalador/empaquetar --firmar hehermes-firma.pem       # y el .sig (hace falta OpenSSL 3)
 ```
@@ -252,8 +285,9 @@ server/instalador/empaquetar --firmar hehermes-firma.pem       # y el .sig (hace
 - **Es reproducible:** la misma versión da siempre el mismo fichero y la misma suma (orden fijo, dueño root, hora fija
   y gzip sin nombre ni hora). Si se cambia algo, hay que subir la versión.
 - **Lleva:** `hehermes-servidor`, `hehermes-pasarela` y `hehermes_servidor/`, `hehermes-dispositivo` (de `server/vpn`),
-  `clave-publica.pem`, `requirements-canje.txt`, este README y, desde la 0.7.0, el código de los avisos
-  (`hehermes_avisos/`, sus `.py`: el vigía de `avisos`). Ni pruebas ni `__pycache__`, ni el despliegue a mano del relé.
+  `clave-publica.pem`, `requirements-canje.txt`, este README, desde la 0.7.0 el código de los avisos
+  (`hehermes_avisos/`, sus `.py`: el vigía) y, desde la 0.8.0, el lector de ficheros (`hehermes-leer-media`, de
+  `server/avisos/despliegue`). Ni pruebas ni `__pycache__`, ni el resto del despliegue a mano del relé.
 
 ### La firma de las actualizaciones
 
@@ -485,6 +519,17 @@ Seguridad
 El `MAL` del agujero es el del sitio escrito a mano (`server/vpn/hehermes-tunel.nginx`), que el doble copia tal cual.
 Lo arregla quitar esa VPN (a mano: no es del instalador), o cerrarlo con `deny 10.77.0.1;` al principio de su
 `location /`.
+
+## Decisiones de la 0.8.0
+
+- **Los avisos sin ningún comando.** El vigía va siempre, sin credencial, y cada iPhone trae su permiso (App Attest):
+  el probador instala desde la bienvenida y ya está. El código de avisos sigue valiendo.
+- **El lector de ficheros, también siempre.** Con root, como en el VPS de Daniel; sin root, como una unidad de usuario
+  del usuario de Hermes, con lo que una unidad de usuario puede ponerse, y dicho lo que no.
+- **La red del vigía sin credencial, a internet pero no a la red de dentro.** La dirección del relé la trae la app en
+  cada alta, y el alta la puede mandar cualquiera con un token de la pasarela: el vigía solo acepta IP públicas o
+  nombres, no se conecta a un nombre que resuelva a una privada y, con root, systemd le niega además las redes de
+  dentro. Lo que cierra el paso a cualquier otro es la huella anclada.
 
 ## Decisiones de la 0.7.0
 

@@ -2,7 +2,9 @@
 
 - ``servir`` (lo que arranca systemd): la API para la app y el bucle que vigila a Hermes.
 - ``comprobar``: la configuración, los secretos, Hermes y el relé, sin mandar ningún aviso. Para después de instalar.
-- ``dispositivos``: los iPhone dados de alta, con el token recortado.
+  Sin credencial (el «modo permisos»), el relé no se mira: cada iPhone trae el suyo, con su permiso.
+- ``dispositivos``: los iPhone dados de alta, con el token recortado y, si lo tienen, hasta cuándo vale su permiso
+  (nunca el permiso).
 """
 
 from __future__ import annotations
@@ -57,7 +59,7 @@ def servir(config: ConfigVigia) -> int:
         registro.error("%s", error)
         return 1
     try:
-        credencial = _secreto(config.rele_credencial)
+        credencial = _secreto(config.rele_credencial) if config.con_credencial else None
         clave_hermes = _clave_de_hermes(config.hermes_clave) if config.hermes_clave else None
         secreto_tunel = _secreto(config.secreto_tunel)
         if not secreto_tunel:
@@ -67,8 +69,9 @@ def servir(config: ConfigVigia) -> int:
         registro.error("%s", error)
         return comun.fuera_de_servicio(heredado, "vigia")
     hermes = ClienteHermes(config.hermes_base, clave_hermes, config.hermes_plazo)
-    mensajero = Mensajero(almacen, ClienteRele(config.rele_url, credencial, config.rele_plazo,
-                                               huella=config.rele_huella))
+    rele = (ClienteRele(config.rele_url, credencial, config.rele_plazo, huella=config.rele_huella)
+            if config.con_credencial else None)
+    mensajero = Mensajero(almacen, rele, plazo=config.rele_plazo)
     vigilante = Vigilante(almacen, hermes, mensajero, intervalo=config.intervalo,
                           intervalo_en_calma=config.intervalo_en_calma, antiguedad_maxima=config.antiguedad_maxima,
                           filas_por_lectura=config.filas_por_lectura, caducidad_aprobacion=config.caducidad_aprobacion,
@@ -85,7 +88,8 @@ def servir(config: ConfigVigia) -> int:
     signal.signal(signal.SIGINT, lambda *_: parar.set())
     registro.info("vigía %s escuchando en %s:%d%s; Hermes en %s%s; relé en %s", VERSION, *servidor.server_address[:2],
                   " (socket de systemd)" if heredado else "", config.hermes_base,
-                  " (con clave)" if clave_hermes else "", config.rele_url)
+                  " (con clave)" if clave_hermes else "",
+                  config.rele_url if config.con_credencial else "el de cada iPhone, con su permiso (sin credencial)")
     try:
         vigilante.correr(parar)
     finally:
@@ -117,11 +121,14 @@ def comprobar(config: ConfigVigia) -> int:
     decir(os.path.isdir(carpeta) and os.access(carpeta, os.W_OK),
           f"la carpeta de la base de datos ({carpeta}) existe y se puede escribir")
     credencial = None
-    try:
-        credencial = _secreto(config.rele_credencial)
-        decir(bool(credencial), f"la credencial del relé ({config.rele_credencial}) se lee y es privada")
-    except (ErrorDeSecreto, UnicodeDecodeError) as error:
-        decir(False, str(error))
+    if config.con_credencial:
+        try:
+            credencial = _secreto(config.rele_credencial)
+            decir(bool(credencial), f"la credencial del relé ({config.rele_credencial}) se lee y es privada")
+        except (ErrorDeSecreto, UnicodeDecodeError) as error:
+            decir(False, str(error))
+    else:
+        decir(True, "relé: sin credencial; los avisos van con el permiso de cada iPhone (lo trae la app en su alta)")
     secreto_tunel = None
     try:
         secreto_tunel = _secreto(config.secreto_tunel)
@@ -166,6 +173,8 @@ def comprobar(config: ConfigVigia) -> int:
         decir(*_comprobar_lector(config.ficheros_lector))
     else:
         decir(True, "sin lector de ficheros ([ficheros] lector vacío): GET /avisos/v1/fichero contesta 503")
+    if not config.con_credencial:
+        return 1 if fallos else 0
     base_rele = config.rele_url.rsplit("/v1/", 1)[0]
     if config.rele_huella:
         # La entrada pública del relé no contesta a nada sin credencial (el 404 de siempre, que además le cuenta un
@@ -232,9 +241,22 @@ def dispositivos(config: ConfigVigia) -> int:
         alta = time.strftime("%Y-%m-%d %H:%M", time.localtime(d.alta))
         estado = "delante" if d.delante(ahora) else "detrás"
         print(f"{cola(d.token):10} {d.entorno:10} alta {alta}  {estado:7}  vista previa «{d.ajustes.vista_previa}», "
-              f"sonido «{d.ajustes.sonido}», {len(d.ajustes.silenciados)} chats silenciados")
+              f"sonido «{d.ajustes.sonido}», {len(d.ajustes.silenciados)} chats silenciados; {_permiso(d, ahora)}")
     almacen.cerrar()
     return 0
+
+
+def _permiso(dispositivo, ahora: float) -> str:
+    """Si tiene permiso y hasta cuándo vale. El permiso mismo, nunca: deja pedir avisos para ese iPhone."""
+    permiso = dispositivo.permiso
+    if permiso is None:
+        return "sin permiso"
+    hasta = time.strftime("%Y-%m-%d", time.localtime(permiso.caduca))
+    if permiso.rechazado is not None:
+        return f"permiso rechazado por el relé (valía hasta {hasta})"
+    if permiso.caduca <= ahora:
+        return f"permiso caducado ({hasta})"
+    return f"permiso hasta {hasta}"
 
 
 def main(argv: list | None = None) -> int:

@@ -66,6 +66,9 @@ class ConfigVigia:
     hermes_base: str = "http://127.0.0.1:8642"
     hermes_clave: str | None = "/etc/hehermes-avisos/vigia/clave-hermes"
     hermes_plazo: float = 15.0
+    # Vacía (o sin poner en el INI): **sin credencial**, el «modo permisos» (spec 2026-09-28, «Avisos sin comandos»).
+    # Cada aviso va a la entrada pública del relé con el permiso que trae la app en el alta de cada iPhone, y a la
+    # dirección y con la huella que trae con él; la credencial ni se busca.
     rele_url: str = "http://127.0.0.1:8791/v1/avisos"
     rele_credencial: str = "/etc/hehermes-avisos/vigia/credencial-rele"
     rele_plazo: float = 8.0
@@ -97,9 +100,14 @@ class ConfigVigia:
 
         clave_hermes = (texto("hermes", "clave", base.hermes_clave) or "").strip() or None
         contestar = _si_o_no(texto("entregas", "contestar", "sí"), "[entregas] contestar")
-        rele_url = texto("rele", "url", base.rele_url).strip()
+        # Sin `url`, sin credencial: lo escribe así el instalador cuando no hay código de avisos. Con ella, las reglas de
+        # siempre (https con huella, o en claro solo a 127.0.0.1).
+        rele_url = (texto("rele", "url", "") or "").strip()
         rele_huella = (texto("rele", "huella", "") or "").strip() or None
-        _comprobar_rele(rele_url, rele_huella)
+        if rele_url:
+            _comprobar_rele(rele_url, rele_huella)
+        else:
+            rele_huella = None
         return cls(
             escucha=direccion(texto("vigia", "escucha", "%s:%d" % base.escucha)),
             base_de_datos=texto("vigia", "base_de_datos", base.base_de_datos),
@@ -129,6 +137,11 @@ class ConfigVigia:
             entregas_antiguedad_maxima=numero("entregas", "antiguedad_maxima", base.entregas_antiguedad_maxima),
             entregas_cadena_maxima=max(1, int(numero("entregas", "cadena_maxima", base.entregas_cadena_maxima))),
         )
+
+    @property
+    def con_credencial(self) -> bool:
+        """Si este vigía habla con el relé con su credencial (`[rele] url` puesta) o con el permiso de cada iPhone."""
+        return bool(self.rele_url)
 
     def reglas_de_entrega(self) -> ReglasDeEntrega | None:
         """Las reglas con las que el vigía contesta las entregas, o ``None`` si no las contesta."""

@@ -66,8 +66,10 @@ class Instalar(Base):
         self.assertEqual(man.ficheros["/etc/hehermes-pasarela/clave-hermes"]["tipo"], "gestionado")
         self.assertEqual(self.sis.modo(p.DISPOSITIVO), 0o750)
         self.assertEqual(self.sis.enlace(p.ORDEN), p.PREFIJO + "/hehermes-servidor")
-        self.assertEqual(man.unidades, ["hehermes-pasarela.service", "hehermes-pasarela-clave.path",
-                                        "hehermes-cortafuegos.service"])
+        # Desde la 0.8.0, también el lector de ficheros y el vigía (sin credencial), después de la pasarela.
+        self.assertEqual(man.unidades, ["hehermes-pasarela.service", "hehermes-leer-media.socket",
+                                        "hehermes-vigia.socket", "hehermes-vigia.service",
+                                        "hehermes-pasarela-clave.path", "hehermes-cortafuegos.service"])
         self.assertEqual((man.modos, man.paquetes, man.reglas), (["tls"], [], []))
         self.assertEqual(self.falso.reinicios, [])
         self.assertNotIn(sf.CLAVE, "\n".join(self.salida))

@@ -31,6 +31,12 @@ Dos maneras de lanzarlo:
 Delante de cualquiera de las dos puede ir ``--hermes-home=<carpeta>``, si Hermes no vive en ``/root/.hermes``: esa
 carpeta entera queda prohibida salvo ``image_cache/`` y ``audio_cache/``. La pone la unidad de systemd, nunca el vigía.
 
+Y ``--usuario``, para el lector **sin root** que pone ``hehermes-servidor`` cuando Hermes corre como un usuario y el
+instalador no tiene root: una unidad de usuario de systemd (``%t/hehermes-leer-media.sock``, 0600) que lanza el lector
+como ese mismo usuario, que ya puede leer lo que Hermes escribe. Entonces solo atiende a **su propio uid** (el vigía
+sin root corre como él): ni a root, ni a ``hh-vigia``. Como root no vale (``--usuario`` es para quien no lo es): un
+lector de root solo atiende a root y a ``hh-vigia``, como siempre.
+
 En los dos, el código de salida dice qué pasó (``SALIDAS``). Nunca apunta el contenido ni la ruta.
 """
 
@@ -72,6 +78,10 @@ PROHIBIDAS = (
 EMPIEZAN = (("/etc", "hehermes"), ("/var/lib", "hehermes"), ("/etc", "ipsec."))
 # En cualquier sitio: las claves de SSH y GnuPG de cualquier casa, y cualquier .env (el de Hermes lleva su clave).
 CARPETAS_EN_CUALQUIER_SITIO = (".ssh", ".gnupg")
+# Lo de hehermes-servidor sin root, en la casa del usuario: ~/.config/hehermes* (el manifiesto, la clave del certificado
+# de la pasarela y sus tokens, los secretos del vigía), ~/.local/share/hehermes* y ~/.local/state/hehermes* (la base de
+# datos del vigía, con la clave de cada iPhone). Lo mismo que /etc/hehermes* y /var/lib/hehermes* con root.
+EMPIEZAN_EN_CASA = ((".config",), (".local", "share"), (".local", "state"))
 # La carpeta de Hermes (HERMES_HOME), entera: .env, auth.json, config.yaml y sus copias, state.db, backups/, cron/,
 # hooks/, engagements/, SOUL.md, gateway.sock… Menos las dos donde deja lo que genera, que sí marca con MEDIA:. La de
 # otro sitio se pasa con --hermes-home (la pone el instalador en la unidad, si el entorno de hermes-gateway dice otra).
@@ -135,6 +145,12 @@ def es_prohibida(ruta: str, casas: tuple = (HERMES_HOME,)) -> bool:
     partes = ruta.split("/")[1:]
     if any(parte in CARPETAS_EN_CUALQUIER_SITIO for parte in partes):
         return True
+    for i in range(len(partes)):
+        for camino in EMPIEZAN_EN_CASA:
+            siguiente = i + len(camino)
+            if (tuple(partes[i:siguiente]) == camino and siguiente < len(partes)
+                    and partes[siguiente].startswith("hehermes")):
+                return True
     nombre = partes[-1] if partes else ""
     return nombre == ".env" or nombre.startswith(".env.")
 
@@ -269,6 +285,19 @@ def par_del_vigia(conexion, uid_vigia: int | None = None) -> bool:
     return uid in (0, uid_vigia)
 
 
+def par_del_mismo_usuario(conexion, uid_propio: int | None = None) -> bool:
+    """Con ``--usuario``: si al otro lado está este mismo usuario (el vigía sin root corre como él), según el núcleo.
+    Ni root ni nadie más: el socket ya es 0600 en su ``/run/user``, y esto lo vuelve a mirar."""
+    try:
+        if uid_propio is None:
+            uid_propio = os.geteuid()
+        credenciales = conexion.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", credenciales)
+    except (OSError, AttributeError, struct.error):
+        return False
+    return uid_propio != 0 and uid == uid_propio
+
+
 def _leer_linea(conexion, plazo: float) -> str:
     conexion.settimeout(plazo)
     recibido = b""
@@ -322,21 +351,31 @@ def atender(conexion, *, prohibidas=es_prohibida, par_permitido=par_del_vigia, p
 
 def main(argv: list) -> int:
     hermes = HERMES_HOME
-    if argv and argv[0].startswith("--hermes-home="):
-        try:
-            hermes = validar_casa(argv[0][len("--hermes-home="):])
-        except Rechazo:
-            sys.stderr.write("hehermes-leer-media: --hermes-home tiene que ser una carpeta absoluta\n")
-            return SALIDAS["invalida"]
+    par_permitido = par_del_vigia
+    while argv and argv[0] != "--conexion" and argv[0].startswith("--"):
+        if argv[0].startswith("--hermes-home="):
+            try:
+                hermes = validar_casa(argv[0][len("--hermes-home="):])
+            except Rechazo:
+                sys.stderr.write("hehermes-leer-media: --hermes-home tiene que ser una carpeta absoluta\n")
+                return SALIDAS["invalida"]
+        elif argv[0] == "--usuario":
+            if os.geteuid() == 0:
+                sys.stderr.write("hehermes-leer-media: --usuario es para el lector sin root; como root atiende a root "
+                                 "y a %s\n" % USUARIO_VIGIA)
+                return SALIDAS["invalida"]
+            par_permitido = par_del_mismo_usuario
+        else:
+            break
         argv = argv[1:]
     if argv == ["--conexion"]:
         conexion = socket.socket(fileno=0)
         try:
-            return atender(conexion, hermes=hermes)
+            return atender(conexion, hermes=hermes, par_permitido=par_permitido)
         finally:
             conexion.detach()
     if len(argv) != 1 or argv[0].startswith("-"):
-        sys.stderr.write("uso: hehermes-leer-media [--hermes-home=<carpeta>] <ruta absoluta> | --conexion\n")
+        sys.stderr.write("uso: hehermes-leer-media [--hermes-home=<carpeta>] [--usuario] <ruta absoluta> | --conexion\n")
         return SALIDAS["invalida"]
     try:
         fd, tamano = abrir(argv[0], hermes=hermes)

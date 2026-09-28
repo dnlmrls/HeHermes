@@ -34,6 +34,10 @@ class ConfigRele:
     por_credencial: int = 60
     por_token: int = 10
     recordar_bajas: float = 3600.0
+    # Los permisos por dispositivo (App Attest): la clave pública con la que se comprueban y la lista de revocados.
+    # Sin la pública, ningún permiso vale (solo las credenciales).
+    permisos_publica: str = "/etc/hehermes-avisos/rele/permisos.pub.pem"
+    permisos_revocados: str = "/etc/hehermes-avisos/rele/permisos-revocados.txt"
 
     @classmethod
     def leer(cls, ruta: str) -> ConfigRele:
@@ -68,4 +72,6 @@ class ConfigRele:
             por_credencial=int(texto("limites", "por_credencial", base.por_credencial)),
             por_token=int(texto("limites", "por_token", base.por_token)),
             recordar_bajas=float(texto("limites", "recordar_bajas", base.recordar_bajas)),
+            permisos_publica=texto("permisos", "publica", base.permisos_publica).strip(),
+            permisos_revocados=texto("permisos", "revocados", base.permisos_revocados).strip(),
         )

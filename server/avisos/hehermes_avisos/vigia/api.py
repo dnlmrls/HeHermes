@@ -10,6 +10,9 @@
   los bytes por partes; es la única que no contesta JSON cuando va bien
 
 Todo contesta 204 si va bien, y los errores con el envoltorio del api_server de Hermes, que es el que entiende la app.
+Menos dos (spec 2026-09-28, «Avisos sin comandos», Contrato C): el alta contesta ``200 {"envio": …}``, con qué va a
+mandar los avisos de ese iPhone, y el primer plano, ``200 {"permiso": "renovar"}`` cuando le hace falta a la app pedir
+otro permiso al relé (un vigía de antes contestaba 204 a las dos, y la app lo sigue dando por bueno).
 
 **Solo lo que llega por el túnel.** La credencial del iPhone es la de su VPN, como con Hermes. Pero el vigía escucha en
 ``127.0.0.1``, y cualquier proceso de la máquina podría hablarle: dar de alta veinte tokens falsos, echar al iPhone de
@@ -27,16 +30,17 @@ cosas, y ninguna basta sola:
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import logging
 import re
 import time
 
 from .. import VERSION, cifrado
-from ..comun import ENTORNOS, PATRON_TOKEN, ErrorHTTP, ManejadorJSON, cola
+from ..comun import ENTORNOS, PATRON_TOKEN, ErrorHTTP, ManejadorJSON, cola, es_ip_publica, es_nombre_dns
 from . import avisos
 from .ajustes import MAX_ID_SESION, Ajustes
-from .almacen import Almacen
-from .envio import BAJA, ENVIADO, LIMITADO, REINTENTABLE, Mensajero
+from .almacen import Almacen, Permiso
+from .envio import BAJA, ENVIADO, LIMITADO, PERMISO, REINTENTABLE, SIN_PERMISO, Mensajero
 from .fichero import Descarga, Ficheros, disposicion, parametros
 
 registro = logging.getLogger("vigia.api")
@@ -52,6 +56,46 @@ PATRON_ID = re.compile(r"[A-Za-z0-9_.:\-]{1,128}")
 CABECERA_TUNEL = "X-HeHermes-Vigia"
 # Una petición sin la cabecera se apunta en el registro una vez cada diez minutos: un proceso insistiendo no lo inunda.
 REPETIR_SIN_TUNEL = 600.0
+# El permiso del relé (Contrato B): `hhp1.<carga>.<firma>`, las dos en base64url. Lo comprueba el relé; aquí solo que
+# tenga su forma y un tamaño razonable, para no guardar ni mandar cualquier cosa en la cabecera Authorization.
+PATRON_PERMISO = re.compile(r"hhp1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+MAX_PERMISO = 1024
+PATRON_HUELLA = re.compile(r"[A-Za-z0-9_-]{43}")
+
+
+def _es_entero(valor: object) -> bool:
+    return isinstance(valor, int) and not isinstance(valor, bool)
+
+
+def permiso_valido(dato: object) -> Permiso:
+    """El ``permiso`` del alta (Contrato C), o ``400 permiso_invalido``. La dirección del relé la trae la app, y el alta
+    la puede mandar cualquiera con un token de la pasarela: tiene que ser una IP pública o un nombre (que al conectar
+    también tendrá que dar una pública), nunca una de la red de dentro."""
+    invalido = ErrorHTTP(400, "permiso_invalido", "El permiso del relé no tiene su forma")
+    if not isinstance(dato, dict):
+        raise invalido
+    valor, caduca, rele = dato.get("valor"), dato.get("caduca"), dato.get("rele")
+    if not (isinstance(valor, str) and len(valor) <= MAX_PERMISO and PATRON_PERMISO.fullmatch(valor)):
+        raise invalido
+    if not _es_entero(caduca) or caduca <= 0 or not isinstance(rele, dict):
+        raise invalido
+    direccion, puerto, huella = rele.get("direccion"), rele.get("puerto"), rele.get("huella")
+    if not isinstance(direccion, str) or not (es_ip_publica(direccion) or _es_nombre(direccion)):
+        raise ErrorHTTP(400, "permiso_invalido", "La dirección del relé tiene que ser una IP pública o un nombre")
+    if not _es_entero(puerto) or not 0 < puerto < 65536:
+        raise invalido
+    if not (isinstance(huella, str) and PATRON_HUELLA.fullmatch(huella)):
+        raise invalido
+    return Permiso(valor=valor, caduca=caduca, direccion=direccion, puerto=puerto, huella=huella)
+
+
+def _es_nombre(direccion: str) -> bool:
+    """Un nombre, y no algo que parezca una IP: «10.0.0.1» es una IP (privada), no un nombre que resolver."""
+    try:
+        ipaddress.ip_address(direccion)
+        return False
+    except ValueError:
+        return es_nombre_dns(direccion)
 
 
 def token_valido(texto: object) -> str:
@@ -92,7 +136,9 @@ class AppVigia:
             registro.warning("petición a la API del vigía sin la cabecera del túnel: 403 (no llegó por nginx)")
         raise ErrorHTTP(403, "fuera_del_tunel", "El vigía solo atiende lo que llega por el túnel")
 
-    def alta(self, cuerpo: dict) -> None:
+    def alta(self, cuerpo: dict) -> dict:
+        """Guarda el iPhone y contesta con qué se mandarán sus avisos: ``{"envio": "credencial" | "permiso" |
+        "ninguno"}``. Un alta sin ``permiso`` no borra el que había."""
         token = token_valido(cuerpo.get("token"))
         entorno = cuerpo.get("entorno")
         if entorno not in ENTORNOS:
@@ -101,13 +147,18 @@ class AppVigia:
             clave = cifrado.clave_desde_base64(cuerpo.get("clave"))
         except cifrado.ErrorDeCifrado:
             raise ErrorHTTP(400, "clave_invalida", "La clave tiene que ser base64 de 32 bytes") from None
+        permiso = permiso_valido(cuerpo["permiso"]) if cuerpo.get("permiso") is not None else None
         ajustes = Ajustes.desde_json(cuerpo.get("ajustes"))
         antes = self.almacen.dispositivo(token)
-        nuevo = self.almacen.guardar_dispositivo(token, entorno, clave, ajustes, self.reloj())
-        registro.info("%s de %s (%s); ajustes: %s", "alta" if nuevo else "alta renovada", cola(token), entorno,
-                      ajustes.cambios(antes.ajustes if antes else None))
+        ahora = self.reloj()
+        nuevo = self.almacen.guardar_dispositivo(token, entorno, clave, ajustes, ahora, permiso=permiso)
+        envio = self.mensajero.como_envia(self.almacen.dispositivo(token), ahora)
+        registro.info("%s de %s (%s); ajustes: %s; avisos: %s%s", "alta" if nuevo else "alta renovada", cola(token),
+                      entorno, ajustes.cambios(antes.ajustes if antes else None), envio,
+                      "" if permiso is None else " (con un permiso nuevo, hasta %s)" % _fecha(permiso.caduca))
         _si_no_avisa_de_nada(token, ajustes)
         self.al_moverse()
+        return {"envio": envio}
 
     def ajustes(self, token: str, cuerpo: dict) -> None:
         ajustes = Ajustes.desde_json(cuerpo)
@@ -117,7 +168,9 @@ class AppVigia:
         registro.info("ajustes de %s al día: %s", cola(token), ajustes.cambios(antes.ajustes))
         _si_no_avisa_de_nada(token, ajustes)
 
-    def primer_plano(self, token: str, cuerpo: dict) -> None:
+    def primer_plano(self, token: str, cuerpo: dict) -> dict | None:
+        """``{"permiso": "renovar"}`` si la app tiene que pedir otro permiso al relé y repetir el alta (sin credencial,
+        y el suyo falta, caduca en menos de 7 días o el relé lo ha rechazado); si no, None (204)."""
         activa = cuerpo.get("activa") is True
         conversacion = cuerpo.get("conversacion")
         if not (isinstance(conversacion, str) and 0 < len(conversacion) <= MAX_ID_SESION):
@@ -133,6 +186,10 @@ class AppVigia:
         self.almacen.vigilar_turnos(turnos, ahora)
         if not activa or turnos:
             self.al_moverse()
+        dispositivo = self.almacen.dispositivo(token)
+        if dispositivo is not None and self.mensajero.pide_renovar(dispositivo, ahora):
+            return {"permiso": "renovar"}
+        return None
 
     def prueba(self, cuerpo: dict) -> None:
         token = token_valido(cuerpo.get("token"))
@@ -147,6 +204,11 @@ class AppVigia:
         if resultado.tipo == LIMITADO:
             raise ErrorHTTP(429, "demasiados_avisos", "Demasiados avisos seguidos",
                             {"Retry-After": str(int(resultado.esperar or 5))})
+        if resultado.tipo == SIN_PERMISO:
+            raise ErrorHTTP(502, "sin_permiso", "Este vigía no tiene credencial y el iPhone no le ha dado un permiso "
+                                                "vigente del relé")
+        if resultado.tipo == PERMISO:
+            raise ErrorHTTP(502, "permiso_rechazado", f"El relé no acepta el permiso de este iPhone: {resultado.motivo}")
         codigo = "rele_no_disponible" if resultado.tipo == REINTENTABLE else "aviso_rechazado"
         raise ErrorHTTP(502, codigo, f"El aviso no ha salido: {resultado.motivo}")
 
@@ -159,6 +221,10 @@ class AppVigia:
         if not self.almacen.borrar_dispositivo(token):
             raise ErrorHTTP(404, "dispositivo_desconocido", "Este dispositivo no estaba dado de alta")
         registro.info("baja de %s", cola(token))
+
+
+def _fecha(instante: float) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(instante))
 
 
 def _si_no_avisa_de_nada(token: str, ajustes: Ajustes) -> None:
@@ -195,7 +261,7 @@ class ManejadorVigia(ManejadorJSON):
         ruta, metodo = self.ruta, self.command
         if ruta == "/avisos/v1/dispositivos":
             self._exigir(metodo, "POST")
-            app.alta(self.leer_json())
+            return self.enviar_json(200, app.alta(self.leer_json()))
         elif ruta == "/avisos/v1/prueba":
             self._exigir(metodo, "POST")
             app.prueba(self.leer_json())
@@ -219,7 +285,9 @@ class ManejadorVigia(ManejadorJSON):
                 app.ajustes(token, self.leer_json())
             else:
                 self._exigir(metodo, "PUT")
-                app.primer_plano(token, self.leer_json())
+                renovar = app.primer_plano(token, self.leer_json())
+                if renovar is not None:
+                    return self.enviar_json(200, renovar)
         self.enviar_json(204)
 
     def _enviar_descarga(self, descarga: Descarga) -> None:

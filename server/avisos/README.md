@@ -15,7 +15,9 @@ Otro servidor (un probador):
 iPhone ──su pasarela──▶ su vigía ──HTTPS anclado──▶ entrada pública del relé (TCP alto) ──▶ relé 127.0.0.1:8791
 ```
 
-Desde la 1.2.0, el relé de Daniel atiende también a los vigías de otros servidores, por su **entrada pública**
+Desde la 1.3.0, sin credencial: con **permisos por dispositivo avalados con App Attest**
+([abajo](#los-permisos-por-dispositivo-app-attest-construido-130)). Desde la 1.2.0, el relé de Daniel atiende también a
+los vigías de otros servidores, por su **entrada pública**
 ([abajo](#la-entrada-pública-del-relé-los-vigías-de-otros-servidores); spec
 `docs/superpowers/specs/2026-09-28-rele-para-probadores-design.md`). El vigía de un probador lo pone el instalador
 (`hehermes-servidor avisos`, 0.7.0).
@@ -299,27 +301,41 @@ TLS en `127.0.0.1` y el vigía de otro servidor delante, con su HTTPS anclado. C
 trae LibreSSL 2.8, sin 1.3); lo que exige 1.3 corre donde haya OpenSSL 3. Las pruebas que escuchan en `127.0.0.1` fallan
 dentro del sandbox de Claude Code: fuera de él.
 
-## El camino para miles (documentado, no construido)
+## Los permisos por dispositivo: App Attest (construido, 1.3.0)
 
-Hoy cada vigía tiene **una credencial por servidor, emitida a mano** (la de esta máquina, `instalar.sh`; las de otros,
-`hehermes-rele credencial alta`), y el relé guarda solo su huella. Sirve para uno o para unos pocos probadores de
-confianza, pero una credencial filtrada deja pedir avisos para cualquier token (limitados, y se corta con `baja`). Para
-miles:
+Hasta la 1.2.0 cada vigía tenía **una credencial por servidor, emitida a mano**. Desde la 1.3.0 hay además
+**permisos por dispositivo avalados con App Attest** (spec `docs/superpowers/specs/2026-09-28-avisos-con-app-attest-design.md`,
+contrato `server/API-CONTRACT.md` §13.5 y §14), y con ellos un probador tiene avisos **sin ejecutar nada**: el
+instalador 0.8.0 pone el vigía sin credencial y la app hace el resto.
 
-1. **Permisos por dispositivo avalados con App Attest.** Al darse de alta, la app pide al relé un permiso de avisos
-   para su token: le manda una atestación de App Attest (la primera vez) o una aserción (después), que demuestra que es
-   la app de verdad, firmada por el equipo `8X7L8YHD9M` y sin tocar. El relé la comprueba con Apple y devuelve un
-   permiso firmado por él (token, entorno, caducidad).
-2. La app le pasa ese permiso a **su** vigía por el túnel, dentro del alta (un campo más, `permiso`), y el vigía lo
-   manda con cada aviso. El relé solo acepta avisos para tokens con permiso vigente y firmado por él: un vigía, o quien
-   robe su credencial, solo puede avisar a los iPhone que se lo han dado. Los permisos caducan (p. ej. a los 30 días) y
-   la app los renueva al arrancar.
-3. La credencial por servidor queda para limitar y para saber de quién es cada aviso, no para autorizar.
-4. El relé, en su propia máquina: detrás de su entrada pública con TLS (ya existe, `rele.publico`), con conexiones HTTP/2 a APNs que se quedan abiertas y
-   se vigilan con PING (hoy se abre una por aviso, que al ritmo de un usuario es lo sensato), un servidor asíncrono o
-   varios procesos, y los límites en un almacén compartido si hay más de una instancia. Sigue sin guardar
-   estado de nadie más allá de los límites, las bajas y la lista de permisos revocados (por huella).
-5. Nada cambia en la extensión ni en el formato del aviso: el sobre ya es de extremo a extremo.
+```
+iPhone ──reto, atestación/aserción──▶ entrada pública del relé (la oficina de permisos, sin la .p8)
+   │    ◀──────── permiso firmado ──────┘
+   └─alta con el permiso──▶ su vigía ──aviso + «Authorization: Permiso …»──▶ entrada pública ──▶ relé ──▶ APNs
+```
+
+- **La oficina** (`rele/permisos.py`, `rele/appattest.py`, `rele/cbor.py`) vive en la entrada pública, que no puede leer
+  la .p8. Comprueba la atestación (la cadena hasta la raíz de Apple, incrustada; el nonce; el keyId; el App ID
+  `8X7L8YHD9M.com.danielmorales.HeHermesMensajes`; el contador; el aaguid de desarrollo o de producción) y las
+  aserciones (la firma sobre el nonce, el contador que sube), guarda lo mínimo de cada clave
+  (`/var/lib/hehermes-rele-publico/permisos.db`) y firma el permiso con Ed25519
+  (`/etc/hehermes-avisos/rele-publico/permisos.pem`, de root, por `LoadCredential`).
+- **El relé** solo tiene la pública (`/etc/hehermes-avisos/rele/permisos.pub.pem`): comprueba la firma, la fecha, la
+  revocación y que el token y el entorno del aviso son los del permiso.
+- **Revocar**: `sudo hehermes-rele permiso revocar <keyId|token>` (y `readmitir`, `lista`). Vale al momento en los dos
+  (`/etc/hehermes-avisos/rele/permisos-revocados.txt`, que vuelven a leer en cuanto cambia; roto, no vale ningún permiso).
+- **Las credenciales siguen valiendo** igual: el vigía de Daniel y los de los códigos de avisos no cambian.
+- `instalar.sh` (con la entrada pública puesta) crea las claves la primera vez y añade la sección `[permisos]` a
+  `rele-publico.ini`; después no las toca (otra clave dejaría sin valor todos los permisos dados).
+- El vigía (`vigia/envio.py`): con credencial, como siempre; sin ella, con el permiso de cada iPhone, a la dirección y
+  la huella que la app le da en el alta (solo IPs públicas o nombres que resuelven a IPs públicas).
+
+Lo que queda para miles: el relé en su propia máquina (con conexiones HTTP/2 a APNs que se quedan abiertas), un dominio
+en lugar de la IP, y los límites en un almacén compartido si hay más de una instancia.
+
+Las pruebas: `tests/test_cbor.py`, `tests/test_appattest.py` (con la atestación y la aserción de un iPhone de verdad,
+`tests/datos/app-attest/`, y con cadenas fabricadas con una raíz de prueba, `tests/atestaciones_de_prueba.py`, que no es
+la de Apple), `tests/test_permisos.py` y, por TLS, `tests/test_rele_publico.py`.
 
 ## Límites conocidos
 

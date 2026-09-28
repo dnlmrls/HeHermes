@@ -12,6 +12,10 @@ la pasarela** (``hehermes_servidor.pasarela``), con las credenciales de los vig�
 - no apunta ni la credencial, ni la ruta con su consulta, ni ningún cuerpo;
 - una baja (``hehermes-rele credencial baja``) vale al momento y corta en un segundo las conexiones abiertas con ella.
 
+Desde la 1.3.0, además, la **oficina de permisos** (``permisos.Oficina``, spec 2026-09-28 «Avisos sin comandos»): las
+rutas ``/v1/permisos/…``, que no piden credencial (la app se atesta con App Attest y recibe un permiso por dispositivo),
+y los avisos con ``Authorization: Permiso hhp1.…`` en lugar de una credencial.
+
 Lo que pasa, lo reenvía tal cual al relé, **con la misma credencial**: el relé la vuelve a comprobar, aplica sus
 límites por credencial y por token y apunta el nombre de la credencial en cada aviso. La entrada no tiene la clave .p8
 ni la puede leer: corre como ``hh-rele-publico``, que solo está en el grupo de ``credenciales.ini``.
@@ -24,7 +28,8 @@ solo en un terminal, o se deja en un fichero 0600.
 
 - ``servir --config RUTA``: lo que arranca ``hehermes-rele-publico.service``.
 - ``preparar --config RUTA --carpeta CARPETA [--direccion D]``: la primera vez, elige el puerto y hace el certificado
-  (con el venv, que tiene ``cryptography``). Después no toca nada: el puerto y la huella son para siempre.
+  (con el venv, que tiene ``cryptography``). Después no toca nada: el puerto y la huella son para siempre. Pone también
+  la oficina de permisos si falta (``preparar_permisos``: sus claves y la sección [permisos]).
 - ``comprobar --config RUTA``: se asoma sin credencial, como cualquiera, y mira el TLS, la huella y el 404.
 """
 
@@ -45,6 +50,7 @@ import urllib.parse
 
 from hehermes_servidor import pasarela as base
 
+from . import permisos as modulo_permisos
 from .credenciales import FORMA, Almacen
 
 #: Lo más grande que acepta el relé (``ManejadorRele.tope_cuerpo``): lo demás, ni se lee.
@@ -101,6 +107,10 @@ class ConfigPublico:
         self.certificado = self.clave = self.credenciales = None
         self.rele = ("127.0.0.1", 8791)
         self.direccion = None
+        # La oficina de permisos (App Attest): la clave privada con la que firma, su base de datos, la lista de
+        # revocados y el App ID. Sin la sección [permisos], no hay oficina (sus rutas dan el 404 de siempre).
+        self.permisos_clave = self.permisos_base = self.permisos_revocados = None
+        self.permisos_app = None
         # Lo que la maquinaria de la pasarela espera encontrar y aquí no hay.
         self.tokens = self.clave_hermes = self.secreto_vigia = self.vigia = None
         self.puerto_hermes = None
@@ -124,10 +134,17 @@ class ConfigPublico:
                 raise ValueError("el relé tiene que estar en 127.0.0.1, no en %s" % host)
             c.rele = (host.strip("[]"), int(puerto))
             c.direccion = ini.get("publico", "direccion", fallback="").strip() or None
+            if ini.has_section("permisos"):
+                c.permisos_clave = _absoluta(ini.get("permisos", "clave"))
+                c.permisos_base = _absoluta(ini.get("permisos", "base_de_datos"))
+                c.permisos_revocados = _absoluta(ini.get("permisos", "revocados"))
+                c.permisos_app = ini.get("permisos", "app", fallback="").strip() or None
         except (OSError, configparser.Error, ValueError) as error:
             raise ValueError("%s: %s" % (ruta, error)) from None
         if credenciales_systemd and os.path.exists(os.path.join(credenciales_systemd, "clave")):
             c.clave = os.path.join(credenciales_systemd, "clave")
+        if c.permisos_clave and credenciales_systemd and os.path.exists(os.path.join(credenciales_systemd, "permisos")):
+            c.permisos_clave = os.path.join(credenciales_systemd, "permisos")
         return c
 
 
@@ -141,13 +158,107 @@ def _absoluta(ruta: str) -> str:
 # MARK: El servidor
 
 
+#: Las rutas de la oficina de permisos: las únicas que no llevan credencial.
+RUTAS_PERMISOS = ("/v1/permisos/reto", "/v1/permisos/atestacion", "/v1/permisos/asercion")
+_FRASES = {200: "OK", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found",
+           413: "Payload Too Large", 429: "Too Many Requests", 503: "Service Unavailable"}
+
+
+def respuesta_json(estado: int, cuerpo: dict, cabeceras: dict | None = None) -> bytes:
+    datos = json.dumps(cuerpo, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    extra = "".join("%s: %s\r\n" % par for par in (cabeceras or {}).items())
+    return (("HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n%s"
+             "Connection: close\r\n\r\n") % (estado, _FRASES.get(estado, "Error"), len(datos), extra)).encode(
+        "latin-1") + datos
+
+
 class FrenteDelRele(base.Pasarela):
-    """La pasarela, con las credenciales de los vigías y un solo destino: el relé, con la misma credencial."""
+    """La pasarela, con las credenciales de los vigías y un solo destino: el relé, con la misma credencial.
+
+    Con la oficina de permisos (``permisos.Oficina``), además: sus tres rutas sin credencial, y los avisos que traen un
+    permiso en lugar de una credencial (``Authorization: Permiso hhp1.…``), que pasan al relé si el permiso está bien
+    firmado, en fecha y sin revocar. El relé lo vuelve a mirar todo, y además que sea para el token del aviso."""
 
     nombre = "entrada pública del relé"
 
-    def __init__(self, config: ConfigPublico, credenciales: Almacen, **opciones):
+    def __init__(self, config: ConfigPublico, credenciales: Almacen, oficina=None, **opciones):
         super().__init__(config, tokens=credenciales, **opciones)
+        self.oficina = oficina
+
+    def _permiso(self, peticion):
+        valores = peticion.valores("authorization")
+        return modulo_permisos.permiso_de(valores[0]) if len(valores) == 1 else None
+
+    async def atender_aparte(self, peticion, lector, escritor, ip):
+        if self.oficina is None:
+            return None
+        if peticion.ruta in RUTAS_PERMISOS:
+            if peticion.metodo != "POST" or peticion.valores("authorization"):
+                return await self._rechazar(escritor, ip)
+            return await self._oficina(peticion, lector, escritor, ip)
+        permiso = self._permiso(peticion)
+        if permiso is None or not modulo_permisos.FORMA.fullmatch(permiso):
+            # Una credencial (o nada, o un permiso sin su forma): lo de siempre.
+            return None
+        if peticion.ruta != "/v1/avisos" or peticion.metodo != "POST":
+            return await self._rechazar(escritor, ip)
+        try:
+            self.oficina.comprobar_permiso(permiso)
+        except modulo_permisos.ErrorDePermiso as error:
+            if error.motivo == "permiso_invalido":
+                self.limites.fallo(ip)
+                await asyncio.sleep(self.retraso_404)
+            return await self._contestar(escritor, ip, peticion, 401, {"resultado": "permiso", "motivo": error.motivo})
+        return None
+
+    def autorizar(self, peticion):
+        permiso = self._permiso(peticion)
+        if permiso is not None:
+            if self.oficina is None:
+                return None
+            try:
+                self.oficina.comprobar_permiso(permiso)
+            except modulo_permisos.ErrorDePermiso:
+                return None
+            return ""
+        return super().autorizar(peticion)
+
+    async def _contestar(self, escritor, ip, peticion, estado, cuerpo, cabeceras=None) -> bool:
+        escritor.write(respuesta_json(estado, cuerpo, cabeceras))
+        try:
+            await escritor.drain()
+        except (OSError, ConnectionError):
+            pass
+        # La ruta de la oficina es fija y no lleva nada; la de un aviso, tampoco. Nunca el cuerpo.
+        self.diario("%s %s %s %d" % (ip, peticion.metodo, peticion.ruta, estado))
+        return False
+
+    async def _oficina(self, peticion, lector, escritor, ip) -> bool:
+        largos = peticion.valores("content-length")
+        if peticion.valores("transfer-encoding") or len(set(largos)) > 1 or (
+                largos and not re.fullmatch(r"[0-9]{1,6}", largos[0])):
+            return await self._contestar(escritor, ip, peticion, 400,
+                                         {"error": {"code": "peticion_invalida", "message": "Cuerpo sin su largo"}})
+        largo = int(largos[0]) if largos else 0
+        if largo > TOPE:
+            return await self._contestar(escritor, ip, peticion, 413, {"error": {
+                "code": "cuerpo_demasiado_grande", "message": "El cuerpo es más grande de lo que se acepta"}})
+        try:
+            datos = await asyncio.wait_for(lector.readexactly(largo), base.PLAZO_TROZO) if largo else b"{}"
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
+            return False
+        try:
+            cuerpo = json.loads(datos.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            cuerpo = None
+        if peticion.ruta == "/v1/permisos/reto" and cuerpo is None:
+            cuerpo = {}
+        # Comprobar una atestación son unos milisegundos de CPU (una cadena de certificados): fuera del bucle.
+        respuesta = await asyncio.get_running_loop().run_in_executor(None, self.oficina.atender, peticion.ruta,
+                                                                     cuerpo, ip)
+        if respuesta.fallo:
+            self.limites.fallo(ip)
+        return await self._contestar(escritor, ip, peticion, respuesta.estado, respuesta.cuerpo, respuesta.cabeceras)
 
     def tope(self, peticion) -> int:
         return TOPE
@@ -158,12 +269,31 @@ class FrenteDelRele(base.Pasarela):
         return self.config.rele, [("Authorization", peticion.valores("authorization")[0])], "rele_no_contesta"
 
 
+def oficina_de(config: ConfigPublico):
+    """La oficina de permisos de esta configuración, o None si no tiene la sección [permisos]."""
+    if not config.permisos_clave:
+        return None
+    # Llega por LoadCredential: systemd la deja en la carpeta de credenciales del servicio, solo suya pero con modo 0440
+    # (como la clave del certificado, que tampoco pasa por `leer_secreto`). Fuera de systemd, la del ini (root 0600).
+    with open(config.permisos_clave, "rb") as fichero:
+        privada = modulo_permisos.cargar_privada(fichero.read())
+    return modulo_permisos.Oficina(privada, modulo_permisos.Claves(config.permisos_base),
+                                   modulo_permisos.Revocados(config.permisos_revocados),
+                                   app_id=config.permisos_app or modulo_permisos.appattest.APP_ID)
+
+
 def servir(config: ConfigPublico, tls_minimo=None) -> int:
+    import logging
+    from ..comun import ErrorDeSecreto, configurar_registro
+    configurar_registro("INFO")
     try:
-        frente = FrenteDelRele(config, Almacen(config.credenciales), tls_minimo=tls_minimo)
-    except (OSError, ssl.SSLError, ValueError) as error:
+        oficina = oficina_de(config)
+        frente = FrenteDelRele(config, Almacen(config.credenciales), oficina=oficina, tls_minimo=tls_minimo)
+    except (OSError, ssl.SSLError, ValueError, ErrorDeSecreto) as error:
         print("error: %s" % error, flush=True)
         return 1
+    logging.getLogger("rele.permisos").info("oficina de permisos: %s", "en marcha (%s)" % config.permisos_app
+                                            if oficina else "sin configurar")
     print("%d credenciales en %s; al relé, en %s:%d" % (len(frente.tokens), config.credenciales, *config.rele),
           flush=True)
     try:
@@ -255,6 +385,36 @@ def preparar(ruta_ini: str, carpeta: str, direccion: str | None = None,
     return {"puerto": puerto, "huella": huella, "direccion": direccion, "nuevo": True}
 
 
+PERMISOS_PUBLICA = "/etc/hehermes-avisos/rele/permisos.pub.pem"
+PERMISOS_BASE = "/var/lib/hehermes-rele-publico/permisos.db"
+PERMISOS_REVOCADOS = "/etc/hehermes-avisos/rele/permisos-revocados.txt"
+
+
+def preparar_permisos(ruta_ini: str, carpeta: str, publica: str = PERMISOS_PUBLICA, base_de_datos: str = PERMISOS_BASE,
+                      revocados: str = PERMISOS_REVOCADOS) -> dict:
+    """La oficina de permisos, en una entrada que ya está: el par de claves Ed25519 (la privada, en la carpeta del
+    certificado, 0600 de root; la pública, para el relé) y la sección [permisos] de ``rele-publico.ini``. Se puede
+    repetir: lo que ya está no se toca (otra clave dejaría sin valor todos los permisos dados). Devuelve
+    ``{nueva_clave, nueva_seccion}``."""
+    privada = os.path.join(carpeta, "permisos.pem")
+    nueva_clave = modulo_permisos.crear_claves(privada, publica)
+    ini = configparser.ConfigParser(interpolation=None)
+    with open(ruta_ini, encoding="utf-8") as fichero:
+        ini.read_file(fichero)
+    nueva_seccion = not ini.has_section("permisos")
+    if nueva_seccion:
+        # Se añade al final, sin reescribir lo de antes (el puerto y la dirección de los códigos que ya se han dado).
+        with open(ruta_ini, "a", encoding="utf-8") as fichero:
+            fichero.write("\n# La oficina de permisos de avisos (App Attest): la clave con la que firma (le llega por\n"
+                          "# LoadCredential=permisos), sus claves atestadas y la lista de revocados, que lee también el relé.\n"
+                          "[permisos]\n"
+                          "clave = %s\n"
+                          "base_de_datos = %s\n"
+                          "revocados = %s\n"
+                          "app = %s\n" % (privada, base_de_datos, revocados, modulo_permisos.appattest.APP_ID))
+    return {"nueva_clave": nueva_clave, "nueva_seccion": nueva_seccion}
+
+
 def sondear(puerto: int, anfitrion: str = "127.0.0.1", tls_maxima=None, plazo: float = 5.0) -> dict | None:
     """Lo que ve cualquiera que se asome sin credencial: la versión de TLS, la huella y lo que contesta a un GET. None
     si no negocia (o si no negocia con ``tls_maxima``)."""
@@ -322,6 +482,9 @@ def main(argv: list | None = None) -> int:
             print("entrada pública del relé: %s en el TCP %d (%s:%d), huella %s" % (
                 "preparada" if hecho["nuevo"] else "ya estaba", hecho["puerto"], hecho["direccion"], hecho["puerto"],
                 hecho["huella"]))
+            permisos = preparar_permisos(argumentos.config, argumentos.carpeta)
+            print("oficina de permisos: %s" % ("preparada" if permisos["nueva_clave"] or permisos["nueva_seccion"]
+                                               else "ya estaba"))
             print("PUERTO=%d" % hecho["puerto"])
             return 0
         config = ConfigPublico.leer(argumentos.config, os.environ.get("CREDENTIALS_DIRECTORY"))

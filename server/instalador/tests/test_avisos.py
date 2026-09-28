@@ -1,5 +1,8 @@
 """Los avisos en el servidor de un probador (spec 2026-09-28): `instalar --avisos` y `avisos`, contra el servidor falso.
 
+Desde la 0.8.0 («Avisos sin comandos»), `instalar` pone siempre el vigía y el lector de ficheros: sin código, el vigía
+va sin credencial (cada aviso, con el permiso de su iPhone); con él, como en la 0.7.0.
+
 El código de avisos lleva la credencial del vigía ante el relé de Daniel: se pide sin eco, no sale nunca por la salida,
 no va al manifiesto y solo queda en su fichero 0600. El vigía de verdad (su `comprobar`, el HTTPS anclado) lo prueban
 las pruebas de los avisos (`server/avisos/tests/test_rele_publico.py`).
@@ -7,7 +10,9 @@ las pruebas de los avisos (`server/avisos/tests/test_rele_publico.py`).
 
 import apoyo
 
+import base64
 import json
+import re
 import sys
 import unittest
 from unittest import mock
@@ -21,6 +26,8 @@ HUELLA = "huella-de-pruebas-del-rele-NO-ES-DE-VERDAD-"
 CREDENCIAL = "hhr1.credencial-de-pruebas-NO-ES-DE-VERDAD------"
 OTRA = "hhr1.otra-credencial-de-pruebas-NO-ES-DE-VERDAD-"
 RELE = "198.51.100.7"
+LLAVE = base64.urlsafe_b64encode(bytes(range(40, 72))).rstrip(b"=").decode()
+LECTOR = apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-leer-media"
 
 
 def codigo(credencial=CREDENCIAL, direccion=RELE, puerto=61999, huella=HUELLA):
@@ -77,6 +84,31 @@ class LaConfiguracionDelVigia(unittest.TestCase):
                 self.assertEqual((config.escucha, config.secreto_tunel, config.base_de_datos, config.ficheros_lector),
                                  (("127.0.0.1", 8790), a.secreto_vigia, a.base_vigia, ""))
                 self.assertEqual(config.hermes_clave, a.clave_hermes_vigia if a.root else "/home/hermes/.hermes/.env")
+                self.assertTrue(config.con_credencial)
+                # Sin código (0.8.0): sin credencial, y con el lector.
+                with open(ruta, "w") as f:
+                    f.write(p.vigia_ini(a, 8642, "/home/hermes/.hermes/.env", "/home/hermes", lector=a.socket_lector))
+                config = ConfigVigia.leer(ruta)
+                self.assertFalse(config.con_credencial)
+                self.assertEqual((config.rele_url, config.rele_huella, config.ficheros_lector),
+                                 ("", None, "/run/hehermes-leer-media.sock" if a.root
+                                  else "/run/user/1000/hehermes-leer-media.sock"))
+
+    def test_la_jaula_del_lector_es_la_del_vps_de_daniel(self):
+        """La unidad del lector de root que escribe el instalador lleva la misma jaula que la de instalar.sh."""
+        from hehermes_servidor import ambito
+
+        def directivas(texto):
+            return {l for l in texto.splitlines() if re.match(r"^[A-Z][A-Za-z]+=", l)
+                    and not l.startswith(("ExecStart=", "InaccessiblePaths=", "Documentation="))}
+
+        suya = (apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-leer-media@.service").read_text()
+        nuestra = p.unidad_lector(ambito.de_root(), "/root/.hermes")
+        self.assertEqual(directivas(nuestra), directivas(suya))
+        for tapada in re.findall(r"-/[^ \n]+", " ".join(l for l in suya.splitlines()
+                                                        if l.startswith("InaccessiblePaths="))):
+            self.assertIn(tapada, nuestra)
+        self.assertIn("-/etc/hehermes-pasarela", nuestra, "y lo del instalador, también")
 
 
 class Base(unittest.TestCase):
@@ -128,7 +160,7 @@ class ConRoot(Base):
         ini = self.sis.leer_texto(a.vigia_ini)
         self.assertIn("url = https://%s:61999/v1/avisos\nhuella = %s\n" % (RELE, HUELLA), ini)
         self.assertIn("clave = /etc/hehermes-avisos/vigia/clave-hermes\n", ini)
-        self.assertIn("lector =\n", ini)
+        self.assertIn("lector = /run/hehermes-leer-media.sock\n", ini)
         self.assertNotIn(CREDENCIAL, ini)
         self.assertEqual(self.sis.leer_texto(a.credencial_rele), CREDENCIAL + "\n")
         self.assertEqual(self.sis.leer_texto(a.clave_hermes_vigia), sf.CLAVE + "\n")
@@ -176,10 +208,16 @@ class ConRoot(Base):
 
     def test_avisos_en_una_pasarela_de_antes_y_con_el_codigo_pegado(self):
         self.assertEqual(self.orden("instalar", "--si", "--iphone", "mi-iphone"), 0, self.salida)
+        secreto = self.sis.leer(self.ambito().secreto_vigia)
         self.assertEqual(self.orden("avisos", "--si", terminal=False, pegado=codigo()), 0, self.salida)
         self.assertIn("Código de avisos: ", self.pedidos)
         self.assertEqual(self.sis.leer_texto(self.ambito().credencial_rele), CREDENCIAL + "\n")
-        self.assertIn("hehermes-pasarela", self.falso.reinicios, "la pasarela se reinicia con el secreto del vigía")
+        self.assertIn("url = https://%s:61999/v1/avisos\n" % RELE, self.sis.leer_texto(self.ambito().vigia_ini))
+        self.assertEqual(self.manifiesto()["vigia"], {"direccion": RELE, "puerto": 61999, "huella": HUELLA})
+        # Desde la 0.8.0 el vigía ya estaba (sin credencial): la pasarela ya le pasaba /avisos/ y no se toca.
+        self.assertEqual(self.sis.leer(self.ambito().secreto_vigia), secreto)
+        self.assertNotIn("hehermes-pasarela", self.falso.reinicios)
+        self.assertIn("hehermes-vigia", self.falso.reinicios)
         self.assertEqual([t["nombre"] for t in json.loads(self.sis.leer(self.ambito().tokens))["tokens"]],
                          ["mi-iphone"], "los iPhone, como estaban")
 
@@ -205,6 +243,34 @@ class ConRoot(Base):
         self.sis.carpeta("/opt/hehermes-avisos/src")
         self.assertEqual(self.orden("instalar", "--plan", "--avisos", codigo()), 1)
         self.assertIn("unos avisos puestos a mano", self.salida)
+
+    def test_unos_avisos_a_mano_tampoco_sin_codigo(self):
+        """Desde la 0.8.0 el vigía va siempre, pero no en un servidor con los suyos: ni su vigía, ni su lector (el de
+        /usr/local/libexec y sus unidades), ni sus secretos. La pasarela, sí, y les pasa /avisos/."""
+        self.sis.carpeta("/opt/hehermes-avisos/src")
+        suyos = {"/usr/local/libexec/hehermes-leer-media": ("#!/usr/bin/python3 -IS\n# el de Daniel\n", 0o755),
+                 "/etc/systemd/system/hehermes-leer-media.socket": ("[Socket]\n# el de Daniel\n", 0o644),
+                 "/etc/hehermes-avisos/vigia.ini": ("[rele]\nurl = http://127.0.0.1:8791/v1/avisos\n", 0o640),
+                 "/etc/hehermes-avisos/vigia/secreto-tunel": ("s" * 43 + "\n", 0o600)}
+        for ruta, (texto, modo) in suyos.items():
+            self.sis.poner(ruta, texto, modo=modo)
+        antes = {r: v for r, v in self.sis.foto().items() if r.startswith(("/etc/hehermes-avisos", "/usr/local/libexec",
+                                                                           "/etc/systemd/system/hehermes-leer"))}
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+        self.assertIn("ni el vigía ni el lector de ficheros los pongo yo", self.salida)
+        despues = {r: v for r, v in self.sis.foto().items() if r.startswith(("/etc/hehermes-avisos", "/usr/local/libexec",
+                                                                             "/etc/systemd/system/hehermes-leer"))}
+        self.assertEqual(despues, antes)
+        man = self.manifiesto()
+        self.assertNotIn("vigia", man)
+        # (Lo único suyo con ese nombre es su propia copia, con el instalador en /opt/hehermes-servidor.)
+        self.assertFalse([r for r in man["ficheros"] if ("avisos" in r or "leer-media" in r or "vigia" in r)
+                          and not r.startswith("/opt/hehermes-servidor/")])
+        self.assertNotIn("hh-vigia", self.falso.usuarios_sistema)
+        self.assertIn("LoadCredential=vigia:/etc/hehermes-avisos/vigia/secreto-tunel\n",
+                      self.sis.leer_texto(self.ambito().unidad))
+        self.assertEqual(self.orden("instalar", "--plan"), 0, self.salida)
+        self.assertIn("Todo al día: 0 cambios.", self.salida)
 
     def test_si_el_vigia_no_llega_al_rele_se_dice_pero_la_pasarela_queda(self):
         self.falso.vigia_comprueba = ["mal:  el relé no contesta a la credencial: timed out"]
@@ -250,6 +316,140 @@ class ConRoot(Base):
         self.assertIn("/etc/hehermes-avisos/vigia/credencial-rele (0644)", self.salida)
 
 
+class SinCodigo(Base):
+    """`instalar` a secas (lo de la frase del chat y el comando por SSH), con root: el vigía sin credencial y el
+    lector, sin que el probador haga nada más."""
+
+    def test_el_vigia_sin_credencial_y_el_lector(self):
+        self.assertEqual(self.orden("instalar", "--si", "--iphone", "mi-iphone"), 0, self.salida)
+        a = self.ambito()
+        ini = self.sis.leer_texto(a.vigia_ini)
+        self.assertIn("[rele]\n", ini)
+        self.assertRegex(ini, r"\nurl =\n")
+        self.assertNotIn("huella =", ini)
+        self.assertNotIn("credencial", ini.replace("Sin credencial", "").replace("la credencial.", ""))
+        self.assertIn("lector = /run/hehermes-leer-media.sock\ncasa = /root\n", ini)
+        self.assertFalse(self.sis.existe(a.credencial_rele), "sin código, ninguna credencial")
+        self.assertEqual(self.manifiesto()["vigia"], {"modo": "permisos"})
+        for ruta in (a.secreto_vigia, a.clave_hermes_vigia):
+            self.assertEqual((self.sis.modo(ruta), self.falso.dueños.get(ruta)), (0o600, "hh-vigia:hh-vigia"), ruta)
+        # La red del vigía: esta máquina e internet, no las redes de dentro (spec, «El instalador 0.8.0»).
+        unidad = self.sis.leer_texto(a.unidad_vigia)
+        self.assertIn("IPAddressAllow=localhost\nIPAddressDeny=10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 "
+                      "100.64.0.0/10 fc00::/7 fe80::/10\n", unidad)
+        self.assertNotIn("IPAddressDeny=any", unidad)
+        self.assertIn("Wants=network-online.target hehermes-leer-media.socket\n", unidad)
+        for linea in ("User=hh-vigia", "ProtectSystem=strict", "ProtectHome=yes", "NoNewPrivileges=yes",
+                      "CapabilityBoundingSet=", "PrivateTmp=yes"):
+            self.assertIn(linea + "\n", unidad, "la jaula de siempre")
+        # El lector, como en el VPS de Daniel: el script de root, su socket root:hh-vigia 0660 y su plantilla.
+        self.assertEqual(self.sis.leer(a.lector), LECTOR.read_bytes())
+        self.assertEqual(self.sis.modo(a.lector), 0o755)
+        socket_ = self.sis.leer_texto(a.unidad_lector_socket)
+        for linea in ("ListenStream=/run/hehermes-leer-media.sock", "SocketUser=root", "SocketGroup=hh-vigia",
+                      "SocketMode=0660", "Accept=yes"):
+            self.assertIn(linea + "\n", socket_)
+        servicio = self.sis.leer_texto(a.unidad_lector)
+        self.assertIn("ExecStart=/usr/bin/python3 -I -S -B /usr/local/libexec/hehermes-leer-media "
+                      "--hermes-home=/root/.hermes --conexion\n", servicio)
+        self.assertNotIn("--usuario", servicio)
+        self.assertIn("-/root/.hermes/.env", servicio)
+        self.assertIn("CapabilityBoundingSet=CAP_DAC_READ_SEARCH\n", servicio)
+        self.assertTrue({"hehermes-leer-media.socket", "hehermes-vigia", "hehermes-vigia.socket"} <= self.falso.activos)
+        self.assertTrue({"hehermes-leer-media.socket"} <= self.falso.habilitados)
+        man = self.manifiesto()
+        self.assertIn("hehermes-leer-media.socket", man["unidades"])
+        self.assertIn(a.lector, man["ficheros"])
+        # Y se comprueba: el vigía (sin credencial) y el lector.
+        self.assertIn("bien vigía: sin credencial; los avisos van con el permiso que la app le da al darse de alta",
+                      self.salida)
+        self.assertIn("bien lector de ficheros: su socket está en marcha (/run/hehermes-leer-media.sock)", self.salida)
+        self.assertIn("Escanéalo desde la app", self.salida)
+        self.assertEqual(self.orden("comprobar"), 0, self.salida)
+        self.assertIn("lector de ficheros: su socket está en marcha", self.salida)
+
+    def test_repetirlo_no_cambia_nada(self):
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+        self.assertEqual(self.orden("instalar", "--plan"), 0, self.salida)
+        self.assertIn("Todo al día: 0 cambios.", self.salida)
+        self.assertIn("el vigía, sin credencial", self.salida)
+        # Lo que falta se repone, sin preguntar nada.
+        self.sis.borrar(self.ambito().unidad_lector)
+        self.falso.activos.discard("hehermes-leer-media.socket")
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+        self.assertTrue(self.sis.existe(self.ambito().unidad_lector))
+        self.assertIn("hehermes-leer-media.socket", self.falso.activos)
+        self.assertEqual(self.pedidos.count("Código de avisos: "), 0)
+
+    def test_por_chat_tambien(self):
+        """Lo que ejecuta Hermes con la frase de la app: el vigía y el lector, sin nada más."""
+        self.assertEqual(self.orden("instalar", "--por-chat", "--iphone", "mi-iphone", "--llave", LLAVE), 0,
+                         self.salida)
+        self.assertEqual(self.manifiesto()["vigia"], {"modo": "permisos"})
+        self.assertTrue({"hehermes-leer-media.socket", "hehermes-vigia"} <= self.falso.activos)
+
+    def test_una_instalacion_de_la_0_6_0_se_pone_al_dia_sin_perder_nada(self):
+        """La 0.6.0 no ponía el vigía: otro `instalar` lo pone, y el lector, con los iPhone y el certificado de antes."""
+        with mock.patch.object(avisos, "planear", lambda *argumentos, **opciones: None):
+            self.assertEqual(self.orden("instalar", "--si", "--iphone", "mi-iphone"), 0, self.salida)
+        a = self.ambito()
+        self.assertFalse(self.sis.existe(a.vigia_ini))
+        certificado, tokens = self.sis.leer(a.cert), self.sis.leer(a.tokens)
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+        self.assertEqual((self.sis.leer(a.cert), self.sis.leer(a.tokens)), (certificado, tokens))
+        self.assertTrue(self.sis.existe(a.vigia_ini))
+        self.assertIn("hehermes-pasarela", self.falso.reinicios, "la pasarela, ahora con el secreto del vigía")
+        self.assertIn("LoadCredential=vigia:", self.sis.leer_texto(a.unidad))
+        self.assertTrue({"hehermes-leer-media.socket", "hehermes-vigia"} <= self.falso.activos)
+
+    def test_una_de_la_0_7_0_con_codigo_lo_conserva(self):
+        """Una 0.7.0 con código de avisos: su vigía no tenía lector (`lector =`). Otro `instalar`, sin el código, le
+        pone el lector y le deja su credencial y su relé."""
+        self.assertEqual(self.orden("instalar", "--si", "--avisos", codigo()), 0, self.salida)
+        a = self.ambito()
+        # Como lo dejaba la 0.7.0: sin lector, en el ini y en el disco.
+        from hehermes_servidor.manifiesto import Manifiesto
+        man = Manifiesto.leer(self.sis, a.manifiesto)
+        de_antes = p.vigia_ini(a, 8642, "/root/.hermes/.env", "/root", RELE, 61999, HUELLA).encode()
+        self.sis.escribir(a.vigia_ini, de_antes, modo=0o640)
+        man.apuntar_fichero(a.vigia_ini, de_antes)
+        for ruta in (a.lector, a.unidad_lector_socket, a.unidad_lector):
+            self.sis.borrar(ruta)
+            man.olvidar(ruta)
+        man.unidades.remove("hehermes-leer-media.socket")
+        man.guardar(self.sis)
+        self.falso.activos.discard("hehermes-leer-media.socket")
+        antes = len(self.falso.reinicios)
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+        ini = self.sis.leer_texto(a.vigia_ini)
+        self.assertIn("url = https://%s:61999/v1/avisos\nhuella = %s\n" % (RELE, HUELLA), ini)
+        self.assertIn("lector = /run/hehermes-leer-media.sock\n", ini)
+        self.assertEqual(self.sis.leer_texto(a.credencial_rele), CREDENCIAL + "\n")
+        self.assertEqual(self.manifiesto()["vigia"], {"direccion": RELE, "puerto": 61999, "huella": HUELLA})
+        self.assertIn("hehermes-vigia", self.falso.reinicios[antes:])
+        self.assertIn("hehermes-leer-media.socket", self.falso.activos)
+        self.assertIn("IPAddressDeny=any\nIPAddressAllow=localhost %s\n" % RELE, self.sis.leer_texto(a.unidad_vigia))
+        self.assertEqual(self.pedidos.count("Código de avisos: "), 0)
+
+    def test_desinstalar_se_lleva_el_lector(self):
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+        a = self.ambito()
+        self.assertEqual(self.orden("desinstalar", "--si"), 0, self.salida)
+        for ruta in (a.lector, a.unidad_lector_socket, a.unidad_lector, a.vigia_ini, "/etc/hehermes-avisos",
+                     "/var/lib/hehermes-vigia"):
+            self.assertFalse(self.sis.existe(ruta), ruta)
+        self.assertFalse({"hehermes-leer-media.socket", "hehermes-vigia"} & self.falso.activos)
+        self.assertIn(["systemctl", "stop", "hehermes-leer-media@*.service"], self.sis.ordenes)
+        self.assertNotIn("hh-vigia", self.falso.usuarios_sistema)
+
+    def test_desinstalar_la_pasarela_se_lleva_el_lector(self):
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+        self.assertEqual(self.orden("desinstalar", "--modo", "tls", "--si"), 0, self.salida)
+        a = self.ambito()
+        for ruta in (a.lector, a.unidad_lector_socket, a.unidad_lector):
+            self.assertFalse(self.sis.existe(ruta), ruta)
+
+
 class SinRoot(Base):
     euid = 1000
     cuenta = ("hermes", "/home/hermes", 1000)
@@ -286,6 +486,47 @@ class SinRoot(Base):
         self.assertEqual(self.orden("desinstalar", "--si"), 0, self.salida)
         self.assertFalse(self.sis.existe(a.carpeta_avisos))
         self.assertFalse(self.sis.existe(a.carpeta_estado_vigia))
+
+    def test_sin_codigo_el_vigia_y_el_lector_de_su_usuario(self):
+        """Lo que hace la frase del chat en un servidor sin root: todo en su casa y en su /run/user, con unidades de
+        usuario, y el lector como él mismo, que solo le atiende a él."""
+        suyo = (self.CASA, "/run/user/1000/")
+        antes_fuera = {r: v for r, v in self.sis.foto().items() if not r.startswith(suyo)}
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+        self.assertEqual({r: v for r, v in self.sis.foto().items() if not r.startswith(suyo)}, antes_fuera,
+                         "sin root no se escribe nada fuera de su casa")
+        a = self.ambito()
+        ini = self.sis.leer_texto(a.vigia_ini)
+        self.assertRegex(ini, r"\nurl =\n")
+        self.assertIn("lector = /run/user/1000/hehermes-leer-media.sock\ncasa = /home/hermes\n", ini)
+        self.assertFalse(self.sis.existe(a.credencial_rele))
+        # El lector: la copia que va con el instalador en su casa, lanzada por una unidad de usuario.
+        self.assertEqual(a.lector, "/home/hermes/.local/share/hehermes-servidor/hehermes-leer-media")
+        self.assertEqual(self.sis.leer(a.lector), LECTOR.read_bytes())
+        socket_ = self.sis.leer_texto(a.unidad_lector_socket)
+        self.assertIn("ListenStream=%t/hehermes-leer-media.sock\nSocketMode=0600\n", socket_)
+        self.assertNotIn("SocketGroup", socket_)
+        servicio = self.sis.leer_texto(a.unidad_lector)
+        self.assertIn("ExecStart=/usr/bin/python3 -I -S -B %s --usuario --hermes-home=/home/hermes/.hermes "
+                      "--conexion\n" % a.lector, servicio)
+        self.assertIn("NoNewPrivileges=yes\nRestrictAddressFamilies=AF_UNIX\n", servicio)
+        self.assertIn("NO puede ponerse", servicio, "dice lo que una unidad de usuario no puede, no lo finge")
+        self.assertNotIn("CapabilityBoundingSet=CAP", servicio)
+        self.assertNotIn("InaccessiblePaths=", servicio)
+        vigia = self.sis.leer_texto(a.unidad_vigia)
+        self.assertIn("Wants=hehermes-leer-media.socket\n", vigia)
+        self.assertNotIn("IPAddress", vigia.replace("IPAddressDeny necesita", ""))
+        self.assertTrue({"hehermes-leer-media.socket", "hehermes-vigia"} <= self.falso.activos_usuario)
+        self.assertFalse({"hehermes-leer-media.socket", "hehermes-vigia"} & self.falso.activos)
+        self.assertIn("bien lector de ficheros: su socket está en marcha (/run/user/1000/hehermes-leer-media.sock)",
+                      self.salida)
+        self.assertEqual(self.orden("instalar", "--plan"), 0, self.salida)
+        self.assertIn("Todo al día: 0 cambios.", self.salida)
+        self.assertEqual(self.orden("desinstalar", "--si"), 0, self.salida)
+        for ruta in (a.lector, a.unidad_lector_socket, a.unidad_lector, a.carpeta_avisos, a.carpeta_estado_vigia):
+            self.assertFalse(self.sis.existe(ruta), ruta)
+        self.assertFalse({"hehermes-leer-media.socket", "hehermes-vigia"} & self.falso.activos_usuario)
+        self.assertIn(["systemctl", "--user", "stop", "hehermes-leer-media@*.service"], self.sis.ordenes)
 
 
 class ElPaquete(unittest.TestCase):
