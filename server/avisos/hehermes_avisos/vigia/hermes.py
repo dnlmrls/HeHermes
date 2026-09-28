@@ -1,4 +1,6 @@
-"""El vigía leyendo el api_server de Hermes como lo lee la app, sin tocarlo: solo ``GET``, y solo rutas del contrato.
+"""El vigía leyendo el api_server de Hermes como lo lee la app: ``GET`` de rutas del contrato y **una sola escritura**,
+el turno que contesta la entrega de un subagente (``lanzar_continuacion``, con el texto fijo de la app y su misma
+``Idempotency-Key``; por qué, en ``entregas``). Nada más: el vigía no escribe lo que quiere, ni en otra ruta.
 
 Dos maneras de llegar, a elegir en la configuración:
 
@@ -17,6 +19,7 @@ import urllib.parse
 import urllib.request
 
 from .. import comun
+from . import deteccion
 
 registro = logging.getLogger("vigia.hermes")
 
@@ -24,9 +27,21 @@ LIMITE_BANDEJA = 200
 
 
 class ErrorHermes(Exception):
-    def __init__(self, mensaje: str, estado: int | None = None):
+    def __init__(self, mensaje: str, estado: int | None = None, codigo: str | None = None):
         super().__init__(mensaje)
         self.estado = estado
+        # El `code` del envoltorio de error de Hermes (contrato §8), si lo trae: `idempotency_key_conflict`…
+        self.codigo = codigo
+
+
+def _codigo_de_error(error: urllib.error.HTTPError) -> str | None:
+    try:
+        cuerpo = json.loads(error.read(65536).decode("utf-8"))
+    except (OSError, ValueError, http.client.HTTPException):
+        return None
+    detalle = cuerpo.get("error") if isinstance(cuerpo, dict) else None
+    codigo = detalle.get("code") if isinstance(detalle, dict) else None
+    return codigo if isinstance(codigo, str) else None
 
 
 class ClienteHermes:
@@ -74,6 +89,38 @@ class ClienteHermes:
             raise ErrorHermes("los mensajes de Hermes no traen «data»")
         validas = [f for f in filas if isinstance(f, dict) and isinstance(f.get("id"), int)]
         return sorted(validas, key=lambda f: f["id"])
+
+    def lanzar_continuacion(self, sesion: str, clave: str) -> str:
+        """``POST /v1/runs`` con el turno de continuación de la app (``deteccion.TEXTO_CONTINUAR``) en ``sesion`` y la
+        ``Idempotency-Key`` ``clave``. Devuelve el ``run_id``.
+
+        El cuerpo es siempre el mismo para la misma clave: un reintento cuyo primer intento sí llegó da el mismo run
+        (``replayed``), no otro turno. No lleva las instrucciones ni el esfuerzo de la conversación, que solo tiene el
+        iPhone: si la app lanza la suya con la misma clave, el servidor contesta 409 y sigue habiendo un solo turno."""
+        cuerpo = json.dumps({"input": deteccion.TEXTO_CONTINUAR, "session_id": sesion}, ensure_ascii=False,
+                            sort_keys=True).encode("utf-8")
+        peticion = urllib.request.Request(self.base + "/v1/runs", data=cuerpo, method="POST",
+                                          headers={"Accept": "application/json", "Content-Type": "application/json",
+                                                   "Idempotency-Key": clave})
+        if self._clave:
+            peticion.add_header("Authorization", f"Bearer {self._clave}")
+        try:
+            with self._abridor.open(peticion, timeout=self.plazo) as respuesta:
+                datos = json.loads(respuesta.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            codigo = _codigo_de_error(error)
+            error.close()
+            raise ErrorHermes(f"Hermes contestó {error.code} ({codigo or 'sin código'}) a POST /v1/runs", error.code,
+                              codigo) from None
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
+            razon = getattr(error, "reason", None) or type(error).__name__
+            raise ErrorHermes(f"no se puede hablar con Hermes: {razon}") from None
+        except ValueError:
+            raise ErrorHermes("Hermes contestó algo que no es JSON") from None
+        run_id = datos.get("run_id") if isinstance(datos, dict) else None
+        if not isinstance(run_id, str) or not run_id:
+            raise ErrorHermes("Hermes aceptó el turno sin decir su run_id")
+        return run_id
 
     def turno(self, run_id: str) -> dict | None:
         """El estado de un run (``GET /v1/runs/{id}``), o ``None`` si Hermes ya no lo conoce (404)."""

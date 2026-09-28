@@ -101,15 +101,21 @@ class AppVigia:
             clave = cifrado.clave_desde_base64(cuerpo.get("clave"))
         except cifrado.ErrorDeCifrado:
             raise ErrorHTTP(400, "clave_invalida", "La clave tiene que ser base64 de 32 bytes") from None
-        nuevo = self.almacen.guardar_dispositivo(token, entorno, clave, Ajustes.desde_json(cuerpo.get("ajustes")),
-                                                 self.reloj())
-        registro.info("%s de %s (%s)", "alta" if nuevo else "alta renovada", cola(token), entorno)
+        ajustes = Ajustes.desde_json(cuerpo.get("ajustes"))
+        antes = self.almacen.dispositivo(token)
+        nuevo = self.almacen.guardar_dispositivo(token, entorno, clave, ajustes, self.reloj())
+        registro.info("%s de %s (%s); ajustes: %s", "alta" if nuevo else "alta renovada", cola(token), entorno,
+                      ajustes.cambios(antes.ajustes if antes else None))
+        _si_no_avisa_de_nada(token, ajustes)
         self.al_moverse()
 
     def ajustes(self, token: str, cuerpo: dict) -> None:
-        if not self.almacen.cambiar_ajustes(token, Ajustes.desde_json(cuerpo), self.reloj()):
+        ajustes = Ajustes.desde_json(cuerpo)
+        antes = self.almacen.dispositivo(token)
+        if antes is None or not self.almacen.cambiar_ajustes(token, ajustes, self.reloj()):
             raise ErrorHTTP(404, "dispositivo_desconocido", "Este dispositivo no está dado de alta")
-        registro.info("ajustes de %s al día", cola(token))
+        registro.info("ajustes de %s al día: %s", cola(token), ajustes.cambios(antes.ajustes))
+        _si_no_avisa_de_nada(token, ajustes)
 
     def primer_plano(self, token: str, cuerpo: dict) -> None:
         activa = cuerpo.get("activa") is True
@@ -153,6 +159,14 @@ class AppVigia:
         if not self.almacen.borrar_dispositivo(token):
             raise ErrorHTTP(404, "dispositivo_desconocido", "Este dispositivo no estaba dado de alta")
         registro.info("baja de %s", cola(token))
+
+
+def _si_no_avisa_de_nada(token: str, ajustes: Ajustes) -> None:
+    """Un iPhone que no quiere ningún aviso es casi siempre un fallo, no una decisión: el 2026-09-27 el de Daniel llegó
+    así en cada alta, y solo se vio cuando una respuesta no le avisó. Apagarlo todo a propósito es el interruptor
+    general de la app, que no manda esto: da de baja el iPhone."""
+    if ajustes.todos_apagados:
+        registro.warning("%s tiene los cuatro tipos de aviso apagados: solo le llegará el aviso de prueba", cola(token))
 
 
 def _turnos(lista: object) -> list:

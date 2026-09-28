@@ -9,6 +9,7 @@ seguridad menos que vigilar en el VPS.
 from __future__ import annotations
 
 import configparser
+import http.client
 import http.server
 import json
 import logging
@@ -307,10 +308,78 @@ class _SinRedirecciones(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def abridor() -> urllib.request.OpenerDirector:
+def abridor(huella: str | None = None, tls_minimo=None) -> urllib.request.OpenerDirector:
     """El cliente HTTP de los dos servicios: sin proxies del entorno (hablan con su propia máquina, o con el relé) y sin
-    seguir redirecciones."""
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _SinRedirecciones())
+    seguir redirecciones. Con ``huella``, además, el HTTPS anclado a ella (``abridor_anclado``)."""
+    manejadores = [urllib.request.ProxyHandler({}), _SinRedirecciones()]
+    if huella is not None:
+        manejadores.append(_ManejadorAnclado(huella, tls_minimo))
+    return urllib.request.build_opener(*manejadores)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# HTTPS anclado: el vigía de otro servidor hablando con la entrada pública del relé
+
+#: Solo TLS 1.3, como la pasarela y la entrada pública del relé. Las pruebas del Mac lo bajan: el Python de Xcode trae
+#: LibreSSL 2.8, que no sabe de 1.3.
+TLS_MINIMO = None
+
+
+class ErrorDeHuella(OSError):
+    """El servidor no es el del código de avisos: su certificado no tiene la huella que se ancló. No se ha mandado nada."""
+
+
+def huella_spki(der: bytes) -> str:
+    """El SHA-256 del SPKI de un certificado DER, en base64url sin relleno: lo mismo que ancla la app con la pasarela, y
+    lo que va en el código de avisos (``f``)."""
+    import base64
+    import hashlib
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    spki = x509.load_der_x509_certificate(der).public_key().public_bytes(Encoding.DER,
+                                                                          PublicFormat.SubjectPublicKeyInfo)
+    return base64.urlsafe_b64encode(hashlib.sha256(spki).digest()).rstrip(b"=").decode("ascii")
+
+
+def _contexto_anclado(tls_minimo=None):
+    import ssl
+    contexto = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    # El certificado es autofirmado y no lleva nombre: lo que vale es la huella, que se mira en `connect`, antes de
+    # mandar un solo byte de la petición.
+    contexto.check_hostname = False
+    contexto.verify_mode = ssl.CERT_NONE
+    contexto.minimum_version = tls_minimo or TLS_MINIMO or ssl.TLSVersion.TLSv1_3
+    return contexto
+
+
+class _ConexionAnclada(http.client.HTTPSConnection):
+    def __init__(self, *argumentos, huella: str, **opciones):
+        super().__init__(*argumentos, **opciones)
+        self._huella = huella
+
+    def connect(self):
+        import hmac
+        super().connect()
+        der = self.sock.getpeercert(binary_form=True)
+        try:
+            vista = huella_spki(der) if der else ""
+        except ValueError:
+            vista = ""
+        if not hmac.compare_digest(vista.encode("ascii"), self._huella.encode("ascii")):
+            # La credencial va en la petición, que todavía no ha salido: se corta aquí y no sale.
+            self.sock.close()
+            self.sock = None
+            raise ErrorDeHuella("el certificado del relé no es el del código de avisos (otra huella)")
+
+
+class _ManejadorAnclado(urllib.request.HTTPSHandler):
+    def __init__(self, huella: str, tls_minimo=None):
+        self._huella_anclada = huella
+        super().__init__(context=_contexto_anclado(tls_minimo))
+
+    def https_open(self, req):
+        return self.do_open(_ConexionAnclada, req, context=self._context, huella=self._huella_anclada)
 
 
 # ---------------------------------------------------------------------------------------------------------------------

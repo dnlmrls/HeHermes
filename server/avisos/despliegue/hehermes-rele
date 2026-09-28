@@ -1,0 +1,12 @@
+#!/bin/sh
+# hehermes-rele: las credenciales de los vigías de otros servidores ante el relé de avisos (/usr/local/sbin, root).
+#
+#   sudo hehermes-rele credencial alta <nombre> [--a-fichero <ruta>] [--por-minuto N]   su código de avisos
+#   sudo hehermes-rele credencial baja <nombre>                                         deja de valer al momento
+#   sudo hehermes-rele credencial lista
+#   sudo hehermes-rele comprobar                                                        la .p8 y las credenciales
+#
+# El código de avisos lleva la credencial: se pinta solo en un terminal, o va a un fichero nuevo 0600.
+set -eu
+cd /
+exec /opt/hehermes-avisos/venv/bin/python -I -B -m hehermes_avisos.rele --config /etc/hehermes-avisos/rele.ini "$@"

@@ -7,8 +7,9 @@ lo quitaría a la app, contrato §3):
   ``tool_calls``) ni un turno parado (``Operation interrupted…``, que la app pinta «Detenido.» y que provocó Daniel).
 - **Trabajo en segundo plano terminado**, de dos maneras:
   - la **entrega de un subagente**: una fila ``user`` con ``display_kind: async_delegation_complete`` (contrato §6).
-    En el api_server nadie lanza el turno siguiente: lo lanza la app cuando está viva. Con la pantalla apagada no lo
-    está, y esta fila es la única señal de que el trabajo ha acabado;
+    En el api_server Hermes no lanza el turno siguiente: lo lanza la app cuando está viva o, si no, el vigía
+    (``entregas``). Cuando el vigía no la contesta (una cadena de delegaciones sin fin), esta fila es la única señal
+    de que el trabajo ha acabado;
   - una respuesta **sin petición de Daniel detrás**: la del turno de continuación que lanza la app
     (``⟦hehermes:continuar⟧``), o una sesión con respuestas y sin ninguna petición.
 - Lo que **no** se avisa: la respuesta a una retirada de «Deshacer envío» (la app no la pinta), salvo que un desvío
@@ -96,14 +97,13 @@ class _Entrega:
     def __init__(self, fila: dict, nueva: bool):
         self.fila = fila
         self.nueva = nueva
-        # El primer turno que empezó después de la entrega, y si ese turno tuvo respuesta: entonces está contestada
-        # (contrato §6, punto 5). La respuesta del turno que ya estaba en marcha cuando llegó no cuenta.
+        # El primer turno que empezó después de la entrega (contrato §6, punto 5): con él, la entrega está en manos de
+        # ese turno. La respuesta del turno que ya estaba en marcha cuando llegó no cuenta.
         self.turno_siguiente: dict | None = None
-        self.contestada = False
 
 
 def sucesos(filas: list, *, ultimo_id: int | None, referencia: float, ahora: float, antiguedad_maxima: float,
-            pagina_llena: bool) -> list:
+            pagina_llena: bool, entregas_del_vigia: int | None = None) -> list:
     """Lo que hay que avisar de una sesión, a partir de sus últimas filas.
 
     - ``ultimo_id``: la última fila ya vista. ``None`` si el vigía aún no ha leído esta sesión nunca: entonces es nuevo
@@ -111,6 +111,8 @@ def sucesos(filas: list, *, ultimo_id: int | None, referencia: float, ahora: flo
     - ``antiguedad_maxima``: lo escrito hace más de esto no se avisa aunque sea nuevo para el vigía. Tras un reinicio
       largo, un aviso de hace una hora es ruido, no un aviso.
     - ``pagina_llena``: la lectura trajo tantas filas como se pidieron, así que puede faltar el principio del turno.
+    - ``entregas_del_vigia``: las entregas hasta esta fila las contesta el vigía (``entregas``), y de ellas no se avisa:
+      el aviso que importa es el de la respuesta, que llega detrás.
     """
     ordenadas = sorted((f for f in filas if isinstance(f, dict) and isinstance(f.get("id"), int)),
                        key=lambda f: f["id"])
@@ -146,9 +148,6 @@ def sucesos(filas: list, *, ultimo_id: int | None, referencia: float, ahora: flo
             contenido = _texto(fila).strip()
             if not contenido or fila.get("finish_reason") == "tool_calls" or fila.get("display_kind") is not None:
                 continue
-            for entrega in entregas:
-                if turno is not None and entrega.turno_siguiente is turno:
-                    entrega.contestada = True
             if es_interrupcion(contenido) or not nueva(fila):
                 continue
             respuestas.append((fila, turno, desvio_en_el_turno))
@@ -161,7 +160,10 @@ def sucesos(filas: list, *, ultimo_id: int | None, referencia: float, ahora: flo
         if tipo and leido:
             resultado.append(Suceso(tipo=tipo, fila=fila["id"], instante=_instante(fila, ahora), texto=leido,
                                     clave=f"{tipo}:{fila['id']}"))
-    sin_contestar = [e for e in entregas if e.nueva and not e.contestada]
+    # Una entrega con un turno detrás ya está en manos de ese turno (una continuación, o un mensaje de Daniel que la
+    # tiene en su contexto): lo que se avisa es su respuesta, cuando llegue.
+    sin_contestar = [e for e in entregas if e.nueva and e.turno_siguiente is None
+                     and (entregas_del_vigia is None or e.fila["id"] > entregas_del_vigia)]
     if sin_contestar:
         fila = sin_contestar[-1].fila
         resultado.append(Suceso(tipo="segundo-plano", fila=fila["id"], instante=_instante(fila, ahora),

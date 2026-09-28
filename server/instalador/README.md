@@ -6,7 +6,10 @@ un certificado propio cuya huella ancla la app y un token por iPhone. **No neces
 del usuario de Hermes. Es `docs/superpowers/specs/2026-09-26-pasarela-tls-design.md`, con su plan en
 `docs/superpowers/plans/2026-09-26-pasarela-servidor.md`.
 
-**Desde la 0.6.0 es lo único que instala.** La VPN IKEv2 de las versiones anteriores ya no se instala, ni se repara,
+**Desde la 0.7.0, también los avisos push**, si te han dado un código de avisos: el vigía, que habla con el relé de
+Daniel ([abajo](#los-avisos-push-avisos-desde-la-070)).
+
+**Desde la 0.6.0 la pasarela es lo único que instala para conectar.** La VPN IKEv2 de las versiones anteriores ya no se instala, ni se repara,
 ni se actualiza, y la app ya no la usa: `instalar --modo vpn` se para y dice que ya no existe. La de un servidor que la
 tenga **se quita** con `desinstalar --modo vpn`, sin tocar la pasarela: [abajo](#la-vpn-de-antes), paso a paso.
 
@@ -19,6 +22,7 @@ sudo hehermes-servidor comprobar                              # lo que tiene que
 sudo hehermes-servidor desinstalar [--quitar-paquetes]        # enseña lo que quita, pregunta y lo quita
 sudo hehermes-servidor desinstalar --modo vpn                 # solo la VPN de una versión anterior
 sudo hehermes-dispositivo alta otro-iphone                    # otro iPhone, con el instalador ya puesto
+sudo hehermes-servidor avisos                                 # los avisos push, con el código de avisos (se pega)
 ```
 
 Más opciones de `instalar`: `--direccion <IP o nombre>` (la del QR, si el servidor está detrás de un NAT),
@@ -106,6 +110,43 @@ sin `Server`; que la API de Hermes solo escuche en 127.0.0.1; que la clave del c
 solo los lea su dueño, que `tokens.json` y `pasarela.ini` no los lea cualquiera y que en `tokens.json` no haya más que
 hashes; con root, que la unidad lleve su usuario y su sandbox, el cortafuegos, el canje y la firma.
 
+## Los avisos push (`avisos`, desde la 0.7.0)
+
+Con la app cerrada, los avisos los pide el **vigía** (`server/avisos`), que vive al lado de Hermes, y los manda el
+**relé de Daniel**, el único con la clave de Apple. El relé está en la máquina de Daniel; a su entrada pública se llega
+con un **código de avisos**, que da él (`sudo hehermes-rele credencial alta <nombre>`, en su VPS):
+
+```bash
+sudo hehermes-servidor avisos                  # lo pide: se pega sin eco (no queda ni en la pantalla ni en el historial)
+sudo hehermes-servidor avisos --plan           # lo mismo, sin cambiar nada
+sudo ./hehermes-servidor instalar --iphone mi-iphone --avisos   # la pasarela y los avisos a la vez (también lo pide)
+```
+
+El código es `hehermes-avisos:1?h=<dirección>&p=<puerto>&f=<huella>&c=<credencial>`: la entrada pública del relé, la
+huella de su certificado (el vigía la ancla: con otra, no manda ni un byte) y la credencial de este servidor ante el
+relé. **Es secreto.** También vale `--avisos <código>` o `avisos <código>`, pero así queda en el historial del shell.
+Contrato: `server/API-CONTRACT.md` §13; spec: `docs/superpowers/specs/2026-09-28-rele-para-probadores-design.md`.
+
+| | Con root | Sin root |
+|---|---|---|
+| El usuario | `hh-vigia`, de sistema, sin casa ni shell | El de Hermes |
+| El código | `hehermes_avisos/`, junto al del instalador; corre con el venv de `cryptography` (el del canje) | Lo mismo, en su casa |
+| Configuración | `/etc/hehermes-avisos/vigia.ini` (`root:hh-vigia` 0640): Hermes, el relé (`https://…` y su huella) y dónde está cada secreto | `~/.config/hehermes-avisos/vigia.ini` (0600) |
+| Secretos | En `/etc/hehermes-avisos/vigia/` (`hh-vigia` 0600): la credencial, el secreto con la pasarela y su copia de la clave de Hermes, que `pasarela-clave` pone al día cuando cambia el `.env` | La credencial y el secreto, 0600; la clave la lee del `.env` de Hermes (si cambia, `systemctl --user restart hehermes-vigia`) |
+| Base de datos | `/var/lib/hehermes-vigia` (la crea systemd, 0700): los iPhone dados de alta, con su clave | `~/.local/state/hehermes-vigia` |
+| Unidades | `hehermes-vigia.socket` (el 127.0.0.1:8790 es de systemd) y `hehermes-vigia.service`, con la jaula de la del VPS de Daniel y la red solo hacia esta máquina y la IP del relé | `hehermes-vigia.service` de usuario, que abre su puerto |
+| La pasarela | Le pasa `/avisos/` con el secreto del vigía (por `LoadCredential`); se reinicia una vez | Lo mismo, leyendo el secreto |
+
+- **Se puede repetir.** Sin código, `instalar` repara el vigía con el de antes (la dirección, el puerto y la huella van
+  en el manifiesto; la credencial, en su fichero). Con otro código, cambia la credencial y reinicia el vigía.
+- **Se comprueba** al instalar (`vigia comprobar`: Hermes, su puerto, el relé con la credencial, sin mandar nada) y en
+  `comprobar`. Si el relé no contesta, se dice, **pero no para**: la pasarela ya funciona, y el relé es de otra máquina.
+- **No pone** el lector de ficheros (`GET /avisos/v1/fichero`, que es de root y va aparte): esa ruta contesta 503.
+- **No toca** unos avisos puestos a mano (`/opt/hehermes-avisos`, los del VPS de Daniel): el plan lo dice y para.
+- El vigía **contesta las entregas de los subagentes** con el turno de continuación de la app, como en el Hermes de
+  Daniel (`[entregas]` de `vigia.ini`): es la única escritura que hace en Hermes.
+- `desinstalar` (y `desinstalar --modo tls`) se lo lleva todo, base de datos incluida.
+
 ## La VPN de antes
 
 Hasta la 0.5.1 el instalador ponía también una VPN IKEv2 (`--modo vpn`), y desde la 0.5.1 las dos podían convivir.
@@ -148,7 +189,7 @@ VPN montada como la dejaba la 0.5.1 (`tests/vpn_antigua.py`): la pasarela sobre 
 Para un servidor con la VPN del instalador (`mi-iphone` por IKEv2):
 
 1. **Añadir la pasarela, sin tocar la VPN.** Primero el plan, que no cambia nada:
-   `sudo ./hehermes-servidor-0.6.0/hehermes-servidor instalar --plan --iphone iphone-tls`. Tiene que decir «Aquí sigue
+   `sudo ./hehermes-servidor-0.7.0/hehermes-servidor instalar --plan --iphone iphone-tls`. Tiene que decir «Aquí sigue
    la VPN IKEv2 que instaló una versión anterior», el TCP elegido y ningún «No puedo seguir».
 2. **Instalarla:** lo mismo sin `--plan`, en un terminal (pinta el QR del token, que no se puede volver a pintar).
 3. **Abrir el TCP de la pasarela en el cortafuegos del proveedor**, si tiene uno en su panel (el plan lo dice con su
@@ -178,7 +219,7 @@ Hay que saber:
   - Aquí hay una VPN de HeHermes (/etc/nginx/sites-available/hehermes-tunel, /etc/swanctl/conf.d/hehermes-poc.conf, /etc/wireguard/hehermes). No la toco: la pasarela va aparte, en su puerto, y las dos conviven
   - /usr/local/sbin/hehermes-dispositivo no es mío: no lo toco. Para los iPhone de la pasarela usa el mío: sudo /opt/hehermes-servidor/hehermes-dispositivo alta <nombre>
 
-43 cambios.
+44 cambios.
 ```
 <!-- /pasarela-de-daniel -->
 
@@ -198,7 +239,7 @@ Con el instalador ya puesto, otro iPhone no necesita el comando entero: `sudo he
 `server/instalador/empaquetar` genera el paquete, su `.sha256` y esa línea ya rellena:
 
 ```bash
-server/instalador/empaquetar                                   # dist/hehermes-servidor-0.6.0.tar.gz y .sha256
+server/instalador/empaquetar                                   # dist/hehermes-servidor-0.7.0.tar.gz y .sha256
 server/instalador/empaquetar --url-base https://ejemplo.org/hehermes --iphone mi-iphone
 server/instalador/empaquetar --firmar hehermes-firma.pem       # y el .sig (hace falta OpenSSL 3)
 ```
@@ -211,8 +252,8 @@ server/instalador/empaquetar --firmar hehermes-firma.pem       # y el .sig (hace
 - **Es reproducible:** la misma versión da siempre el mismo fichero y la misma suma (orden fijo, dueño root, hora fija
   y gzip sin nombre ni hora). Si se cambia algo, hay que subir la versión.
 - **Lleva:** `hehermes-servidor`, `hehermes-pasarela` y `hehermes_servidor/`, `hehermes-dispositivo` (de `server/vpn`),
-  `clave-publica.pem`, `requirements-canje.txt` y este README. Ni pruebas ni `__pycache__`. Desde la 0.6.0 ya no lleva
-  los avisos (`server/avisos`): solo los instalaba `--avisos`, que iba con la VPN.
+  `clave-publica.pem`, `requirements-canje.txt`, este README y, desde la 0.7.0, el código de los avisos
+  (`hehermes_avisos/`, sus `.py`: el vigía de `avisos`). Ni pruebas ni `__pycache__`, ni el despliegue a mano del relé.
 
 ### La firma de las actualizaciones
 
@@ -445,14 +486,23 @@ El `MAL` del agujero es el del sitio escrito a mano (`server/vpn/hehermes-tunel.
 Lo arregla quitar esa VPN (a mano: no es del instalador), o cerrarlo con `deny 10.77.0.1;` al principio de su
 `location /`.
 
-## Decisiones de esta versión (0.6.0)
+## Decisiones de la 0.7.0
+
+- **Los avisos, con un código.** El vigía vuelve, pero no con un relé propio: con el de Daniel, por su entrada pública,
+  una credencial por servidor y la huella anclada. Sin código no se instala nada de los avisos.
+- **El código se pega, no se escribe en la orden.** Lleva la credencial: `avisos` lo pide sin eco.
+- **Un relé que no contesta no tumba la instalación.** Lo del relé es de otra máquina; lo que depende de este servidor
+  (la pasarela) ya funciona, y los avisos llegarán cuando se arregle.
+
+## Decisiones de la 0.6.0
 
 - **Sin VPN.** La conexión directa es el único modo: la app ya no usa la VPN, y mantener dos caminos al mismo Hermes era
   el doble de superficie. Lo que la reconoce y la quita se queda; lo que la creaba, se ha ido.
 - **`actualizar` no convierte una VPN en pasarela por su cuenta.** Poner la pasarela abre un puerto a internet: lo decide
   quien lanza `instalar`, que ve el plan.
 - **Sin avisos en el paquete.** Solo los instalaba `--avisos`, que necesitaba el nginx del túnel. Los avisos que ya
-  estén en un servidor siguen funcionando: la pasarela les pasa `/avisos/`.
+  estén en un servidor siguen funcionando: la pasarela les pasa `/avisos/`. (La 0.7.0 los vuelve a traer, de otra
+  forma: arriba.)
 
 ## Pruebas
 

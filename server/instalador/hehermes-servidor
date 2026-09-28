@@ -3,13 +3,15 @@
 
 Uso (como root, o sin root en la casa del usuario de Hermes):
   hehermes-servidor instalar [--plan] [--iphone <nombre>] [--direccion <IP o nombre>] [--hermes-home <carpeta>]
-                             [--reemplazar <fichero>]... [--si]
+                             [--reemplazar <fichero>]... [--si] [--avisos [<código de avisos>]]
+  hehermes-servidor avisos [<código de avisos>] [--plan] [--si]
   hehermes-servidor comprobar
   hehermes-servidor actualizar --paquete <hehermes-servidor-X.tar.gz> --firma <hehermes-servidor-X.tar.gz.sig>
   hehermes-servidor desinstalar [--modo vpn|tls] [--si] [--quitar-paquetes]
 
-Instala la conexión directa (la pasarela TLS). La VPN IKEv2 ya no se instala desde la 0.6.0; la de una versión
-anterior se quita con «desinstalar --modo vpn».
+Instala la conexión directa (la pasarela TLS) y, con un código de avisos, el vigía de los avisos push (sin el código en
+la orden, lo pide y se pega sin eco). La VPN IKEv2 ya no se instala desde la 0.6.0; la de una versión anterior se
+quita con «desinstalar --modo vpn».
 """
 
 import os

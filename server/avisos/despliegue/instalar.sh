@@ -24,6 +24,21 @@
 #
 #   sudo …/instalar.sh --desinstalar-lector         quita solo el lector (y con él, GET /avisos/v1/fichero da 503)
 #
+# La entrada pública del relé (spec 2026-09-28, «El relé para los probadores»): por donde llegan los avisos de los
+# vigías de otros servidores. Se pone una vez, y desde entonces cada pasada la mantiene:
+#
+#   sudo …/instalar.sh --rele-publico               la primera vez: elige su puerto, hace su certificado y abre el
+#                                                   cortafuegos. RELE_DIRECCION=<ip o nombre> si la de los códigos no
+#                                                   es la de la pasarela
+#   sudo …/instalar.sh --quitar-rele-publico        la para y cierra su puerto; el puerto, el certificado y las
+#                                                   credenciales se quedan (volver a ponerla no invalida los códigos)
+#
+#   /etc/hehermes-avisos/rele-publico.ini           su puerto y su dirección (root:hh-rele-publico 0640)
+#   /etc/hehermes-avisos/rele-publico/              cert.pem (0644) y clave.pem (root 0600, le llega por LoadCredential)
+#   /etc/systemd/system/hehermes-rele-publico.service   como hh-rele-publico, que no puede leer la .p8
+#   /usr/local/sbin/hehermes-rele                   `sudo hehermes-rele credencial alta|baja|lista`
+#   /opt/hehermes-avisos/src/hehermes_servidor      la maquinaria de la pasarela, copiada de server/instalador
+#
 # El lector va por un socket de systemd y no por sudo: el vigía corre con NoNewPrivileges (sudo no podría subir) y
 # ProtectHome (no vería /root), y quitárselos sería abrir el proceso que atiende al túnel. Así el vigía no tiene nada
 # de root y el lector, su propia jaula (despliegue/hehermes-leer-media@.service).
@@ -168,13 +183,76 @@ desinstalar_lector() {
 }
 # --- fin del lector ----------------------------------------------------------------------------------------------------
 
+# --- La entrada pública del relé (funciones) ---------------------------------------------------------------------------
+PUBLICO_INI="$CONF/rele-publico.ini"
+PUBLICO_CARPETA="$CONF/rele-publico"
+PUBLICO_UNIDAD=hehermes-rele-publico.service
+PUBLICO_USUARIO=hh-rele-publico
+ORDEN_RELE=/usr/local/sbin/hehermes-rele
+COMENTARIO_UFW=hehermes-rele
+
+puerto_publico() { sed -n 's/^[[:space:]]*puerto[[:space:]]*=[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' "$PUBLICO_INI" | head -1; }
+
+abrir_cortafuegos() {
+  # Con la herramienta que haya, como el instalador con la pasarela: se añade la regla, no se enciende nada.
+  local puerto="$1"
+  if command -v ufw >/dev/null 2>&1; then
+    ufw allow proto tcp from any to any port "$puerto" comment "$COMENTARIO_UFW" | sed 's/^/    ufw: /'
+    ufw status | head -1 | grep -q "Status: active" \
+      || echo "    ufw está apagado: la regla queda puesta para cuando se encienda"
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --quiet --add-port="$puerto/tcp"
+    firewall-cmd --quiet --permanent --add-port="$puerto/tcp"
+    echo "    firewalld: abierto el TCP $puerto"
+  else
+    echo "    no hay ufw ni firewalld: si nftables o iptables cierran el paso, abre el TCP $puerto a mano"
+  fi
+  echo "    y si tu proveedor tiene un cortafuegos en su panel, abre ahí también el TCP $puerto"
+}
+
+cerrar_cortafuegos() {
+  local puerto="$1"
+  if command -v ufw >/dev/null 2>&1; then
+    ufw delete allow proto tcp from any to any port "$puerto" | sed 's/^/    ufw: /' || true
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --quiet --remove-port="$puerto/tcp" || true
+    firewall-cmd --quiet --permanent --remove-port="$puerto/tcp" || true
+  fi
+}
+
+quitar_rele_publico() {
+  paso "quitando la entrada pública del relé"
+  systemctl disable --now --quiet "$PUBLICO_UNIDAD" 2>/dev/null || true
+  rm -f "$SYSTEMD/$PUBLICO_UNIDAD"
+  systemctl daemon-reload
+  if [[ -f "$PUBLICO_INI" ]]; then
+    cerrar_cortafuegos "$(puerto_publico)"
+  fi
+  echo "    quitada: los vigías de otros servidores ya no llegan al relé. Se quedan $PUBLICO_INI y el certificado, así"
+  echo "    que volver a ponerla (--rele-publico) no invalida ningún código; las credenciales, en «hehermes-rele credencial"
+  echo "    lista». Para borrarlo todo: rm -r $PUBLICO_INI $PUBLICO_CARPETA y userdel $PUBLICO_USUARIO"
+}
+# --- fin de la entrada pública -----------------------------------------------------------------------------------------
+
+RELE_PUBLICO=0
 if [[ $# -gt 0 ]]; then
-  [[ $# -eq 1 && "$1" == "--desinstalar-lector" ]] || fallar "uso: instalar.sh [--desinstalar-lector]"
-  desinstalar_lector
-  exit 0
+  [[ $# -eq 1 ]] || fallar "uso: instalar.sh [--desinstalar-lector | --rele-publico | --quitar-rele-publico]"
+  case "$1" in
+    --desinstalar-lector) desinstalar_lector; exit 0 ;;
+    --quitar-rele-publico) quitar_rele_publico; exit 0 ;;
+    --rele-publico) RELE_PUBLICO=1 ;;
+    *) fallar "uso: instalar.sh [--desinstalar-lector | --rele-publico | --quitar-rele-publico]" ;;
+  esac
 fi
+# Una vez puesta, cada pasada la mantiene (con el código nuevo): se sabe por su unidad.
+if [[ -f "$SYSTEMD/$PUBLICO_UNIDAD" ]]; then RELE_PUBLICO=1; fi
+PASARELA_ORIGEN="$(cd "$ORIGEN/.." && pwd)/instalador/hehermes_servidor"
 
 [[ -f "$ORIGEN/requirements.txt" && -d "$ORIGEN/hehermes_avisos" ]] || fallar "no encuentro el código junto a $AQUI"
+if [[ $RELE_PUBLICO -eq 1 && ! -f "$PASARELA_ORIGEN/pasarela.py" ]]; then
+  fallar "la entrada pública del relé usa la pasarela del instalador, y no está en $PASARELA_ORIGEN (copia server/ entero)"
+fi
 if ! grep -q -- "--solo-vigia" "$DISPOSITIVO" 2>/dev/null; then
   fallar "$DISPOSITIVO no sabe del vigía (es de antes, o no está): instala el de server/vpn con
     sudo install -m 0750 <repo>/server/vpn/hehermes-dispositivo /usr/local/sbin/
@@ -221,6 +299,12 @@ NUEVO="$PREFIJO/src.nuevo"
 rm -rf "$NUEVO"
 install -d -m 0755 "$NUEVO"
 cp -R "$ORIGEN/hehermes_avisos" "$NUEVO/"
+# La maquinaria de la pasarela, que usa la entrada pública del relé (y el vigía sin root, para leer el .env): la misma
+# que la del instalador, copiada tal cual. Sin ella, el relé y el vigía de esta máquina funcionan igual.
+if [[ -f "$PASARELA_ORIGEN/pasarela.py" ]]; then
+  install -d -m 0755 "$NUEVO/hehermes_servidor"
+  cp "$PASARELA_ORIGEN"/*.py "$NUEVO/hehermes_servidor/"
+fi
 cp "$ORIGEN/README.md" "$ORIGEN/requirements.txt" "$NUEVO/"
 find "$NUEVO" -name __pycache__ -prune -exec rm -rf {} +
 chown -R root:root "$NUEVO"
@@ -431,6 +515,36 @@ for unidad in hehermes-vigia hehermes-rele; do
   systemctl restart "$unidad.service"
 done
 
+# La orden de las credenciales, siempre (sin la entrada pública, `alta` dice que falta).
+install -m 0755 -o root -g root "$AQUI/hehermes-rele" "$ORDEN_RELE.nuevo"
+mv -f "$ORDEN_RELE.nuevo" "$ORDEN_RELE"
+
+# --- La entrada pública del relé ---------------------------------------------------------------------------------------
+if [[ $RELE_PUBLICO -eq 1 ]]; then
+  paso "la entrada pública del relé"
+  if ! id -u "$PUBLICO_USUARIO" >/dev/null 2>&1; then
+    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$PUBLICO_USUARIO"
+    echo "    creado $PUBLICO_USUARIO"
+  fi
+  install -d -m 0755 -o root -g root "$PUBLICO_CARPETA"
+  # La primera vez elige el puerto y hace el certificado; después no toca nada (van en los códigos que ya se dieron).
+  "$VENV_PY" -I -B -m hehermes_avisos.rele.publico preparar --config "$PUBLICO_INI" --carpeta "$PUBLICO_CARPETA" \
+    --credenciales "$CONF/rele/credenciales.ini" ${RELE_DIRECCION:+--direccion "$RELE_DIRECCION"} | grep -v '^PUERTO='
+  PUERTO_PUBLICO="$(puerto_publico)"
+  [[ "$PUERTO_PUBLICO" =~ ^[0-9]+$ ]] || fallar "$PUBLICO_INI no dice su puerto"
+  chown "root:$PUBLICO_USUARIO" "$PUBLICO_INI"
+  chmod 0640 "$PUBLICO_INI"
+  chown root:root "$PUBLICO_CARPETA/cert.pem" "$PUBLICO_CARPETA/clave.pem"
+  chmod 0644 "$PUBLICO_CARPETA/cert.pem"
+  chmod 0600 "$PUBLICO_CARPETA/clave.pem"
+  install -m 0644 -o root -g root "$AQUI/$PUBLICO_UNIDAD" "$SYSTEMD/$PUBLICO_UNIDAD"
+  systemctl daemon-reload
+  systemctl enable --quiet "$PUBLICO_UNIDAD"
+  # Con el código nuevo. Las conexiones abiertas de los vigías se cortan: reintentan solos.
+  systemctl restart "$PUBLICO_UNIDAD"
+  abrir_cortafuegos "$PUERTO_PUBLICO"
+fi
+
 # --- Comprobación ------------------------------------------------------------------------------------------------------
 paso "comprobación (con los usuarios de los servicios)"
 sleep 2
@@ -438,11 +552,22 @@ runuser -u hh-vigia -- "$VENV_PY" -I -m hehermes_avisos.vigia --config "$CONF/vi
 if [[ $RELE_LISTO -eq 1 ]]; then
   runuser -u hh-rele -- "$VENV_PY" -I -m hehermes_avisos.rele --config "$CONF/rele.ini" comprobar || true
 fi
+if [[ $RELE_PUBLICO -eq 1 ]]; then
+  "$VENV_PY" -I -B -m hehermes_avisos.rele.publico comprobar --config "$PUBLICO_INI" || true
+fi
 
 echo
 estado() { systemctl is-active "$1" 2>/dev/null || true; }
 echo "Hecho. Vigía: $(estado hehermes-vigia.service) (su puerto: $(estado hehermes-vigia.socket)). Relé:" \
   "$(estado hehermes-rele.service) (su puerto: $(estado hehermes-rele.socket))."
+if [[ $RELE_PUBLICO -eq 1 ]]; then
+  echo "Entrada pública del relé: $(estado "$PUBLICO_UNIDAD"), en el TCP $PUERTO_PUBLICO. Un vigía de otro servidor:" \
+    "sudo hehermes-rele credencial alta <nombre>"
+fi
+# Con la pasarela (el VPS de hoy), /avisos/ le llega al vigía por ella: el nginx del túnel ya no hace falta.
+if grep -Eq '^[[:space:]]*vigia[[:space:]]*=' /etc/hehermes-pasarela/pasarela.ini 2>/dev/null; then
+  INCLUIDO=1
+fi
 if [[ $RELE_LISTO -eq 0 ]]; then
   cat <<EOF
 

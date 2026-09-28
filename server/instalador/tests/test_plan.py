@@ -108,9 +108,10 @@ class Limpio(Base):
 
     def test_los_avisos_no_se_instalan_pero_se_sirven_si_estan(self):
         self.montar(sf.servidor())
-        self.assertIn("el relé central todavía no existe", pintar(self.plan()))
+        self.assertIn("sin código de avisos. Con el de quien te dé los avisos: sudo hehermes-servidor avisos",
+                      pintar(self.plan()))
         self.sis.poner(p.SECRETO_VIGIA, "s" * 43 + "\n", modo=0o600)
-        self.assertIn("el vigía ya está: la pasarela le pasa /avisos/", pintar(self.plan()))
+        self.assertIn("el vigía ya está (puesto a mano): la pasarela le pasa /avisos/", pintar(self.plan()))
 
 
 class NoPisar(Base):

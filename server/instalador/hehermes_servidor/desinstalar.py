@@ -84,6 +84,8 @@ def resumen(sis, man, ambito=None, modo=None) -> str:
             lineas.append("  iPhone de la pasarela (sus tokens dejan de valer): " + ", ".join(de_la_pasarela))
     if man.datos.get("venv_canje") and (que.todo or modo == "tls"):
         lineas.append("  " + ambito.carpeta_venv)
+    if man.datos.get("vigia") and que.tls:
+        lineas.append("  " + ambito.carpeta_estado_vigia + " (la base de datos del vigía, con las claves de los iPhone)")
     for usuario in man.datos.get("usuarios", []):
         if que.de(md.de_usuario(usuario)):
             lineas.append("  el usuario " + usuario)
@@ -159,7 +161,7 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
     # 0. La pasarela, lo primero: sin ella, ningún token vale ya.
     if que.tls:
         salida("==> la pasarela")
-        for unidad in (p.UNIDAD_PASARELA, "hehermes-pasarela-clave.path"):
+        for unidad in (p.UNIDAD_PASARELA, "hehermes-pasarela-clave.path", p.UNIDAD_VIGIA, p.SOCKET_VIGIA):
             if unidad in man.unidades:
                 sis.ejecutar(ambito.systemctl + ["disable", "--now", unidad])
     # 1. Los iPhone: sin esto, las sesiones vivas siguen aunque se borre su conexión.
@@ -268,8 +270,8 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
     for unidad in reversed(list(man.unidades)):
         if not que.de(md.de_unidad(unidad)):
             continue
-        sis.ejecutar((ambito.systemctl if unidad == p.UNIDAD_PASARELA else ["systemctl"]) + ["disable", "--now",
-                                                                                             unidad])
+        sis.ejecutar((ambito.systemctl if unidad in (p.UNIDAD_PASARELA, p.UNIDAD_VIGIA) else ["systemctl"])
+                     + ["disable", "--now", unidad])
         if not que.todo:
             man.unidades.remove(unidad)
     # 6. Las líneas de --activar-api (que son de los dos), y el resto de ficheros.
@@ -282,6 +284,13 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
         if ruta not in NGINX and que.fichero(ruta):
             quitar(ruta)
     sis.ejecutar(ambito.systemctl + ["daemon-reload"])
+    #    La base de datos del vigía (con root, la hizo systemd; sin root, el instalador): lleva la clave de cada iPhone.
+    if man.datos.get("vigia") and que.tls:
+        sis.borrar_arbol(ambito.carpeta_estado_vigia)
+        if ambito.carpeta_estado_vigia in man.carpetas:
+            man.carpetas.remove(ambito.carpeta_estado_vigia)
+        if not que.todo:
+            del man.datos["vigia"]
     for usuario in list(man.datos.get("usuarios", [])):
         if not que.de(md.de_usuario(usuario)):
             continue

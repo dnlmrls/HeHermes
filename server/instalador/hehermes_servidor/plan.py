@@ -24,7 +24,7 @@ EJECUTABLES_PROPIOS = ("hehermes-servidor", "hehermes-pasarela")
 class Opciones:
     def __init__(self, iphone=None, direccion=None, hermes_home=None, reemplazar=(), si=False, solo_plan=False,
                  por_chat=False, llave=None, activar_api=False, qr_png=None, ahora=None, cortafuegos_a_mano=False,
-                 corregir_exposicion=False):
+                 corregir_exposicion=False, avisos=None):
         #: Si hay alguien delante de un terminal (el QR de la pasarela solo se pinta ahí).
         self.terminal = True
         self.iphone = iphone
@@ -44,6 +44,8 @@ class Opciones:
         self.cortafuegos_a_mano = cortafuegos_a_mano
         #: Permiso para cerrar a 127.0.0.1 una API de Hermes que escucha en todas las interfaces.
         self.corregir_exposicion = corregir_exposicion
+        #: El código de avisos ya leído (`avisos.leer_codigo`): el vigía, con el relé de ese código. Lleva la credencial.
+        self.avisos = avisos
 
 
 class Accion:
@@ -175,9 +177,16 @@ def pintar(plan: Plan, color: bool = False) -> str:
     for titulo, tipos in SECCIONES:
         de_aqui = [a for a in plan.acciones if a.tipo in tipos]
         if titulo == "Avisos push" and h is not None:
-            lineas += ["", titulo, "  %-10s %s" % ("sí" if det.con_vigia else "no",
-                                                   "el vigía ya está: la pasarela le pasa /avisos/" if det.con_vigia
-                                                   else "el relé central todavía no existe")]
+            vigia = getattr(det, "vigia", None)
+            if vigia:
+                texto = "el vigía, con el relé de %s:%d (su huella, anclada); la pasarela le pasa /avisos/" % (
+                    vigia["direccion"], vigia["puerto"])
+            elif det.con_vigia:
+                texto = "el vigía ya está (puesto a mano): la pasarela le pasa /avisos/"
+            else:
+                texto = "sin código de avisos. Con el de quien te dé los avisos: %s avisos" % (
+                    "sudo hehermes-servidor" if ambito.root else ambito.orden)
+            lineas += ["", titulo, "  %-10s %s" % ("sí" if (vigia or det.con_vigia) else "no", texto)]
             continue
         if titulo == "iPhone" and not de_aqui and h is not None and plan.opciones.iphone is None:
             lineas += ["", titulo, "  %-10s %s" % ("ninguno", "--iphone <nombre> lo da de alta y pinta su QR")]

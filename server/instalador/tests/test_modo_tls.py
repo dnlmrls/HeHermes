@@ -173,11 +173,14 @@ class ConRoot(Base):
         self.assertIn("LoadCredential=vigia:/etc/hehermes-avisos/vigia/secreto-tunel\n", unidad)
         self.assertIn("vigia = 127.0.0.1:8790\n", self.sis.leer_texto("/etc/hehermes-pasarela/pasarela.ini"))
 
-    def test_avisos_ya_no_es_una_opcion(self):
-        """--avisos solo iba con la VPN (su instalador necesita el nginx del túnel), y se fue con ella."""
+    def test_un_codigo_de_avisos_que_no_lo_es_para_antes_de_nada(self):
+        """--avisos era de la VPN y se fue con ella; desde la 0.7.0 lleva el código de avisos (`test_avisos`). Uno que
+        no lo es se para antes de mirar nada, y el error no lo repite (un código de verdad lleva la credencial)."""
         antes = self.sis.foto()
-        self.assertEqual(self.orden("instalar", "--plan", "--avisos"), 2)
-        self.assertIn("--avisos", self.salida)
+        malo = "hehermes-avisos:1?h=198.51.100.7&p=61234&f=corta&c=hhr1.secreta"
+        self.assertEqual(self.orden("instalar", "--plan", "--avisos", malo), 2)
+        self.assertIn("la huella o la credencial", self.salida)
+        self.assertNotIn("hhr1.secreta", self.salida)
         self.assertEqual(self.sis.ordenes, [])
         self.assertEqual(self.sis.foto(), antes)
 

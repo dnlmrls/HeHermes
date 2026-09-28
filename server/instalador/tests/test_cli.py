@@ -141,7 +141,8 @@ class Instalar(Base):
     def test_opciones_que_no_valen(self):
         self.assertEqual(self.orden("instalar", "--nada"), 2)
         self.assertEqual(self.orden("nada"), 2)
-        self.assertEqual(self.orden("instalar", "--avisos"), 2, "solo iba con la VPN")
+        # Desde la 0.7.0, --avisos lleva un código de avisos: uno que no lo es para antes de nada.
+        self.assertEqual(self.orden("instalar", "--avisos", "hehermes-avisos:1?h=x"), 2)
 
 
 class LaVpnYaNoSeInstala(Base):
