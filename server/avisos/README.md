@@ -8,9 +8,17 @@ contrato está en `server/API-CONTRACT.md` §11, y cómo se lee sin darle al vig
 [«El lector de ficheros»](#el-lector-de-ficheros-de-hermes).
 
 ```
-iPhone ──túnel──▶ nginx 10.77.0.1 ──/avisos/──▶ vigía 127.0.0.1:8790 ──▶ relé 127.0.0.1:8791 ──HTTP/2──▶ APNs ──▶ iPhone
-                                   └──── / ────▶ Hermes 127.0.0.1:8642 ◀── el vigía lo lee (sin tocarlo)
+iPhone ──pasarela TLS──▶ vigía 127.0.0.1:8790 ──▶ relé 127.0.0.1:8791 ──HTTP/2──▶ APNs ──▶ iPhone
+         (o, antes, el nginx del túnel)  └── lee a Hermes 127.0.0.1:8642 (sin tocarlo)
+
+Otro servidor (un probador):
+iPhone ──su pasarela──▶ su vigía ──HTTPS anclado──▶ entrada pública del relé (TCP alto) ──▶ relé 127.0.0.1:8791
 ```
+
+Desde la 1.2.0, el relé de Daniel atiende también a los vigías de otros servidores, por su **entrada pública**
+([abajo](#la-entrada-pública-del-relé-los-vigías-de-otros-servidores); spec
+`docs/superpowers/specs/2026-09-28-rele-para-probadores-design.md`). El vigía de un probador lo pone el instalador
+(`hehermes-servidor avisos`, 0.7.0).
 
 | Pieza | Qué hace | Qué guarda |
 |---|---|---|
@@ -95,6 +103,45 @@ su puerto, Hermes y el relé, sin mandar nada). Se puede repetir a mano, siempre
 sudo -u hh-vigia /opt/hehermes-avisos/venv/bin/python -I -m hehermes_avisos.vigia comprobar
 sudo -u hh-rele  /opt/hehermes-avisos/venv/bin/python -I -m hehermes_avisos.rele comprobar
 ```
+
+## La entrada pública del relé (los vigías de otros servidores)
+
+El relé sigue en `127.0.0.1:8791`. Delante, en un TCP alto elegido una vez al azar (58000–65500), va su entrada
+pública (`hehermes_avisos.rele.publico`), que es **la pasarela** (`hehermes_servidor.pasarela`, la del instalador,
+copiada por `instalar.sh` junto a este paquete) con las credenciales de los vigías en lugar de los tokens de los iPhone:
+TLS 1.3 con un certificado propio cuya huella ancla el vigía, el 404 idéntico y con retraso a lo que no trae una
+credencial válida, el bloqueo por IP tras 10 fallos, 16 conexiones por IP y 128 en total, 10 s para las cabeceras,
+16 KiB de cuerpo, y un registro sin credenciales, rutas ni cuerpos. Lo que pasa va al relé **con la misma credencial**:
+el relé la vuelve a comprobar, la limita (por credencial y por token) y apunta su nombre. El contrato está en
+`server/API-CONTRACT.md` §13.
+
+```bash
+sudo server/avisos/despliegue/instalar.sh --rele-publico      # la primera vez: puerto, certificado, ufw
+sudo hehermes-rele credencial alta <nombre>                   # su código de avisos, solo en un terminal
+sudo hehermes-rele credencial alta <nombre> --a-fichero /root/hehermes-codigos/<nombre>.txt   # o a un fichero 0600
+sudo hehermes-rele credencial lista                            # nombres y fechas, sin huellas
+sudo hehermes-rele credencial baja <nombre>                   # deja de valer al momento
+sudo server/avisos/despliegue/instalar.sh --quitar-rele-publico   # la para y cierra su puerto
+```
+
+- **El código de avisos** (`hehermes-avisos:1?h=…&p=…&f=…&c=…`) lleva la dirección, el puerto, la huella y la
+  credencial: es secreto. `alta` lo saca una vez; del secreto, el relé solo guarda su SHA-256. En el otro servidor:
+  `sudo hehermes-servidor avisos`, y se pega (sin eco).
+- **En caliente**: el relé y su entrada vuelven a leer `credenciales.ini` en cuanto cambia (`credenciales.Almacen`), y
+  la entrada corta en un segundo las conexiones de una credencial dada de baja. Un fichero roto no deja pasar a nadie.
+- **Quién es quién**: la entrada corre como `hh-rele-publico` (en el grupo `hh-rele`, para leer `credenciales.ini`), sin
+  poder leer la `.p8` (`hh-rele 0600`, y además `InaccessiblePaths`). La clave de su certificado le llega por
+  `LoadCredential`.
+- **Qué deja**: `/etc/hehermes-avisos/rele-publico.ini` (puerto y dirección, `root:hh-rele-publico 0640`),
+  `/etc/hehermes-avisos/rele-publico/{cert.pem,clave.pem}`, `hehermes-rele-publico.service`, `/usr/local/sbin/hehermes-rele`
+  y la regla de ufw (`comment hehermes-rele`). Quitarla (`--quitar-rele-publico`) deja el puerto y el certificado:
+  volver a ponerla no invalida ningún código.
+- `sudo /opt/hehermes-avisos/venv/bin/python -I -B -m hehermes_avisos.rele.publico comprobar` se asoma como cualquiera:
+  TLS 1.3, la huella de los códigos y el 404.
+- **El vigía de otro servidor** tiene en su `vigia.ini` `[rele] url = https://<h>:<p>/v1/avisos` y `huella = <f>`. Sin
+  huella no habla HTTPS con nadie, y en claro solo con `127.0.0.1`: la credencial va en cada aviso. La huella se mira al
+  acabar el apretón TLS, antes de mandar nada. Su `comprobar` no se asoma sin credencial (contaría como un fallo de su
+  IP): solo `GET /v1/credencial`, anclado.
 
 ## El lector de ficheros de Hermes
 
@@ -182,15 +229,32 @@ Leyendo el historial como la app (el SSE de un run es de un solo uso: si el vig�
 
 - **Respuesta**: una fila `assistant` con texto que no es un paso intermedio ni un «Operation interrupted». Una por
   conversación y vuelta: la última. No se avisa la respuesta a una retirada de «Deshacer envío», que la app no pinta.
-- **Trabajo en segundo plano**: la entrega de un subagente (`display_kind: async_delegation_complete`), que con la app
-  dormida es la única señal de que ha acabado, y la respuesta a la continuación que lanza la app (`⟦hehermes:continuar⟧`)
-  o de una conversación sin ninguna petición.
+- **Trabajo en segundo plano**: la respuesta a la continuación que lanza la app o el vigía (`⟦hehermes:continuar⟧`, abajo)
+  o de una conversación sin ninguna petición; y la entrega de un subagente (`display_kind: async_delegation_complete`)
+  solo cuando nadie la va a contestar (el vigía con `[entregas] contestar = no`, o tras una cadena de delegaciones).
 - **Aprobación pendiente y error**: no dejan rastro fiable en el historial. Salen del estado del run
   (`GET /v1/runs/{id}`), y para eso el vigía necesita el `run_id`, que solo tiene la app. **Hoy no llegan**: hace falta
   la ampliación de abajo.
 
 No se avisa de nada con la app delante (ni de lo que llegó mientras lo estaba, aunque el vigía lo lea después), ni de
 lo escrito hace más de 15 minutos, ni de nada anterior a la primera vuelta del vigía.
+
+### Las entregas de los subagentes: el vigía lanza el turno que falta
+
+Cuando un subagente en segundo plano acaba, Hermes escribe su entrega en el historial y **no lanza ningún turno**: en
+el api_server el cliente es dueño del turno siguiente (`gateway/wake.py` del VPS, #85957, sin ajuste que lo cambie).
+La app lo lanza si está viva; con el iPhone dormido, nadie. El 2026-09-27, en una conversación de Daniel, la entrega llegó a
+las 02:36 y la respuesta no salió hasta que Daniel preguntó «¿cómo vas?» a las 08:43.
+
+Ahora lo lanza el vigía (`vigia/entregas.py`), que corre siempre y ya lee ese historial: el **mismo turno** que la app
+(`⟦hehermes:continuar⟧ …`) con la **misma `Idempotency-Key`** (`continuar-<delegation_id>` de la entrega más reciente),
+por `POST /v1/runs`, la única escritura del vigía en Hermes. Solo si la entrega no tiene ningún turno detrás, han
+pasado 60 s (los de la app, que si está delante la contesta con las instrucciones y el esfuerzo de la conversación),
+no hay un turno a medias, tiene menos de 3 h y no van ya 3 continuaciones seguidas sin un mensaje de Daniel (Hermes
+puede volver a delegar al recibirla). No se duplica: una entrega con un turno detrás no se toca, lo lanzado se recuerda,
+y la misma clave con el mismo cuerpo da el mismo run (con el de la app, un 409). Su run se vigila como los de la app
+(aviso de error si falla sin respuesta), y el aviso que llega es el de la **respuesta**, no «ha terminado un trabajo».
+Se ajusta o se apaga en `[entregas]` de `vigia.ini`; en el registro sale `continuación … lanzada`.
 
 ### La ampliación del contrato que falta (compatible con lo de hoy)
 
@@ -229,11 +293,18 @@ fija contra el vector de la app en los dos sentidos (`tests/datos/`). Del instal
 nginx y el del secreto, sobre una carpeta temporal y con `nginx` y `systemctl` simulados; lo demás (root, systemd) se
 ensayó aparte.
 
+La entrada pública del relé (`tests/test_rele_publico.py`) va de verdad: el relé con Apple de mentira, su entrada con
+TLS en `127.0.0.1` y el vigía de otro servidor delante, con su HTTPS anclado. Carga la pasarela de
+`server/instalador` (como en el VPS, donde `instalar.sh` la copia al lado). En el Mac, con TLS 1.2 (el Python de Xcode
+trae LibreSSL 2.8, sin 1.3); lo que exige 1.3 corre donde haya OpenSSL 3. Las pruebas que escuchan en `127.0.0.1` fallan
+dentro del sandbox de Claude Code: fuera de él.
+
 ## El camino para miles (documentado, no construido)
 
-Hoy cada vigía tiene **una credencial por servidor, emitida a mano** (`python -m hehermes_avisos.rele credencial`), y
-el relé guarda solo su huella. Sirve para uno o para unos pocos, pero una credencial filtrada deja pedir avisos para
-cualquier token. Para miles:
+Hoy cada vigía tiene **una credencial por servidor, emitida a mano** (la de esta máquina, `instalar.sh`; las de otros,
+`hehermes-rele credencial alta`), y el relé guarda solo su huella. Sirve para uno o para unos pocos probadores de
+confianza, pero una credencial filtrada deja pedir avisos para cualquier token (limitados, y se corta con `baja`). Para
+miles:
 
 1. **Permisos por dispositivo avalados con App Attest.** Al darse de alta, la app pide al relé un permiso de avisos
    para su token: le manda una atestación de App Attest (la primera vez) o una aserción (después), que demuestra que es
@@ -244,7 +315,7 @@ cualquier token. Para miles:
    robe su credencial, solo puede avisar a los iPhone que se lo han dado. Los permisos caducan (p. ej. a los 30 días) y
    la app los renueva al arrancar.
 3. La credencial por servidor queda para limitar y para saber de quién es cada aviso, no para autorizar.
-4. El relé, en su propia máquina: detrás de un proxy con TLS, con conexiones HTTP/2 a APNs que se quedan abiertas y
+4. El relé, en su propia máquina: detrás de su entrada pública con TLS (ya existe, `rele.publico`), con conexiones HTTP/2 a APNs que se quedan abiertas y
    se vigilan con PING (hoy se abre una por aviso, que al ritmo de un usuario es lo sensato), un servidor asíncrono o
    varios procesos, y los límites en un almacén compartido si hay más de una instancia. Sigue sin guardar
    estado de nadie más allá de los límites, las bajas y la lista de permisos revocados (por huella).

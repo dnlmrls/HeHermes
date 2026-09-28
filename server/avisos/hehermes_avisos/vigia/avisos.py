@@ -23,6 +23,7 @@ import json
 from dataclasses import dataclass
 
 from .. import cifrado, texto
+from .ajustes import INTERRUPTOR_DE
 from .almacen import Dispositivo
 
 TITULO_DE_RESERVA = "Hermes"
@@ -89,15 +90,27 @@ def decidir(aviso: Aviso, dispositivo: Dispositivo, ahora: float) -> str:
       suspende en segundos, y la VPN puede estar caída justo entonces) y se avisa. Antes eso se daba por visto y se
       perdía.
     """
+    return decidir_con_motivo(aviso, dispositivo, ahora)[0]
+
+
+def decidir_con_motivo(aviso: Aviso, dispositivo: Dispositivo, ahora: float) -> tuple:
+    """Lo mismo que ``decidir``, con el porqué de un ``DESCARTAR`` para el registro (``None`` en lo demás).
+
+    El 2026-09-28 una continuación contestó a Daniel y el aviso no salió: sus ajustes tenían ``segundo_plano`` apagado.
+    El registro no decía nada —se descartaba en silencio— y hubo que sacarlo de la base de datos."""
     if aviso.tipo == "prueba":
-        return ENVIAR
-    if not dispositivo.ajustes.avisa_de(aviso.tipo) or dispositivo.ajustes.silenciada(aviso.sesion):
-        return DESCARTAR
+        return ENVIAR, None
+    if not dispositivo.ajustes.avisa_de(aviso.tipo):
+        return DESCARTAR, f"{INTERRUPTOR_DE.get(aviso.tipo, aviso.tipo)} apagado en sus ajustes"
+    if dispositivo.ajustes.silenciada(aviso.sesion):
+        return DESCARTAR, "el chat tiene «Ocultar alertas»"
     if dispositivo.lo_vio(aviso.instante):
-        return DESCARTAR
+        return DESCARTAR, "la app estaba delante cuando llegó"
     if dispositivo.delante(ahora):
-        return DESCARTAR if aviso.instante < dispositivo.delante_desde else ESPERAR
-    return ENVIAR
+        if aviso.instante < dispositivo.delante_desde:
+            return DESCARTAR, "la app está delante y llegó antes: lo enseña ella"
+        return ESPERAR, None
+    return ENVIAR, None
 
 
 def contenido(aviso: Aviso, vista_previa: str) -> bytes:

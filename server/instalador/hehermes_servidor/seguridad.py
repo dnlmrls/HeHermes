@@ -169,11 +169,14 @@ def _pasarela(sis, man, ambito):
 def _secretos_tls(sis, ambito, env):
     import json
     mal, aviso = [], []
-    for ruta in (ambito.clave, ambito.clave_hermes, man_ruta(ambito)):
+    # Con los avisos, los secretos del vigía también: su credencial ante el relé, su secreto con la pasarela y su copia
+    # de la clave de Hermes.
+    for ruta in (ambito.clave, ambito.clave_hermes, man_ruta(ambito), ambito.secreto_vigia, ambito.credencial_rele,
+                 ambito.clave_hermes_vigia):
         problema = _abierto(sis, ruta)
         if problema:
             mal.append("%s (%s)" % (ruta, problema))
-    for ruta in (ambito.tokens, ambito.pasarela_ini):
+    for ruta in (ambito.tokens, ambito.pasarela_ini, ambito.vigia_ini):
         modo = sis.modo(ruta)
         if modo is not None and (modo & 0o007 or sis.enlace(ruta) is not None):
             mal.append("%s (%04o)" % (ruta, modo))

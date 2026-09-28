@@ -18,8 +18,9 @@ NOMBRES = {VPN: "la VPN IKEv2", TLS: "la pasarela TLS"}
 FICHEROS_VPN = frozenset((p.SERVIDOR_INI, p.SCRIPT_XFRM, p.UNIDAD_XFRM, p.UNIDAD_CLAVE_PATH, p.UNIDAD_CLAVE_SERVICE,
                           p.DROP_IN_NGINX, p.SITIO, p.SITIO_ENLACE, p.SITIO_CONF_D, p.BEARER))
 UNIDADES_VPN = frozenset(("hehermes-xfrm.service", "hehermes-clave.path", "strongswan.service"))
-UNIDADES_TLS = frozenset((p.UNIDAD_PASARELA, "hehermes-pasarela-clave.path"))
-USUARIOS_TLS = frozenset((p.USUARIO_PASARELA,))
+#: El vigía de los avisos va con la pasarela (le llega por ella): `desinstalar --modo tls` se lo lleva también.
+UNIDADES_TLS = frozenset((p.UNIDAD_PASARELA, "hehermes-pasarela-clave.path", p.UNIDAD_VIGIA, p.SOCKET_VIGIA))
+USUARIOS_TLS = frozenset((p.USUARIO_PASARELA, p.USUARIO_VIGIA))
 #: El único paquete que pueden pedir los dos (el venv de `cryptography`); los demás son de strongSwan y nginx.
 PAQUETES_COMUNES = frozenset(("python3-venv",))
 
@@ -29,6 +30,9 @@ def de_fichero(ruta: str, ambito) -> str | None:
         return VPN
     if ruta.startswith(ambito.carpeta_pasarela + "/") or ruta in (ambito.unidad, p.UNIDAD_PASARELA_CLAVE_PATH,
                                                                  p.UNIDAD_PASARELA_CLAVE_SERVICE):
+        return TLS
+    if (ruta.startswith((ambito.carpeta_avisos + "/", ambito.prefijo + "/hehermes_avisos/"))
+            or ruta in (ambito.unidad_vigia, ambito.socket_vigia)):
         return TLS
     return None
 

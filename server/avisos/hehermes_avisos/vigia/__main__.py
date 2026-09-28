@@ -36,6 +36,19 @@ def _secreto(ruta: str) -> str:
     return leer_secreto(ruta).decode("utf-8").strip()
 
 
+def _clave_de_hermes(ruta: str) -> str:
+    """La clave del api_server: un fichero con la clave sola (la copia 0600 del vigía, con root) o, sin root, el mismo
+    ``.env`` de Hermes (también 0600), del que se saca ``API_SERVER_KEY`` como lo hace la pasarela."""
+    texto = _secreto(ruta)
+    if "API_SERVER_KEY" not in texto and "=" not in texto:
+        return texto
+    from hehermes_servidor.pasarela import leer_clave_hermes
+    clave = leer_clave_hermes(texto)
+    if not clave:
+        raise ErrorDeSecreto(f"{ruta} no tiene una API_SERVER_KEY que se pueda usar")
+    return clave
+
+
 def servir(config: ConfigVigia) -> int:
     # El puerto es de systemd (hehermes-vigia.socket): si lo pasa, se atiende en ese y no se abre ninguno.
     try:
@@ -45,7 +58,7 @@ def servir(config: ConfigVigia) -> int:
         return 1
     try:
         credencial = _secreto(config.rele_credencial)
-        clave_hermes = _secreto(config.hermes_clave) if config.hermes_clave else None
+        clave_hermes = _clave_de_hermes(config.hermes_clave) if config.hermes_clave else None
         secreto_tunel = _secreto(config.secreto_tunel)
         if not secreto_tunel:
             raise ErrorDeSecreto(f"{config.secreto_tunel} está vacío: sin el secreto del túnel, la API quedaría abierta")
@@ -54,10 +67,12 @@ def servir(config: ConfigVigia) -> int:
         registro.error("%s", error)
         return comun.fuera_de_servicio(heredado, "vigia")
     hermes = ClienteHermes(config.hermes_base, clave_hermes, config.hermes_plazo)
-    mensajero = Mensajero(almacen, ClienteRele(config.rele_url, credencial, config.rele_plazo))
+    mensajero = Mensajero(almacen, ClienteRele(config.rele_url, credencial, config.rele_plazo,
+                                               huella=config.rele_huella))
     vigilante = Vigilante(almacen, hermes, mensajero, intervalo=config.intervalo,
                           intervalo_en_calma=config.intervalo_en_calma, antiguedad_maxima=config.antiguedad_maxima,
-                          filas_por_lectura=config.filas_por_lectura, caducidad_aprobacion=config.caducidad_aprobacion)
+                          filas_por_lectura=config.filas_por_lectura, caducidad_aprobacion=config.caducidad_aprobacion,
+                          reglas_entrega=config.reglas_de_entrega())
     ficheros = Ficheros(hermes, ClienteLector(config.ficheros_lector),
                         Limites(config.ficheros_por_minuto, config.ficheros_simultaneos), casa=config.ficheros_casa)
     app = AppVigia(almacen, mensajero, secreto_tunel=secreto_tunel, caducidad_prueba=config.caducidad_prueba,
@@ -116,7 +131,7 @@ def comprobar(config: ConfigVigia) -> int:
     clave_hermes = None
     if config.hermes_clave:
         try:
-            clave_hermes = _secreto(config.hermes_clave)
+            clave_hermes = _clave_de_hermes(config.hermes_clave)
             decir(bool(clave_hermes), f"la clave de Hermes ({config.hermes_clave}) se lee y es privada")
         except (ErrorDeSecreto, UnicodeDecodeError) as error:
             decir(False, str(error))
@@ -147,26 +162,35 @@ def comprobar(config: ConfigVigia) -> int:
                   f"y sin el secreto contesta {error.code}")
         except (urllib.error.URLError, OSError):
             pass
-    decir(*_comprobar_lector(config.ficheros_lector))
+    if config.ficheros_lector:
+        decir(*_comprobar_lector(config.ficheros_lector))
+    else:
+        decir(True, "sin lector de ficheros ([ficheros] lector vacío): GET /avisos/v1/fichero contesta 503")
     base_rele = config.rele_url.rsplit("/v1/", 1)[0]
-    try:
-        with abridor.open(f"{base_rele}/v1/salud", timeout=config.rele_plazo) as respuesta:
-            decir(respuesta.status == 200, f"el relé contesta en {base_rele}")
-    except urllib.error.HTTPError as error:
-        decir(False, f"el relé contesta {error.code} en {base_rele}" + (
-            ": está en marcha, pero sin la clave de APNs, y no puede mandar avisos" if _sin_clave(error) else ""))
-    except (urllib.error.URLError, OSError) as error:
-        decir(False, f"el relé no contesta en {base_rele}: {getattr(error, 'reason', error)}")
+    if config.rele_huella:
+        # La entrada pública del relé no contesta a nada sin credencial (el 404 de siempre, que además le cuenta un
+        # intento fallido a esta IP): se mira solo con ella, y anclada.
+        abridor_rele = comun.abridor(config.rele_huella)
+    else:
+        abridor_rele = abridor
+        try:
+            with abridor.open(f"{base_rele}/v1/salud", timeout=config.rele_plazo) as respuesta:
+                decir(respuesta.status == 200, f"el relé contesta en {base_rele}")
+        except urllib.error.HTTPError as error:
+            decir(False, f"el relé contesta {error.code} en {base_rele}" + (
+                ": está en marcha, pero sin la clave de APNs, y no puede mandar avisos" if _sin_clave(error) else ""))
+        except (urllib.error.URLError, OSError) as error:
+            decir(False, f"el relé no contesta en {base_rele}: {getattr(error, 'reason', error)}")
     if credencial:
         try:
             peticion = urllib.request.Request(f"{base_rele}/v1/credencial",
                                               headers={"Authorization": f"Bearer {credencial}"})
-            with abridor.open(peticion, timeout=config.rele_plazo) as respuesta:
+            with abridor_rele.open(peticion, timeout=config.rele_plazo) as respuesta:
                 nombre = json.loads(respuesta.read().decode("utf-8")).get("credencial")
                 decir(True, f"el relé acepta la credencial de este vigía («{nombre}»)")
         except urllib.error.HTTPError as error:
             decir(False, f"el relé contesta {error.code} a la credencial" + (
-                ": no la acepta" if error.code == 401 else ""))
+                ": no la acepta" if error.code == 401 or (error.code == 404 and config.rele_huella) else ""))
         except (urllib.error.URLError, OSError, ValueError) as error:
             decir(False, f"el relé no contesta a la credencial: {getattr(error, 'reason', error)}")
     return 1 if fallos else 0

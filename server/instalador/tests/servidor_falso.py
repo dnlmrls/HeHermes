@@ -155,6 +155,10 @@ class ServidorFalso:
         self.ensurepip = True
         self.venvs_listos: set = set()
         self.sondas: list = []
+        #: Lo que dice el `comprobar` del vigía de los avisos, y cada vez que se le llama.
+        self.vigia_comprueba = ["bien: Hermes contesta en http://127.0.0.1:8642: 0 conversaciones en la bandeja",
+                                "bien: el relé acepta la credencial de este vigía («probador»)"]
+        self.comprobaciones_del_vigia: list = []
         self._montar_base()
 
     # Montaje
@@ -662,6 +666,11 @@ class ServidorFalso:
             self.sis.poner(args[5] + "/cert.pem", CERT_PASARELA.read_bytes(), modo=0o600)
             self.sis.poner(args[5] + "/clave.pem", CLAVE_PASARELA.read_bytes(), modo=0o600)
             return Resultado(0, json.dumps({"huella": HUELLA_PASARELA}) + "\n")
+        if args[:4] == ["-I", "-B", "-m", "hehermes_avisos.vigia"] and args[-1] == "comprobar":
+            # El `comprobar` del vigía (el de verdad lo prueban las pruebas de los avisos): lo que diga la prueba.
+            self.comprobaciones_del_vigia.append(args)
+            return Resultado(1 if any(l.startswith("mal") for l in self.vigia_comprueba) else 0,
+                             "".join(l + "\n" for l in self.vigia_comprueba))
         if args[:5] == ["-I", "-B", "-m", "hehermes_servidor.canje", "preparar"]:
             self.sis.poner(args[5] + "/cert.pem", "-----BEGIN CERTIFICATE-----\nfalso\n", modo=0o600)
             self.sis.poner(args[5] + "/clave.pem", "-----BEGIN PRIVATE KEY-----\nfalsa\n", modo=0o600)

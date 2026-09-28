@@ -257,7 +257,7 @@ def unidad_pasarela(ambito, con_vigia: bool) -> str:
             "WantedBy=default.target\n"
         ) % (orden, comun)
     credenciales = ("LoadCredential=clave:%s\nLoadCredential=hermes:%s\n" % (ambito.clave, ambito.clave_hermes)
-                    + ("LoadCredential=vigia:%s\n" % SECRETO_VIGIA if con_vigia else ""))
+                    + ("LoadCredential=vigia:%s\n" % _ruta_segura(ambito.secreto_vigia) if con_vigia else ""))
     return (
         CABECERA
         + "# La pasarela TLS de HeHermes (server/API-CONTRACT.md, §12). Corre como %s, sin ningún privilegio: el\n"
@@ -355,7 +355,165 @@ def pasarela_ini(ambito, puerto: int, puerto_hermes: int, env: str, direccion: s
     ) % (puerto, _ruta_segura(ambito.cert), _ruta_segura(ambito.clave), _ruta_segura(ambito.tokens), puerto_hermes,
          _ruta_segura(ambito.clave_hermes if ambito.root else env), _ruta_segura(env))
     if vigia:
-        texto += "\n[avisos]\nvigia = %s\nsecreto = %s\n" % (VIGIA, SECRETO_VIGIA)
+        texto += "\n[avisos]\nvigia = %s\nsecreto = %s\n" % (VIGIA, _ruta_segura(ambito.secreto_vigia))
     texto += ("\n[qr]\n# La que va en el QR de cada iPhone.\ndireccion = %s\n\n[instalador]\ncodigo = %s\n"
               % (direccion, _ruta_segura(ambito.prefijo)))
     return texto
+
+
+# MARK: Los avisos: el vigía (spec 2026-09-28, «El relé para los probadores»)
+
+USUARIO_VIGIA = "hh-vigia"
+UNIDAD_VIGIA = "hehermes-vigia.service"
+SOCKET_VIGIA = "hehermes-vigia.socket"
+
+
+def url_del_rele(direccion: str, puerto: int) -> str:
+    """La de la entrada pública del relé de un código de avisos. Una IPv6 va entre corchetes."""
+    if not _DIRECCION_VALIDA.fullmatch(direccion or ""):
+        raise ValueError("dirección del relé no válida: %r" % direccion)
+    if not isinstance(puerto, int) or isinstance(puerto, bool) or not 0 < puerto < 65536:
+        raise ValueError("puerto del relé no válido: %r" % (puerto,))
+    return "https://%s:%d/v1/avisos" % ("[%s]" % direccion if ":" in direccion else direccion, puerto)
+
+
+def _ip_del_rele(direccion: str) -> str | None:
+    try:
+        return str(ipaddress.ip_address(direccion))
+    except ValueError:
+        return None
+
+
+def vigia_ini(ambito, puerto_hermes: int, env: str, casa_hermes: str, direccion: str, puerto: int,
+              huella: str) -> str:
+    """Lo que lee el vigía (`hehermes_avisos.vigia.configuracion`). Sin secretos: dice dónde están. El relé es el de
+    otra máquina (el de Daniel), por HTTPS y con la huella de su certificado anclada; la credencial, en su fichero."""
+    if not isinstance(puerto_hermes, int) or not 0 < puerto_hermes < 65536:
+        raise ValueError("puerto de Hermes no válido: %r" % (puerto_hermes,))
+    if not re.fullmatch(r"[A-Za-z0-9_-]{43}", huella or ""):
+        raise ValueError("huella del relé no válida")
+    return (
+        CABECERA
+        + "# El vigía de avisos de HeHermes (server/avisos/README.md): lee a Hermes, cifra cada aviso para cada iPhone y\n"
+        "# se lo pasa al relé, que es el único que habla con Apple.\n"
+        "[vigia]\n"
+        "escucha = %s\n"
+        "base_de_datos = %s\n"
+        "secreto_tunel = %s\n"
+        "\n"
+        "[hermes]\n"
+        "base = http://127.0.0.1:%d\n"
+        "clave = %s\n"
+        "\n"
+        "[rele]\n"
+        "url = %s\n"
+        "huella = %s\n"
+        "credencial = %s\n"
+        "\n"
+        "[ficheros]\n"
+        "# El lector de ficheros (GET /avisos/v1/fichero) no lo pone el instalador: esa ruta contesta 503.\n"
+        "lector =\n"
+        "casa = %s\n"
+    ) % (VIGIA, _ruta_segura(ambito.base_vigia), _ruta_segura(ambito.secreto_vigia), puerto_hermes,
+         _ruta_segura(ambito.clave_hermes_vigia if ambito.root else env), url_del_rele(direccion, puerto), huella,
+         _ruta_segura(ambito.credencial_rele), _ruta_segura(casa_hermes))
+
+
+def unidad_vigia_socket() -> str:
+    """Con root, el puerto del vigía es de systemd, esté el vigía en marcha o no: nadie más puede escuchar en
+    127.0.0.1:8790 y quedarse con lo que le manda la pasarela (el secreto del vigía y la clave de cada alta)."""
+    return (
+        CABECERA
+        + "[Unit]\n"
+        "Description=HeHermes: el puerto del vigía de avisos\n"
+        "\n"
+        "[Socket]\n"
+        "ListenStream=%s\n"
+        "IPAddressDeny=any\n"
+        "IPAddressAllow=localhost\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=sockets.target\n"
+    ) % VIGIA
+
+
+def unidad_vigia(ambito, direccion_rele: str) -> str:
+    """Con root, como `hh-vigia`, con el socket de systemd y la jaula de la del VPS de Daniel
+    (`server/avisos/despliegue/hehermes-vigia.service`); la red, solo hacia esta máquina y hacia el relé si su dirección
+    es una IP. Sin root, una unidad de usuario que abre su propio puerto. Sin `MemoryDenyWriteExecute`: cffi (de
+    cryptography) puede necesitar memoria ejecutable, y un vigía que no arranca no avisa de nada."""
+    orden = "%s -I -B -m hehermes_avisos.vigia --config %s servir" % (_ruta_segura(ambito.python_venv),
+                                                                      _ruta_segura(ambito.vigia_ini))
+    comun = (
+        "NoNewPrivileges=yes\n"
+        "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK\n"
+        "RestrictRealtime=yes\n"
+        "RestrictSUIDSGID=yes\n"
+        "LockPersonality=yes\n"
+        "SystemCallArchitectures=native\n"
+        "SystemCallFilter=@system-service\n"
+        "SystemCallErrorNumber=EPERM\n"
+        "UMask=0077\n"
+        "LimitCORE=0\n"
+    )
+    if not ambito.root:
+        return (
+            CABECERA
+            + "# El vigía de avisos de HeHermes, como el usuario de Hermes: lee su .env.\n"
+            "[Unit]\n"
+            "Description=HeHermes: vigía de avisos\n"
+            "\n"
+            "[Service]\n"
+            "Type=simple\n"
+            "ExecStart=%s\n"
+            "Restart=always\n"
+            "RestartSec=5\n"
+            "%s"
+            "\n"
+            "[Install]\n"
+            "WantedBy=default.target\n"
+        ) % (orden, comun)
+    ip = _ip_del_rele(direccion_rele)
+    red = ("# Solo esta máquina (Hermes, la pasarela) y el relé.\nIPAddressDeny=any\nIPAddressAllow=localhost %s\n" % ip
+           if ip else "# El relé va por nombre (%s): sin filtro de direcciones.\n" % direccion_rele)
+    return (
+        CABECERA
+        + "# El vigía de avisos de HeHermes: lee a Hermes (sin tocarlo) y pide los avisos al relé.\n"
+        "[Unit]\n"
+        "Description=HeHermes: vigía de avisos\n"
+        "Wants=network-online.target\n"
+        "Requires=%s\n"
+        "After=network-online.target %s\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "User=%s\n"
+        "Group=%s\n"
+        "ExecStart=%s\n"
+        "Restart=always\n"
+        "RestartSec=5\n"
+        "StateDirectory=hehermes-vigia\n"
+        "StateDirectoryMode=0700\n"
+        "%s"
+        "CapabilityBoundingSet=\n"
+        "AmbientCapabilities=\n"
+        "ProtectSystem=strict\n"
+        "ProtectHome=yes\n"
+        "PrivateTmp=yes\n"
+        "PrivateDevices=yes\n"
+        "ProtectKernelTunables=yes\n"
+        "ProtectKernelModules=yes\n"
+        "ProtectKernelLogs=yes\n"
+        "ProtectControlGroups=yes\n"
+        "ProtectClock=yes\n"
+        "ProtectHostname=yes\n"
+        "ProtectProc=invisible\n"
+        "RestrictNamespaces=yes\n"
+        "InaccessiblePaths=-%s -%s -/etc/nginx -/etc/wireguard -/etc/swanctl\n"
+        "%s"
+        "\n"
+        "[Install]\n"
+        "WantedBy=multi-user.target\n"
+        "Also=%s\n"
+    ) % (SOCKET_VIGIA, SOCKET_VIGIA, USUARIO_VIGIA, USUARIO_VIGIA, orden, red, ambito.carpeta_pasarela,
+         ambito.carpeta_config, comun, SOCKET_VIGIA)

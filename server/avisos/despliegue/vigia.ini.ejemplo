@@ -38,6 +38,10 @@ clave = /etc/hehermes-avisos/vigia/clave-hermes
 plazo = 15
 
 [rele]
+# El relé de esta misma máquina, en claro por 127.0.0.1. El de otra (la entrada pública del de Daniel, para el vigía de
+# un probador) va por https://<dirección>:<puerto>/v1/avisos con «huella = <la del código de avisos>», que se ancla: sin
+# huella no se habla HTTPS con nadie, y en claro solo con 127.0.0.1 (la credencial va en cada aviso). Eso lo escribe el
+# instalador (hehermes-servidor avisos).
 url = http://127.0.0.1:8791/v1/avisos
 # La credencial de este vigía ante el relé (fichero 0600 de hh-vigia). La crea el instalador.
 credencial = /etc/hehermes-avisos/vigia/credencial-rele
@@ -45,9 +49,26 @@ credencial = /etc/hehermes-avisos/vigia/credencial-rele
 # que puede tardar el relé con Apple ([rele] plazo_apns, 6 s).
 plazo = 8
 
+[entregas]
+# Cuando un subagente en segundo plano acaba, Hermes deja su entrega en el historial y no lanza ningún turno: lo lanza la
+# app si está viva. Con el iPhone dormido nadie lo hacía y la respuesta no llegaba hasta el siguiente mensaje de Daniel.
+# Con esto encendido, el vigía lanza él el turno de continuación de la app (el mismo texto, la misma clave de
+# idempotencia) y el aviso que llega es el de la respuesta. «no» vuelve a lo de antes: solo avisa de la entrega.
+contestar = sí
+# Segundos que se deja a la app, si está delante, para lanzar la suya (con las instrucciones y el esfuerzo de la
+# conversación, que el vigía no conoce). Como mínimo 30.
+gracia = 60
+# Una entrega sin contestar más vieja que esto (segundos) ya no se contesta: tras un reinicio largo, no se despiertan
+# conversaciones de ayer.
+antiguedad_maxima = 10800
+# Continuaciones seguidas sin un mensaje de Daniel en medio tras las que el vigía se para (Hermes puede volver a delegar
+# al recibir cada entrega): a partir de ahí solo avisa de la entrega.
+cadena_maxima = 3
+
 [ficheros]
 # Los ficheros que Hermes marca con MEDIA: (GET /avisos/v1/fichero). Los lee como root el lector de
 # /usr/local/libexec/hehermes-leer-media, que systemd lanza por cada conexión a este socket (root:hh-vigia 0660).
+# Vacío: sin lector (el del instalador), y esa ruta contesta 503.
 lector = /run/hehermes-leer-media.sock
 # Lo que vale «~» en una línea MEDIA:~/… (Hermes corre como root).
 casa = /root

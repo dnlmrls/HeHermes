@@ -68,6 +68,13 @@ def _analizador():
                    help="si la API de Hermes escucha en todas las interfaces, la cierro a 127.0.0.1 (en su .env)")
     i.add_argument("--cortafuegos-a-mano", action="store_true",
                    help="el cortafuegos lo llevas tú: no lo toco aunque cierre el paso")
+    i.add_argument("--avisos", nargs="?", const="-", metavar="CÓDIGO",
+                   help="los avisos push, con el código de avisos que te han dado (sin él, lo pido y se pega sin eco)")
+    v = ordenes.add_parser("avisos", help="los avisos push en una instalación que ya tiene la pasarela")
+    v.add_argument("codigo", nargs="?", metavar="CÓDIGO", help="el código de avisos (sin él, lo pido y se pega sin eco)")
+    v.add_argument("--plan", action="store_true", help="enseña lo que haría, sin cambiar nada")
+    v.add_argument("--si", action="store_true", help="no pregunta")
+    v.add_argument("--reemplazar", action="append", default=[], metavar="FICHERO", help=argparse.SUPPRESS)
     ordenes.add_parser("comprobar")
     # Lo que lanza hehermes-cortafuegos.service al arrancar (poner) y al pararse (quitar). No es para personas.
     c = ordenes.add_parser("cortafuegos")
@@ -87,9 +94,10 @@ def _analizador():
     return a
 
 
-ORDENES = ("instalar", "comprobar", "actualizar", "desinstalar", "canje-limpiar", "cortafuegos", "pasarela-clave")
+ORDENES = ("instalar", "avisos", "comprobar", "actualizar", "desinstalar", "canje-limpiar", "cortafuegos",
+           "pasarela-clave")
 #: Lo que se puede hacer sin root en una instalación de la pasarela de un usuario.
-DEL_USUARIO = ("instalar", "comprobar", "desinstalar", "canje-limpiar")
+DEL_USUARIO = ("instalar", "avisos", "comprobar", "desinstalar", "canje-limpiar")
 
 
 def main(argv, doc, aqui, sis=None, entrada=input, salida=print, terminal=None, euid=None, relanzar=None,
@@ -111,6 +119,15 @@ def main(argv, doc, aqui, sis=None, entrada=input, salida=print, terminal=None, 
         if uso:
             salida("error: %s\n\n%s" % (uso, doc.strip()))
             return 2
+    # Un código dado en la orden se mira antes de nada (y el error no lo repite: lleva la credencial).
+    dado = op.avisos if op.orden == "instalar" else (op.codigo if op.orden == "avisos" else None)
+    if dado not in (None, "-"):
+        from .avisos import CodigoNoValido, leer_codigo
+        try:
+            leer_codigo(dado)
+        except CodigoNoValido as error:
+            salida("error: %s" % error)
+            return 2
     if getattr(op, "adoptar", False):
         salida("error: --adoptar todavía no existe: una instalación hecha a mano no se toca (spec, «Lo que queda fuera»)")
         return 2
@@ -130,7 +147,7 @@ def _con_ambito(op, sis, ambito, aqui, entrada, salida, terminal) -> int:
     except ManifiestoRoto as error:
         salida("error: %s" % error)
         return 1
-    orden = {"instalar": _instalar, "comprobar": _comprobar, "actualizar": _actualizar,
+    orden = {"instalar": _instalar, "avisos": _avisos, "comprobar": _comprobar, "actualizar": _actualizar,
              "desinstalar": _desinstalar, "canje-limpiar": _canje_limpiar, "cortafuegos": _cortafuegos,
              "pasarela-clave": _pasarela_clave}[op.orden]
     if op.orden in ("comprobar", "canje-limpiar", "cortafuegos", "pasarela-clave") or getattr(op, "plan", False):
@@ -266,14 +283,63 @@ def _pregunta_si(entrada, salida, terminal, si, texto="¿Sigo? [s/N] "):
         return False
 
 
+def _codigo_de_avisos(dado, entrada, salida, terminal):
+    """El código de avisos, leído: el dado, o pedido (sin eco en un terminal). None si no vale (y ya se ha dicho)."""
+    from .avisos import CodigoNoValido, leer_codigo, pedir_codigo
+    if dado in (None, "-"):
+        try:
+            dado = pedir_codigo(entrada, terminal)
+        except EOFError:
+            dado = ""
+    try:
+        return leer_codigo(dado)
+    except CodigoNoValido as error:
+        salida("error: %s" % error)
+        return None
+
+
+def _avisos(op, sis, man, aqui, entrada, salida, terminal, ambito):
+    """`avisos [CÓDIGO]`: el vigía, en una instalación que ya tiene la pasarela. Es `instalar` con el código y con lo
+    de antes (la dirección del QR, la que ya está), así que repara también lo que falte; y se puede repetir."""
+    import argparse as _argparse
+    import configparser
+    if "tls" not in man.modos:
+        salida("error: aquí no está la pasarela, y los avisos le llegan a la app por ella. Primero la conexión directa "
+               "(el comando de la app, o %s instalar), y luego esto" % ("sudo hehermes-servidor" if ambito.root
+                                                                       else ambito.orden))
+        return 1
+    ini = configparser.ConfigParser(interpolation=None)
+    try:
+        ini.read_string(sis.leer_texto(ambito.pasarela_ini) or "")
+        direccion = ini.get("qr", "direccion", fallback="").strip() or None
+    except configparser.Error:
+        direccion = None
+    if direccion == "PENDIENTE":
+        direccion = None
+    ns = _argparse.Namespace(iphone=None, direccion=direccion, hermes_home=None, reemplazar=op.reemplazar, si=op.si,
+                             plan=op.plan, por_chat=False, llave=None, activar_api=False, qr_png=None,
+                             # nftables o iptables a pelo, solo si ya los llevaba el instalador: poner los avisos no
+                             # es motivo para empezar a tocar un cortafuegos (el vigía solo sale hacia el relé).
+                             cortafuegos_a_mano=not man.datos.get("cortafuegos_propio"), corregir_exposicion=False,
+                             avisos=op.codigo or "-")
+    return _instalar(ns, sis, man, aqui, entrada, salida, terminal, ambito)
+
+
 def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
     """La pasarela: la instala, la repara o da de alta un iPhone en ella. En un servidor con la VPN de antes, va a su
-    lado sin tocarla, y el plan dice cómo quitarla (`modo_tls._convivir`)."""
+    lado sin tocarla, y el plan dice cómo quitarla (`modo_tls._convivir`). Con `--avisos`, también el vigía."""
     from . import modo_tls, porchat
+    codigo = None
+    if getattr(op, "avisos", None):
+        codigo = _codigo_de_avisos(op.avisos, entrada, salida, terminal)
+        if codigo is None:
+            return 2
     opciones = Opciones(iphone=op.iphone, direccion=op.direccion, hermes_home=op.hermes_home,
                         reemplazar=op.reemplazar, si=op.si or op.por_chat, solo_plan=op.plan, por_chat=op.por_chat,
                         llave=op.llave, activar_api=op.activar_api, qr_png=op.qr_png,
-                        cortafuegos_a_mano=op.cortafuegos_a_mano, corregir_exposicion=op.corregir_exposicion)
+                        cortafuegos_a_mano=op.cortafuegos_a_mano, corregir_exposicion=op.corregir_exposicion,
+                        avisos=codigo)
+    del codigo
     if op.por_chat:
         # Lo lanza Hermes: no hay nadie a quien preguntar.
         terminal = False

@@ -46,6 +46,24 @@ class Ambito:
             # En /run/user, que es suyo y en memoria: dentro de ~/.config, desinstalar no podría quitar su carpeta.
             self.cerrojo = "/run/user/%d/hehermes-servidor.lock" % uid
             self.systemctl = ["systemctl", "--user"]
+        # Los avisos (el vigía, `avisos`): con root, donde los deja también `server/avisos/despliegue/instalar.sh` en el
+        # VPS de Daniel; sin root, en su casa, como la pasarela.
+        if root:
+            self.carpeta_avisos = "/etc/hehermes-avisos"
+            self.carpeta_estado_vigia = "/var/lib/hehermes-vigia"
+        else:
+            self.carpeta_avisos = casa + "/.config/hehermes-avisos"
+            self.carpeta_estado_vigia = casa + "/.local/state/hehermes-vigia"
+        self.carpeta_vigia = self.carpeta_avisos + "/vigia"
+        self.vigia_ini = self.carpeta_avisos + "/vigia.ini"
+        self.secreto_vigia = self.carpeta_vigia + "/secreto-tunel"
+        self.credencial_rele = self.carpeta_vigia + "/credencial-rele"
+        #: Con root, la copia 0600 de la clave de Hermes del vigía (la pone al día `pasarela-clave`); sin root, el vigía
+        #: lee el .env de Hermes, como la pasarela.
+        self.clave_hermes_vigia = self.carpeta_vigia + "/clave-hermes"
+        self.base_vigia = self.carpeta_estado_vigia + "/vigia.db"
+        self.unidad_vigia = self.unidades + "/hehermes-vigia.service"
+        self.socket_vigia = self.unidades + "/hehermes-vigia.socket"
         self.manifiesto = self.carpeta_config + "/instalacion.json"
         self.pasarela_ini = self.carpeta_pasarela + "/pasarela.ini"
         self.cert = self.carpeta_pasarela + "/cert.pem"

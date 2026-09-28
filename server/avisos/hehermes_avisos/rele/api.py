@@ -41,7 +41,9 @@ MOTIVOS_DE_CONFIGURACION = frozenset({
 
 
 class AppRele:
-    """Con ``apns=None``, el relé está en marcha sin la clave de APNs: autentica igual, pero a cada aviso contesta 503
+    """``credenciales``: un ``credenciales.Almacen`` (el de verdad, que sigue al fichero) o un dict fijo de huellas.
+
+    Con ``apns=None``, el relé está en marcha sin la clave de APNs: autentica igual, pero a cada aviso contesta 503
     (``sin_clave_apns``), y su salud lo dice."""
 
     def __init__(self, credenciales: dict, apns: ClienteAPNs | None, limitador: Limitador, reservas: list,
@@ -56,7 +58,11 @@ class AppRele:
         tipo, _, secreto = (cabecera or "").partition(" ")
         credencial = None
         if tipo.lower() == "bearer" and secreto.strip():
-            credencial = modulo_credenciales.buscar(self.credenciales, secreto.strip())
+            # Con un `Almacen`, el fichero al día (un alta o una baja valen sin reiniciar); con un dict, lo que se dio.
+            if isinstance(self.credenciales, dict):
+                credencial = modulo_credenciales.buscar(self.credenciales, secreto.strip())
+            else:
+                credencial = self.credenciales.buscar(secreto.strip())
         if credencial is None:
             raise ErrorHTTP(401, "credencial_invalida", "Credencial desconocida", {"WWW-Authenticate": "Bearer"})
         return credencial

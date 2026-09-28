@@ -407,7 +407,8 @@ _MENSAJES = {"peticion_invalida": "La petición no tiene una forma que la pasare
              "cuerpo_demasiado_grande": "El cuerpo es más grande de lo que la pasarela acepta",
              "hermes_no_contesta": "Hermes no contesta en este servidor",
              "avisos_no_instalados": "Los avisos no están instalados en este servidor",
-             "vigia_no_contesta": "El vigía de avisos no contesta en este servidor"}
+             "vigia_no_contesta": "El vigía de avisos no contesta en este servidor",
+             "rele_no_contesta": "El relé de avisos no contesta"}
 PLAZO_CONECTAR = 5
 #: Lo que espera la respuesta de Hermes entre dos trozos: lo mismo que el `proxy_read_timeout 1h` del túnel.
 PLAZO_HERMES = 3600
@@ -498,11 +499,17 @@ def token_de(peticion: Peticion):
 
 
 class Pasarela:
+    """El servidor. Lo reutiliza la entrada pública del relé de avisos (`hehermes_avisos.rele.publico`), con sus
+    credenciales en lugar de los tokens y su `destino`: el mismo TLS, los mismos límites y el mismo 404."""
+
+    #: Cómo se llama en su registro.
+    nombre = "pasarela"
+
     def __init__(self, config, tokens=None, limites=None, diario=None, tls_minimo=None, retraso_404=RETRASO_404,
                  plazo_cabeceras=PLAZO_CABECERAS, plazo_parada=PLAZO_PARADA, revision=REVISION_TOKENS):
         self.config = config
-        self.tokens = tokens or Tokens(config.tokens)
-        self.limites = limites or Limites()
+        self.tokens = tokens if tokens is not None else Tokens(config.tokens)
+        self.limites = limites if limites is not None else Limites()
         self.clave_hermes = Secreto(config.clave_hermes, leer_clave_hermes)
         self.secreto_vigia = Secreto(config.secreto_vigia, leer_secreto_vigia) if config.vigia else None
         self.diario = diario or (lambda texto: print(texto, flush=True))
@@ -523,7 +530,7 @@ class Pasarela:
         escucha = _escuchar(self.config.escucha, self.config.puerto)
         escucha.setblocking(False)
         puerto = escucha.getsockname()[1]
-        self.diario("pasarela escuchando en el puerto %d" % puerto)
+        self.diario("%s escuchando en el puerto %d" % (self.nombre, puerto))
         if listo:
             listo(puerto)
         tareas = [asyncio.ensure_future(self._aceptar(escucha)), asyncio.ensure_future(self._vigilar_tokens())]
@@ -651,32 +658,38 @@ class Pasarela:
             self.diario("%s %s %d" % (ip, peticion.metodo, error.estado))
             return False
 
+    def tope(self, peticion) -> int:
+        """El cuerpo más grande que se deja pasar a esa ruta."""
+        return MAX_CUERPO_AVISOS if peticion.ruta.startswith("/avisos/") else MAX_CUERPO
+
+    def destino(self, peticion, ip):
+        """(dirección en 127.0.0.1, cabeceras que pone la pasarela, código de error si no contesta) de una petición que
+        ya trae un token válido. La entrada pública del relé (`hehermes_avisos.rele.publico`) pone la suya."""
+        if peticion.ruta.startswith("/avisos/"):
+            if self.config.vigia is None:
+                raise _Error(503, "avisos_no_instalados")
+            secreto = self.secreto_vigia.valor()
+            if secreto is None:
+                raise _Error(503, "avisos_no_instalados")
+            return self.config.vigia, [("X-HeHermes-Vigia", secreto)], "vigia_no_contesta"
+        clave = self.clave_hermes.valor()
+        if clave is None:
+            self.diario("%s sin la clave de Hermes: no la puedo leer" % ip)
+            raise _Error(502, "hermes_no_contesta")
+        return ("127.0.0.1", self.config.puerto_hermes), [("Authorization", "Bearer " + clave)], "hermes_no_contesta"
+
     async def _reenviar(self, peticion, lector, escritor, ip) -> bool:
-        avisos = peticion.ruta.startswith("/avisos/")
         if peticion.valores("transfer-encoding"):
             raise _Error(400, "peticion_invalida")
         largos = peticion.valores("content-length")
         if len(set(largos)) > 1 or (largos and not re.match(r"^[0-9]{1,12}$", largos[0])):
             raise _Error(400, "peticion_invalida")
         peticion.largo = int(largos[0]) if largos else 0
-        if peticion.largo > (MAX_CUERPO_AVISOS if avisos else MAX_CUERPO):
+        if peticion.largo > self.tope(peticion):
             raise _Error(413, "cuerpo_demasiado_grande")
         conexion = ",".join(peticion.valores("connection")).lower()
         peticion.cerrar = "close" in conexion or (peticion.version == "HTTP/1.0" and "keep-alive" not in conexion)
-        if avisos:
-            if self.config.vigia is None:
-                raise _Error(503, "avisos_no_instalados")
-            secreto = self.secreto_vigia.valor()
-            if secreto is None:
-                raise _Error(503, "avisos_no_instalados")
-            destino, poner, caido = self.config.vigia, [("X-HeHermes-Vigia", secreto)], "vigia_no_contesta"
-        else:
-            clave = self.clave_hermes.valor()
-            if clave is None:
-                self.diario("%s sin la clave de Hermes: no la puedo leer" % ip)
-                raise _Error(502, "hermes_no_contesta")
-            destino, poner = ("127.0.0.1", self.config.puerto_hermes), [("Authorization", "Bearer " + clave)]
-            caido = "hermes_no_contesta"
+        destino, poner, caido = self.destino(peticion, ip)
         try:
             arriba_lector, arriba = await asyncio.wait_for(asyncio.open_connection(*destino, limit=MAX_CABECERAS * 4),
                                                            PLAZO_CONECTAR)

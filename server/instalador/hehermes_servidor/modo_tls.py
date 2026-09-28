@@ -57,9 +57,10 @@ def detectar_tls(sis, man, ambito, direccion=None, hermes_home=None, activar_api
     det.puerto_pasarela = _puerto(sis, man)
     _python_venv(sis, det, ambito)
     _systemd(sis, det, ambito)
+    # Un vigía, lo haya puesto este instalador (`avisos`) o instalar.sh (el VPS de Daniel): la pasarela le pasa /avisos/.
+    det.con_vigia = sis.existe(ambito.secreto_vigia)
     if ambito.root:
         det.usuario_pasarela = sis.ejecutar(["id", "-u", p.USUARIO_PASARELA]).bien
-        det.con_vigia = sis.existe(p.SECRETO_VIGIA)
         _cortafuegos(sis, det, cortafuegos_a_mano, puerto_pasarela=det.puerto_pasarela)
     else:
         det.avisos.append("No corro como root, así que ni miro ni toco el cortafuegos. Si este servidor tiene uno (ufw, "
@@ -193,6 +194,11 @@ def calcular_plan_tls(sis, det, man, op, origen) -> Plan:
                            (m.AJENO if hay_cert else m.NUEVO),
                            "ECDSA P-256, autofirmado y sin datos, diez años; la app ancla su huella"))
 
+    # Los avisos (el vigía), si hay un código ahora o uno de antes: antes que la pasarela, que así ya sabe que le pasa
+    # /avisos/ (y con root, lleva su secreto por credencial).
+    from . import avisos as vigias
+    det.vigia = vigias.planear(sis, det, man, op, origen, acciones, bloqueos, fichero)
+
     # La pasarela
     pasarela = [
         fichero(ambito.pasarela_ini, p.pasarela_ini(ambito, det.puerto_pasarela, det.hermes.puerto, det.hermes.env,
@@ -305,6 +311,10 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
         man.datos["instalado"] = time.time()
     man.anadir_modo("tls")
     man.datos["pasarela"] = {"puerto": det.puerto_pasarela, "root": ambito.root}
+    vigia = getattr(det, "vigia", None)
+    if vigia:
+        # Lo que no es secreto del código de avisos: con ello se repara sin pedirlo otra vez. La credencial, no.
+        man.datos["vigia"] = {"direccion": vigia["direccion"], "puerto": vigia["puerto"], "huella": vigia["huella"]}
     if det.familia != "debian":
         man.datos["familia"] = det.familia
     man.guardar(sis)
@@ -327,9 +337,11 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
             man.guardar(sis)
             salida("==> el usuario %s" % a.objeto)
 
+    from . import avisos as vigias
     pasarela = {ambito.pasarela_ini, ambito.tokens, ambito.clave_hermes, ambito.unidad}
     unidades = {p.UNIDAD_PASARELA_CLAVE_PATH, p.UNIDAD_PASARELA_CLAVE_SERVICE, p.UNIDAD_CORTAFUEGOS}
-    sueltos = [a for a in acciones if a.tipo in ("fichero", "enlace") and a.objeto not in pasarela | unidades]
+    sueltos = [a for a in acciones if a.tipo in ("fichero", "enlace")
+               and a.objeto not in pasarela | unidades | vigias.rutas(ambito)]
     _ficheros(sis, man, sueltos, "ficheros", salida)
 
     # La carpeta de la pasarela: con root, 0750 y del grupo hh-pasarela, que tiene que llegar a pasarela.ini, al
@@ -366,8 +378,12 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
             if accion.objeto in (ambito.pasarela_ini, ambito.tokens):
                 _orden(sis, ["chown", "root:" + p.USUARIO_PASARELA, accion.objeto], "chown de %s" % accion.objeto)
 
+    if vigia:
+        vigias.aplicar_secretos(sis, man, acciones, ambito, salida, _orden)
     _con_unidad(sis, man, [a for a in acciones if a.objeto in pasarela or a.objeto == p.UNIDAD_PASARELA],
                 p.UNIDAD_PASARELA, salida, systemctl=systemctl, despues=permisos)
+    if vigia:
+        vigias.aplicar_unidades(sis, man, acciones, ambito, salida)
     if ambito.root:
         _con_unidad(sis, man, [a for a in acciones if a.objeto in (p.UNIDAD_PASARELA_CLAVE_PATH,
                                                                     p.UNIDAD_PASARELA_CLAVE_SERVICE,
@@ -381,9 +397,23 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
 
     _esperar_a_la_pasarela(sis, det.puerto_pasarela)
     pendiente = any(a.tipo in ("env", "exposicion") and a.cambia for a in acciones)
-    fallos = [texto for bien, texto in comprobar_tls(sis, man, ambito, hermes_pendiente=pendiente) if not bien]
+    fallos = [texto for bien, texto in comprobar_tls(sis, man, ambito, hermes_pendiente=pendiente, con_vigia=False)
+              if not bien]
     if fallos:
         raise Parada("la comprobación no pasa:\n  - " + "\n  - ".join(fallos))
+    if vigia:
+        # Lo del vigía se dice, pero no para: la pasarela ya funciona, y el relé es de otra máquina (su cortafuegos, su
+        # credencial) y no se arregla repitiendo esto. `comprobar` lo vuelve a mirar cuando se quiera.
+        resultados = []
+        vigias.comprobar(sis, man, ambito, lambda bien, si, no: resultados.append((bool(bien), si if bien else no)),
+                         hermes_pendiente=pendiente)
+        salida("==> los avisos")
+        for bien, texto in resultados:
+            salida("    %-4s %s" % ("bien" if bien else "MAL", texto))
+        if not all(bien for bien, _ in resultados):
+            salida("    El vigía no está bien del todo (arriba). La pasarela sí: la app ya puede conectar, y los avisos "
+                   "llegarán cuando se arregle lo de arriba (\"%s comprobar\" lo vuelve a mirar)."
+                   % ("sudo hehermes-servidor" if ambito.root else ambito.orden))
 
     resultado = {}
     for a in de("dispositivo"):
@@ -434,7 +464,7 @@ def huella(sis, ambito) -> str | None:
 # MARK: Comprobar
 
 
-def comprobar_tls(sis, man, ambito, hermes_pendiente=False) -> list:
+def comprobar_tls(sis, man, ambito, hermes_pendiente=False, con_vigia=True) -> list:
     """(bien, texto) de cada cosa que tiene que estar en marcha. Solo lee (y se asoma a la pasarela sin token)."""
     from .pasarela import NO_ENCONTRADO, leer_clave_hermes
     resultados = []
@@ -474,6 +504,9 @@ def comprobar_tls(sis, man, ambito, hermes_pendiente=False) -> list:
                  "systemctl start hehermes-pasarela-clave")
     else:
         mira(False, "", "Hermes: no encuentro su clave (%s)" % env)
+    if con_vigia and man.datos.get("vigia"):
+        from . import avisos
+        avisos.comprobar(sis, man, ambito, mira, hermes_pendiente=hermes_pendiente)
     if ambito.root:
         _comprobar_cortafuegos(sis, man, puerto, mira)
     else:
@@ -533,10 +566,24 @@ def poner_al_dia_la_clave(sis, salida=print) -> int:
     if not clave:
         salida("error: no encuentro la clave de Hermes (%s)" % env)
         return 1
+    codigo = 0
     if leer_clave_hermes(sis.leer_texto(ambito.clave_hermes) or "") == clave:
         salida("la copia de la clave de Hermes de la pasarela ya está al día")
-        return 0
-    sis.escribir(ambito.clave_hermes, (clave + "\n").encode(), modo=0o600)
-    sis.ejecutar(["systemctl", "try-restart", p.UNIDAD_PASARELA])
-    salida("clave de Hermes copiada a la pasarela, y la pasarela reiniciada")
-    return 0
+    else:
+        sis.escribir(ambito.clave_hermes, (clave + "\n").encode(), modo=0o600)
+        sis.ejecutar(["systemctl", "try-restart", p.UNIDAD_PASARELA])
+        salida("clave de Hermes copiada a la pasarela, y la pasarela reiniciada")
+    # La del vigía, si lo puso este instalador (la de un vigía puesto a mano la lleva `hehermes-dispositivo clave`).
+    man = m.Manifiesto.leer(sis, ambito.manifiesto)
+    if man.datos.get("vigia") and ambito.clave_hermes_vigia in man.ficheros:
+        if leer_clave_hermes(sis.leer_texto(ambito.clave_hermes_vigia) or "") == clave:
+            salida("la copia de la clave de Hermes del vigía ya está al día")
+        else:
+            sis.escribir(ambito.clave_hermes_vigia, (clave + "\n").encode(), modo=0o600)
+            r = sis.ejecutar(["chown", p.USUARIO_VIGIA + ":" + p.USUARIO_VIGIA, ambito.clave_hermes_vigia])
+            if not r.bien:
+                salida("error: no he podido dar la copia del vigía a %s" % p.USUARIO_VIGIA)
+                codigo = 1
+            sis.ejecutar(["systemctl", "try-restart", p.UNIDAD_VIGIA])
+            salida("clave de Hermes copiada al vigía, y el vigía reiniciado")
+    return codigo

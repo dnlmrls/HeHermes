@@ -79,12 +79,16 @@ class Paquete(unittest.TestCase):
             with self.subTest(fichero=nombre):
                 self.assertIn(prefijo + nombre, miembros)
                 self.assertEqual(miembros[prefijo + nombre].mode, modo)
-        # Los avisos solo los instalaba --avisos, que iba con la VPN: ya no van.
+        # Desde la 0.7.0, el código de los avisos (el vigía, `avisos`): sus .py y nada más (ni pruebas, ni despliegue).
         self.assertFalse([n for n in miembros if n.startswith(prefijo + "avisos")])
         ficheros = sorted(n[len(prefijo):] for n, m in miembros.items() if m.isfile())
         modulos = sorted("hehermes_servidor/" + p.name for p in (apoyo.RAIZ / "hehermes_servidor").glob("*.py"))
+        de_avisos = apoyo.REPO / "server" / "avisos" / "hehermes_avisos"
+        avisos = sorted("hehermes_avisos/" + str(p.relative_to(de_avisos)) for p in de_avisos.rglob("*.py")
+                        if "__pycache__" not in p.parts)
+        self.assertIn("hehermes_avisos/vigia/__main__.py", avisos)
         self.assertEqual(ficheros, sorted(["README.md", "clave-publica.pem", "hehermes-dispositivo", "hehermes-pasarela",
-                                           "hehermes-servidor", "requirements-canje.txt"] + modulos))
+                                           "hehermes-servidor", "requirements-canje.txt"] + modulos + avisos))
         # El dispositivo es el de server/vpn, byte a byte.
         with tarfile.open(ruta) as tar:
             dentro = tar.extractfile(prefijo + "hehermes-dispositivo").read()

@@ -2,8 +2,10 @@
 
 1. lee la bandeja de Hermes (``GET /api/sessions``) y, de las sesiones que han cambiado (``last_active`` o
    ``message_count`` distintos de la vuelta anterior), lee sus últimas filas;
-2. decide qué avisar (``deteccion``), a qué iPhone (``avisos.decidir``) y lo manda (``envio``);
-3. mira el estado de los turnos que la app dejó en marcha, si se los ha dicho: es lo único que deja ver las aprobaciones
+2. si una entrega de un subagente se ha quedado sin contestar, lanza el turno de continuación de la app
+   (``entregas``): Hermes no lo lanza nunca en el api_server, y con el iPhone dormido la app tampoco;
+3. decide qué avisar (``deteccion``), a qué iPhone (``avisos.decidir``) y lo manda (``envio``);
+4. mira el estado de los turnos que la app dejó en marcha, si se los ha dicho: es lo único que deja ver las aprobaciones
    que esperan y los errores sin abrir el SSE del run, que es de un solo uso y es de la app.
 
 **Cada conversación va por su cuenta.** Se lee, se avisa de lo suyo y se apunta en SQLite antes de pasar a la
@@ -32,7 +34,8 @@ import time
 from dataclasses import dataclass, replace
 
 from .. import texto
-from . import avisos, deteccion
+from ..comun import cola
+from . import avisos, deteccion, entregas
 from .almacen import Almacen, EstadoSesion
 from .envio import ENVIADO, LIMITADO, REINTENTABLE, Mensajero
 from .hermes import ClienteHermes, ErrorHermes
@@ -80,11 +83,40 @@ class _Espera:
     hasta: float
 
 
+# Lo que se espera, tras lanzar una continuación, a ver su fila en el historial. Hermes la escribe al empezar el turno,
+# en menos de un segundo; si en dos minutos no está, algo va mal y se deja de insistir: se avisa de la entrega.
+VER_LA_CONTINUACION = 120.0
+# Lo que se insiste en lanzar una continuación que falla por algo pasajero (Hermes reiniciándose, un 429, un 5xx).
+INSISTIR_EN_LA_CONTINUACION = 1800.0
+
+
+ReglasDeEntrega = entregas.ReglasDeEntrega
+
+
+@dataclass(frozen=True)
+class _Continuacion:
+    """Lo que el vigía ha hecho con la entrega de una delegación: lanzada (``run_id``), esperando a reintentar o
+    rendida (se avisa de la entrega, como antes)."""
+
+    desde: float
+    run_id: str | None = None
+    lanzada: float | None = None
+    fallos: int = 0
+    hasta: float = 0.0
+    rendida: bool = False
+
+
 class Vigilante:
     def __init__(self, almacen: Almacen, hermes: ClienteHermes, mensajero: Mensajero, *, intervalo: float = 5.0,
                  intervalo_en_calma: float = INTERVALO_EN_CALMA, antiguedad_maxima: float = 900.0,
-                 filas_por_lectura: int = 100, caducidad_aprobacion: int = 120, reloj=time.time):
+                 filas_por_lectura: int = 100, caducidad_aprobacion: int = 120, reloj=time.time,
+                 reglas_entrega: ReglasDeEntrega | None = None):
         self.almacen = almacen
+        # Sin reglas, el vigía no contesta ninguna entrega: solo avisa de ella.
+        self.reglas_entrega = reglas_entrega
+        # (sesión, delegation_id) → lo hecho con su entrega. En memoria: tras un reinicio, la misma clave de
+        # idempotencia hace que relanzarla dé el mismo turno, no otro.
+        self._continuaciones: dict = {}
         self.hermes = hermes
         self.mensajero = mensajero
         self.intervalo = intervalo
@@ -232,9 +264,19 @@ class Vigilante:
         filas, limite = self._leer(sid)
         ids = [fila["id"] for fila in filas] + ([estado.ultimo_id] if estado.ultimo_id is not None else [])
         pendiente = None
+        entregas_del_vigia = None
+        try:
+            entregas_del_vigia, volver = self._atender_entrega(sid, filas, ahora)
+            if volver:
+                pendiente = entregas_del_vigia
+        except Exception:  # noqa: BLE001 — contestar una entrega no puede dejar la conversación sin avisos
+            self._apuntar_fallo(f"entrega {sid}", "fallo contestando la entrega de %s: se avisa de ella", sid,
+                                excepcion=True)
+            entregas_del_vigia = None
         try:
             sucesos = deteccion.sucesos(filas, ultimo_id=estado.ultimo_id, referencia=estado.referencia, ahora=ahora,
-                                        antiguedad_maxima=self.antiguedad_maxima, pagina_llena=len(filas) >= limite)
+                                        antiguedad_maxima=self.antiguedad_maxima, pagina_llena=len(filas) >= limite,
+                                        entregas_del_vigia=entregas_del_vigia)
             for suceso in sucesos:
                 aviso = avisos.Aviso(tipo=suceso.tipo, sesion=sid, titulo=self._titulos.get(sid, "Hermes"),
                                      texto=suceso.texto, instante=suceso.instante, clave=suceso.clave)
@@ -254,6 +296,67 @@ class Vigilante:
         antes = [i for i in ids if i < pendiente]
         self.almacen.guardar_sesion(EstadoSesion(sid, max(antes) if antes else estado.ultimo_id, estado.referencia,
                                                  estado.ultima_actividad, estado.mensajes, ahora))
+
+    # -- Las entregas de los subagentes
+
+    def _atender_entrega(self, sid: str, filas: list, ahora: float) -> tuple:
+        """Contesta, si toca, la entrega sin atender más reciente de la conversación (``entregas``) lanzando el turno de
+        continuación de la app. Devuelve la fila de la entrega de la que se ocupa el vigía (``None`` si de ninguna: se
+        avisa de ella como antes) y si hay que volver a leer la conversación en la vuelta siguiente aunque no cambie
+        (se espera la gracia, a que acabe un turno o a ver la fila de la continuación lanzada)."""
+        if self.reglas_entrega is None:
+            return None, False
+        decision = entregas.decidir(filas, ahora=ahora, gracia=self.reglas_entrega.gracia,
+                                    antiguedad_maxima=self.reglas_entrega.antiguedad_maxima,
+                                    cadena_maxima=self.reglas_entrega.cadena_maxima)
+        if decision is None:
+            return None, False
+        clave = (sid, decision.delegacion)
+        if decision.accion == entregas.RENUNCIAR:
+            if clave not in self._continuaciones:
+                self._continuaciones[clave] = _Continuacion(desde=ahora, rendida=True)
+                registro.warning("la entrega %s de %s no se contesta: %d continuaciones seguidas sin un mensaje de "
+                                 "Daniel; se avisa de ella", decision.delegacion, sid, self.reglas_entrega.cadena_maxima)
+            return None, False
+        if decision.accion == entregas.ESPERAR:
+            return decision.fila, True
+        hecho = self._continuaciones.get(clave) or _Continuacion(desde=ahora)
+        if hecho.rendida:
+            return None, False
+        if hecho.lanzada is not None:
+            if ahora - hecho.lanzada < VER_LA_CONTINUACION:
+                return decision.fila, True
+            self._continuaciones[clave] = replace(hecho, rendida=True)
+            registro.warning("la continuación %s de %s no aparece en el historial; se avisa de la entrega",
+                             hecho.run_id, sid)
+            return None, False
+        if ahora < hecho.hasta:
+            return decision.fila, True
+        try:
+            run_id = self.hermes.lanzar_continuacion(sid, decision.clave)
+        except ErrorHermes as error:
+            if error.estado == 409 and error.codigo == "idempotency_key_conflict":
+                # La misma clave con otro cuerpo: la app ya lanzó esta continuación, con sus instrucciones. Es la buena.
+                self._continuaciones[clave] = replace(hecho, run_id=None, lanzada=ahora)
+                registro.info("la continuación de %s en %s ya la lanzó la app", decision.delegacion, sid)
+                return decision.fila, True
+            pasajero = error.estado is None or error.estado in (429, 503) or error.estado >= 500
+            if pasajero and ahora - hecho.desde < INSISTIR_EN_LA_CONTINUACION:
+                fallos = hecho.fallos + 1
+                pausa = REINTENTOS[min(fallos, len(REINTENTOS)) - 1]
+                self._continuaciones[clave] = replace(hecho, fallos=fallos, hasta=ahora + pausa)
+                self._apuntar_fallo(f"continuar {sid}", "no se pudo lanzar la continuación de %s en %s (%s); se "
+                                    "reintenta", decision.delegacion, sid, error)
+                return decision.fila, True
+            self._continuaciones[clave] = replace(hecho, rendida=True)
+            registro.warning("no se pudo lanzar la continuación de %s en %s: %s; se avisa de la entrega",
+                             decision.delegacion, sid, error)
+            return None, False
+        self._continuaciones[clave] = replace(hecho, run_id=run_id, lanzada=ahora)
+        # Se vigila como los turnos de la app: si falla sin respuesta, llega el aviso de error.
+        self.almacen.vigilar_turnos([(run_id, sid)], ahora)
+        registro.info("entrega %s de %s sin contestar: continuación %s lanzada", decision.delegacion, sid, run_id)
+        return decision.fila, True
 
     def _leer(self, sid: str) -> tuple:
         """Las últimas filas de una conversación, y cuántas se pidieron. Casi siempre bastan 20, las del turno que
@@ -326,9 +429,11 @@ class Vigilante:
             clave = (dispositivo.token, aviso.identidad)
             if clave in self._aceptados:
                 continue
-            decision = avisos.decidir(aviso, dispositivo, ahora)
+            decision, motivo = avisos.decidir_con_motivo(aviso, dispositivo, ahora)
             if decision == avisos.DESCARTAR:
                 self._esperas.pop(clave, None)
+                # Sin esto, un aviso que no sale por los ajustes del iPhone no deja rastro (`decidir_con_motivo`).
+                registro.info("no se avisa a %s de %s: %s", cola(dispositivo.token), aviso.tipo, motivo)
                 continue
             espera = self._esperas.get(clave)
             if decision == avisos.ESPERAR or (espera is not None and ahora < espera.hasta):
@@ -359,6 +464,11 @@ class Vigilante:
         # Una espera vencida hace más que la antigüedad máxima es de un aviso que ya no puede ser nuevo: se dejó de buscar.
         for clave in [c for c, espera in self._esperas.items() if ahora - espera.hasta > self.antiguedad_maxima]:
             del self._esperas[clave]
+        # Lo hecho con una entrega se recuerda mientras esa entrega pueda volver a decidirse: después ya es vieja.
+        if self.reglas_entrega is not None:
+            for clave in [c for c, hecho in self._continuaciones.items()
+                          if ahora - hecho.desde > self.reglas_entrega.antiguedad_maxima]:
+                del self._continuaciones[clave]
 
     def _apuntar_fallo(self, clave: str, formato: str, *argumentos, excepcion: bool = False) -> None:
         ahora = self.reloj()

@@ -35,8 +35,9 @@ EJECUTABLES = {"hehermes-servidor", "hehermes-pasarela", "hehermes-dispositivo"}
 
 
 def ficheros():
-    """(ruta dentro del paquete, ruta en el repositorio) de todo lo que lleva, en orden. Desde la 0.6.0 ya no lleva los
-    avisos (`server/avisos`): solo los instalaba `--avisos`, que iba con la VPN y se fue con ella."""
+    """(ruta dentro del paquete, ruta en el repositorio) de todo lo que lleva, en orden. Desde la 0.7.0 lleva otra vez
+    el código de los avisos (`server/avisos/hehermes_avisos`, solo los .py): `avisos` pone el vigía, que habla con el
+    relé de Daniel (spec 2026-09-28). Ni sus pruebas ni su despliegue a mano."""
     lista = [("hehermes-servidor", os.path.join(AQUI, "hehermes-servidor")),
              ("hehermes-pasarela", os.path.join(AQUI, "hehermes-pasarela")),
              ("clave-publica.pem", os.path.join(AQUI, "clave-publica.pem")),
@@ -46,6 +47,13 @@ def ficheros():
     for nombre in sorted(os.listdir(os.path.join(AQUI, "hehermes_servidor"))):
         if nombre.endswith(".py"):
             lista.append(("hehermes_servidor/" + nombre, os.path.join(AQUI, "hehermes_servidor", nombre)))
+    avisos = os.path.join(SERVER, "avisos", "hehermes_avisos")
+    for carpeta, subcarpetas, nombres in os.walk(avisos):
+        subcarpetas[:] = sorted(s for s in subcarpetas if s != "__pycache__")
+        for nombre in sorted(nombres):
+            if nombre.endswith(".py"):
+                ruta = os.path.join(carpeta, nombre)
+                lista.append(("hehermes_avisos/" + os.path.relpath(ruta, avisos).replace(os.sep, "/"), ruta))
     return sorted(lista)
 
 

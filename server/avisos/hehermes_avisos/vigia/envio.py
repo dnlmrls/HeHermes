@@ -37,13 +37,18 @@ class Resultado:
 
 
 class ClienteRele:
-    """``POST /v1/avisos`` con la credencial de este vigía. Todo lo que no sea una respuesta del relé es reintentable."""
+    """``POST /v1/avisos`` con la credencial de este vigía. Todo lo que no sea una respuesta del relé es reintentable.
 
-    def __init__(self, url: str, credencial: str, plazo: float = 8.0, abridor=None):
+    El relé de la misma máquina, en claro por ``127.0.0.1``; el de otra (la entrada pública del de Daniel), por HTTPS
+    con la huella de su certificado anclada. Un certificado con otra huella no recibe nada: ni la credencial ni el
+    aviso (``comun.ErrorDeHuella``), y cuenta como que el relé no contesta."""
+
+    def __init__(self, url: str, credencial: str, plazo: float = 8.0, abridor=None, huella: str | None = None):
+        """``huella``: la del relé de otra máquina (``https://…``), que se ancla antes de mandar la credencial."""
         self.url = url
         self._credencial = credencial
         self.plazo = plazo
-        self._abridor = abridor or comun.abridor()
+        self._abridor = abridor or comun.abridor(huella)
 
     def enviar(self, peticion: dict) -> Resultado:
         cuerpo = json.dumps(peticion, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
