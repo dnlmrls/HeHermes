@@ -32,12 +32,26 @@ from .entorno import leer_env
 
 # MARK: Los números (los de server/API-CONTRACT.md, §12.6)
 
-#: Intentos sin token válido desde una IP en `VENTANA_FALLOS` segundos que la bloquean `BLOQUEO` segundos.
+#: Intentos sin token válido desde una IP en `VENTANA_FALLOS` segundos que la bloquean `BLOQUEO` segundos. Desde la
+#: 0.9.0, una IP bloqueada no se queda sin pasarela (detrás de un CGNAT hay muchos iPhone con la misma): lo que traiga un
+#: token válido pasa, y lo que no, se cierra al momento, sin el 404 ni su segundo, y con solo
+#: `CONEXIONES_POR_IP_BLOQUEADA` a la vez sin autenticar.
 MAX_FALLOS = 10
 VENTANA_FALLOS = 600
 BLOQUEO = 900
+#: Conexiones **sin autenticar** (el apretón TLS y la primera cabecera) por IP y en total. Una conexión que ya ha pasado
+#: una petición con un token válido deja de contar aquí: los SSE y el pool de cada iPhone no se comen el cupo de los
+#: demás iPhone de su IP.
 CONEXIONES_POR_IP = 16
 CONEXIONES_EN_TOTAL = 128
+CONEXIONES_POR_IP_BLOQUEADA = 4
+#: Las rechazadas esperan su segundo aparte, sin ocupar el cupo de arriba: por IP y en total. Si no caben, se cierran
+#: sin contestar.
+CASTIGADAS_POR_IP = 16
+CASTIGADAS_EN_TOTAL = 256
+#: Con el cupo lleno, una conexión sin autenticar de más de estos segundos deja su sitio a la nueva: un slowloris no
+#: puede quedarse con el cupo de su IP (ni con el de todos). Un apretón y una cabecera de verdad tardan menos.
+PLAZO_DESALOJO = 3.0
 #: IP distintas que se recuerdan: un barrido desde muchas direcciones no hace crecer la memoria sin fin.
 MAX_IPS = 4096
 #: Contra slowloris: la línea de la petición y las cabeceras, enteras, en este plazo.
@@ -48,6 +62,8 @@ PLAZO_PARADA = 75
 #: Mientras llega un cuerpo, cada trozo; mientras Hermes contesta, no hay plazo (el SSE dura lo que dura el turno).
 PLAZO_TROZO = 30
 RETRASO_404 = 1.0
+#: Con lo que sale si no puede arrancar por su configuración (EX_CONFIG): su unidad no lo reinicia en bucle.
+SALIDA_CONFIGURACION = 78
 MAX_CABECERAS = 16 * 1024
 MAX_LINEAS_CABECERA = 100
 #: Una foto va en base64 dentro del JSON de /v1/runs: lo mismo que el `client_max_body_size 25m` del túnel.
@@ -56,8 +72,8 @@ MAX_CUERPO_AVISOS = 64 * 1024
 #: Cada cuánto se mira si ha cambiado tokens.json (y se cortan las conexiones de un token dado de baja).
 REVISION_TOKENS = 1.0
 
-TOKEN_VALIDO = re.compile(r"^[A-Za-z0-9_-]{43}$")
-_HASH_VALIDO = re.compile(r"^[0-9a-f]{64}$")
+TOKEN_VALIDO = re.compile(r"[A-Za-z0-9_-]{43}")
+_HASH_VALIDO = re.compile(r"[0-9a-f]{64}")
 
 
 # MARK: Los tokens
@@ -102,7 +118,7 @@ class Tokens:
     def quien(self, token) -> str | None:
         """El nombre del iPhone de ese token, o None. Contra todas las entradas y sin salir en la que coincide, con
         `hmac.compare_digest`: el tiempo no dice ni cuál es ni si hay alguno que se le parezca."""
-        if not isinstance(token, str) or not TOKEN_VALIDO.match(token):
+        if not isinstance(token, str) or not TOKEN_VALIDO.fullmatch(token):
             return None
         buscado = hash_token(token).encode("ascii")
         hallado = None
@@ -132,7 +148,7 @@ def _leer_tokens(ruta):
         return []
     entradas = []
     for t in datos["tokens"]:
-        if isinstance(t, dict) and isinstance(t.get("nombre"), str) and _HASH_VALIDO.match(str(t.get("sha256"))):
+        if isinstance(t, dict) and isinstance(t.get("nombre"), str) and _HASH_VALIDO.fullmatch(str(t.get("sha256"))):
             entradas.append((t["nombre"], t["sha256"].encode("ascii")))
     return entradas
 
@@ -141,8 +157,9 @@ def _leer_tokens(ruta):
 
 
 class Limites:
-    """Quién puede abrir otra conexión: las IP bloqueadas por sus fallos no llegan ni al apretón TLS, y hay un tope de
-    conexiones por IP y otro en total. Todo en memoria: al reiniciarse la pasarela, se empieza de cero."""
+    """Quién puede abrir otra conexión sin autenticar: un tope por IP (más bajo si la IP está bloqueada por sus fallos) y
+    otro en total; y aparte, cuántas rechazadas esperan su 404. Todo en memoria: al reiniciarse la pasarela, se empieza
+    de cero."""
 
     def __init__(self, reloj=time.monotonic, contar_locales=False):
         self.reloj = reloj
@@ -152,6 +169,8 @@ class Limites:
         self._bloqueos = collections.OrderedDict()  # ip -> hasta cuándo
         self._abiertas = {}
         self.abiertas = 0
+        self._castigadas = {}
+        self.castigadas = 0
 
     def bloqueada(self, ip: str) -> bool:
         hasta = self._bloqueos.get(ip)
@@ -162,24 +181,34 @@ class Limites:
             return False
         return True
 
+    def tope_de(self, ip: str) -> int:
+        return CONEXIONES_POR_IP_BLOQUEADA if self.bloqueada(ip) else CONEXIONES_POR_IP
+
+    def llena(self, ip: str) -> bool:
+        """Si la IP ya tiene todas las que puede sin autenticar (y no el total)."""
+        return self._abiertas.get(ip, 0) >= self.tope_de(ip)
+
     def admitir(self, ip: str) -> bool:
-        if self.bloqueada(ip):
-            return False
-        if self.abiertas >= CONEXIONES_EN_TOTAL or self._abiertas.get(ip, 0) >= CONEXIONES_POR_IP:
+        """Una conexión nueva sin autenticar, si cabe."""
+        if self.abiertas >= CONEXIONES_EN_TOTAL or self.llena(ip):
             return False
         self._abiertas[ip] = self._abiertas.get(ip, 0) + 1
         self.abiertas += 1
         return True
 
     def soltar(self, ip: str) -> None:
-        cuantas = self._abiertas.get(ip, 0)
-        if cuantas <= 0:
-            return
-        if cuantas == 1:
-            del self._abiertas[ip]
-        else:
-            self._abiertas[ip] = cuantas - 1
-        self.abiertas -= 1
+        self.abiertas -= _restar(self._abiertas, ip)
+
+    def castigar(self, ip: str) -> bool:
+        """Sitio para que una rechazada espere su 404, fuera del cupo de `admitir`. False si no cabe."""
+        if self.castigadas >= CASTIGADAS_EN_TOTAL or self._castigadas.get(ip, 0) >= CASTIGADAS_POR_IP:
+            return False
+        self._castigadas[ip] = self._castigadas.get(ip, 0) + 1
+        self.castigadas += 1
+        return True
+
+    def perdonar(self, ip: str) -> None:
+        self.castigadas -= _restar(self._castigadas, ip)
 
     def fallo(self, ip: str) -> None:
         """Las de este mismo servidor no cuentan: `comprobar` se asoma sin token, y un bloqueo de 127.0.0.1 no
@@ -211,6 +240,17 @@ class Limites:
         self._bloqueos[ip] = ahora + BLOQUEO
 
 
+def _restar(cuentas: dict, ip: str) -> int:
+    cuantas = cuentas.get(ip, 0)
+    if cuantas <= 0:
+        return 0
+    if cuantas == 1:
+        del cuentas[ip]
+    else:
+        cuentas[ip] = cuantas - 1
+    return 1
+
+
 def _local(ip) -> bool:
     try:
         return ipaddress.ip_address(ip).is_loopback
@@ -218,10 +258,89 @@ def _local(ip) -> bool:
         return False
 
 
+# MARK: El mantenimiento (desde la 0.9.0)
+
+#: Lo que apunta la pasarela en su carpeta de estado para el borrado de verdad (`mantenimiento.py`): que hay algo borrado
+#: de Hermes pendiente de limpiar del disco (sin ids ni nada del contenido: solo desde cuándo), y su actividad, para que
+#: la limpieza espere a un rato tranquilo. `MANTENIMIENTO` lo escribe la limpieza, y la pasarela lo enseña a la app.
+BORRADO_PENDIENTE = "borrado-pendiente"
+ACTIVIDAD = "actividad.json"
+MANTENIMIENTO = "mantenimiento.json"
+RUTA_MANTENIMIENTO = "/hehermes/v1/mantenimiento"
+#: Lo que es borrar una conversación de Hermes para siempre (el «Eliminar también de Hermes» de la app).
+BORRAR_SESION = re.compile(r"/api/sessions/[A-Za-z0-9_.:%-]{1,256}(?:\?[\x21-\x7e]*)?")
+#: Cada cuánto se apunta la actividad (solo si ha cambiado, o cada cinco minutos aunque no).
+APUNTAR_ACTIVIDAD = 30.0
+#: Lo que se enseña de `MANTENIMIENTO`, y nada más.
+_CAMPOS_MANTENIMIENTO = ("ultimo_borrado", "ultimo_intento", "fallo", "fallos_seguidos", "no_puede", "metodo")
+
+
+class Mantenimiento:
+    """La carpeta de estado de la pasarela (con root, `StateDirectory=hehermes-pasarela`: /var/lib/hehermes-pasarela;
+    sin root, ~/.local/state/hehermes-pasarela). Escribe siempre al lado y renombra, sin seguir enlaces."""
+
+    def __init__(self, carpeta: str, reloj=time.time):
+        self.carpeta, self.reloj = carpeta, reloj
+
+    def _ruta(self, nombre):
+        return os.path.join(self.carpeta, nombre)
+
+    def _escribir(self, nombre, datos: bytes):
+        temporal = self._ruta(".%s.%d.%s" % (nombre, os.getpid(), secrets.token_hex(4)))
+        fd = os.open(temporal, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(datos)
+            os.replace(temporal, self._ruta(nombre))
+        except BaseException:
+            if os.path.exists(temporal):
+                os.unlink(temporal)
+            raise
+
+    def _leer(self, nombre, tope=4096):
+        try:
+            fd = os.open(self._ruta(nombre), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            return None
+        with os.fdopen(fd, "rb") as f:
+            return f.read(tope)
+
+    def apuntar_borrado(self) -> None:
+        """Hay algo borrado pendiente de limpiar. Si ya lo había, se queda la fecha de la primera."""
+        if pendiente_desde(self._leer(BORRADO_PENDIENTE)) is None:
+            self._escribir(BORRADO_PENDIENTE, b"%d\n" % int(self.reloj()))
+
+    def apuntar_actividad(self, reenviando: int, ultima) -> None:
+        self._escribir(ACTIVIDAD, json.dumps({"reenviando": int(reenviando), "ultima": ultima,
+                                              "escrita": int(self.reloj())}).encode("ascii"))
+
+    def estado(self) -> dict:
+        """Lo que se le enseña a la app: si hay un borrado pendiente (y desde cuándo) y lo que apuntó la limpieza."""
+        desde = pendiente_desde(self._leer(BORRADO_PENDIENTE))
+        salida = {"borrado_pendiente": desde is not None, "pendiente_desde": desde}
+        try:
+            datos = json.loads(self._leer(MANTENIMIENTO) or b"{}")
+        except ValueError:
+            datos = {}
+        for campo in _CAMPOS_MANTENIMIENTO:
+            valor = datos.get(campo) if isinstance(datos, dict) else None
+            salida[campo] = valor if isinstance(valor, (int, float, str, bool)) or valor is None else None
+        return salida
+
+
+def pendiente_desde(datos) -> int | None:
+    """La fecha (segundos) de `borrado-pendiente`, o None si no hay o no se entiende."""
+    try:
+        texto = (datos or b"").decode("ascii").strip()
+    except UnicodeDecodeError:
+        return None
+    return int(texto) if re.fullmatch(r"[0-9]{1,12}", texto) else None
+
+
 # MARK: Los secretos de 127.0.0.1
 
 
-_CLAVE_VALIDA = re.compile(r"^[\x21-\x7e]+$")
+_CLAVE_VALIDA = re.compile(r"[\x21-\x7e]+")
 
 
 def leer_clave_hermes(texto: str) -> str | None:
@@ -235,7 +354,7 @@ def leer_clave_hermes(texto: str) -> str | None:
         return None
     else:
         clave = texto.strip()
-    if not clave or not _CLAVE_VALIDA.match(clave) or '"' in clave:
+    if not clave or not _CLAVE_VALIDA.fullmatch(clave) or '"' in clave:
         return None
     return clave
 
@@ -243,12 +362,14 @@ def leer_clave_hermes(texto: str) -> str | None:
 def leer_secreto_vigia(texto: str) -> str | None:
     """El secreto que el vigía espera en `X-HeHermes-Vigia` (`server/avisos/despliegue/instalar.sh`)."""
     valor = (texto or "").strip()
-    return valor if re.match(r"^[A-Za-z0-9_-]{32,128}$", valor) else None
+    return valor if re.fullmatch(r"[A-Za-z0-9_-]{32,128}", valor) else None
 
 
 class Secreto:
-    """Un fichero pequeño que se vuelve a leer si cambia. Así, sin root, la pasarela coge la clave nueva de Hermes sin
-    reiniciarse; con root, la copia la cambia `pasarela-clave` y reinicia."""
+    """Un fichero pequeño que se vuelve a leer si cambia. Así la pasarela coge la clave nueva de Hermes sin reiniciarse
+    (ni cortar los SSE): sin root, del .env de Hermes; con root, de su copia, que cambia `pasarela-clave` (desde la 0.9.0,
+    sin reiniciarla). Un fichero que no se deja leer no se da por visto: se vuelve a probar en la petición siguiente
+    (por ejemplo, entre que se escribe y se le da a su dueño)."""
 
     def __init__(self, ruta, extraer):
         self.ruta, self.extraer = ruta, extraer
@@ -264,7 +385,8 @@ class Secreto:
                 with open(self.ruta, "r", encoding="utf-8", errors="replace") as f:
                     self._valor = self.extraer(f.read(65536))
             except OSError:
-                self._valor = None
+                self._firma, self._valor = None, None
+                return None
             self._firma = firma
         return self._valor
 
@@ -323,6 +445,11 @@ class Configuracion:
         self.puerto = None
         self.escucha = ""
         self.certificado = self.clave = self.tokens = None
+        #: El certificado que viene después (solo el público: su clave no se usa hasta rotar). Su huella se publica a
+        #: quien trae un token (`RUTA_HUELLAS`), para que el cliente la ancle también y la rotación no le pille.
+        self.certificado_siguiente = None
+        #: La carpeta de estado (`Mantenimiento`), si la hay.
+        self.mantenimiento = None
         self.puerto_hermes = None
         self.clave_hermes = None
         self.vigia = None
@@ -343,6 +470,10 @@ class Configuracion:
             c.certificado = _absoluta(ini.get("pasarela", "certificado"))
             c.clave = _absoluta(ini.get("pasarela", "clave"))
             c.tokens = _absoluta(ini.get("pasarela", "tokens"))
+            siguiente = ini.get("pasarela", "certificado_siguiente", fallback="").strip()
+            c.certificado_siguiente = _absoluta(siguiente) if siguiente else None
+            estado = ini.get("mantenimiento", "carpeta", fallback="").strip()
+            c.mantenimiento = _absoluta(estado) if estado else None
             c.puerto_hermes = _puerto(ini.get("hermes", "puerto"))
             c.clave_hermes = _absoluta(ini.get("hermes", "clave"))
             vigia = ini.get("avisos", "vigia", fallback="").strip()
@@ -377,7 +508,7 @@ def _absoluta(ruta):
 
 
 def _es_base64url(texto, bytes_=32) -> bool:
-    if not isinstance(texto, str) or not re.match(r"^[A-Za-z0-9_-]+$", texto):
+    if not isinstance(texto, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", texto):
         return False
     try:
         datos = base64.urlsafe_b64decode(texto + "=" * (-len(texto) % 4))
@@ -392,11 +523,16 @@ import asyncio  # noqa: E402
 import socket  # noqa: E402
 import ssl  # noqa: E402
 
+#: Lo que contesta la pasarela misma (no va a Hermes) a quien trae un token: la huella de su certificado y la del que
+#: viene después, para rotarlo sin volver a emparejar (server/API-CONTRACT.md, §12.7).
+RUTA_HUELLAS = "/hehermes/v1/huellas"
 #: Lo que recibe todo lo que no trae un token válido: siempre estos bytes, ni más ni menos.
 NO_ENCONTRADO = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 _METODOS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
-_RUTA = re.compile(r"^/[\x21-\x7e]*$")
-_NOMBRE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+#: Con `fullmatch`, nunca con `match` y `$`: `$` casa también delante de un «\n» final, y «GET /x\n HTTP/1.1» (o una
+#: cabecera «X\n: y») pasaba a Hermes con un salto de línea suelto dentro (el fuzz de la auditoría, §14.9).
+_RUTA = re.compile(r"/[\x21-\x7e]*")
+_NOMBRE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 #: Lo que no pasa de un salto al siguiente, lo que pone la pasarela y los secretos que pone ella.
 _QUITAR_DE_LA_APP = {"connection", "keep-alive", "proxy-connection", "proxy-authorization", "te", "trailer",
                      "transfer-encoding", "upgrade", "expect", "host", "authorization", "x-hehermes-vigia",
@@ -449,6 +585,19 @@ def respuesta_de_error(estado, codigo) -> bytes:
              "Connection: close\r\n\r\n") % (estado, _TEXTOS[estado], len(cuerpo))).encode("ascii") + cuerpo
 
 
+class _Conexion:
+    """Lo que la pasarela sabe de cada conexión atendida: de qué IP, desde cuándo, en qué cupo está (`previa`: sin
+    autenticar; `dentro`: ya pasó una petición con un token válido; `castigo`: esperando su 404; `fuera`: ya no cuenta)
+    y el hash del token con el que pasó (el que se sigue por si se da de baja)."""
+
+    __slots__ = ("ip", "inicio", "fase", "huella", "tarea")
+
+    def __init__(self, ip, inicio, tarea=None):
+        self.ip, self.inicio, self.tarea = ip, inicio, tarea
+        self.fase = "previa"
+        self.huella = None
+
+
 class Peticion:
     __slots__ = ("metodo", "ruta", "version", "cabeceras", "largo", "cerrar")
 
@@ -475,7 +624,7 @@ def leer_cabeza(bruto: bytes) -> Peticion:
     if len(partes) != 3:
         raise _Rechazo()
     metodo, ruta, version = partes
-    if metodo not in _METODOS or version not in ("HTTP/1.1", "HTTP/1.0") or not _RUTA.match(ruta):
+    if metodo not in _METODOS or version not in ("HTTP/1.1", "HTTP/1.0") or not _RUTA.fullmatch(ruta):
         raise _Rechazo()
     cabeceras = []
     for linea in lineas[1:]:
@@ -483,11 +632,23 @@ def leer_cabeza(bruto: bytes) -> Peticion:
             raise _Rechazo()
         nombre, dos_puntos, valor = linea.partition(":")
         valor = valor.strip(" \t")
-        if not dos_puntos or not _NOMBRE.match(nombre) or any(ord(c) < 32 and c != "\t" or ord(c) == 127
+        if not dos_puntos or not _NOMBRE.fullmatch(nombre) or any(ord(c) < 32 and c != "\t" or ord(c) == 127
                                                                 for c in valor):
             raise _Rechazo()
         cabeceras.append((nombre, valor))
     return Peticion(metodo, ruta, version, cabeceras)
+
+
+def cabeza_hacia_arriba(peticion: Peticion, destino, ip: str, poner) -> bytes:
+    """La línea y las cabeceras que salen hacia 127.0.0.1: las de la app menos lo que no pasa de un salto al siguiente y
+    los secretos (que pone la pasarela), y el largo que ella ha medido, con `Connection: close`."""
+    cabeceras = [(n, v) for n, v in peticion.cabeceras if n.lower() not in _QUITAR_DE_LA_APP]
+    cabeceras += [("Host", "%s:%d" % tuple(destino)), ("X-Forwarded-For", ip)] + list(poner)
+    if peticion.largo or peticion.metodo in ("POST", "PUT", "PATCH"):
+        cabeceras.append(("Content-Length", str(peticion.largo)))
+    cabeceras.append(("Connection", "close"))
+    return (("%s %s HTTP/1.1\r\n" % (peticion.metodo, peticion.ruta)).encode("latin-1")
+            + "".join("%s: %s\r\n" % c for c in cabeceras).encode("latin-1") + b"\r\n")
 
 
 def token_de(peticion: Peticion):
@@ -506,7 +667,8 @@ class Pasarela:
     nombre = "pasarela"
 
     def __init__(self, config, tokens=None, limites=None, diario=None, tls_minimo=None, retraso_404=RETRASO_404,
-                 plazo_cabeceras=PLAZO_CABECERAS, plazo_parada=PLAZO_PARADA, revision=REVISION_TOKENS):
+                 plazo_cabeceras=PLAZO_CABECERAS, plazo_parada=PLAZO_PARADA, revision=REVISION_TOKENS,
+                 desalojo=PLAZO_DESALOJO):
         self.config = config
         self.tokens = tokens if tokens is not None else Tokens(config.tokens)
         self.limites = limites if limites is not None else Limites()
@@ -514,9 +676,17 @@ class Pasarela:
         self.secreto_vigia = Secreto(config.secreto_vigia, leer_secreto_vigia) if config.vigia else None
         self.diario = diario or (lambda texto: print(texto, flush=True))
         self.contexto = contexto_tls(config, tls_minimo)
+        self.huellas = {"actual": _huella_de_pem(config.certificado),
+                        "siguiente": _huella_de_pem(getattr(config, "certificado_siguiente", None))}
+        carpeta = getattr(config, "mantenimiento", None)
+        self.mantenimiento = Mantenimiento(carpeta) if carpeta else None
+        #: Las peticiones que están ahora con Hermes (un SSE cuenta mientras dura) y cuándo llegó la última con token.
+        self._reenviando = 0
+        self._ultima = None
         self.retraso_404, self.plazo_cabeceras, self.plazo_parada = retraso_404, plazo_cabeceras, plazo_parada
         self.revision = revision
-        #: Cada conexión atendida, con el hash de su token (None mientras no ha pasado una petición).
+        self.desalojo = desalojo
+        #: Cada conexión atendida (su tarea), con lo que se sabe de ella (`_Conexion`).
         self._conexiones = {}
         self._parado = None
 
@@ -534,6 +704,8 @@ class Pasarela:
         if listo:
             listo(puerto)
         tareas = [asyncio.ensure_future(self._aceptar(escucha)), asyncio.ensure_future(self._vigilar_tokens())]
+        if self.mantenimiento is not None:
+            tareas.append(asyncio.ensure_future(self._apuntar_actividad()))
         try:
             await self._parado
         finally:
@@ -551,21 +723,81 @@ class Pasarela:
                 await asyncio.sleep(0.05)
                 continue
             ip = _ip(origen)
-            if not self.limites.admitir(ip):
-                # Bloqueada o sobre el tope: ni el apretón TLS.
+            if not self.limites.admitir(ip) and not (self._desalojar(ip) and self.limites.admitir(ip)):
+                # Sobre el tope (y nadie a quien desalojar): ni el apretón TLS.
                 crudo.close()
                 continue
-            tarea = asyncio.ensure_future(self._conexion(crudo, ip))
-            self._conexiones[tarea] = None
-            tarea.add_done_callback(lambda t, ip=ip: (self._conexiones.pop(t, None), self.limites.soltar(ip)))
+            conexion = _Conexion(ip, self.limites.reloj())
+            conexion.tarea = asyncio.ensure_future(self._conexion(crudo, ip))
+            self._conexiones[conexion.tarea] = conexion
+            conexion.tarea.add_done_callback(self._acabada)
+
+    def _acabada(self, tarea):
+        conexion = self._conexiones.pop(tarea, None)
+        if conexion is not None:
+            self._pasar(conexion, "fuera")
+
+    def _pasar(self, conexion, fase):
+        """Saca la conexión del cupo en el que estaba. El de `castigo` se toma aparte (`Limites.castigar`), antes."""
+        if conexion.fase == fase:
+            return
+        if conexion.fase == "previa":
+            self.limites.soltar(conexion.ip)
+        elif conexion.fase == "castigo":
+            self.limites.perdonar(conexion.ip)
+        conexion.fase = fase
+
+    def _desalojar(self, ip) -> bool:
+        """Con el cupo lleno (el de la IP o el de todas), la conexión sin autenticar más vieja de esa IP (o de todas)
+        deja su sitio, si lleva más de `desalojo` segundos: un slowloris no retiene el cupo, y un apretón de verdad no
+        tarda tanto. True si ha dejado sitio."""
+        de_la_ip = self.limites.llena(ip)
+        ahora = self.limites.reloj()
+        for conexion in self._conexiones.values():  # en orden de llegada: la primera que valga es la más vieja
+            if conexion.fase == "previa" and (not de_la_ip or conexion.ip == ip) and \
+                    ahora - conexion.inicio >= self.desalojo:
+                self._pasar(conexion, "fuera")
+                conexion.tarea.cancel()
+                self.diario("%s desalojada: sin cabeceras en %.0f s" % (conexion.ip, ahora - conexion.inicio))
+                return True
+        return False
+
+    def _esta(self):
+        return self._conexiones.get(asyncio.current_task())
+
+    async def _apuntar_actividad(self, cada=None):
+        """Para la limpieza de noche: cuántas peticiones están con Hermes y cuándo llegó la última. Solo si cambia (y
+        cada cinco minutos aunque no, para que se vea que la pasarela vive)."""
+        antes, vez = None, 0
+        while True:
+            ahora = (self._reenviando, self._ultima)
+            if ahora != antes or vez >= 10:
+                try:
+                    self.mantenimiento.apuntar_actividad(*ahora)
+                    antes, vez = ahora, 0
+                except OSError as error:
+                    self.diario("no puedo apuntar la actividad (%s)" % type(error).__name__)
+            vez += 1
+            await asyncio.sleep(cada or APUNTAR_ACTIVIDAD)
+
+    async def _contestar_mantenimiento(self, peticion, escritor, ip) -> bool:
+        estado = self.mantenimiento.estado() if self.mantenimiento is not None else {"disponible": False}
+        cuerpo = json.dumps(estado, separators=(",", ":")).encode("ascii")
+        escritor.write(("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n"
+                        "Cache-Control: no-store\r\nConnection: %s\r\n\r\n"
+                        % (len(cuerpo), "close" if peticion.version == "HTTP/1.0" else "keep-alive")).encode("ascii")
+                       + (b"" if peticion.metodo == "HEAD" else cuerpo))
+        await escritor.drain()
+        self.diario("%s %s 200 %d" % (ip, peticion.metodo, len(cuerpo)))
+        return peticion.version != "HTTP/1.0" and "close" not in ",".join(peticion.valores("connection")).lower()
 
     async def _vigilar_tokens(self):
         """Una baja o una rotación cierran las conexiones abiertas con ese token, también un SSE a medias."""
         while True:
             await asyncio.sleep(self.revision)
             if self.tokens.recargar_si_cambia():
-                for tarea, huella in list(self._conexiones.items()):
-                    if huella is not None and not self.tokens.sigue(huella):
+                for tarea, conexion in list(self._conexiones.items()):
+                    if conexion.huella is not None and not self.tokens.sigue(conexion.huella):
                         tarea.cancel()
 
     async def _conexion(self, crudo, ip):
@@ -616,10 +848,32 @@ class Pasarela:
             raise _Rechazo()
         return (primero + resto)[:-4]
 
+    async def castigo(self, ip, bloqueada=None) -> bool:
+        """El segundo de espera de un rechazo, fuera del cupo de las conexiones sin autenticar (y de las autenticadas):
+        el retraso no lo pagan los demás de esa IP. False si no hay que contestar nada: la IP ya estaba bloqueada (se
+        cierra al momento; `bloqueada`, como estaba antes de contar este fallo) o ya hay demasiadas esperando."""
+        conexion = self._esta()
+        if bloqueada is None:
+            bloqueada = self.limites.bloqueada(ip)
+        if bloqueada or not self.limites.castigar(ip):
+            if conexion is not None:
+                self._pasar(conexion, "fuera")
+            return False
+        if conexion is not None:
+            self._pasar(conexion, "castigo")
+        else:
+            self.limites.perdonar(ip)
+        await asyncio.sleep(self.retraso_404)
+        return True
+
     async def _rechazar(self, escritor, ip, contar=True):
+        # El fallo que bloquea la IP aún recibe su 404; los de después, ya no.
+        bloqueada = self.limites.bloqueada(ip)
         if contar:
             self.limites.fallo(ip)
-        await asyncio.sleep(self.retraso_404)
+        if not await self.castigo(ip, bloqueada):
+            self.diario("%s rechazada: cerrada sin contestar" % ip)
+            return False
         escritor.write(NO_ENCONTRADO)
         try:
             await escritor.drain()
@@ -648,10 +902,17 @@ class Pasarela:
         huella = self.autorizar(peticion)
         if huella is None:
             return await self._rechazar(escritor, ip)
-        tarea = asyncio.current_task()
-        if tarea in self._conexiones:
+        conexion = self._esta()
+        if conexion is not None:
+            # Ya es de alguien de verdad: deja el cupo de las conexiones sin autenticar de su IP.
+            self._pasar(conexion, "dentro")
             # Una autorización que no es un token (`""`) no se sigue: no hay baja que la corte a media conexión.
-            self._conexiones[tarea] = huella or None
+            conexion.huella = huella or None
+        self._ultima = int(time.time())
+        if peticion.ruta == RUTA_HUELLAS and peticion.metodo in ("GET", "HEAD"):
+            return await self._contestar_huellas(peticion, escritor, ip)
+        if peticion.ruta == RUTA_MANTENIMIENTO and peticion.metodo in ("GET", "HEAD"):
+            return await self._contestar_mantenimiento(peticion, escritor, ip)
         try:
             return await self._reenviar(peticion, lector, escritor, ip)
         except _Error as error:
@@ -660,10 +921,30 @@ class Pasarela:
             self.diario("%s %s %d" % (ip, peticion.metodo, error.estado))
             return False
 
+    async def _contestar_huellas(self, peticion, escritor, ip) -> bool:
+        cuerpo = json.dumps(self.huellas, separators=(",", ":")).encode("ascii")
+        escritor.write(("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n"
+                        "Cache-Control: no-store\r\nConnection: %s\r\n\r\n"
+                        % (len(cuerpo), "close" if peticion.version == "HTTP/1.0" else "keep-alive")).encode("ascii")
+                       + (b"" if peticion.metodo == "HEAD" else cuerpo))
+        await escritor.drain()
+        self.diario("%s %s 200 %d" % (ip, peticion.metodo, len(cuerpo)))
+        return peticion.version != "HTTP/1.0" and "close" not in ",".join(peticion.valores("connection")).lower()
+
     async def atender_aparte(self, peticion, lector, escritor, ip):
         """Lo que se atiende antes de mirar el token: aquí nada (None). La entrada pública del relé atiende así las
         rutas de los permisos de avisos, que no llevan credencial. Devuelve si la conexión sigue, como `_una`."""
         return None
+
+    def _apuntar_borrado(self, ip):
+        """Hermes ha borrado una conversación: queda en su disco (páginas libres de SQLite) hasta que la limpieza de
+        noche lo compacte con Hermes parado (`mantenimiento.py`). Ni el id ni nada de lo que era."""
+        if self.mantenimiento is None:
+            return
+        try:
+            self.mantenimiento.apuntar_borrado()
+        except OSError as error:
+            self.diario("%s no puedo apuntar el borrado pendiente (%s)" % (ip, type(error).__name__))
 
     def autorizar(self, peticion):
         """El hash del token de la petición si es uno dado de alta (el que se sigue por si se da de baja), `""` si la
@@ -698,7 +979,7 @@ class Pasarela:
         if peticion.valores("transfer-encoding"):
             raise _Error(400, "peticion_invalida")
         largos = peticion.valores("content-length")
-        if len(set(largos)) > 1 or (largos and not re.match(r"^[0-9]{1,12}$", largos[0])):
+        if len(set(largos)) > 1 or (largos and not re.fullmatch(r"[0-9]{1,12}", largos[0])):
             raise _Error(400, "peticion_invalida")
         peticion.largo = int(largos[0]) if largos else 0
         if peticion.largo > self.tope(peticion):
@@ -711,20 +992,16 @@ class Pasarela:
                                                            PLAZO_CONECTAR)
         except (OSError, asyncio.TimeoutError):
             raise _Error(502, caido)
+        self._reenviando += 1
         try:
             return await self._ida_y_vuelta(peticion, lector, escritor, arriba_lector, arriba, destino, poner, ip,
                                             caido)
         finally:
+            self._reenviando -= 1
             arriba.close()
 
     async def _ida_y_vuelta(self, peticion, lector, escritor, arriba_lector, arriba, destino, poner, ip, caido):
-        cabeceras = [(n, v) for n, v in peticion.cabeceras if n.lower() not in _QUITAR_DE_LA_APP]
-        cabeceras += [("Host", "%s:%d" % destino), ("X-Forwarded-For", ip)] + poner
-        if peticion.largo or peticion.metodo in ("POST", "PUT", "PATCH"):
-            cabeceras.append(("Content-Length", str(peticion.largo)))
-        cabeceras.append(("Connection", "close"))
-        arriba.write(("%s %s HTTP/1.1\r\n" % (peticion.metodo, peticion.ruta)).encode("latin-1")
-                     + "".join("%s: %s\r\n" % c for c in cabeceras).encode("latin-1") + b"\r\n")
+        arriba.write(cabeza_hacia_arriba(peticion, destino, ip, poner))
         quedan = peticion.largo
         while quedan:
             trozo = await asyncio.wait_for(lector.read(min(TROZO, quedan)), PLAZO_TROZO)
@@ -743,6 +1020,8 @@ class Pasarela:
         if len(estado_linea) < 2 or not estado_linea[1].isdigit() or not estado_linea[0].startswith("HTTP/1."):
             raise _Error(502, caido)
         estado = int(estado_linea[1])
+        if peticion.metodo == "DELETE" and 200 <= estado < 300 and BORRAR_SESION.fullmatch(peticion.ruta):
+            self._apuntar_borrado(ip)
         salida, largo, troceada = [], None, False
         for linea in lineas[1:]:
             nombre, _, valor = linea.partition(":")
@@ -780,6 +1059,17 @@ class Pasarela:
         return seguir
 
 
+def _huella_de_pem(ruta):
+    """La huella del certificado de `ruta` (PEM), o None si no hay o no se entiende."""
+    if not ruta:
+        return None
+    try:
+        with open(ruta, encoding="ascii") as f:
+            return huella_de_der(ssl.PEM_cert_to_DER_cert(f.read()))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
 def _escuchar(direccion, puerto):
     if direccion == "" and socket.has_dualstack_ipv6():
         return socket.create_server(("", puerto), family=socket.AF_INET6, dualstack_ipv6=True, backlog=128)
@@ -803,8 +1093,10 @@ def main(argv) -> int:
         config = Configuracion.leer(argv[1], credenciales=os.environ.get("CREDENTIALS_DIRECTORY"))
         pasarela = Pasarela(config)
     except (ValueError, OSError, ssl.SSLError) as error:
-        print("error: %s" % error, flush=True)
-        return 1
+        # La configuración o un secreto: reiniciar no lo arregla. La unidad no reinicia con 78 (EX_CONFIG).
+        print("error: no arranco: %s. Arréglalo (sudo hehermes-servidor comprobar) y reinicia hehermes-pasarela"
+              % error, flush=True)
+        return SALIDA_CONFIGURACION
     try:
         asyncio.run(pasarela.servir())
     except KeyboardInterrupt:

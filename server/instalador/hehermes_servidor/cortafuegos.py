@@ -177,7 +177,7 @@ def analizar_nft(ruleset, iptables_nft=False) -> tuple:
         todas = reglas.get((familia, tabla, nombre), [])
         suyas = [r for r in todas if r.get("comment") not in _PROPIAS]
         marcadas = sum(1 for r in todas if r.get("comment") == MARCA)
-        if not all(_NOMBRE.match(str(x or "")) for x in (familia, tabla, nombre)):
+        if not all(_NOMBRE.fullmatch(str(x or "")) for x in (familia, tabla, nombre)):
             dudas.append("la cadena %s %s %s tiene un nombre que no sé escribir" % (familia, tabla, nombre))
             continue
         ultima = suyas[-1] if suyas else None
@@ -311,7 +311,7 @@ def quitar(sis, marca) -> int:
             r = objeto.get("rule")
             if not r or r.get("comment") != marca or _de_iptables(r.get("family"), r.get("table"), iptables_nft):
                 continue
-            if all(_NOMBRE.match(str(r.get(k) or "")) for k in ("family", "table", "chain")):
+            if all(_NOMBRE.fullmatch(str(r.get(k) or "")) for k in ("family", "table", "chain")):
                 if sis.ejecutar(["nft", "delete", "rule", r["family"], r["table"], r["chain"], "handle",
                                  str(r.get("handle"))]).bien:
                     quitadas += 1

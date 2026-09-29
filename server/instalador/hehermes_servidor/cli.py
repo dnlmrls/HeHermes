@@ -21,7 +21,7 @@ from .aplicar import Parada
 from .desinstalar import desinstalar, resumen
 from .deteccion import DIRECCION_VALIDA
 from .manifiesto import Manifiesto, ManifiestoRoto
-from .plan import Opciones, pintar
+from .plan import PREFIJO_ERROR, Opciones, pintar
 from .sistema import Sistema
 
 SI = ("s", "si", "sí")
@@ -76,6 +76,9 @@ def _analizador():
     v.add_argument("--si", action="store_true", help="no pregunta")
     v.add_argument("--reemplazar", action="append", default=[], metavar="FICHERO", help=argparse.SUPPRESS)
     ordenes.add_parser("comprobar")
+    r = ordenes.add_parser("certificado", help="el certificado de la pasarela: rotar (el siguiente pasa a ser el de ahora)")
+    r.add_argument("accion", choices=("rotar",))
+    r.add_argument("--si", action="store_true", help="no pregunta")
     # Lo que lanza hehermes-cortafuegos.service al arrancar (poner) y al pararse (quitar). No es para personas.
     c = ordenes.add_parser("cortafuegos")
     c.add_argument("accion", choices=("poner", "quitar"))
@@ -83,6 +86,8 @@ def _analizador():
     ordenes.add_parser("canje-limpiar")
     # Lo que lanza hehermes-pasarela-clave.path cuando cambia el .env de Hermes. No es para personas.
     ordenes.add_parser("pasarela-clave")
+    # Lo que lanza hehermes-borrado.timer de noche (el borrado de verdad, `mantenimiento.py`). No es para personas.
+    ordenes.add_parser("borrado-seguro")
     u = ordenes.add_parser("actualizar")
     u.add_argument("--paquete", required=True)
     u.add_argument("--firma", required=True)
@@ -94,10 +99,10 @@ def _analizador():
     return a
 
 
-ORDENES = ("instalar", "avisos", "comprobar", "actualizar", "desinstalar", "canje-limpiar", "cortafuegos",
-           "pasarela-clave")
+ORDENES = ("instalar", "avisos", "comprobar", "certificado", "actualizar", "desinstalar", "canje-limpiar", "cortafuegos",
+           "pasarela-clave", "borrado-seguro")
 #: Lo que se puede hacer sin root en una instalación de la pasarela de un usuario.
-DEL_USUARIO = ("instalar", "avisos", "comprobar", "desinstalar", "canje-limpiar")
+DEL_USUARIO = ("instalar", "avisos", "comprobar", "certificado", "desinstalar", "canje-limpiar", "borrado-seguro")
 
 
 def main(argv, doc, aqui, sis=None, entrada=input, salida=print, terminal=None, euid=None, relanzar=None,
@@ -147,10 +152,12 @@ def _con_ambito(op, sis, ambito, aqui, entrada, salida, terminal) -> int:
     except ManifiestoRoto as error:
         salida("error: %s" % error)
         return 1
-    orden = {"instalar": _instalar, "avisos": _avisos, "comprobar": _comprobar, "actualizar": _actualizar,
+    orden = {"instalar": _instalar, "avisos": _avisos, "comprobar": _comprobar, "certificado": _certificado,
+             "actualizar": _actualizar,
              "desinstalar": _desinstalar, "canje-limpiar": _canje_limpiar, "cortafuegos": _cortafuegos,
-             "pasarela-clave": _pasarela_clave}[op.orden]
-    if op.orden in ("comprobar", "canje-limpiar", "cortafuegos", "pasarela-clave") or getattr(op, "plan", False):
+             "pasarela-clave": _pasarela_clave, "borrado-seguro": _borrado_seguro}[op.orden]
+    if op.orden in ("comprobar", "canje-limpiar", "cortafuegos", "pasarela-clave", "borrado-seguro") or \
+            getattr(op, "plan", False):
         # canje-limpiar tampoco: corre dentro del `systemctl stop` de un instalar que ya tiene el cerrojo.
         # Lo que solo lee no toma el cerrojo: --plan no deja ni un fichero en /run.
         return orden(op, sis, man, aqui, entrada, salida, terminal, ambito)
@@ -348,7 +355,8 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
     def detectar_ya():
         return modo_tls.detectar_tls(sis, man, ambito, direccion=opciones.direccion, hermes_home=opciones.hermes_home,
                                      activar_api=opciones.activar_api, cortafuegos_a_mano=opciones.cortafuegos_a_mano,
-                                     corregir_exposicion=opciones.corregir_exposicion)
+                                     corregir_exposicion=opciones.corregir_exposicion, por_chat=opciones.por_chat,
+                                     solo_plan=op.plan)
 
     det = detectar_ya()
     if det.direccion_privada and terminal and not op.plan:
@@ -357,12 +365,16 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
             dada = entrada("Este servidor sale por una dirección privada. ¿Cuál es su dirección pública (IP o nombre)? ")
         except EOFError:
             dada = ""
-        if DIRECCION_VALIDA.match(dada.strip()):
+        if DIRECCION_VALIDA.fullmatch(dada.strip()):
             opciones.direccion = dada.strip()
             det = detectar_ya()
     plan = modo_tls.calcular_plan_tls(sis, det, man, opciones, aqui)
     salida(pintar(plan, color=terminal).rstrip("\n"))
     if op.plan or not plan.puede_seguir:
+        if opciones.por_chat and not plan.puede_seguir:
+            # Lo último, sola: la app lo reconoce (`ErrorDelInstalador`) donde se pega el enlace, y sabe que no se ha
+            # tocado nada. Por un terminal no hace falta: quien lo lee es una persona.
+            salida("\n" + PREFIJO_ERROR + plan.codigo_de_error)
         return 0 if plan.puede_seguir else 1
     if not plan.cambios:
         if opciones.iphone:
@@ -422,10 +434,29 @@ def _comprobar(op, sis, man, aqui, entrada, salida, terminal, ambito):
     return 0 if all(bien for bien, _ in resultados) and all(e != seguridad.MAL for e, _ in revision) else 1
 
 
+def _certificado(op, sis, man, aqui, entrada, salida, terminal, ambito):
+    """`certificado rotar`: el siguiente pasa a ser el de la pasarela (`modo_tls.rotar_certificado`). Deja fuera a los
+    iPhone que no anclaban aún la huella siguiente: se pregunta, salvo con --si."""
+    from . import modo_tls
+    salida("Voy a rotar el certificado de la pasarela: %s pasa a ser el suyo. Los iPhone que aún no anclaban esa "
+           "huella dejarán de conectar hasta escanear un QR nuevo." % modo_tls.huella_de(sis, ambito.cert_siguiente))
+    if not _pregunta_si(entrada, salida, terminal, op.si):
+        salida("No he cambiado nada.")
+        return 1
+    return modo_tls.rotar_certificado(sis, man, ambito, salida)
+
+
 def _canje_limpiar(op, sis, man, aqui, entrada, salida, terminal, ambito):
     from .porchat import limpiar
     limpiar(sis, os.environ, ambito)
     return 0
+
+
+def _borrado_seguro(op, sis, man, aqui, entrada, salida, terminal, ambito):
+    from . import mantenimiento
+    if "tls" not in man.modos:
+        return 0
+    return mantenimiento.borrado_seguro(sis, man, ambito, salida)
 
 
 def _pasarela_clave(op, sis, man, aqui, entrada, salida, terminal, ambito):

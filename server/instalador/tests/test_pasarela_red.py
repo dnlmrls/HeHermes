@@ -24,6 +24,7 @@ from hehermes_servidor import pasarela as pa
 
 CERT = str(apoyo.DATOS / "pasarela-NO-ES-DE-DANIEL.cert.pem")
 CLAVE = str(apoyo.DATOS / "pasarela-NO-ES-DE-DANIEL.clave.pem")
+SIGUIENTE = str(apoyo.DATOS / "pasarela-siguiente-NO-ES-DE-DANIEL.cert.pem")
 CLAVE_HERMES = "clave-del-api-server-de-las-pruebas"
 SECRETO_VIGIA = "secreto-del-vigia-de-las-pruebas-0123456789"
 TOKEN = "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8"
@@ -78,7 +79,7 @@ class Manejador(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"0\r\n\r\n")
             return
         respuesta = json.dumps({"ruta": self.path, "largo": len(cuerpo)}).encode()
-        self.send_response(200)
+        self.send_response(404 if "no-existe" in self.path else 200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(respuesta)))
         self.end_headers()
@@ -91,6 +92,7 @@ class ConPasarela(unittest.TestCase):
     retraso = 0.05
     con_vigia = True
     plazo_cabeceras = 0.5
+    desalojo = pa.PLAZO_DESALOJO
 
     def setUp(self):
         # Las conexiones que deja abiertas cada prueba las cierra el recolector: no son un fallo de la pasarela.
@@ -108,8 +110,11 @@ class ConPasarela(unittest.TestCase):
             f.write(SECRETO_VIGIA + "\n")
         self.escribir_tokens([("mi-iphone", TOKEN), ("otro", OTRO)])
         ini = ("[pasarela]\npuerto = 1\nescucha = 127.0.0.1\ncertificado = %s\nclave = %s\ntokens = %s\n"
-               "[hermes]\npuerto = %d\nclave = %s\n" % (CERT, CLAVE, c("tokens.json"), self.hermes.puerto,
-                                                        c("clave-hermes")))
+               "certificado_siguiente = %s\n"
+               "[hermes]\npuerto = %d\nclave = %s\n"
+               "[mantenimiento]\ncarpeta = %s\n" % (CERT, CLAVE, c("tokens.json"), SIGUIENTE, self.hermes.puerto,
+                                                   c("clave-hermes"), c("estado")))
+        os.mkdir(c("estado"))
         if self.con_vigia:
             ini += "[avisos]\nvigia = 127.0.0.1:%d\nsecreto = %s\n" % (self.vigia.puerto, c("secreto"))
         with open(c("pasarela.ini"), "w") as f:
@@ -118,7 +123,7 @@ class ConPasarela(unittest.TestCase):
         config = pa.Configuracion.leer(c("pasarela.ini"))
         config.puerto = 0
         self.p = pa.Pasarela(config, limites=pa.Limites(contar_locales=True), diario=self.diario.append, tls_minimo=TLS_MINIMO, retraso_404=self.retraso,
-                             plazo_cabeceras=self.plazo_cabeceras, revision=0.1)
+                             plazo_cabeceras=self.plazo_cabeceras, revision=0.1, desalojo=self.desalojo)
         listo = threading.Event()
         self.bucle = asyncio.new_event_loop()
 
@@ -282,6 +287,87 @@ class LoQueSePasaAHermes(ConPasarela):
         self.assertEqual(self.hermes.peticiones[-1]["cabeceras"]["Authorization"], "Bearer otra-clave-mas-larga")
 
 
+class LasHuellas(ConPasarela):
+    """`GET /hehermes/v1/huellas`: la pasarela misma le dice a quien trae un token la huella de su certificado y la del
+    siguiente, para que la app ancle las dos y rotar no obligue a emparejar (contrato §12.7). No va a Hermes."""
+
+    def test_con_token_las_dos_huellas(self):
+        import json as json_
+        estado, cabeceras, cuerpo, _ = self.leer_respuesta(self.peticion(ruta="/hehermes/v1/huellas"))
+        self.assertEqual(estado, 200)
+        self.assertEqual(cabeceras["cache-control"], "no-store")
+        self.assertEqual(json_.loads(cuerpo), {"actual": sf_huella(CERT), "siguiente": sf_huella(SIGUIENTE)})
+        self.assertNotEqual(sf_huella(CERT), sf_huella(SIGUIENTE))
+        self.assertEqual(self.hermes.peticiones, [])
+        # En la misma conexión, lo siguiente sigue su camino.
+        tls = self.peticion(ruta="/hehermes/v1/huellas")
+        self.leer_respuesta(tls)
+        self.assertEqual(self.leer_respuesta(self.peticion(tls=tls))[0], 200)
+
+    def test_sin_token_el_404_de_siempre(self):
+        tls = self.peticion(ruta="/hehermes/v1/huellas", token=None)
+        self.assertEqual(self.todo(tls), NO_404)
+
+
+def sf_huella(ruta):
+    with open(ruta) as f:
+        return pa.huella_de_der(ssl.PEM_cert_to_DER_cert(f.read()))
+
+
+class ElBorradoPendiente(ConPasarela):
+    """«Eliminar también de Hermes»: si Hermes contesta 2xx a `DELETE /api/sessions/{id}`, la pasarela apunta que hay
+    algo por limpiar del disco (sin el id), y lo enseña en `GET /hehermes/v1/mantenimiento`."""
+
+    def marca(self):
+        ruta = self.c("estado/" + pa.BORRADO_PENDIENTE)
+        return open(ruta).read() if os.path.exists(ruta) else None
+
+    def test_un_borrado_de_verdad_deja_la_marca_sin_el_id(self):
+        self.assertIsNone(self.marca())
+        self.assertEqual(self.leer_respuesta(self.peticion("DELETE", "/api/sessions/api_17900_abcd"))[0], 200)
+        marca = self.marca()
+        self.assertRegex(marca, r"^[0-9]+\n$")
+        self.assertNotIn("api_17900", marca)
+        estado, _, cuerpo, _ = self.leer_respuesta(self.peticion(ruta="/hehermes/v1/mantenimiento"))
+        self.assertEqual(estado, 200)
+        datos = json.loads(cuerpo)
+        self.assertEqual((datos["borrado_pendiente"], datos["pendiente_desde"]), (True, int(marca)))
+        self.assertNotIn("/hehermes/v1/mantenimiento", [p["ruta"] for p in self.hermes.peticiones])
+
+    def test_lo_que_no_es_un_borrado_de_verdad_no(self):
+        for metodo, ruta in (("DELETE", "/api/sessions/no-existe"), ("GET", "/api/sessions/api_1"),
+                             ("DELETE", "/api/jobs/tarea"), ("DELETE", "/api/sessions/api_1/messages"),
+                             ("POST", "/api/sessions/api_1")):
+            with self.subTest(metodo=metodo, ruta=ruta):
+                self.leer_respuesta(self.peticion(metodo, ruta))
+                self.assertIsNone(self.marca())
+
+    def test_sin_token_ni_la_marca_ni_el_estado(self):
+        self.assertEqual(self.todo(self.peticion("DELETE", "/api/sessions/api_1", token=None)), NO_404)
+        self.assertEqual(self.todo(self.peticion(ruta="/hehermes/v1/mantenimiento", token=None)), NO_404)
+        self.assertIsNone(self.marca())
+
+    def test_apunta_su_actividad(self):
+        tls = self.peticion(ruta="/v1/runs/r1/events")
+        tls.settimeout(5)
+        recibido = b""
+        while b'"n": 0' not in recibido:
+            recibido += tls.recv(65536)
+        # Un SSE abierto es una petición con Hermes: la limpieza de noche no para Hermes con él.
+        tarea = asyncio.run_coroutine_threadsafe(self._una_vuelta(), self.bucle)
+        tarea.result(5)
+        with open(self.c("estado/" + pa.ACTIVIDAD)) as f:
+            actividad = json.load(f)
+        self.assertEqual(actividad["reenviando"], 1)
+        self.assertIsInstance(actividad["ultima"], int)
+        self.hermes.sse_siguiente.set()
+
+    async def _una_vuelta(self):
+        tarea = asyncio.ensure_future(self.p._apuntar_actividad(cada=0.01))
+        await asyncio.sleep(0.05)
+        tarea.cancel()
+
+
 class LoQueSePasaAlVigia(ConPasarela):
     def test_avisos_va_al_vigia_con_su_secreto_y_sin_authorization(self):
         tls = self.peticion("PUT", "/avisos/v1/dispositivos/abc/ajustes", cuerpo=b'{"a": 1}',
@@ -342,11 +428,25 @@ class ElCuatrocientosCuatro(ConPasarela):
     def test_una_cabeza_enorme_tambien(self):
         self.assertEqual(self.rechazo(b"GET /" + b"a" * (pa.MAX_CABECERAS + 10) + b" HTTP/1.1\r\n\r\n"), NO_404)
 
-    def test_diez_fallos_bloquean_la_ip_antes_del_apreton(self):
+    def test_diez_fallos_bloquean_la_ip_pero_no_a_los_suyos(self):
+        """Detrás de un CGNAT, los fallos de otros no pueden dejar sin pasarela a un iPhone con su token: bloqueada, lo
+        que no trae token se cierra al momento (sin el 404 y sin su segundo), y lo que lo trae pasa."""
         for _ in range(pa.MAX_FALLOS):
             self.rechazo(b"GET / HTTP/1.1\r\n\r\n")
+        self.assertTrue(self.p.limites.bloqueada("127.0.0.1"))
+        self.assertEqual(self.leer_respuesta(self.peticion())[0], 200)
+        inicio = time.monotonic()
+        self.assertEqual(self.rechazo(b"GET / HTTP/1.1\r\n\r\n"), b"")
+        self.assertEqual(self.rechazo(("GET / HTTP/1.1\r\nAuthorization: Bearer %s\r\n\r\n" % ("A" * 43)).encode()),
+                         b"")
+        self.assertLess(time.monotonic() - inicio, 2)
+        self.assertEqual(self.leer_respuesta(self.peticion(token=OTRO))[0], 200)
+        # Y sin autenticar, solo unas pocas a la vez.
+        abiertas = [self.conectar() for _ in range(pa.CONEXIONES_POR_IP_BLOQUEADA)]
         with self.assertRaises((ssl.SSLError, OSError)):
-            self.leer_respuesta(self.peticion())
+            self.conectar()
+        for tls in abiertas:
+            tls.close()
 
     def test_las_cabeceras_a_medias_se_cierran_y_cuentan(self):
         tls = self.conectar()
@@ -364,6 +464,23 @@ class ElCuatrocientosCuatro(ConPasarela):
 
 class ConElRetrasoDeVerdad(ConPasarela):
     retraso = pa.RETRASO_404
+
+    def test_el_segundo_de_los_rechazos_no_ocupa_el_cupo_de_la_ip(self):
+        """Antes, cada rechazo retenía su sitio de los 16 de su IP durante su segundo: 16 fallos seguidos dejaban fuera
+        a un iPhone de la misma IP. Ahora esperan aparte."""
+        # Sin bloqueo por medio (cerraría las de después sin su 404): lo que se mira aquí es solo el cupo.
+        self.p.limites.contar_locales = False
+        malas = []
+        for _ in range(pa.CONEXIONES_POR_IP):
+            tls = self.conectar()
+            tls.sendall(b"GET / HTTP/1.1\r\n\r\n")
+            malas.append(tls)
+        time.sleep(0.2)
+        inicio = time.monotonic()
+        self.assertEqual(self.leer_respuesta(self.peticion())[0], 200)
+        self.assertLess(time.monotonic() - inicio, pa.RETRASO_404 / 2, "no ha esperado a que acaben los rechazos")
+        for tls in malas:
+            self.assertEqual(self.todo(tls), NO_404)
 
     def test_el_404_llega_un_segundo_despues(self):
         tls = self.conectar()
@@ -409,6 +526,20 @@ class LaBaja(ConPasarela):
 class LosTopesDeConexiones(ConPasarela):
     # Que las abiertas no caduquen por no mandar cabeceras mientras dura la prueba (eso contaría como fallos).
     plazo_cabeceras = 10
+
+    def test_las_de_los_iphone_con_su_token_no_cuentan_para_su_ip(self):
+        """Un CGNAT con varios iPhone, cada uno con su pool y su SSE: las conexiones autenticadas no ocupan el cupo de
+        las nuevas de su IP."""
+        dentro = []
+        for _ in range(pa.CONEXIONES_POR_IP + 4):
+            tls = self.peticion()
+            self.assertEqual(self.leer_respuesta(tls)[0], 200)
+            dentro.append(tls)
+        self.assertEqual(self.leer_respuesta(self.peticion())[0], 200)
+        self.assertEqual(self.p.limites._abiertas.get("127.0.0.1", 0), 0)
+        for tls in dentro:
+            tls.close()
+
     def test_la_decimoseptima_de_una_ip_ni_llega_al_tls(self):
         abiertas = [self.conectar() for _ in range(pa.CONEXIONES_POR_IP)]
         with self.assertRaises((ssl.SSLError, OSError)):
@@ -417,6 +548,26 @@ class LosTopesDeConexiones(ConPasarela):
         time.sleep(0.2)
         self.conectar().close()
         for tls in abiertas[1:]:
+            tls.close()
+
+
+class ElDesalojo(ConPasarela):
+    """Un slowloris con todo el cupo de su IP: pasado `desalojo`, la más vieja sin autenticar deja su sitio."""
+
+    plazo_cabeceras = 10
+    desalojo = 1.0
+
+    def test_la_mas_vieja_sin_cabeceras_deja_sitio(self):
+        inicio = time.monotonic()
+        quietas = [self.conectar() for _ in range(pa.CONEXIONES_POR_IP)]
+        if time.monotonic() - inicio < self.desalojo * 0.8:
+            with self.assertRaises((ssl.SSLError, OSError)):
+                self.conectar()  # recién abiertas: nadie a quien desalojar
+        time.sleep(max(0.0, self.desalojo + 0.2 - (time.monotonic() - inicio)))
+        self.assertEqual(self.leer_respuesta(self.peticion())[0], 200)
+        self.assertEqual(self.todo(quietas[0]), b"", "la primera se ha cerrado")
+        self.assertTrue(any("desalojada" in linea for linea in self.diario))
+        for tls in quietas[1:]:
             tls.close()
 
 

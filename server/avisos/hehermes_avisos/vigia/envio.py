@@ -75,9 +75,10 @@ class ClienteRele:
     permiso, ni el aviso (``comun.ErrorDeHuella``), y cuenta como que el relé no contesta. Con ``solo_publicas`` (el
     relé de un permiso, cuya dirección trae la app), tampoco se conecta a una dirección que no sea de internet."""
 
-    def __init__(self, url: str, credencial: str | None, plazo: float = 8.0, abridor=None, huella: str | None = None,
+    def __init__(self, url: str, credencial: str | None, plazo: float = 8.0, abridor=None, huella=None,
                  solo_publicas: bool = False, permiso: str | None = None):
-        """``huella``: la del relé de otra máquina (``https://…``), que se ancla antes de mandar nada. ``credencial``
+        """``huella``: la del relé de otra máquina (``https://…``), que se ancla antes de mandar nada; o varias (la de
+        ahora y la siguiente, si el relé la ha dado), y vale cualquiera. ``credencial``
         None: el cliente de un permiso, el que se da aquí (``permiso``) o el de cada ``enviar(…, permiso=…)``."""
         self.url = url
         self._credencial = credencial
@@ -178,7 +179,7 @@ class Mensajero:
         permiso = dispositivo.permiso
         return permiso is None or permiso.rechazado is not None or permiso.caduca - ahora < RENOVAR_ANTES
 
-    def _cliente_de_permiso(self, direccion: str, puerto: int, huella: str) -> ClienteRele:
+    def _cliente_de_permiso(self, direccion: str, puerto: int, huella) -> ClienteRele:
         return ClienteRele(url_del_rele(direccion, puerto), None, self.plazo, huella=huella, solo_publicas=True)
 
     def _cliente(self, permiso: Permiso):

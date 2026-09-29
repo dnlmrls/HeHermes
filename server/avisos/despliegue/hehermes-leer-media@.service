@@ -1,7 +1,8 @@
 # /etc/systemd/system/hehermes-leer-media@.service
 # Un lector por conexión a /run/hehermes-leer-media.sock (hehermes-leer-media.socket, Accept=yes): lee una línea con la
-# ruta y contesta con el fichero por el mismo socket. Es root, porque Hermes es root y deja sus ficheros donde quiere,
-# pero con lo justo para leer y nada más.
+# ruta y contesta con el fichero por el mismo socket. Desde la 1.4.0 solo lee de una lista de permitidas (las caches de
+# Hermes y su carpeta de exportaciones), así que corre como el dueño de la casa de Hermes (aquí root, porque Hermes es
+# root) y SIN NINGUNA capacidad: el dueño lee lo suyo sin CAP_DAC_READ_SEARCH.
 [Unit]
 Description=HeHermes: lector de un fichero que Hermes marcó
 Documentation=file:///opt/hehermes-avisos/src/README.md
@@ -13,8 +14,8 @@ CollectMode=inactive-or-failed
 Type=simple
 # Python del sistema, sin nada del entorno ni del directorio (-I), sin site (-S: no hace falta ningún paquete) y sin
 # escribir bytecode (-B).
-# La carpeta de Hermes, prohibida salvo sus caches. Si el entorno de hermes-gateway dice otra, instalar.sh deja un
-# añadido (hehermes-leer-media@.service.d/hermes-home.conf) que cambia esta línea y la de los secretos de abajo.
+# La casa de Hermes, de la que solo salen sus caches y exports/. Si el entorno de hermes-gateway dice otra, instalar.sh
+# deja un añadido (hehermes-leer-media@.service.d/hermes-home.conf) que cambia esta línea y la de BindReadOnlyPaths.
 ExecStart=/usr/bin/python3 -I -S -B /usr/local/libexec/hehermes-leer-media --hermes-home=/root/.hermes --conexion
 StandardInput=socket
 StandardOutput=socket
@@ -22,22 +23,23 @@ StandardError=journal
 # Los rechazos de siempre (ruta inválida, no existe, prohibida, no es un fichero, demasiado grande) no son un fallo
 # del servicio. Una carrera (7), un error de lectura (8) o alguien que no es el vigía (9), sí.
 SuccessExitStatus=2 3 4 5 6
-# 50 MB por una VPN lenta caben de sobra.
+# 50 MB por una conexión lenta caben de sobra.
 RuntimeMaxSec=900
 UMask=0077
 LimitCORE=0
 
-# Leer, y solo leer: todo el sistema de ficheros de solo lectura, y de las capacidades de root solo la de leer y
-# recorrer carpetas de cualquiera (CAP_DAC_READ_SEARCH). Ni red ni dispositivos.
-CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+# Leer, y solo leer: todo el sistema de ficheros de solo lectura, ninguna capacidad, ni red ni dispositivos.
+CapabilityBoundingSet=
+AmbientCapabilities=
 NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=read-only
 PrivateNetwork=yes
 IPAddressDeny=any
 RestrictAddressFamilies=AF_UNIX
 PrivateDevices=yes
 PrivateIPC=yes
+# Hermes deja lo suyo en su casa: /tmp ya no hace falta, y el del lector es suyo y vacío.
+PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
@@ -55,18 +57,14 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
-# Sin PrivateTmp a propósito: Hermes deja ficheros en /tmp, y el lector tiene que ver el /tmp de verdad.
 
-# La lista de prohibidas del lector, otra vez, pero ahora la hace cumplir el núcleo: aunque el código tuviera un fallo,
-# aquí dentro estas rutas están tapadas (vacías). /proc, /sys, /dev y /run ya los recortan las líneas de arriba, y lo
-# que el lector prohíbe por su nombre en cualquier sitio (.ssh, .gnupg, .env) se tapa donde se sabe que está.
+# La lista de permitidas, otra vez, pero ahora la hace cumplir el núcleo: /root y /home, vacíos (un tmpfs), y dentro solo
+# las carpetas permitidas, de solo lectura. La que aún no exista se salta (el «-»): el lector contesta que no está.
+ProtectHome=tmpfs
+BindReadOnlyPaths=-/root/.hermes/image_cache -/root/.hermes/audio_cache -/root/.hermes/exports
+# Y fuera de las casas, lo que la segunda red del lector prohíbe por su nombre, tapado. /proc, /sys, /dev y /run ya los
+# recortan las líneas de arriba.
 InaccessiblePaths=-/etc/shadow -/etc/shadow- -/etc/gshadow -/etc/gshadow- -/etc/sudoers -/etc/sudoers.d
 InaccessiblePaths=-/etc/ssh -/etc/ssl/private -/etc/letsencrypt
 InaccessiblePaths=-/etc/hehermes -/etc/hehermes-avisos -/var/lib/hehermes-vigia
 InaccessiblePaths=-/etc/nginx -/etc/swanctl -/etc/strongswan -/etc/ipsec.secrets -/etc/ipsec.d -/etc/wireguard
-InaccessiblePaths=-/root/.ssh -/root/.gnupg
-# Lo que se sabe que hay en la carpeta de Hermes, fuera de sus caches (el lector prohíbe además todo lo demás de ella,
-# también las copias .bak, que no tienen un nombre fijo).
-InaccessiblePaths=-/root/.hermes/.env -/root/.hermes/auth.json -/root/.hermes/config.yaml -/root/.hermes/state.db
-InaccessiblePaths=-/root/.hermes/state.db-wal -/root/.hermes/state.db-shm -/root/.hermes/SOUL.md
-InaccessiblePaths=-/root/.hermes/backups -/root/.hermes/cron -/root/.hermes/hooks -/root/.hermes/engagements

@@ -36,7 +36,7 @@ import urllib.parse
 
 from . import manifiesto as m
 from . import piezas as p
-from .plan import Accion, _unidad, buscar_en_origen, fuente_del_lector
+from .plan import Accion, _unidad, bloqueo, buscar_en_origen, etiquetar, fuente_del_lector
 
 ESQUEMA = "hehermes-avisos:1"
 _HUELLA = re.compile(r"[A-Za-z0-9_-]{43}")
@@ -147,6 +147,7 @@ def planear(sis, det, man, op, origen, acciones, bloqueos, fichero, avisos=None)
         if getattr(op, "avisos", None):
             bloqueos.append("Aquí ya hay unos avisos puestos a mano (%s, los de server/avisos/despliegue/instalar.sh): "
                             "no los toco. Su vigía se configura en %s" % (A_MANO, ambito.vigia_ini))
+            etiquetar(bloqueos, "avisos-a-mano")
         elif avisos is not None:
             avisos.append("Aquí ya hay unos avisos puestos a mano (%s, los de server/avisos/despliegue/instalar.sh): ni "
                           "el vigía ni el lector de ficheros los pongo yo, y lo suyo no lo toco" % A_MANO)
@@ -155,6 +156,7 @@ def planear(sis, det, man, op, origen, acciones, bloqueos, fichero, avisos=None)
     if con_codigo(vigia) and vigia["credencial"] is None and not sis.existe(ambito.credencial_rele):
         bloqueos.append("Al vigía le falta su credencial (%s): vuelve a darle el código de avisos: %s avisos"
                         % (ambito.credencial_rele, "sudo hehermes-servidor" if ambito.root else ambito.orden))
+        etiquetar(bloqueos, "avisos-credencial")
         return None
     det.con_vigia = True
     detalle = ("el relé de %s:%d, con su huella anclada" % (vigia["direccion"], vigia["puerto"]) if con_codigo(vigia)
@@ -164,7 +166,7 @@ def planear(sis, det, man, op, origen, acciones, bloqueos, fichero, avisos=None)
                                else m.NUEVO, "sin casa ni shell, solo para el vigía de avisos"))
     codigo = ficheros_del_codigo(origen, ambito.prefijo)
     if not codigo:
-        bloqueos.append("el paquete no trae el código de los avisos (hehermes_avisos)")
+        bloqueos.append(bloqueo("paquete", "el paquete no trae el código de los avisos (hehermes_avisos)"))
         return None
     for ruta, datos in codigo:
         fichero(ruta, datos, 0o644, grupo=ambito.prefijo + "/hehermes_avisos/")
@@ -208,7 +210,7 @@ def planear_lector(sis, det, origen, acciones, bloqueos, avisos, fichero) -> boo
         return False
     fuente = fuente_del_lector(origen)
     if fuente is None:
-        bloqueos.append("el paquete no trae el lector de ficheros (hehermes-leer-media)")
+        bloqueos.append(bloqueo("paquete", "el paquete no trae el lector de ficheros (hehermes-leer-media)"))
         return False
     if ambito.root:
         # Suelto (lo escribe `aplicar_tls` con los demás ficheros): cambiarlo no pide reiniciar nada, cada conexión
@@ -216,7 +218,7 @@ def planear_lector(sis, det, origen, acciones, bloqueos, avisos, fichero) -> boo
         with open(fuente, "rb") as f:
             fichero(ambito.lector, f.read(), 0o755)
     unidades = [fichero(ambito.unidad_lector_socket, p.unidad_lector_socket(ambito)),
-                fichero(ambito.unidad_lector, p.unidad_lector(ambito, casa))]
+                fichero(ambito.unidad_lector, p.unidad_lector(ambito, casa, det.hermes.usuario if ambito.root else None))]
     _unidad(sis, acciones, p.SOCKET_LECTOR, unidades, "el lector de ficheros de Hermes (GET /avisos/v1/fichero), %s"
             % ("de root, enjaulado, uno por conexión" if ambito.root else "como %s, uno por conexión" % ambito.usuario),
             "restart", ambito.systemctl)
@@ -272,11 +274,30 @@ def aplicar_secretos(sis, man, acciones, ambito, salida, orden) -> None:
     man.guardar(sis)
 
 
-def aplicar_unidades(sis, man, acciones, ambito, salida) -> None:
+def crear_exportaciones(sis, man, hermes, ambito, salida) -> None:
+    """`<HERMES_HOME>/exports`: donde Hermes deja lo que quiere mandarle al iPhone (con `MEDIA:`), lo único de su casa que
+    el lector lee además de sus caches. Del dueño de la casa de Hermes y solo suya. Va al manifiesto aparte
+    (`exportaciones`), con la pasarela: desinstalarla la quita solo si está vacía (lo que Hermes deje ahí es suyo)."""
+    ruta = hermes.home.rstrip("/") + "/" + p.EXPORTACIONES
+    if sis.es_carpeta(ruta) or not sis.es_carpeta(hermes.home):
+        return
+    man.datos["exportaciones"] = ruta
+    man.guardar(sis)
+    sis.carpeta(ruta, 0o700)
+    if ambito.root and hermes.usuario and hermes.usuario != "root":
+        r = sis.ejecutar(["chown", "%s:" % hermes.usuario, ruta])
+        if not r.bien:
+            salida("    No he podido darle %s a %s: el lector no podrá leerla" % (ruta, hermes.usuario))
+    salida("==> la carpeta de exportaciones de Hermes: %s (lo que deje ahí con MEDIA:, la app lo descarga)" % ruta)
+
+
+def aplicar_unidades(sis, man, acciones, ambito, salida, hermes=None) -> None:
     """El lector primero (el vigía lo quiere, `Wants=`), luego el puerto del vigía y el vigía."""
     from .aplicar import _con_unidad
     del_lector = [a for a in acciones if a.objeto in (ambito.unidad_lector_socket, ambito.unidad_lector,
                                                         p.SOCKET_LECTOR)]
+    if hermes is not None and any(a.objeto == ambito.unidad_lector for a in acciones):
+        crear_exportaciones(sis, man, hermes, ambito, salida)
     if del_lector:
         _con_unidad(sis, man, del_lector, p.SOCKET_LECTOR, salida, systemctl=ambito.systemctl)
     if ambito.root:

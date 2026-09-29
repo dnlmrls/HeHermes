@@ -78,7 +78,7 @@ def _buscar(datos, nombre):
 
 def alta(ruta: str, nombre: str, ahora: str | None = None) -> str:
     """Un token nuevo para `nombre`. Devuelve el token: es la única vez que existe fuera del iPhone."""
-    if not isinstance(nombre, str) or not NOMBRE_VALIDO.match(nombre):
+    if not isinstance(nombre, str) or not NOMBRE_VALIDO.fullmatch(nombre):
         raise ValueError("el nombre tiene que ser de minúsculas, números y guiones, hasta 31 (no «%s»)" % nombre)
     datos = leer(ruta)
     if _buscar(datos, nombre):
@@ -117,7 +117,7 @@ def lista(ruta: str) -> list:
 
 def texto_qr(direccion: str, puerto: int, huella: str, token: str) -> str:
     """El texto del QR del alta por SSH (server/API-CONTRACT.md, §12.1). Lleva el token: solo en un terminal."""
-    if not isinstance(direccion, str) or not DIRECCION_VALIDA.match(direccion):
+    if not isinstance(direccion, str) or not DIRECCION_VALIDA.fullmatch(direccion):
         raise ValueError("dirección no válida para el QR: %r" % (direccion,))
     if not isinstance(puerto, int) or isinstance(puerto, bool) or not 0 < puerto < 65536:
         raise ValueError("puerto no válido para el QR: %r" % (puerto,))

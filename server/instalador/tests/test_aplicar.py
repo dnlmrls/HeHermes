@@ -68,7 +68,7 @@ class Instalar(Base):
         self.assertEqual(self.sis.enlace(p.ORDEN), p.PREFIJO + "/hehermes-servidor")
         # Desde la 0.8.0, también el lector de ficheros y el vigía (sin credencial), después de la pasarela.
         self.assertEqual(man.unidades, ["hehermes-pasarela.service", "hehermes-leer-media.socket",
-                                        "hehermes-vigia.socket", "hehermes-vigia.service",
+                                        "hehermes-vigia.socket", "hehermes-vigia.service", "hehermes-borrado.timer",
                                         "hehermes-pasarela-clave.path", "hehermes-cortafuegos.service"])
         self.assertEqual((man.modos, man.paquetes, man.reglas), (["tls"], [], []))
         self.assertEqual(self.falso.reinicios, [])

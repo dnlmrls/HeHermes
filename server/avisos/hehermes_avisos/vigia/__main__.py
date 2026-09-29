@@ -69,7 +69,8 @@ def servir(config: ConfigVigia) -> int:
         registro.error("%s", error)
         return comun.fuera_de_servicio(heredado, "vigia")
     hermes = ClienteHermes(config.hermes_base, clave_hermes, config.hermes_plazo)
-    rele = (ClienteRele(config.rele_url, credencial, config.rele_plazo, huella=config.rele_huella)
+    huellas_del_rele = tuple(h for h in (config.rele_huella, config.rele_huella_siguiente) if h) or None
+    rele = (ClienteRele(config.rele_url, credencial, config.rele_plazo, huella=huellas_del_rele)
             if config.con_credencial else None)
     mensajero = Mensajero(almacen, rele, plazo=config.rele_plazo)
     vigilante = Vigilante(almacen, hermes, mensajero, intervalo=config.intervalo,
@@ -179,7 +180,7 @@ def comprobar(config: ConfigVigia) -> int:
     if config.rele_huella:
         # La entrada pública del relé no contesta a nada sin credencial (el 404 de siempre, que además le cuenta un
         # intento fallido a esta IP): se mira solo con ella, y anclada.
-        abridor_rele = comun.abridor(config.rele_huella)
+        abridor_rele = comun.abridor(tuple(h for h in (config.rele_huella, config.rele_huella_siguiente) if h))
     else:
         abridor_rele = abridor
         try:
@@ -206,16 +207,19 @@ def comprobar(config: ConfigVigia) -> int:
 
 
 def _comprobar_lector(ruta_socket: str) -> tuple:
-    """El lector de los ficheros de Hermes, sin leer nada: pedir «/» tiene que dar «no es un fichero»."""
+    """El lector de los ficheros de Hermes, sin leer nada: pedir «/» tiene que dar su rechazo (``prohibida``, fuera de
+    las permitidas; un lector de antes de la 1.4.0 decía ``no_es_fichero``). Se mira la línea del lector tal cual: por
+    HTTP, desde la 1.4.0, los dos son el mismo 404 que lo que no existe."""
     try:
-        conexion, _, _ = ClienteLector(ruta_socket, plazo=5).abrir("/")
-        conexion.close()
+        estado = ClienteLector(ruta_socket, plazo=5).estado_de("/")
     except ErrorHTTP as error:
-        if error.estado == 403:
-            return True, f"el lector de ficheros contesta en {ruta_socket}"
         return False, f"el lector de ficheros en {ruta_socket}: {error.estado} {error.codigo} (¿está en marcha " \
                       f"hehermes-leer-media.socket?)"
-    return False, f"el lector de ficheros en {ruta_socket} ha dado «/» por un fichero"
+    if estado in ("prohibida", "no_es_fichero"):
+        return True, f"el lector de ficheros contesta en {ruta_socket}"
+    if estado.startswith("ok"):
+        return False, f"el lector de ficheros en {ruta_socket} ha dado «/» por un fichero"
+    return False, f"el lector de ficheros en {ruta_socket} contesta «{estado[:40]}» a «/»"
 
 
 def _sin_clave(error: urllib.error.HTTPError) -> bool:

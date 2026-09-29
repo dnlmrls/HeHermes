@@ -66,9 +66,10 @@ def _http_de_verdad(url, cabeceras, plazo=5):
         return None, b""
 
 
-def _sondear_de_verdad(puerto, maxima=None, plazo=5):
-    """Lo que ve un cliente sin token en 127.0.0.1:<puerto>: la versión de TLS, la huella del certificado y los bytes
-    de la respuesta a un GET. None si no hay apretón (o no con esa versión como máximo)."""
+def _sondear_de_verdad(puerto, maxima=None, plazo=5, anfitrion="127.0.0.1"):
+    """Lo que ve un cliente sin token en <anfitrion>:<puerto> (127.0.0.1, o la dirección pública del QR): la versión de
+    TLS, la huella del certificado y los bytes de la respuesta a un GET. None si no hay apretón (o no con esa versión
+    como máximo)."""
     import socket
     import ssl
     from .pasarela import huella_de_der
@@ -78,7 +79,7 @@ def _sondear_de_verdad(puerto, maxima=None, plazo=5):
     if maxima:
         contexto.maximum_version = maxima
     try:
-        with socket.create_connection(("127.0.0.1", int(puerto)), timeout=plazo) as crudo:
+        with socket.create_connection((anfitrion, int(puerto)), timeout=plazo) as crudo:
             with contexto.wrap_socket(crudo) as tls:
                 datos = {"tls": tls.version(), "huella": huella_de_der(tls.getpeercert(binary_form=True))}
                 tls.sendall(b"GET / HTTP/1.1\r\nHost: comprobar\r\n\r\n")
@@ -158,6 +159,18 @@ class Sistema:
             return None
 
     # Escritura
+
+    def libre(self, ruta: str) -> int | None:
+        """Los bytes libres (para quien no es root) del sistema de ficheros donde iría `ruta`: el de su carpeta más
+        cercana que exista. None si no se sabe."""
+        real = self.ruta(ruta)
+        while real and not os.path.exists(real):
+            real = os.path.dirname(real)
+        try:
+            datos = os.statvfs(real or "/")
+        except OSError:
+            return None
+        return datos.f_bavail * datos.f_frsize
 
     def carpeta(self, ruta: str, modo: int = 0o755) -> None:
         real = self.ruta(ruta)
@@ -252,5 +265,15 @@ class Sistema:
     def http_get(self, url: str, cabeceras: dict | None = None):
         return self._http(url, cabeceras or {})
 
-    def sondear_pasarela(self, puerto, maxima=None):
-        return self._sonda(puerto, maxima)
+    def sondear_pasarela(self, puerto, maxima=None, anfitrion=None):
+        if anfitrion is None:
+            return self._sonda(puerto, maxima)
+        return self._sonda(puerto, maxima, anfitrion=anfitrion, plazo=3)
+
+    def resolver(self, nombre: str) -> list:
+        """Las IP de un nombre (o la IP misma), sin repetir. Vacía si no se resuelve."""
+        import socket
+        try:
+            return list(dict.fromkeys(i[4][0] for i in socket.getaddrinfo(nombre, None, type=socket.SOCK_STREAM)))
+        except (OSError, UnicodeError):
+            return []

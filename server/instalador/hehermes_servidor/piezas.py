@@ -222,9 +222,12 @@ def _puerto_pasarela(puerto) -> int:
 
 def unidad_pasarela(ambito, con_vigia: bool) -> str:
     """Con root: un usuario propio sin ningún privilegio (el puerto es alto), el sistema de ficheros de solo lectura, y
-    los secretos (la clave del certificado, la de Hermes y el del vigía) como credenciales de systemd, que los copia
-    desde ficheros de root. Sin root: una unidad de usuario, con lo que un usuario puede ponerse (sin espacios de
-    nombres: un gestor de usuario puede no tenerlos)."""
+    la clave del certificado y el secreto del vigía como credenciales de systemd, que los copia desde ficheros de root.
+    La copia de la clave de Hermes no: desde la 0.9.0 es de `hh-pasarela` (0600) y la pasarela la vuelve a leer cuando
+    cambia, así que rotar la clave de Hermes ya no la reinicia (ni corta los SSE abiertos). Sin root: una unidad de
+    usuario, con lo que un usuario puede ponerse (sin espacios de nombres: un gestor de usuario puede no tenerlos).
+
+    Un error de configuración (un secreto que no se lee, el ini roto) sale con 78, que no se reinicia en bucle."""
     orden = "%s -I -B %s/hehermes-pasarela --config %s" % (_ruta_segura(ambito_python()), _ruta_segura(ambito.prefijo),
                                                            _ruta_segura(ambito.pasarela_ini))
     comun = (
@@ -251,21 +254,25 @@ def unidad_pasarela(ambito, con_vigia: bool) -> str:
             "ExecStart=%s\n"
             "Restart=on-failure\n"
             "RestartSec=2\n"
+            "RestartPreventExitStatus=78\n"
             "%s"
             "\n"
             "[Install]\n"
             "WantedBy=default.target\n"
         ) % (orden, comun)
-    credenciales = ("LoadCredential=clave:%s\nLoadCredential=hermes:%s\n" % (ambito.clave, ambito.clave_hermes)
+    credenciales = ("LoadCredential=clave:%s\n" % ambito.clave
                     + ("LoadCredential=vigia:%s\n" % _ruta_segura(ambito.secreto_vigia) if con_vigia else ""))
     return (
         CABECERA
         + "# La pasarela TLS de HeHermes (server/API-CONTRACT.md, §12). Corre como %s, sin ningún privilegio: el\n"
-        "# puerto es alto, y la clave del certificado y la de Hermes le llegan como credenciales de systemd.\n"
+        "# puerto es alto, y la clave del certificado le llega como credencial de systemd. Su copia de la clave de\n"
+        "# Hermes es suya (0600) y la vuelve a leer cuando cambia: rotarla no la reinicia.\n"
         "[Unit]\n"
         "Description=HeHermes: la pasarela TLS hacia Hermes\n"
         "After=network-online.target\n"
         "Wants=network-online.target\n"
+        "StartLimitIntervalSec=120\n"
+        "StartLimitBurst=5\n"
         "\n"
         "[Service]\n"
         "Type=simple\n"
@@ -275,6 +282,11 @@ def unidad_pasarela(ambito, con_vigia: bool) -> str:
         "%s"
         "Restart=on-failure\n"
         "RestartSec=2\n"
+        "# 78: la configuración o un secreto; reiniciar no lo arregla (journalctl -u hehermes-pasarela).\n"
+        "RestartPreventExitStatus=78\n"
+        "# Lo único que escribe: el borrado pendiente y su actividad, para la limpieza de noche (hehermes-borrado).\n"
+        "StateDirectory=hehermes-pasarela\n"
+        "StateDirectoryMode=0755\n"
         "CapabilityBoundingSet=\n"
         "AmbientCapabilities=\n"
         "ProtectSystem=strict\n"
@@ -296,6 +308,48 @@ def unidad_pasarela(ambito, con_vigia: bool) -> str:
     ) % (USUARIO_PASARELA, USUARIO_PASARELA, USUARIO_PASARELA, orden, credenciales, comun)
 
 
+def unidad_borrado(ambito) -> str:
+    """La limpieza de noche de lo que la app borra de Hermes (`mantenimiento.py`): una vez, con un tope duro, y sin
+    reintentos de systemd (los intentos los lleva ella, uno por noche). Con root, como root: tiene que parar y arrancar
+    la unidad de Hermes y compactar su base como su usuario."""
+    return (
+        CABECERA
+        + "# El borrado de verdad de lo que la app borra de Hermes (hehermes_servidor/mantenimiento.py). La lanza\n"
+        "# hehermes-borrado.timer; si no hay nada pendiente, o no es un rato tranquilo, no hace nada.\n"
+        "[Unit]\n"
+        "Description=HeHermes: el borrado de verdad de lo borrado de Hermes (compacta su base de noche)\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        "ExecStart=%s borrado-seguro\n"
+        "# El tope duro: compactar tiene 15 minutos, y arrancar Hermes otra vez y esperar su /health, el resto.\n"
+        "TimeoutStartSec=20min\n"
+        "UMask=0022\n"
+        "LimitCORE=0\n"
+        "PrivateTmp=yes\n"
+        "NoNewPrivileges=%s\n"
+    ) % ("/usr/bin/python3 -I -B %s/hehermes-servidor" % _ruta_segura(ambito.prefijo),
+         # Con root cambia de usuario (runuser) para compactar como el de Hermes: NoNewPrivileges no le deja.
+         "no" if ambito.root else "yes")
+
+
+def temporizador_borrado() -> str:
+    return (
+        CABECERA
+        + "# Cada 15 minutos de 2:00 a 5:45 (hora del servidor): la limpieza decide si es un rato tranquilo.\n"
+        "[Unit]\n"
+        "Description=HeHermes: el borrado de verdad, de noche\n"
+        "\n"
+        "[Timer]\n"
+        "OnCalendar=*-*-* 02..05:00/15:00\n"
+        "RandomizedDelaySec=120\n"
+        "Persistent=false\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+
+
 def ambito_python() -> str:
     from .ambito import PYTHON
     return PYTHON
@@ -304,7 +358,8 @@ def ambito_python() -> str:
 def unidad_pasarela_clave_path(env: str) -> str:
     return (
         CABECERA
-        + "# Si cambia la clave del api_server en el .env de Hermes, se copia a la pasarela y se reinicia.\n"
+        + "# Si cambia la clave del api_server en el .env de Hermes, se copia a la pasarela, que la vuelve a leer sola\n"
+        "# (sin reiniciarse: los SSE abiertos siguen).\n"
         "[Unit]\n"
         "Description=HeHermes: vigila la clave del api_server de Hermes, para la pasarela\n"
         "\n"
@@ -331,7 +386,8 @@ def unidad_pasarela_clave_service() -> str:
 
 def pasarela_ini(ambito, puerto: int, puerto_hermes: int, env: str, direccion: str, vigia: bool) -> str:
     """Lo que lee la pasarela (`pasarela.Configuracion`) y `hehermes-dispositivo` (la dirección del QR y dónde está el
-    código). Con root, la clave de Hermes es una copia suya (`clave-hermes`, 0600); sin root, el .env mismo."""
+    código). Con root, la clave de Hermes es una copia suya (`clave-hermes`, de hh-pasarela y 0600); sin root, el .env
+    mismo. En los dos casos la vuelve a leer cuando cambia."""
     _puerto_pasarela(puerto)
     if not isinstance(puerto_hermes, int) or not 0 < puerto_hermes < 65536:
         raise ValueError("puerto de Hermes no válido: %r" % (puerto_hermes,))
@@ -346,14 +402,21 @@ def pasarela_ini(ambito, puerto: int, puerto_hermes: int, env: str, direccion: s
         "escucha =\n"
         "certificado = %s\n"
         "clave = %s\n"
+        "# El que viene después: su huella se da a quien trae un token (GET /hehermes/v1/huellas), para rotar sin\n"
+        "# volver a emparejar (hehermes-servidor certificado rotar).\n"
+        "certificado_siguiente = %s\n"
         "tokens = %s\n"
         "\n"
         "[hermes]\n"
         "puerto = %d\n"
         "clave = %s\n"
         "env = %s\n"
-    ) % (puerto, _ruta_segura(ambito.cert), _ruta_segura(ambito.clave), _ruta_segura(ambito.tokens), puerto_hermes,
+    ) % (puerto, _ruta_segura(ambito.cert), _ruta_segura(ambito.clave), _ruta_segura(ambito.cert_siguiente),
+         _ruta_segura(ambito.tokens), puerto_hermes,
          _ruta_segura(ambito.clave_hermes if ambito.root else env), _ruta_segura(env))
+    texto += ("\n[mantenimiento]\n# Donde apunta que hay algo borrado de Hermes por limpiar (sin ids), su actividad, y lo\n"
+              "# que apunta la limpieza de noche (hehermes-borrado.timer).\ncarpeta = %s\n"
+              % _ruta_segura(ambito.carpeta_estado_pasarela))
     if vigia:
         texto += "\n[avisos]\nvigia = %s\nsecreto = %s\n" % (VIGIA, _ruta_segura(ambito.secreto_vigia))
     texto += ("\n[qr]\n# La que va en el QR de cada iPhone.\ndireccion = %s\n\n[instalador]\ncodigo = %s\n"
@@ -554,10 +617,11 @@ def unidad_vigia(ambito, direccion_rele: str | None) -> str:
 # MARK: El lector de ficheros (spec 2026-09-28, «El instalador 0.8.0»)
 
 SOCKET_LECTOR = "hehermes-leer-media.socket"
-#: Lo que se sabe que hay en la carpeta de Hermes, fuera de sus caches: la jaula lo tapa además de que el lector lo
-#: prohíba (lo mismo que `server/avisos/despliegue/instalar.sh`, SECRETOS_HERMES).
-SECRETOS_HERMES = (".env", "auth.json", "config.yaml", "state.db", "state.db-wal", "state.db-shm", "SOUL.md",
-                   "backups", "cron", "hooks", "engagements")
+#: Lo único que el lector lee de la carpeta de Hermes (desde la 0.9.0, una lista de permitidas): sus caches y la
+#: carpeta de exportaciones que crea el instalador. Lo mismo que `server/avisos/despliegue/instalar.sh`,
+#: PERMITIDAS_HERMES, y que el lector (PERMITIDAS_EN_LA_CASA).
+PERMITIDAS_HERMES = ("image_cache", "audio_cache", "exports")
+EXPORTACIONES = "exports"
 
 
 def unidad_lector_socket(ambito) -> str:
@@ -595,15 +659,16 @@ def unidad_lector_socket(ambito) -> str:
 #: La jaula del lector de root, la misma que la de `server/avisos/despliegue/hehermes-leer-media@.service` (una prueba
 #: las compara): leer, y solo leer.
 _JAULA_LECTOR = (
-    "CapabilityBoundingSet=CAP_DAC_READ_SEARCH\n"
+    "CapabilityBoundingSet=\n"
+    "AmbientCapabilities=\n"
     "NoNewPrivileges=yes\n"
     "ProtectSystem=strict\n"
-    "ProtectHome=read-only\n"
     "PrivateNetwork=yes\n"
     "IPAddressDeny=any\n"
     "RestrictAddressFamilies=AF_UNIX\n"
     "PrivateDevices=yes\n"
     "PrivateIPC=yes\n"
+    "PrivateTmp=yes\n"
     "ProtectKernelTunables=yes\n"
     "ProtectKernelModules=yes\n"
     "ProtectKernelLogs=yes\n"
@@ -638,24 +703,24 @@ _JAULA_LECTOR_USUARIO = (
 )
 
 
-def unidad_lector(ambito, hermes_home: str) -> str:
+def unidad_lector(ambito, hermes_home: str, usuario_hermes: str | None = None) -> str:
     """Un lector por conexión (`Accept=yes`): lee una línea con la ruta y contesta con el fichero por el mismo socket.
 
-    Con root, de root y con la jaula del VPS de Daniel, y la carpeta de Hermes (`--hermes-home`) prohibida salvo sus
-    caches, también tapada en la jaula, igual que los secretos del instalador. Sin root, como el usuario de Hermes, que
-    ya puede leer lo que Hermes escribe, con `--usuario` (solo atiende a su propio uid) y con lo que una unidad de
-    usuario se puede poner. Lo que no puede (ProtectSystem, ProtectHome, InaccessiblePaths, PrivateNetwork…) lo dice
-    ella misma: ahí, lo que no se lee lo decide solo el lector, con su lista de prohibidas."""
+    Desde la 0.9.0 solo lee de una lista de permitidas: las caches de Hermes y su `exports/`. Con root, con la jaula del
+    VPS de Daniel: como el dueño de la casa de Hermes (root si Hermes es root; si no, su usuario) y **sin ninguna
+    capacidad**, con las casas tapadas (`ProtectHome=tmpfs`) salvo las permitidas (`BindReadOnlyPaths`), y lo de los
+    secretos del sistema y del instalador, tapado. Sin root, como el usuario de Hermes, con `--usuario` (solo atiende a
+    su propio uid) y con lo que una unidad de usuario se puede poner. Lo que no puede (ProtectSystem, ProtectHome,
+    InaccessiblePaths, PrivateNetwork…) lo dice ella misma: ahí, lo que se lee lo decide solo el lector."""
     casa = _ruta_segura(hermes_home.rstrip("/"))
     if not ambito.root:
         return (
             CABECERA
-            + "# Un lector por conexión a %%t/hehermes-leer-media.sock, como el usuario de Hermes: lee lo que él puede\n"
-            "# leer y nada de lo que el lector prohíbe (la carpeta de Hermes salvo sus caches, ~/.ssh, cualquier .env,\n"
-            "# lo de hehermes en ~/.config y ~/.local…).\n"
+            + "# Un lector por conexión a %%t/hehermes-leer-media.sock, como el usuario de Hermes: de su casa, solo las\n"
+            "# caches de Hermes y su exports/ (la lista de permitidas del lector).\n"
             "# Lo que una unidad de usuario NO puede ponerse (necesita espacios de nombres o privilegios que un gestor\n"
             "# de usuario no tiene): ProtectSystem, ProtectHome, InaccessiblePaths, PrivateNetwork, PrivateDevices,\n"
-            "# IPAddressDeny ni CapabilityBoundingSet. Aquí el núcleo no tapa nada: la lista de prohibidas la hace\n"
+            "# IPAddressDeny ni CapabilityBoundingSet. Aquí el núcleo no tapa nada: la lista de permitidas la hace\n"
             "# cumplir solo el lector, y sin red lo deja RestrictAddressFamilies=AF_UNIX.\n"
             "[Unit]\n"
             "Description=HeHermes: lector de un fichero que Hermes marcó\n"
@@ -673,11 +738,16 @@ def unidad_lector(ambito, hermes_home: str) -> str:
             "LimitCORE=0\n"
             "%s"
         ) % (_ruta_segura(ambito.lector), casa, _JAULA_LECTOR_USUARIO)
-    tapadas = " ".join("-%s/%s" % (casa, secreto) for secreto in SECRETOS_HERMES)
+    vistas = " ".join("-%s/%s" % (casa, permitida) for permitida in PERMITIDAS_HERMES)
+    usuario = ""
+    if usuario_hermes and usuario_hermes != "root":
+        if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", usuario_hermes):
+            raise ValueError("usuario de Hermes no válido para una unidad: %r" % usuario_hermes)
+        usuario = "User=%s\n" % usuario_hermes
     return (
         CABECERA
-        + "# Un lector por conexión a /run/hehermes-leer-media.sock (hehermes-leer-media.socket, Accept=yes). Es root,\n"
-        "# porque Hermes puede serlo y deja sus ficheros donde quiere, pero con lo justo para leer y nada más.\n"
+        + "# Un lector por conexión a /run/hehermes-leer-media.sock (hehermes-leer-media.socket, Accept=yes). Corre como\n"
+        "# el dueño de la casa de Hermes, sin ninguna capacidad: solo lee sus caches y su exports/.\n"
         "[Unit]\n"
         "Description=HeHermes: lector de un fichero que Hermes marcó\n"
         "CollectMode=inactive-or-failed\n"
@@ -694,12 +764,14 @@ def unidad_lector(ambito, hermes_home: str) -> str:
         "UMask=0077\n"
         "LimitCORE=0\n"
         "%s"
-        "# Sin PrivateTmp a propósito: Hermes deja ficheros en /tmp, y el lector tiene que ver el /tmp de verdad.\n"
-        "# Lo que el lector prohíbe, otra vez, pero ahora lo hace cumplir el núcleo.\n"
+        "%s"
+        "# La lista de permitidas, otra vez, pero ahora la hace cumplir el núcleo: las casas vacías, y dentro solo las\n"
+        "# carpetas permitidas, de solo lectura (la que aún no exista se salta).\n"
+        "ProtectHome=tmpfs\n"
+        "BindReadOnlyPaths=%s\n"
+        "# Y fuera de las casas, los secretos del sistema y del instalador, tapados.\n"
         "InaccessiblePaths=-/etc/shadow -/etc/shadow- -/etc/gshadow -/etc/gshadow- -/etc/sudoers -/etc/sudoers.d\n"
         "InaccessiblePaths=-/etc/ssh -/etc/ssl/private -/etc/letsencrypt\n"
         "InaccessiblePaths=-/etc/hehermes -/etc/hehermes-avisos -/etc/hehermes-pasarela -/var/lib/hehermes-vigia\n"
         "InaccessiblePaths=-/etc/nginx -/etc/swanctl -/etc/strongswan -/etc/ipsec.secrets -/etc/ipsec.d -/etc/wireguard\n"
-        "InaccessiblePaths=-/root/.ssh -/root/.gnupg\n"
-        "InaccessiblePaths=%s\n"
-    ) % (_ruta_segura(ambito.lector), casa, _JAULA_LECTOR, tapadas)
+    ) % (_ruta_segura(ambito.lector), casa, usuario, _JAULA_LECTOR, vistas)

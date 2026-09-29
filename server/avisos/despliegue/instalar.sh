@@ -85,9 +85,9 @@ PROC=/proc
 # Lo usan la instalación (en el paso de systemd) y --desinstalar-lector. Todo por las variables de arriba.
 LECTOR_CAMBIADO=0
 HERMES_DE_SERIE=/root/.hermes
-# Lo que se sabe que hay en la carpeta de Hermes, para taparlo también con la jaula si vive en otro sitio (lo mismo que
-# lleva la unidad para /root/.hermes). El lector prohíbe la carpeta entera, menos image_cache/ y audio_cache/.
-SECRETOS_HERMES=".env auth.json config.yaml state.db state.db-wal state.db-shm SOUL.md backups cron hooks engagements"
+# Lo único que sale de la carpeta de Hermes (desde la 1.4.0, una lista de permitidas): sus dos caches y la carpeta de
+# exportaciones, que crea este instalador. La unidad las deja ver (BindReadOnlyPaths) y tapa el resto de las casas.
+PERMITIDAS_HERMES="image_cache audio_cache exports"
 ANADIDO_LECTOR="$SYSTEMD/hehermes-leer-media@.service.d/hermes-home.conf"
 
 hermes_del_gateway() {
@@ -132,9 +132,10 @@ instalar_lector() {
       LECTOR_CAMBIADO=1
     fi
   done
-  # Si Hermes no vive en /root/.hermes, un añadido a la unidad le dice al lector dónde (y tapa sus secretos allí).
-  local casa texto secreto tapadas=""
+  # Si Hermes no vive en /root/.hermes, un añadido a la unidad le dice al lector dónde (y qué carpetas dejarle ver).
+  local casa texto permitida vistas="" dueno usuario=""
   casa="$(hermes_del_gateway)"
+  crear_exportaciones "$casa"
   if [[ "$casa" == "$HERMES_DE_SERIE" ]]; then
     if [[ -e "$ANADIDO_LECTOR" ]]; then
       rm -f "$ANADIDO_LECTOR"
@@ -143,12 +144,17 @@ instalar_lector() {
     fi
     return 0
   fi
-  for secreto in $SECRETOS_HERMES; do tapadas="$tapadas -$casa/$secreto"; done
+  for permitida in $PERMITIDAS_HERMES; do vistas="$vistas -$casa/$permitida"; done
+  # Sin capacidades, el lector lee como el dueño de la casa de Hermes: si no es root, como él.
+  dueno="$(stat -c %U "$casa" 2>/dev/null || echo root)"
+  [[ "$dueno" =~ ^[a-z_][a-z0-9_-]*$ && "$dueno" != root ]] && usuario="
+User=$dueno"
   texto="# Lo escribe instalar.sh: el HERMES_HOME de hermes-gateway es $casa, no $HERMES_DE_SERIE.
 [Service]
 ExecStart=
 ExecStart=/usr/bin/python3 -I -S -B $LECTOR --hermes-home=$casa --conexion
-InaccessiblePaths=${tapadas# }"
+BindReadOnlyPaths=
+BindReadOnlyPaths=${vistas# }$usuario"
   if [[ ! -f "$ANADIDO_LECTOR" || "$(cat "$ANADIDO_LECTOR")" != "$texto" ]]; then
     install -d -m 0755 -o root -g root "$(dirname "$ANADIDO_LECTOR")"
     printf '%s\n' "$texto" > "$ANADIDO_LECTOR.nuevo"
@@ -156,7 +162,19 @@ InaccessiblePaths=${tapadas# }"
     mv -f "$ANADIDO_LECTOR.nuevo" "$ANADIDO_LECTOR"
     LECTOR_CAMBIADO=1
   fi
-  echo "    Hermes vive en $casa (del entorno de hermes-gateway): el lector prohíbe esa carpeta, menos sus caches"
+  echo "    Hermes vive en $casa (del entorno de hermes-gateway): de ahí el lector solo lee sus caches y exports/"
+}
+
+crear_exportaciones() {
+  # La carpeta donde Hermes deja lo que quiere mandarle al iPhone, del dueño de su casa y solo suya. Si la casa aún no
+  # existe (Hermes sin instalar), no se inventa: el lector contesta que no está hasta que se vuelva a lanzar esto.
+  local casa="$1" dueno grupo
+  [[ -d "$casa" ]] || return 0
+  [[ -d "$casa/exports" ]] && return 0
+  dueno="$(stat -c %U "$casa" 2>/dev/null || echo root)"
+  grupo="$(stat -c %G "$casa" 2>/dev/null || echo root)"
+  install -d -m 0700 -o "$dueno" -g "$grupo" "$casa/exports"
+  echo "    carpeta de exportaciones de Hermes: $casa/exports (lo que Hermes deje ahí con MEDIA:, la app lo descarga)"
 }
 
 arrancar_lector() {

@@ -78,6 +78,18 @@ class Ambito:
         self.pasarela_ini = self.carpeta_pasarela + "/pasarela.ini"
         self.cert = self.carpeta_pasarela + "/cert.pem"
         self.clave = self.carpeta_pasarela + "/clave.pem"
+        # El certificado que viene después (su huella se publica a los iPhone para que la anclen también) y el de antes
+        # de la última rotación (`hehermes-servidor certificado rotar`), por si hay que volver atrás.
+        self.carpeta_siguiente = self.carpeta_pasarela + "/siguiente"
+        self.cert_siguiente = self.carpeta_siguiente + "/cert.pem"
+        self.clave_siguiente = self.carpeta_siguiente + "/clave.pem"
+        self.carpeta_anterior = self.carpeta_pasarela + "/anterior"
+        # La carpeta de estado de la pasarela (el borrado pendiente, su actividad y lo que apunta la limpieza de noche,
+        # `mantenimiento.py`): con root, la de su StateDirectory; sin root, en ~/.local/state. Y la limpieza.
+        self.carpeta_estado_pasarela = ("/var/lib/hehermes-pasarela" if root
+                                        else self.casa + "/.local/state/hehermes-pasarela")
+        self.unidad_borrado = self.unidades + "/hehermes-borrado.service"
+        self.temporizador_borrado = self.unidades + "/hehermes-borrado.timer"
         self.tokens = self.carpeta_pasarela + "/tokens.json"
         self.clave_hermes = self.carpeta_pasarela + "/clave-hermes"
         self.unidad = self.unidades + "/hehermes-pasarela.service"

@@ -12,7 +12,7 @@ import re
 from . import VERSION
 from . import manifiesto as m
 from . import piezas as p
-from .deteccion import NORMAL, ROJO
+from .deteccion import NORMAL, PREFIJO_ERROR, ROJO, Bloqueo, bloqueo, etiquetar  # noqa: F401
 
 NOMBRE_VALIDO = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 # Lo que va en /opt/hehermes-servidor: con eso, `comprobar`, `actualizar` y `desinstalar` siguen ahí después de que se
@@ -77,6 +77,11 @@ class Plan:
     @property
     def puede_seguir(self) -> bool:
         return not self.bloqueos
+
+    @property
+    def codigo_de_error(self) -> str | None:
+        """El código del primer bloqueo (el que se arregla primero), o None si no hay."""
+        return next((getattr(b, "codigo", Bloqueo.codigo) for b in self.bloqueos), None)
 
 
 def ficheros_propios(origen: str, prefijo: str = p.PREFIJO) -> list:
@@ -151,7 +156,7 @@ def _unidad(sis, acciones, unidad, ficheros, detalle, como_recargar, systemctl=(
 
 
 SECCIONES = (("Hermes", ("env", "exposicion")), ("Paquetes", ("paquete",)),
-             ("La pasarela", ("usuario", "venv", "certificado")),
+             ("La pasarela", ("usuario", "venv", "certificado", "certificado_siguiente")),
              ("Ficheros", ("fichero", "gestionado", "enlace")),
              ("Servicios", ("unidad",)), ("Cortafuegos (ufw)", ("regla",)),
              ("Cortafuegos (firewalld)", ("firewalld",)), ("Cortafuegos (nftables e iptables)", ("propio",)),

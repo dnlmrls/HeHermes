@@ -47,7 +47,7 @@ oyFraWVIyd/dganmrduC1bmTBGwD
 #: El SHA-256 de ese certificado en DER: lo comprueba una prueba, para que un cambio en el PEM no pase sin verse.
 HUELLA_RAIZ_APPLE = "1cb9823ba28ba6ad2d33a006941de2ae4f513ef1d4e831b9f7e0fa7b6242c932"
 
-#: El App ID de HeHermes Mensajes: equipo y bundle.
+#: El App ID de HeHermes: equipo y bundle.
 APP_ID = "8X7L8YHD9M.com.danielmorales.HeHermesMensajes"
 #: Los dos «aaguid» de App Attest: el de las compilaciones de desarrollo (Xcode) y el de producción (TestFlight y App
 #: Store, «appattest» y siete bytes a cero).

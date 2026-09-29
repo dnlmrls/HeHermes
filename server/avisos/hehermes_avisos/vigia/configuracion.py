@@ -6,6 +6,8 @@ copiar o pegar en un informe sin enseñar nada.
 
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass
 
 from ..comun import direccion, leer_ini
@@ -75,6 +77,9 @@ class ConfigVigia:
     # El relé de otra máquina (la entrada pública del de Daniel): `https://…` y la huella de su certificado, que se
     # ancla. Sin huella no se habla HTTPS con nadie, y en claro solo con 127.0.0.1: la credencial va en cada petición.
     rele_huella: str | None = None
+    #: La huella del certificado que el relé pondrá cuando rote el suyo (la da su `GET /hehermes/v1/huellas`): con ella,
+    #: la rotación no deja a este vigía fuera. Opcional.
+    rele_huella_siguiente: str | None = None
     # Los ficheros que Hermes marca con `MEDIA:`: el socket del lector de root (`hehermes-leer-media.socket`), la casa
     # de Hermes (lo que vale `~`) y cuántas descargas se aceptan por minuto y a la vez.
     ficheros_lector: str = "/run/hehermes-leer-media.sock"
@@ -104,10 +109,13 @@ class ConfigVigia:
         # siempre (https con huella, o en claro solo a 127.0.0.1).
         rele_url = (texto("rele", "url", "") or "").strip()
         rele_huella = (texto("rele", "huella", "") or "").strip() or None
+        rele_huella_siguiente = (texto("rele", "huella_siguiente", "") or "").strip() or None
         if rele_url:
             _comprobar_rele(rele_url, rele_huella)
+            if rele_huella_siguiente is not None and not re.fullmatch(r"[A-Za-z0-9_-]{43}", rele_huella_siguiente):
+                raise ValueError("[rele] huella_siguiente tiene que ser una huella (43 caracteres), o no estar")
         else:
-            rele_huella = None
+            rele_huella = rele_huella_siguiente = None
         return cls(
             escucha=direccion(texto("vigia", "escucha", "%s:%d" % base.escucha)),
             base_de_datos=texto("vigia", "base_de_datos", base.base_de_datos),
@@ -127,6 +135,7 @@ class ConfigVigia:
             rele_credencial=texto("rele", "credencial", base.rele_credencial),
             rele_plazo=numero("rele", "plazo", base.rele_plazo),
             rele_huella=rele_huella,
+            rele_huella_siguiente=rele_huella_siguiente,
             ficheros_lector=texto("ficheros", "lector", base.ficheros_lector).strip(),
             ficheros_casa=texto("ficheros", "casa", base.ficheros_casa).strip(),
             ficheros_por_minuto=max(1, int(numero("ficheros", "por_minuto", base.ficheros_por_minuto))),

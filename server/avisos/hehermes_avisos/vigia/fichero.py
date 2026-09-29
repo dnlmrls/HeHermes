@@ -8,8 +8,14 @@ su propia jaula. El vigía solo decide **si** se puede pedir, y el lector, **qu�
 
 1. Que la ruta esté marcada: una fila ``assistant`` de esa sesión, entre las 500 últimas, con una línea ``MEDIA:``
    que, con las mismas reglas que la app (``ExtraccionMedia.swift``), dé exactamente esa ruta. Si no, 404 sin mirar
-   el disco: la respuesta no dice si el fichero existe.
-2. Que el lector la dé por buena (sus reglas, en su propio fichero), y los bytes, por partes, de él a la app.
+   el disco: la respuesta no dice si el fichero existe. Primero se piden las 50 últimas (casi siempre es un mensaje
+   reciente: una foto paga así unos KB de historial y no 1–2 MB), y las 500 solo si esas 50 vuelven llenas y sin la
+   marca. Una marca vista se recuerda ``RECUERDO`` segundos (sesión + ruta): abrir la vista previa y luego el visor no
+   pide el historial dos veces. Solo se recuerda lo marcado, nunca lo que no: una marca nueva vale al momento.
+2. Que el lector la dé por buena (sus reglas, en su propio fichero: desde la 1.4.0, una lista de permitidas), y los
+   bytes, por partes, de él a la app. Lo que el lector no deja leer (fuera de las permitidas, no es un fichero normal,
+   cambió mientras se abría, no existe) se contesta con **el mismo 404** que lo que no está marcado: la respuesta no
+   dice ni si existe ni si está fuera.
 
 En el registro sale el resultado, la extensión y el tamaño: ni la ruta ni nada del contenido.
 """
@@ -34,6 +40,11 @@ registro = logging.getLogger("vigia.fichero")
 TOPE = 50 * 1024 * 1024
 MAX_RUTA = 4096
 FILAS = 500
+#: Las filas que se piden primero: si vuelven menos, la sesión entera ya estaba dentro.
+FILAS_PRIMERO = 50
+#: Cuánto se recuerda una marca vista, y cuántas como mucho.
+RECUERDO = 120.0
+MAX_RECORDADAS = 256
 TROZO = 64 * 1024
 PREFIJO = "MEDIA:"
 # Lo que `CharacterSet.whitespaces` de Swift quita de los bordes: el tabulador y los espacios de Unicode (Zs).
@@ -59,10 +70,11 @@ for _extension in ("py", "sh", "zsh", "bash", "swift", "ts", "toml", "sql", "go"
 # Lo que dice el lector y cómo se le contesta a la app.
 POR_ESTADO = {
     "invalida": (400, "parametro_invalido", "La ruta no tiene la forma que se espera"),
+    # Desde la 1.4.0, todo lo que el lector no deja leer es el mismo 404 que lo que no está marcado (contrato §11).
     "no_existe": (404, "fichero_no_disponible", "Ese fichero no está disponible"),
-    "prohibida": (403, "ruta_prohibida", "Esa ruta no se puede leer"),
-    "no_es_fichero": (403, "ruta_prohibida", "Eso no es un fichero normal"),
-    "carrera": (403, "ruta_prohibida", "La ruta cambió mientras se abría"),
+    "prohibida": (404, "fichero_no_disponible", "Ese fichero no está disponible"),
+    "no_es_fichero": (404, "fichero_no_disponible", "Ese fichero no está disponible"),
+    "carrera": (404, "fichero_no_disponible", "Ese fichero no está disponible"),
     "demasiado_grande": (413, "fichero_demasiado_grande", "El fichero pasa de 50 MB"),
     "no_autorizado": (503, "lector_no_disponible", "El lector de ficheros no atiende al vigía"),
 }
@@ -203,6 +215,26 @@ class ClienteLector:
         self.ruta_socket = ruta_socket
         self.plazo = plazo
 
+    def estado_de(self, ruta: str) -> str:
+        """La primera línea que contesta el lector a esa ruta, tal cual (``prohibida``, ``ok 12``…), sin leer nada más:
+        para ``comprobar``. ``ErrorHTTP`` si no contesta."""
+        conexion = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        conexion.settimeout(self.plazo)
+        try:
+            conexion.connect(self.ruta_socket)
+            conexion.sendall(ruta.encode("utf-8") + b"\n")
+            recibido = b""
+            while b"\n" not in recibido and len(recibido) < 64:
+                trozo = conexion.recv(64)
+                if not trozo:
+                    break
+                recibido += trozo
+        except OSError:
+            raise ErrorHTTP(503, "lector_no_disponible", "El lector de ficheros no está instalado o no contesta") from None
+        finally:
+            conexion.close()
+        return recibido.partition(b"\n")[0].decode("ascii", "replace")
+
     def abrir(self, ruta: str) -> tuple:
         """``(conexion, tamano, lo ya leído tras la cabecera)``, o ``ErrorHTTP``."""
         conexion = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -236,14 +268,41 @@ class ClienteLector:
         raise ErrorHTTP(502, "lectura_fallida", "El lector de ficheros no ha podido leerlo")
 
 
+class Marcas:
+    """Las marcas ya vistas (sesión, ruta), unos segundos. Solo lo marcado: lo que no lo está se vuelve a mirar."""
+
+    def __init__(self, recuerdo: float = RECUERDO, maximo: int = MAX_RECORDADAS, reloj=time.monotonic):
+        self.recuerdo, self.maximo, self.reloj = recuerdo, maximo, reloj
+        self._vistas: collections.OrderedDict = collections.OrderedDict()
+        self._candado = threading.Lock()
+
+    def vista(self, sesion: str, ruta: str) -> bool:
+        with self._candado:
+            hasta = self._vistas.get((sesion, ruta))
+            if hasta is None:
+                return False
+            if self.reloj() >= hasta:
+                del self._vistas[(sesion, ruta)]
+                return False
+            return True
+
+    def apuntar(self, sesion: str, ruta: str) -> None:
+        with self._candado:
+            self._vistas.pop((sesion, ruta), None)
+            while len(self._vistas) >= self.maximo:
+                self._vistas.popitem(last=False)
+            self._vistas[(sesion, ruta)] = self.reloj() + self.recuerdo
+
+
 class Ficheros:
     """Lo que hace la ruta, sin HTTP."""
 
-    def __init__(self, hermes, lector: ClienteLector, limites: Limites, casa: str = "/root"):
+    def __init__(self, hermes, lector: ClienteLector, limites: Limites, casa: str = "/root", marcas: Marcas = None):
         self.hermes = hermes
         self.lector = lector
         self.limites = limites
         self.casa = casa.rstrip("/") or "/"
+        self.marcas = marcas if marcas is not None else Marcas()
 
     def preparar(self, sesion: object, ruta: object) -> Descarga:
         if not (isinstance(sesion, str) and PATRON_SESION.fullmatch(sesion)):
@@ -264,14 +323,29 @@ class Ficheros:
         registro.info("fichero: 200, .%s, %d bytes", _extension(descarga.nombre), descarga.tamano)
         return descarga
 
+    def _marcada(self, sesion: str, ruta: str) -> bool:
+        """Las 50 últimas filas y, si vuelven llenas y sin la marca, las 500 (las mismas que pinta la app)."""
+        if self.marcas.vista(sesion, ruta):
+            return True
+        marcada = False
+        for limite in (FILAS_PRIMERO, FILAS):
+            try:
+                filas = self.hermes.mensajes(sesion, limite)
+            except ErrorHermes as error:
+                if error.estado == 404:
+                    raise _no_disponible() from None
+                raise ErrorHTTP(502, "hermes_no_disponible", "No se ha podido leer el historial de Hermes") from None
+            if esta_marcada(filas, ruta):
+                marcada = True
+                break
+            if len(filas) < limite:
+                break
+        if marcada:
+            self.marcas.apuntar(sesion, ruta)
+        return marcada
+
     def _preparar(self, sesion: str, ruta: str) -> Descarga:
-        try:
-            filas = self.hermes.mensajes(sesion, FILAS)
-        except ErrorHermes as error:
-            if error.estado == 404:
-                raise _no_disponible() from None
-            raise ErrorHTTP(502, "hermes_no_disponible", "No se ha podido leer el historial de Hermes") from None
-        if not esta_marcada(filas, ruta):
+        if not self._marcada(sesion, ruta):
             raise _no_disponible()
         en_disco = self.casa.rstrip("/") + ruta[1:] if ruta == "~" or ruta.startswith("~/") else ruta
         conexion, tamano, adelantado = self.lector.abrir(en_disco)

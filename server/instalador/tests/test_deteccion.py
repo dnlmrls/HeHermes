@@ -200,6 +200,73 @@ class Hermes(Base):
         self.assertEqual(det.hermes.puerto, 9000)
 
 
+class LosCodigos(Base):
+    """Cada bloqueo lleva su código, el que la app lee por chat en la última línea (`hehermes-error:<código>`): el
+    texto es para la persona, el código para la app, y los dos dicen que no se ha tocado nada."""
+
+    def codigo(self, det, codigo):
+        self.assertIn(codigo, [getattr(b, "codigo", None) for b in det.bloqueos], det.bloqueos)
+
+    def test_cada_caso_con_el_suyo(self):
+        from unittest import mock
+
+        def sin_hermes():
+            sis = apoyo.SistemaFalso()
+            sf.ServidorFalso(sis)
+            return sis, None
+
+        def parado():
+            sis, falso = sf.servidor()
+            falso.activos.discard("hermes-gateway")
+            falso.unidades_hermes.clear()
+            return sis, falso
+
+        def varios():
+            sis, falso = sf.servidor()
+            falso.con_hermes(usuario="ana", como="proceso", puerto=9000)
+            return sis, falso
+
+        def privada():
+            sis, falso = sf.servidor()
+            falso.direccion_salida = "192.168.1.20"
+            return sis, falso
+
+        def sin_systemd():
+            sis, falso = sf.servidor()
+            sis.borrar("/run/systemd/system")
+            return sis, falso
+
+        def sin_puerto():
+            sis, falso = sf.servidor()
+            falso.tcp += [("0.0.0.0:%d" % puerto, "otro") for puerto in range(58000, 65501)]
+            return sis, falso
+
+        def muda():
+            sis, falso = sf.servidor()
+            falso.hermes.clear()
+            return sis, falso
+
+        def otra_clave():
+            sis, falso = sf.servidor()
+            falso.hermes[8642] = "otra-clave"
+            return sis, falso
+
+        casos = [("sin-hermes", sin_hermes), ("hermes-parado", parado), ("varios-hermes", varios), ("nat", privada),
+                 ("sistema", sin_systemd), ("puerto", sin_puerto), ("api-hermes", muda), ("clave-hermes", otra_clave),
+                 ("api-apagada", lambda: sf.servidor(habilitada=False)), ("clave-hermes", lambda: sf.servidor(clave=None))]
+        for codigo, montar in casos:
+            with self.subTest(codigo=codigo):
+                self.montar(montar())
+                self.codigo(self.detectar(), codigo)
+        self.montar(sf.servidor())
+        with mock.patch.object(self.sis, "libre", return_value=20 * 1024 * 1024):
+            det = self.detectar()
+        self.codigo(det, "sin-disco")
+        self.bloqueo(det, "quedan 20 MB libres")
+        # Un bloqueo sigue siendo su texto.
+        self.assertTrue(all(isinstance(b, str) for b in det.bloqueos))
+
+
 class Direccion(Base):
     def test_privada_pide_direccion(self):
         sis, falso = sf.servidor()
