@@ -60,9 +60,11 @@ class LaUnidad(unittest.TestCase):
                       "LockPersonality=yes", "MemoryDenyWriteExecute=yes", "UMask=0077",
                       "ExecStart=/usr/bin/python3 -I -B /opt/hehermes-servidor/hehermes-pasarela --config "
                       "/etc/hehermes-pasarela/pasarela.ini",
-                      "LoadCredential=clave:/etc/hehermes-pasarela/clave.pem",
-                      "LoadCredential=hermes:/etc/hehermes-pasarela/clave-hermes", "WantedBy=multi-user.target"):
+                      "LoadCredential=clave:/etc/hehermes-pasarela/clave.pem", "RestartPreventExitStatus=78",
+                      "StartLimitBurst=5", "WantedBy=multi-user.target"):
             self.assertIn(linea + "\n", texto)
+        # La clave de Hermes ya no llega por credencial: la pasarela lee su copia y la vuelve a leer si cambia.
+        self.assertNotIn("LoadCredential=hermes", texto)
         self.assertNotIn("vigia", texto)
         self.assertTrue(texto.startswith(p.CABECERA))
 

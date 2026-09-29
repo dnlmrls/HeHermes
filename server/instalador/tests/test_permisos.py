@@ -207,9 +207,11 @@ class ElFormato(unittest.TestCase):
                 with self.subTest(sudo=sudo, por_chat=por_chat):
                     lineas = permisos.mensaje(sudo, "hermes", ORIGEN, ["instalar"], por_chat, otra_version="0.1.0")
                     self.assertFalse([l for l in lineas if "hehermes-error" in l])
-        # Ni como texto que se pueda imprimir: solo la nombra la historia de permisos.py.
+        # Ni como texto que se pueda imprimir: solo la nombra la historia de permisos.py. Los códigos de la 0.9.0
+        # (`hehermes-error:nat`, `linger`…) sí salen por chat, pero nunca este.
         codigo = "".join(p.read_text() for p in (apoyo.RAIZ / "hehermes_servidor").glob("*.py"))
-        self.assertFalse('"hehermes-error' in codigo or "'hehermes-error" in codigo)
+        self.assertNotIn('"sin-permisos"', codigo)
+        self.assertNotIn("'sin-permisos'", codigo)
 
     def test_la_linea_de_sudoers_solo_para_un_usuario_que_valga(self):
         self.assertEqual(permisos.linea_sudoers("hermes"), "hermes ALL=(root) NOPASSWD: /usr/local/sbin/hehermes-servidor")

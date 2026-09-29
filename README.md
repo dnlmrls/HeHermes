@@ -1,6 +1,6 @@
 # HeHermes: el instalador de servidor
 
-El código que se ejecuta en tu servidor cuando conectas la app **HeHermes Mensajes** (iPhone) con tu
+El código que se ejecuta en tu servidor cuando conectas la app **HeHermes** (iPhone) con tu
 [Hermes Agent](https://hermes-agent.nousresearch.com). Está aquí para que puedas **leer y auditar lo que instalas**
 antes de darle `sudo`.
 

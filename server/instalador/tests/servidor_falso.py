@@ -30,6 +30,10 @@ VENV_CANJE = "/opt/hehermes-canje/venv"
 CERT_PASARELA = apoyo.DATOS / "pasarela-NO-ES-DE-DANIEL.cert.pem"
 CLAVE_PASARELA = apoyo.DATOS / "pasarela-NO-ES-DE-DANIEL.clave.pem"
 HUELLA_PASARELA = "0GUKsxTavhZWbjkIBTXZmhJX0PMoBKdRcxK1ljakLyc"
+#: El que deja en `siguiente/` (el certificado que viene después), otro de prueba, con otra huella.
+CERT_SIGUIENTE = apoyo.DATOS / "pasarela-siguiente-NO-ES-DE-DANIEL.cert.pem"
+CLAVE_SIGUIENTE = apoyo.DATOS / "pasarela-siguiente-NO-ES-DE-DANIEL.clave.pem"
+HUELLA_SIGUIENTE = "2om4uFk_P-Bmxouf9_eCcIVKLssSxHRX4HQNeUQ4hac"
 NO_ENCONTRADO = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 IP_PUBLICA = "198.51.100.23"
 
@@ -152,6 +156,19 @@ class ServidorFalso:
         self.habilitados_usuario: set = set()
         self.gestor_usuario = True
         self.linger = True
+        self.puede_linger = False
+        #: Lo que hay entre internet y la dirección pública que no es de este servidor (ver `sonda`).
+        self.alcance = None
+        #: La limpieza de noche: si el `hermes` sabe `sessions optimize`, si compacta bien, si se pasa del tope, qué se
+        #: ha compactado, con qué tope, como quién y con qué entorno.
+        self.sabe_optimizar = True
+        self.optimiza_bien = True
+        self.se_pasa = False
+        self.compactados: list = []
+        self.topes: list = []
+        self.como: list = []
+        self.entornos: list = []
+        self.lingers_pedidos: list = []
         self.ensurepip = True
         self.venvs_listos: set = set()
         self.sondas: list = []
@@ -266,8 +283,35 @@ class ServidorFalso:
 
     def _env(self, args, entrada):
         while args and "=" in args[0]:
+            self.entornos.append(args[0])
             args = args[1:]
         return self(args, entrada)
+
+    def _timeout(self, args, entrada):
+        """`timeout [--kill-after=N] SEGUNDOS orden…`: lo que diga `se_pasa` (124, como el de verdad), o la orden."""
+        while args and args[0].startswith("-"):
+            args = args[1:]
+        self.topes.append(args[0])
+        if self.se_pasa:
+            return Resultado(124)
+        return self(args[1:], entrada)
+
+    def _runuser(self, args, entrada):
+        if args[:1] == ["-u"] and args[2:3] == ["--"]:
+            self.como.append(args[1])
+            return self(args[3:], entrada)
+        return Resultado(127, "", "runuser %s" % args)
+
+    def _hermes(self, args, entrada):
+        """El `hermes` de Hermes: `sessions optimize` si ese Hermes lo sabe (`sabe_optimizar`), con él parado."""
+        if args[:2] != ["sessions", "optimize"] or not self.sabe_optimizar:
+            return Resultado(2, "", "hermes: error: invalid choice")
+        if args[2:] == ["--help"]:
+            return Resultado(0, "usage: hermes sessions optimize [--force]\n")
+        if "hermes-gateway" in self.activos:
+            return Resultado(1, "", "refusing: the gateway is running (use --force)")
+        self.compactados.append("hermes sessions optimize")
+        return Resultado(0 if self.optimiza_bien else 1, "", "" if self.optimiza_bien else "database is locked")
 
     def _dpkg(self, args, entrada):
         if args == ["--print-architecture"]:
@@ -398,12 +442,22 @@ class ServidorFalso:
     def pasarela_en_marcha(self):
         return "hehermes-pasarela" in self.activos or "hehermes-pasarela" in self.activos_usuario
 
-    def sonda(self, puerto, maxima=None):
-        """Lo que ve `comprobar` al asomarse a la pasarela sin token: TLS 1.3, su huella y el 404 de siempre."""
-        self.sondas.append((puerto, maxima))
+    def sonda(self, puerto, maxima=None, anfitrion=None, plazo=None):
+        """Lo que ve `comprobar` al asomarse a la pasarela sin token: TLS 1.3, su huella y el 404 de siempre. Por su
+        dirección pública (`anfitrion`), si es de este servidor, lo mismo; si no (un NAT), lo que diga `alcance`:
+        «reenvía» (el router lleva el puerto aquí), «otro» (lleva a otra máquina) o None (no llega)."""
+        self.sondas.append((puerto, maxima) if anfitrion is None else (puerto, maxima, anfitrion))
         if not self.pasarela_en_marcha() or puerto != self.puerto_pasarela() or maxima is not None:
             return None
+        if anfitrion is not None and anfitrion not in self.direcciones_locales():
+            if self.alcance == "otro":
+                return {"tls": "TLSv1.3", "huella": "O" * 43, "respuesta": NO_ENCONTRADO}
+            if self.alcance != "reenvía":
+                return None
         return {"tls": "TLSv1.3", "huella": HUELLA_PASARELA, "respuesta": NO_ENCONTRADO}
+
+    def direcciones_locales(self):
+        return {a.split("/")[0] for datos in self.enlaces_ip.values() for a in datos.get("addr", [])} | {"127.0.0.1"}
 
     def _arrancar(self, unidad):
         if unidad == "firewalld":
@@ -640,6 +694,9 @@ class ServidorFalso:
             return Resultado(0)
         if args[:2] == ["-I", "-c"] and "ensurepip" in args[2]:
             return Resultado(0) if self.ensurepip else Resultado(1, "", "ModuleNotFoundError: No module named 'ensurepip'")
+        if args[:2] == ["-I", "-c"] and "VACUUM" in args[2]:
+            self.compactados.append("sqlite " + args[3])
+            return Resultado(0 if self.optimiza_bien else 1, "", "" if self.optimiza_bien else "database is locked")
         return Resultado(127, "", "python3 %s" % args)
 
     def _python(self, args, entrada):
@@ -662,10 +719,13 @@ class ServidorFalso:
                 venv + "/lib/python3.11/site-packages/hehermes-servidor.pth")
             return Resultado(0 if listo else 1, "", "" if listo else "ModuleNotFoundError: cryptography")
         if args[:5] == ["-I", "-B", "-m", "hehermes_servidor.canje", "preparar"] and args[6:7] == ["--dias"]:
-            # El certificado de la pasarela: el de prueba, para que su huella sea una conocida.
-            self.sis.poner(args[5] + "/cert.pem", CERT_PASARELA.read_bytes(), modo=0o600)
-            self.sis.poner(args[5] + "/clave.pem", CLAVE_PASARELA.read_bytes(), modo=0o600)
-            return Resultado(0, json.dumps({"huella": HUELLA_PASARELA}) + "\n")
+            # El certificado de la pasarela: el de prueba, para que su huella sea una conocida (y en `siguiente/`, otro).
+            siguiente = args[5].endswith("/siguiente")
+            self.sis.poner(args[5] + "/cert.pem", (CERT_SIGUIENTE if siguiente else CERT_PASARELA).read_bytes(),
+                           modo=0o600)
+            self.sis.poner(args[5] + "/clave.pem", (CLAVE_SIGUIENTE if siguiente else CLAVE_PASARELA).read_bytes(),
+                           modo=0o600)
+            return Resultado(0, json.dumps({"huella": HUELLA_SIGUIENTE if siguiente else HUELLA_PASARELA}) + "\n")
         if args[:4] == ["-I", "-B", "-m", "hehermes_avisos.vigia"] and args[-1] == "comprobar":
             # El `comprobar` del vigía (el de verdad lo prueban las pruebas de los avisos): lo que diga la prueba.
             self.comprobaciones_del_vigia.append(args)
@@ -838,6 +898,13 @@ class ServidorFalso:
     def _loginctl(self, args, entrada):
         if args[:1] == ["show-user"] and args[2:] == ["-p", "Linger"]:
             return Resultado(0, "Linger=%s\n" % ("yes" if self.linger else "no"))
+        if args[:2] == ["--no-ask-password", "enable-linger"]:
+            # Lo que decida su polkit: en unos sistemas cada usuario puede encender el suyo, en otros no.
+            self.lingers_pedidos.append(args[2])
+            if not self.puede_linger:
+                return Resultado(1, "", "Could not enable linger: Access denied")
+            self.linger = True
+            return Resultado(0)
         return Resultado(127, "", "loginctl %s" % args)
 
     def http(self, url, cabeceras):

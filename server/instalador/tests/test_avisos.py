@@ -353,8 +353,16 @@ class SinCodigo(Base):
         self.assertIn("ExecStart=/usr/bin/python3 -I -S -B /usr/local/libexec/hehermes-leer-media "
                       "--hermes-home=/root/.hermes --conexion\n", servicio)
         self.assertNotIn("--usuario", servicio)
-        self.assertIn("-/root/.hermes/.env", servicio)
-        self.assertIn("CapabilityBoundingSet=CAP_DAC_READ_SEARCH\n", servicio)
+        self.assertIn("BindReadOnlyPaths=-/root/.hermes/image_cache -/root/.hermes/audio_cache -/root/.hermes/exports\n",
+                      servicio)
+        self.assertIn("ProtectHome=tmpfs\n", servicio)
+        self.assertIn("CapabilityBoundingSet=\n", servicio, "desde la 0.9.0, ninguna capacidad")
+        self.assertNotIn("CAP_DAC_READ_SEARCH", servicio)
+        self.assertNotIn("User=", servicio, "Hermes es root: el lector también, pero sin capacidades")
+        # La carpeta de exportaciones, creada y apuntada (desinstalar la quita solo si está vacía).
+        self.assertTrue(self.sis.es_carpeta("/root/.hermes/exports"))
+        self.assertEqual(self.sis.modo("/root/.hermes/exports"), 0o700)
+        self.assertEqual(self.manifiesto()["exportaciones"], "/root/.hermes/exports")
         self.assertTrue({"hehermes-leer-media.socket", "hehermes-vigia", "hehermes-vigia.socket"} <= self.falso.activos)
         self.assertTrue({"hehermes-leer-media.socket"} <= self.falso.habilitados)
         man = self.manifiesto()

@@ -1,15 +1,21 @@
 #!/usr/bin/python3 -IS
-"""Lee como root un fichero que Hermes marcó con ``MEDIA:``, y nada más. Va en /usr/local/libexec/hehermes-leer-media.
+"""Lee un fichero que Hermes marcó con ``MEDIA:``, y nada más. Va en /usr/local/libexec/hehermes-leer-media.
 
-Hermes corre como root y deja sus ficheros donde quiere (``/root``, ``/tmp``…), donde el vigía (``hh-vigia``) no puede
-leer. Este lector es lo único que lee por él, y está hecho para que no sirva de nada más aunque el vigía estuviera
-comprometido y le pidiera cualquier cosa:
+Hermes deja sus ficheros en su casa, donde el vigía (``hh-vigia``) no puede leer. Este lector es lo único que lee por
+él, y está hecho para que no sirva de nada más aunque el vigía estuviera comprometido y le pidiera cualquier cosa, o
+aunque quien tenga el token de un iPhone consiguiera que Hermes escribiera ``MEDIA:/root/.bash_history``:
 
 - **Solo rutas absolutas y limpias** (sin NUL, sin saltos de línea, hasta 4096 bytes).
-- **Una lista de prohibidas** que se mira sobre la ruta pedida y sobre la resuelta (``realpath``), así que un enlace
-  que escapa a ``/etc/shadow`` se queda fuera. La carpeta de Hermes está prohibida entera, menos sus dos caches, y lo
-  pedido en una cache tiene que estar, resuelto, en esa misma cache. Es texto y no depende de que el fichero exista: la respuesta no dice
-  qué hay en una zona prohibida.
+- **Una lista de permitidas, no de prohibidas** (desde la 1.4.0 de los avisos; auditoría del 2026-09-29, §14.5): solo
+  lo que está **dentro** de las caches de Hermes (``image_cache/`` y ``audio_cache/``) y de su carpeta de exportaciones
+  (``exports/``, u otra con ``--exportaciones``), donde Hermes deja lo que genera para el iPhone. Todo lo demás, exista
+  o no, es ``prohibida``, y el vigía lo contesta con el mismo 404 que lo que no está marcado. Se mira sobre la ruta
+  pedida y sobre la resuelta (``realpath``): lo pedido en una permitida tiene que estar, resuelto, en **esa misma**
+  permitida, así que un enlace de dentro no lleva a ningún otro sitio, ni a otra permitida. Una permitida que sea ella
+  misma un enlace no vale (lo resuelto ya no cae dentro de su texto); la casa de Hermes sí puede serlo, porque la da
+  la unidad. Encima se sigue mirando la lista de prohibidas de antes (``/etc/shadow``, ``.ssh``, cualquier ``.env``,
+  lo de ``hehermes``…): si alguien dejara dentro de una permitida una carpeta con uno de esos nombres, tampoco sale.
+  Es texto y no depende de que el fichero exista: la respuesta no dice qué hay fuera.
 - **Sin carreras.** Entre resolver la ruta y abrirla, otro proceso podría cambiar una carpeta del camino por un enlace.
   Por eso no se abre la ruta de golpe: se baja desde ``/`` carpeta a carpeta con ``O_NOFOLLOW``, relativo a la carpeta
   anterior (``dir_fd``). Un enlace que aparezca por el camino hace fallar la apertura, y lo que se abre está en una
@@ -18,6 +24,10 @@ comprometido y le pidiera cualquier cosa:
   abierto: el mismo inodo, un fichero normal, **un solo enlace duro** (otro nombre del mismo inodo no se ve en la ruta)
   y no más de 50 MB.
 - **Sin dependencias**, y nada del entorno: ``-IS`` en la primera línea, y ninguna variable cambia lo que hace.
+- **Sin privilegios de más.** Con la lista de permitidas, todo lo que se lee es de Hermes: la unidad lanza el lector
+  como el dueño de la casa de Hermes (root, si Hermes es root) **sin ninguna capacidad** (ya no ``CAP_DAC_READ_SEARCH``:
+  el dueño lee lo suyo sin ella), y con las casas tapadas (``ProtectHome=tmpfs``) salvo las carpetas permitidas
+  (``BindReadOnlyPaths``): lo que el código permite dentro de las casas es lo único que el núcleo le deja ver.
 
 Dos maneras de lanzarlo:
 
@@ -28,8 +38,9 @@ Dos maneras de lanzarlo:
 - ``hehermes-leer-media <ruta>``: para root a mano, y para las pruebas. Los bytes por la salida estándar y el estado,
   si no es ``ok``, en la de errores.
 
-Delante de cualquiera de las dos puede ir ``--hermes-home=<carpeta>``, si Hermes no vive en ``/root/.hermes``: esa
-carpeta entera queda prohibida salvo ``image_cache/`` y ``audio_cache/``. La pone la unidad de systemd, nunca el vigía.
+Delante de cualquiera de las dos pueden ir ``--hermes-home=<carpeta>``, si Hermes no vive en ``/root/.hermes`` (sus
+caches y su ``exports/`` son las permitidas), y ``--exportaciones=<carpeta>``, si la de exportaciones no es la de dentro
+de la casa de Hermes. Las pone la unidad de systemd, nunca el vigía.
 
 Y ``--usuario``, para el lector **sin root** que pone ``hehermes-servidor`` cuando Hermes corre como un usuario y el
 instalador no tiene root: una unidad de usuario de systemd (``%t/hehermes-leer-media.sock``, 0600) que lanza el lector
@@ -67,7 +78,17 @@ SALIDAS = {
     "no_autorizado": 9,
 }
 
-# Lo que no sale aunque Hermes lo marque: la ruta misma y todo lo que hay debajo.
+# La casa de Hermes (HERMES_HOME) de serie. La de otro sitio se pasa con --hermes-home (la pone el instalador en la
+# unidad, si el entorno de hermes-gateway dice otra).
+HERMES_HOME = "/root/.hermes"
+# Donde Hermes deja lo que genera, dentro de su casa: sus dos caches (las imágenes y los audios que genera) y la carpeta
+# de exportaciones que crea el instalador, para lo que Hermes quiera mandarle al iPhone (un PDF, un informe…).
+CACHES_DE_HERMES = ("image_cache", "audio_cache")
+EXPORTACIONES = "exports"
+PERMITIDAS_EN_LA_CASA = CACHES_DE_HERMES + (EXPORTACIONES,)
+
+# La lista de prohibidas de antes, que ahora es la segunda red: dentro de una permitida no debería haber nada de esto,
+# y si lo hay (un enlace a /etc que alguien dejó en exports/, una carpeta .ssh), tampoco sale.
 PROHIBIDAS = (
     "/proc", "/sys", "/dev", "/run",
     "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-", "/etc/sudoers", "/etc/sudoers.d",
@@ -78,15 +99,10 @@ PROHIBIDAS = (
 EMPIEZAN = (("/etc", "hehermes"), ("/var/lib", "hehermes"), ("/etc", "ipsec."))
 # En cualquier sitio: las claves de SSH y GnuPG de cualquier casa, y cualquier .env (el de Hermes lleva su clave).
 CARPETAS_EN_CUALQUIER_SITIO = (".ssh", ".gnupg")
-# Lo de hehermes-servidor sin root, en la casa del usuario: ~/.config/hehermes* (el manifiesto, la clave del certificado
-# de la pasarela y sus tokens, los secretos del vigía), ~/.local/share/hehermes* y ~/.local/state/hehermes* (la base de
-# datos del vigía, con la clave de cada iPhone). Lo mismo que /etc/hehermes* y /var/lib/hehermes* con root.
+# Lo de hehermes-servidor sin root, en la casa del usuario: ~/.config/hehermes*, ~/.local/share/hehermes* y
+# ~/.local/state/hehermes* (el manifiesto, la clave del certificado de la pasarela y sus tokens, los secretos del
+# vigía, su base de datos). Lo mismo que /etc/hehermes* y /var/lib/hehermes* con root.
 EMPIEZAN_EN_CASA = ((".config",), (".local", "share"), (".local", "state"))
-# La carpeta de Hermes (HERMES_HOME), entera: .env, auth.json, config.yaml y sus copias, state.db, backups/, cron/,
-# hooks/, engagements/, SOUL.md, gateway.sock… Menos las dos donde deja lo que genera, que sí marca con MEDIA:. La de
-# otro sitio se pasa con --hermes-home (la pone el instalador en la unidad, si el entorno de hermes-gateway dice otra).
-HERMES_HOME = "/root/.hermes"
-CACHES_DE_HERMES = ("image_cache", "audio_cache")
 
 
 class Rechazo(Exception):
@@ -114,26 +130,33 @@ def casas_de_hermes(hermes: str) -> tuple:
     return tuple(dict.fromkeys((canonica(hermes), canonica(os.path.realpath(hermes)))))
 
 
-def cache_de(ruta: str, casas: tuple) -> str | None:
-    """En qué cache de Hermes está (``casa/image_cache/…``, estrictamente dentro), o ``None``."""
-    for casa in casas:
-        for cache in CACHES_DE_HERMES:
-            if ruta.startswith(casa.rstrip("/") + "/" + cache + "/"):
-                return casa.rstrip("/") + "/" + cache
+def permitidas(hermes: str = HERMES_HOME, exportaciones: str | None = None) -> tuple:
+    """``((nombre, carpeta), …)``: cada carpeta permitida con el nombre que la identifica, una vez por cada forma de
+    escribir la casa de Hermes (``casas_de_hermes``). Lo pedido y lo resuelto tienen que caer en carpetas del mismo
+    nombre. La de exportaciones dada aparte va solo como texto: si fuera un enlace, nada de dentro valdría."""
+    lista = []
+    for casa in casas_de_hermes(hermes):
+        for nombre in PERMITIDAS_EN_LA_CASA:
+            if nombre == EXPORTACIONES and exportaciones is not None:
+                continue
+            lista.append((nombre, casa.rstrip("/") + "/" + nombre))
+    if exportaciones is not None:
+        lista.append((EXPORTACIONES, canonica(exportaciones)))
+    return tuple(lista)
+
+
+def permitida_de(ruta: str, lista: tuple) -> str | None:
+    """El nombre de la permitida en la que está la ruta (estrictamente dentro: la carpeta misma no), o ``None``."""
+    ruta = canonica(ruta)
+    for nombre, carpeta in lista:
+        if ruta.startswith(carpeta.rstrip("/") + "/"):
+            return nombre
     return None
 
 
-def fuera_de_las_caches(ruta: str, casas: tuple) -> bool:
-    """Si está en la carpeta de Hermes y no en una de sus caches."""
+def es_prohibida(ruta: str) -> bool:
+    """La segunda red: lo que no sale aunque estuviera dentro de una permitida."""
     ruta = canonica(ruta)
-    en_casa = any(ruta == casa or ruta.startswith(casa.rstrip("/") + "/") for casa in casas)
-    return en_casa and cache_de(ruta, casas) is None
-
-
-def es_prohibida(ruta: str, casas: tuple = (HERMES_HOME,)) -> bool:
-    ruta = canonica(ruta)
-    if fuera_de_las_caches(ruta, casas):
-        return True
     for prohibida in PROHIBIDAS:
         if ruta == prohibida or ruta.startswith(prohibida + "/"):
             return True
@@ -164,8 +187,8 @@ def validar(ruta: object) -> str:
 
 
 def validar_casa(hermes: object) -> str:
-    """La carpeta de Hermes que viene de --hermes-home: absoluta, limpia y que no sea «/» (lo prohibiría todo menos
-    dos carpetas, pero una opción mal puesta tiene que decirse, no adivinarse)."""
+    """La carpeta de Hermes que viene de --hermes-home (o la de --exportaciones): absoluta, limpia y que no sea «/»
+    (una opción mal puesta tiene que decirse, no adivinarse)."""
     hermes = validar(hermes)
     if canonica(hermes) == "/":
         raise Rechazo("invalida")
@@ -179,7 +202,7 @@ def _por_errno(error: OSError) -> Rechazo:
         # `realpath` ya resolvió todos los enlaces: si ahora hay uno, alguien ha cambiado el camino.
         return Rechazo("carrera")
     if error.errno in (errno.EACCES, errno.EPERM):
-        # Lo que la jaula de systemd tapa (InaccessiblePaths) llega aquí.
+        # Lo que la jaula de systemd tapa, o lo que el dueño de Hermes no puede leer, llega aquí.
         return Rechazo("prohibida")
     return Rechazo("error")
 
@@ -191,22 +214,21 @@ def _es_enlace(nombre: str, carpeta: int) -> bool:
         return False
 
 
-def abrir(ruta: str, *, prohibidas=es_prohibida, hermes: str = HERMES_HOME, tope: int = TOPE, _costura=None) -> tuple:
+def abrir(ruta: str, *, prohibidas=es_prohibida, hermes: str = HERMES_HOME, exportaciones: str | None = None,
+          tope: int = TOPE, _costura=None) -> tuple:
     """El descriptor del fichero, abierto para leer, y su tamaño; o ``Rechazo``. ``_costura(momento)`` es para las
     pruebas: se llama con ``"resuelta"`` (la ruta dada por buena, sin abrir nada) y ``"vista"`` (el fichero mirado con
     ``lstat``, sin abrir), los dos momentos en los que otro proceso podría colarse."""
     ruta = validar(ruta)
-    casas = casas_de_hermes(validar_casa(hermes))
+    lista = permitidas(validar_casa(hermes), None if exportaciones is None else validar_casa(exportaciones))
     pedida = canonica(ruta)
-    if prohibidas(pedida) or fuera_de_las_caches(pedida, casas):
+    donde = permitida_de(pedida, lista)
+    if donde is None or prohibidas(pedida):
         raise Rechazo("prohibida")
-    real = os.path.realpath(ruta)
-    if prohibidas(canonica(real)) or fuera_de_las_caches(real, casas):
-        raise Rechazo("prohibida")
-    # Lo pedido en una cache de Hermes tiene que estar de verdad en esa cache: un enlace de dentro (o la cache misma, si
-    # fuera un enlace) no lleva a ningún otro sitio, ni a otra cache, ni fuera de Hermes.
-    cache, cache_real = cache_de(pedida, casas), cache_de(canonica(real), casas)
-    if cache is not None and (cache_real is None or cache.rsplit("/", 1)[1] != cache_real.rsplit("/", 1)[1]):
+    real = canonica(os.path.realpath(ruta))
+    # Lo pedido en una permitida tiene que estar de verdad en esa misma: un enlace de dentro (o la permitida misma, si
+    # fuera un enlace) no lleva a ningún otro sitio, ni a otra permitida, ni fuera de Hermes.
+    if permitida_de(real, lista) != donde or prohibidas(real):
         raise Rechazo("prohibida")
     if _costura:
         _costura("resuelta")
@@ -323,12 +345,13 @@ def _decir(estado: str, tamano: int | None = None) -> None:
 
 
 def atender(conexion, *, prohibidas=es_prohibida, par_permitido=par_del_vigia, plazo: float = 10.0,
-            hermes: str = HERMES_HOME) -> int:
+            hermes: str = HERMES_HOME, exportaciones: str | None = None) -> int:
     """Una conexión: una línea con la ruta, y la respuesta. Devuelve el código de salida."""
     try:
         if not par_permitido(conexion):
             raise Rechazo("no_autorizado")
-        fd, tamano = abrir(_leer_linea(conexion, plazo), prohibidas=prohibidas, hermes=hermes)
+        fd, tamano = abrir(_leer_linea(conexion, plazo), prohibidas=prohibidas, hermes=hermes,
+                           exportaciones=exportaciones)
     except Rechazo as rechazo:
         _decir(rechazo.estado)
         try:
@@ -351,6 +374,7 @@ def atender(conexion, *, prohibidas=es_prohibida, par_permitido=par_del_vigia, p
 
 def main(argv: list) -> int:
     hermes = HERMES_HOME
+    exportaciones = None
     par_permitido = par_del_vigia
     while argv and argv[0] != "--conexion" and argv[0].startswith("--"):
         if argv[0].startswith("--hermes-home="):
@@ -358,6 +382,12 @@ def main(argv: list) -> int:
                 hermes = validar_casa(argv[0][len("--hermes-home="):])
             except Rechazo:
                 sys.stderr.write("hehermes-leer-media: --hermes-home tiene que ser una carpeta absoluta\n")
+                return SALIDAS["invalida"]
+        elif argv[0].startswith("--exportaciones="):
+            try:
+                exportaciones = validar_casa(argv[0][len("--exportaciones="):])
+            except Rechazo:
+                sys.stderr.write("hehermes-leer-media: --exportaciones tiene que ser una carpeta absoluta\n")
                 return SALIDAS["invalida"]
         elif argv[0] == "--usuario":
             if os.geteuid() == 0:
@@ -371,14 +401,15 @@ def main(argv: list) -> int:
     if argv == ["--conexion"]:
         conexion = socket.socket(fileno=0)
         try:
-            return atender(conexion, hermes=hermes, par_permitido=par_permitido)
+            return atender(conexion, hermes=hermes, exportaciones=exportaciones, par_permitido=par_permitido)
         finally:
             conexion.detach()
     if len(argv) != 1 or argv[0].startswith("-"):
-        sys.stderr.write("uso: hehermes-leer-media [--hermes-home=<carpeta>] [--usuario] <ruta absoluta> | --conexion\n")
+        sys.stderr.write("uso: hehermes-leer-media [--hermes-home=<carpeta>] [--exportaciones=<carpeta>] [--usuario] "
+                         "<ruta absoluta> | --conexion\n")
         return SALIDAS["invalida"]
     try:
-        fd, tamano = abrir(argv[0], hermes=hermes)
+        fd, tamano = abrir(argv[0], hermes=hermes, exportaciones=exportaciones)
     except Rechazo as rechazo:
         _decir(rechazo.estado)
         return SALIDAS[rechazo.estado]

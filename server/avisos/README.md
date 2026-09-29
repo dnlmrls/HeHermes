@@ -1,6 +1,6 @@
 # Avisos push: el vigía y el relé
 
-Lo del servidor de los avisos de HeHermes Mensajes (spec: `docs/superpowers/specs/2026-09-23-avisos-push-design.md`).
+Lo del servidor de los avisos de HeHermes (spec: `docs/superpowers/specs/2026-09-23-avisos-push-design.md`).
 La app y su extensión ya están hechas; esto es lo que les falta para avisar con la app cerrada.
 
 El vigía sirve además, de solo lectura, los ficheros que Hermes marca con `MEDIA:` (`GET /avisos/v1/fichero`): el
@@ -143,7 +143,21 @@ sudo server/avisos/despliegue/instalar.sh --quitar-rele-publico   # la para y ci
 - **El vigía de otro servidor** tiene en su `vigia.ini` `[rele] url = https://<h>:<p>/v1/avisos` y `huella = <f>`. Sin
   huella no habla HTTPS con nadie, y en claro solo con `127.0.0.1`: la credencial va en cada aviso. La huella se mira al
   acabar el apretón TLS, antes de mandar nada. Su `comprobar` no se asoma sin credencial (contaría como un fallo de su
-  IP): solo `GET /v1/credencial`, anclado.
+  IP): solo `GET /v1/credencial`, anclado. Desde la 1.4.0 puede llevar también `huella_siguiente` (vale cualquiera de
+  las dos, comparadas en tiempo constante).
+- **Rotar el certificado** (desde la 1.4.0): `preparar` deja hecho el siguiente (`rele-publico/siguiente/`, su clave
+  sin usar) y su huella se da a quien trae una credencial o un permiso en `GET /hehermes/v1/huellas`. Cuando los vigías
+  (su `huella_siguiente`) y la app (que hoy lleva una sola huella horneada: contrato §12.7) la anclen:
+  `sudo /opt/hehermes-avisos/venv/bin/python -I -B -m hehermes_avisos.rele.publico rotar` y
+  `sudo systemctl restart hehermes-rele-publico`. El de antes queda en `rele-publico/anterior/`: volver atrás es
+  copiarlo encima y reiniciar.
+- **Un secreto mal puesto falla una vez.** La clave de la oficina de permisos llega por `LoadCredential` en 0440, y
+  `leer_secreto` lo acepta solo dentro de `$CREDENTIALS_DIRECTORY` (fuera, 0600 u 0400). Si algo de la configuración o
+  de un secreto no sirve, sale con 78 y un mensaje con el remedio, y la unidad no la reinicia
+  (`RestartPreventExitStatus=78`; y a los 5 arranques en 2 minutos, `StartLimitBurst`): el 28-sep, con el 0440, se
+  reinició 15 veces.
+- **Límites y CGNAT** (desde la 1.4.0, los de la pasarela 0.9.0): el cupo por IP es de conexiones sin credencial; una IP
+  bloqueada por sus fallos deja pasar lo que trae una credencial o un permiso buenos, y cierra al momento lo demás.
 
 ## El lector de ficheros de Hermes
 
@@ -151,31 +165,30 @@ sudo server/avisos/despliegue/instalar.sh --quitar-rele-publico   # la para y ci
 marcó con una línea `MEDIA:<ruta>`. Hermes corre como root y deja sus ficheros donde quiere, y `hh-vigia` no los puede
 leer, así que el reparto es este:
 
-- **El vigía decide si se puede pedir.** Lee las 500 últimas filas de la sesión y exige una fila `assistant` con una
-  línea que, con las reglas de la app (`ExtraccionMedia.swift`), dé esa ruta exacta. Si no la hay, 404, sin mirar el
-  disco. Además limita: 30 por minuto, contando también las que no estaban marcadas, y 2 a la vez.
+- **El vigía decide si se puede pedir.** Lee las 50 últimas filas de la sesión (y las 500 solo si esas vuelven llenas
+  y sin la marca) y exige una fila `assistant` con una línea que, con las reglas de la app (`ExtraccionMedia.swift`),
+  dé esa ruta exacta. Si no la hay, 404, sin mirar el disco. Una marca vista se recuerda 2 minutos. Además limita: 30
+  por minuto, contando también las que no estaban marcadas, y 2 a la vez. Desde la 1.4.0, lo que el lector no deja
+  leer es **el mismo 404** que lo que no está marcado.
 - **El lector decide qué se puede leer.** Es `/usr/local/libexec/hehermes-leer-media` (`despliegue/`), Python sin
   dependencias:
-  - resuelve la ruta y rechaza las prohibidas, sobre la pedida y sobre la resuelta (la lista está en el propio
-    lector, y la copia en el contrato);
-  - prohíbe la carpeta de Hermes entera (su `.env`, `auth.json`, `config.yaml` y sus copias, `state.db`, `backups/`…),
-    menos `image_cache/` y `audio_cache/`, donde deja lo que genera. Lo pedido en una cache tiene que estar, resuelto,
-    en esa misma cache. Si el entorno de `hermes-gateway` dice otro `HERMES_HOME`, `instalar.sh` deja un añadido a la
-    unidad (`hehermes-leer-media@.service.d/hermes-home.conf`) con `--hermes-home=`, y lo quita si vuelve a
-    `/root/.hermes`;
+  - desde la 1.4.0, **solo lee de una lista de permitidas**: `image_cache/`, `audio_cache/` y `exports/` de la carpeta
+    de Hermes (la última la crea `instalar.sh`, 0700, del dueño de Hermes: ahí tiene que dejar Hermes lo que quiera
+    mandar al iPhone). Lo pedido y lo resuelto tienen que estar en la misma permitida; la lista de prohibidas de antes
+    sigue como segunda red. Si el entorno de `hermes-gateway` dice otro `HERMES_HOME`, `instalar.sh` deja un añadido a
+    la unidad (`hehermes-leer-media@.service.d/hermes-home.conf`) con `--hermes-home=` y sus carpetas visibles (y
+    `User=` si Hermes no es root), y lo quita si vuelve a `/root/.hermes`;
   - baja desde `/` carpeta a carpeta con `O_NOFOLLOW`, así que un enlace colado a mitad de camino hace fallar la
     apertura;
   - comprueba con `fstat` del descriptor abierto que es el mismo inodo, un fichero normal, con un solo enlace duro y de
     no más de 50 MB;
   - y lo manda por partes.
 - **Cómo se llega al lector: un socket de systemd, no sudo.** `hehermes-leer-media.socket` (`/run/hehermes-leer-media.sock`,
-  `root:hh-vigia 0660`, `Accept=yes`) lanza un `hehermes-leer-media@.service` de root por cada conexión, con su propia
-  jaula:
-  - todo de solo lectura;
-  - sin red;
-  - de las capacidades de root, solo `CAP_DAC_READ_SEARCH`;
-  - y las rutas prohibidas tapadas también por el núcleo (`InaccessiblePaths`): aunque el código fallara, dentro no
-    se ven.
+  `root:hh-vigia 0660`, `Accept=yes`) lanza un `hehermes-leer-media@.service` por cada conexión, con su propia jaula:
+  - como el dueño de la casa de Hermes (root en el VPS) y, desde la 1.4.0, **sin ninguna capacidad**;
+  - todo de solo lectura, sin red y con su propio `/tmp`;
+  - las casas tapadas (`ProtectHome=tmpfs`) salvo las carpetas permitidas (`BindReadOnlyPaths`), y los secretos del
+    sistema tapados también (`InaccessiblePaths`): aunque el código fallara, dentro no se ven.
 
   Solo atiende a root o a `hh-vigia` (`SO_PEERCRED`).
 
@@ -196,7 +209,8 @@ que se aplica así es solo el código del lector, sin la jaula de systemd.
 
 **En el VPS:**
 
-- `sudo -u hh-vigia …vigia comprobar` dice si el lector contesta: le pide `/`, que tiene que dar «no es un fichero».
+- `sudo -u hh-vigia …vigia comprobar` dice si el lector contesta: le pide `/`, que tiene que dar su rechazo
+  (`prohibida`; uno de antes de la 1.4.0, `no_es_fichero`).
 - Lo que pasa, en `journalctl -u 'hehermes-leer-media@*' -u hehermes-vigia`: solo el estado, el tamaño y la
   extensión, nunca la ruta ni el contenido.
 - `sudo server/avisos/despliegue/instalar.sh --desinstalar-lector` lo quita, y la ruta pasa a contestar 503.

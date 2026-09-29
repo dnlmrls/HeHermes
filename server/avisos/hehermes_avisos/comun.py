@@ -31,13 +31,25 @@ class ErrorDeSecreto(Exception):
     """Un secreto que no se puede usar: no existe, no es un fichero o lo pueden leer otros usuarios."""
 
 
-def leer_secreto(ruta: str) -> bytes:
+#: El código con el que sale un servicio que no puede arrancar por su configuración o sus secretos (EX_CONFIG, de
+#: sysexits.h): su unidad lo lleva en `RestartPreventExitStatus`, así que falla una vez, con su motivo en el registro,
+#: en lugar de reiniciarse en bucle (el 2026-09-28, la entrada pública del relé se reinició 15 veces por esto).
+SALIDA_CONFIGURACION = 78
+
+
+def leer_secreto(ruta: str, credenciales: str | None = None) -> bytes:
     """Lee un secreto de un fichero que solo puede leer su dueño.
 
     Se niega, como ``ssh`` con una clave privada, si el fichero lo pueden leer el grupo u otros: un secreto así ya no es
     un secreto, y arrancar con él solo aplazaría el problema. Se comprueba sobre el descriptor ya abierto, no sobre la
     ruta, para que nadie pueda cambiar el fichero entre la comprobación y la lectura.
+
+    La excepción es la carpeta de credenciales de systemd (``LoadCredential``, ``$CREDENTIALS_DIRECTORY``, o la que se
+    pase en ``credenciales``): systemd la hace solo para este servicio (0500, en memoria) y deja dentro cada credencial
+    en 0440 u 0400. Ahí se acepta que la lea el grupo, pero nunca que la escriba ni que la lea nadie más.
     """
+    directorio = credenciales if credenciales is not None else os.environ.get("CREDENTIALS_DIRECTORY")
+    de_systemd = bool(directorio) and os.path.dirname(os.path.realpath(ruta)) == os.path.realpath(directorio)
     try:
         fd = os.open(ruta, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError as error:
@@ -47,7 +59,11 @@ def leer_secreto(ruta: str) -> bytes:
         # Una carpeta también se abre para leer: se mira el tipo antes de envolver el descriptor en un fichero.
         if not stat.S_ISREG(datos.st_mode):
             raise ErrorDeSecreto(f"{ruta} no es un fichero normal")
-        if datos.st_mode & 0o077:
+        if de_systemd and datos.st_mode & 0o037:
+            raise ErrorDeSecreto(
+                f"{ruta} tiene permisos {stat.S_IMODE(datos.st_mode):04o}: una credencial de systemd tiene que ser "
+                f"0440 o 0400")
+        if not de_systemd and datos.st_mode & 0o077:
             raise ErrorDeSecreto(
                 f"{ruta} tiene permisos {stat.S_IMODE(datos.st_mode):04o}: tiene que ser 0600 o 0400, solo para su dueño")
         with os.fdopen(fd, "rb") as fichero:
@@ -309,10 +325,13 @@ class _SinRedirecciones(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def abridor(huella: str | None = None, tls_minimo=None, solo_publicas: bool = False) -> urllib.request.OpenerDirector:
+def abridor(huella=None, tls_minimo=None, solo_publicas: bool = False) -> urllib.request.OpenerDirector:
     """El cliente HTTP de los dos servicios: sin proxies del entorno (hablan con su propia máquina, o con el relé) y sin
     seguir redirecciones. Con ``huella``, además, el HTTPS anclado a ella (``_ManejadorAnclado``); y con
-    ``solo_publicas``, solo hacia direcciones de internet (``conectar_solo_a_publicas``): la del relé de un permiso."""
+    ``solo_publicas``, solo hacia direcciones de internet (``conectar_solo_a_publicas``): la del relé de un permiso.
+
+    ``huella`` puede ser una o varias (la de ahora y la siguiente, para que el relé pueda rotar su certificado sin que
+    este vigía se quede fuera): vale un certificado con cualquiera de ellas, y ninguna otra."""
     manejadores = [urllib.request.ProxyHandler({}), _SinRedirecciones()]
     if huella is not None:
         manejadores.append(_ManejadorAnclado(huella, tls_minimo, solo_publicas))
@@ -430,10 +449,16 @@ def _contexto_anclado(tls_minimo=None):
     return contexto
 
 
+def huellas_de(huella) -> tuple:
+    """Una huella o varias, como tupla de las que valen (sin vacías ni repetidas)."""
+    lista = [huella] if isinstance(huella, str) else list(huella or ())
+    return tuple(dict.fromkeys(h for h in lista if isinstance(h, str) and h))
+
+
 class _ConexionAnclada(http.client.HTTPSConnection):
-    def __init__(self, *argumentos, huella: str, solo_publicas: bool = False, **opciones):
+    def __init__(self, *argumentos, huella, solo_publicas: bool = False, **opciones):
         super().__init__(*argumentos, **opciones)
-        self._huella = huella
+        self._huellas = huellas_de(huella)
         if solo_publicas:
             # `HTTPConnection.connect` abre el socket con esto: así la dirección se mira antes del primer paquete.
             self._create_connection = conectar_solo_a_publicas
@@ -446,7 +471,11 @@ class _ConexionAnclada(http.client.HTTPSConnection):
             vista = huella_spki(der) if der else ""
         except ValueError:
             vista = ""
-        if not hmac.compare_digest(vista.encode("ascii"), self._huella.encode("ascii")):
+        # Contra todas, sin salir en la que coincide: el tiempo no dice cuál ha valido.
+        coincide = False
+        for anclada in self._huellas:
+            coincide |= hmac.compare_digest(vista.encode("ascii"), anclada.encode("ascii"))
+        if not coincide:
             # La credencial va en la petición, que todavía no ha salido: se corta aquí y no sale.
             self.sock.close()
             self.sock = None
@@ -454,8 +483,10 @@ class _ConexionAnclada(http.client.HTTPSConnection):
 
 
 class _ManejadorAnclado(urllib.request.HTTPSHandler):
-    def __init__(self, huella: str, tls_minimo=None, solo_publicas: bool = False):
-        self._huella_anclada = huella
+    def __init__(self, huella, tls_minimo=None, solo_publicas: bool = False):
+        if not huellas_de(huella):
+            raise ValueError("HTTPS anclado sin ninguna huella")
+        self._huella_anclada = huellas_de(huella)
         self._solo_publicas = solo_publicas
         super().__init__(context=_contexto_anclado(tls_minimo))
 

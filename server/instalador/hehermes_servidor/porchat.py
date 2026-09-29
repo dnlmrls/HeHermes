@@ -15,7 +15,7 @@ import secrets
 import time
 
 from . import piezas as p
-from .plan import registro_de_dispositivos
+from .plan import etiquetar, registro_de_dispositivos
 
 #: Decisión 7: por chat, solo en la media hora siguiente a instalar.
 VENTANA = 30 * 60
@@ -25,7 +25,7 @@ _LLAVE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 def llave_valida(texto) -> bool:
     """La clave pública X25519 de la frase: 32 bytes en base64url sin relleno, sin nada que un descodificador
     permisivo se tragara (se vuelve a codificar y tiene que dar lo mismo)."""
-    if not isinstance(texto, str) or not _LLAVE.match(texto):
+    if not isinstance(texto, str) or not _LLAVE.fullmatch(texto):
         return False
     try:
         datos = base64.urlsafe_b64decode(texto + "=")
@@ -58,18 +58,22 @@ def bloqueos(sis, man, op, ahora=None, activos=None) -> list:
     if otros:
         salida.append("Por chat solo se conecta el primer iPhone, y aquí ya hay: %s. El siguiente, desde la app o "
                       "por SSH (%s)" % (", ".join(otros), alta))
+        etiquetar(salida, "por-chat")
     elif any(d.get("nombre") == op.iphone for d in activos) and por_chat.get("iphone") != op.iphone:
         salida.append("«%s» ya está dado de alta y no se dio de alta por chat: por chat solo se conecta el primer "
                       "iPhone. Por SSH: hehermes-dispositivo rotar %s" % (op.iphone, op.iphone))
+        etiquetar(salida, "por-chat")
     if por_chat.get("canjeado"):
         salida.append("El alta por chat de «%s» ya se canjeó: por chat solo se conecta una vez. Otro iPhone, desde la "
                       "app o por SSH" % por_chat.get("iphone", "?"))
+        etiquetar(salida, "por-chat")
     if man.en_disco:
         instalado = man.datos.get("instalado")
         if not isinstance(instalado, (int, float)) or ahora - instalado > VENTANA:
             salida.append("Esta instalación es de hace más de media hora: por chat solo se da de alta en la media "
                           "hora siguiente a instalar, para que nada que lea Hermes le pueda pedir un alta nueva. Por "
                           "SSH: %s" % alta)
+            etiquetar(salida, "por-chat")
     return salida
 
 

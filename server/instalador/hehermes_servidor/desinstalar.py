@@ -295,6 +295,19 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
             man.carpetas.remove(ambito.carpeta_estado_vigia)
         if not que.todo:
             del man.datos["vigia"]
+    #    La carpeta de estado de la pasarela (el borrado pendiente, su actividad): nada que no sea de HeHermes.
+    if que.tls and sis.existe(ambito.carpeta_estado_pasarela):
+        sis.borrar_arbol(ambito.carpeta_estado_pasarela)
+        if ambito.carpeta_estado_pasarela in man.carpetas:
+            man.carpetas.remove(ambito.carpeta_estado_pasarela)
+    #    La carpeta de exportaciones de Hermes que creó el instalador, solo si está vacía: lo de dentro es de Hermes.
+    if man.datos.get("exportaciones") and que.tls:
+        sis.borrar(man.datos["exportaciones"])
+        if sis.existe(man.datos["exportaciones"]):
+            quedan.append("%s: la carpeta de exportaciones de Hermes no está vacía; lo de dentro es suyo, no lo toco"
+                          % man.datos["exportaciones"])
+        if not que.todo:
+            del man.datos["exportaciones"]
     for usuario in list(man.datos.get("usuarios", [])):
         if not que.de(md.de_usuario(usuario)):
             continue

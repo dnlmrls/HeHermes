@@ -1,4 +1,4 @@
-"""Los avisos push de HeHermes Mensajes, del lado del servidor.
+"""Los avisos push de HeHermes, del lado del servidor.
 
 Dos servicios que no se conocen más que por HTTP:
 
@@ -21,4 +21,9 @@ máquina se lleva este paquete entero y arranca solo su mitad.
 # 1.3.0: avisos sin comandos. Permisos por dispositivo avalados con App Attest: la oficina de permisos en la entrada
 #        pública del relé (`rele.permisos`, `rele.appattest`, `rele.cbor`), el relé acepta `Authorization: Permiso`, y
 #        el vigía sin credencial manda los avisos con el permiso que le da la app en el alta.
-VERSION = "1.3.0"
+# 1.4.0: la auditoría del 2026-09-29. El lector de ficheros lee de una lista de permitidas (las caches de Hermes y su
+#        exports/), sin ninguna capacidad, y el vigía contesta con el mismo 404 todo lo que no deja leer (pide 50 filas
+#        y 500 solo si hace falta, y recuerda una marca 2 minutos). Las credenciales de systemd en 0440 valen dentro de
+#        $CREDENTIALS_DIRECTORY, y un secreto mal puesto sale con 78 y no en bucle. La entrada pública del relé tiene
+#        un certificado siguiente y `rotar`, y el vigía ancla varias huellas ([rele] huella_siguiente).
+VERSION = "1.4.0"

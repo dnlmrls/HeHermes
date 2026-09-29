@@ -7,6 +7,9 @@ Description=HeHermes: la entrada pública del relé de avisos (TLS)
 Documentation=file:///opt/hehermes-avisos/src/README.md
 Wants=network-online.target hehermes-rele.socket
 After=network-online.target hehermes-rele.socket
+# Si aun así se cae en bucle (lo que no es de configuración), a los 5 arranques en 2 minutos systemd deja de intentarlo.
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -25,6 +28,9 @@ StateDirectory=hehermes-rele-publico
 StateDirectoryMode=0700
 Restart=on-failure
 RestartSec=2
+# 78 (EX_CONFIG): un secreto que no se lee o la configuración rota. Reiniciar no lo arregla: falla una vez, con el motivo
+# en el registro (journalctl -u hehermes-rele-publico), y espera a un `systemctl restart`.
+RestartPreventExitStatus=78
 UMask=0077
 LimitCORE=0
 

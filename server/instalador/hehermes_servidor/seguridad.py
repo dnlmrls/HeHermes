@@ -131,11 +131,53 @@ def revisar_tls(sis, man, ambito) -> list:
     resultados += _secretos_tls(sis, ambito, env)
     if ambito.root:
         resultados += _unidad_tls(sis, ambito)
+        resultados += _restos_de_la_vpn(sis)
         resultados += _cortafuegos(sis, man)
         resultados.append(_canje(sis))
         resultados += _avisos(sis, man)
         resultados.append(_firma(sis))
     return resultados
+
+
+#: Los sitios de nginx de la VPN de antes (y de los primeros montajes a mano): el del túnel, el de sslip.io, el del ACME.
+SITIOS_VPN = "/etc/nginx/sites-available"
+
+
+def _restos_de_la_vpn(sis) -> list:
+    """Lo que quedó de la VPN IKEv2 retirada el 2026-09-26 en un servidor que ya solo tiene la pasarela (auditoría,
+    §13.8): strongSwan escuchando en UDP 500/4500 y nginx habilitado con los sitios del túnel en sites-available (un
+    enlace en sites-enabled volvería a abrir la API de Hermes con su clave). No se quita nada: se dice, con la orden
+    exacta. Un sitio así **habilitado** ya no es un resto: es un mal."""
+    salida = []
+    charon = sorted({puerto for _, puerto, dueno in _escuchan(sis, "udp")
+                     if puerto in ("500", "4500") and ("charon" in dueno or "starter" in dueno or "strongswan" in dueno)},
+                    key=int)
+    if charon:
+        unidades = [u for u in ("strongswan", "strongswan-starter", "ipsec") if
+                    sis.ejecutar(["systemctl", "is-active", u]).bien or sis.ejecutar(["systemctl", "is-enabled", u]).bien]
+        salida.append((AVISO, "restos de la VPN: strongSwan (charon) sigue escuchando en UDP %s, y la app ya no lo usa. "
+                              "Si no lo usas para nada más, apágalo: sudo systemctl disable --now %s; y quítalo: sudo "
+                              "apt purge charon-systemd strongswan-swanctl (o strongswan, según tu sistema)"
+                       % (" y ".join(charon), " ".join(u + ".service" for u in unidades) or "strongswan.service")))
+    sitios = sorted(n for n in sis.listar(SITIOS_VPN) if n.startswith("hehermes"))
+    habilitados = []
+    for carpeta in ("/etc/nginx/sites-enabled", "/etc/nginx/conf.d"):
+        for nombre in sis.listar(carpeta):
+            real = sis.enlace(carpeta + "/" + nombre) or carpeta + "/" + nombre
+            if real.startswith(SITIOS_VPN + "/hehermes") or nombre.startswith("hehermes"):
+                habilitados.append(carpeta + "/" + nombre)
+    if habilitados:
+        salida.append((MAL, "restos de la VPN: nginx tiene habilitado %s, de la VPN de antes: con él, la API de Hermes "
+                            "puede volver a quedar a la vista con su clave. Quítalo: sudo rm %s && sudo systemctl "
+                            "reload nginx" % (", ".join(habilitados), " ".join(habilitados))))
+    if sitios:
+        nginx = sis.ejecutar(["systemctl", "is-enabled", "nginx"]).bien
+        salida.append((AVISO, "restos de la VPN: en %s quedan %s; un enlace en sites-enabled los volvería a abrir. "
+                              "Bórralos: sudo rm %s%s"
+                       % (SITIOS_VPN, ", ".join(sitios), " ".join(SITIOS_VPN + "/" + n for n in sitios),
+                          ("; y si nginx no sirve nada más en este servidor, apágalo: sudo systemctl disable --now "
+                           "nginx") if nginx else "")))
+    return salida
 
 
 def _pasarela(sis, man, ambito):

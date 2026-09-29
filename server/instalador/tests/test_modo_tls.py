@@ -147,6 +147,82 @@ class ConRoot(Base):
         self.assertIn("hehermes-dispositivo rotar mi-iphone", self.salida)
         self.assertFalse([o for o in self.ordenes_de(desde) if cambia(o)])
 
+    def test_por_chat_cada_parada_acaba_en_su_codigo(self):
+        """Lo que no deja instalar, por chat, acaba en `hehermes-error:<código>`, sola y la última: la app lo explica
+        donde se pega el enlace. Y no se ha tocado nada."""
+        casos = {"nat": lambda f: setattr(f, "direccion_salida", "192.168.1.20"),
+                 "varios-hermes": lambda f: f.con_hermes(usuario="ana", como="proceso", puerto=9000),
+                 "api-apagada": lambda f: f.con_hermes(habilitada=False)}
+        for codigo, preparar in casos.items():
+            with self.subTest(codigo=codigo):
+                sis, falso = sf.servidor()
+                self.addCleanup(sis.limpiar)
+                self.sis, self.falso = sis, falso
+                preparar(falso)
+                antes = sis.foto()
+                self.assertEqual(self.orden("instalar", "--por-chat", "--iphone", "mi-iphone", "--llave", LLAVE,
+                                            terminal=False), 1, self.salida)
+                self.assertEqual(self.texto[-1], "\nhehermes-error:" + codigo)
+                self.assertEqual(sum("hehermes-error:" in linea for linea in self.texto), 1)
+                self.assertEqual(sis.foto(), antes)
+        # Por un terminal no sale: lo lee una persona.
+        sis, falso = sf.servidor()
+        self.addCleanup(sis.limpiar)
+        self.sis, self.falso = sis, falso
+        falso.direccion_salida = "192.168.1.20"
+        self.assertEqual(self.orden("instalar", "--plan"), 1)
+        self.assertNotIn("hehermes-error", self.salida)
+
+    def test_el_certificado_siguiente_para_rotar_sin_emparejar(self):
+        self.assertEqual(self.orden("instalar", "--iphone", "mi-iphone"), 0, self.salida)
+        self.assertIn("certificado siguiente de la pasarela: huella %s" % sf.HUELLA_SIGUIENTE, self.salida)
+        self.assertEqual(self.sis.modo("/etc/hehermes-pasarela/siguiente/clave.pem"), 0o600)
+        self.assertEqual(self.sis.modo("/etc/hehermes-pasarela/siguiente/cert.pem"), 0o644)
+        self.assertEqual(self.sis.modo("/etc/hehermes-pasarela/siguiente"), 0o750)
+        self.assertEqual(self.falso.dueños["/etc/hehermes-pasarela/siguiente"], "root:hh-pasarela")
+        self.assertIn("certificado_siguiente = /etc/hehermes-pasarela/siguiente/cert.pem\n",
+                      self.sis.leer_texto("/etc/hehermes-pasarela/pasarela.ini"))
+        man = self.manifiesto()
+        self.assertIn("/etc/hehermes-pasarela/siguiente/clave.pem", man["ficheros"])
+        self.assertIn("/etc/hehermes-pasarela/siguiente", man["carpetas"])
+        self.assertEqual(self.orden("comprobar"), 0, self.salida)
+        self.assertIn("la huella siguiente, para rotar sin volver a emparejar: %s" % sf.HUELLA_SIGUIENTE, self.salida)
+        # Rotar: el siguiente pasa a ser el de ahora, el de antes queda en anterior/, y hay otro siguiente.
+        cert_antes = self.sis.leer("/etc/hehermes-pasarela/cert.pem")
+        clave_siguiente = self.sis.leer("/etc/hehermes-pasarela/siguiente/clave.pem")
+        reinicios = len(self.falso.reinicios)
+        self.assertEqual(self.orden("certificado", "rotar", "--si"), 0, self.salida)
+        self.assertEqual(self.sis.leer("/etc/hehermes-pasarela/anterior/cert.pem"), cert_antes)
+        self.assertEqual(self.sis.leer("/etc/hehermes-pasarela/clave.pem"), clave_siguiente)
+        self.assertEqual(self.sis.modo("/etc/hehermes-pasarela/clave.pem"), 0o600)
+        self.assertEqual(self.sis.modo("/etc/hehermes-pasarela/anterior/clave.pem"), 0o600)
+        self.assertEqual(self.sis.modo("/etc/hehermes-pasarela/anterior"), 0o700)
+        self.assertTrue(self.sis.existe("/etc/hehermes-pasarela/siguiente/cert.pem"), "y otro siguiente")
+        self.assertIn("hehermes-pasarela", self.falso.reinicios[reinicios:])
+        self.assertIn("ahora     %s" % sf.HUELLA_SIGUIENTE, self.salida)
+        self.assertIn("antes     %s" % sf.HUELLA_PASARELA, self.salida)
+        self.assertIn("hehermes-dispositivo rotar <nombre>", self.salida)
+        self.assertNotIn("PRIVATE KEY", self.salida)
+        # Y desinstalar se lo lleva todo, anterior/ incluida.
+        self.assertEqual(self.orden("desinstalar", "--si"), 0, self.salida)
+        for ruta in ("/etc/hehermes-pasarela/anterior", "/etc/hehermes-pasarela/siguiente", "/etc/hehermes-pasarela"):
+            self.assertFalse(self.sis.existe(ruta), ruta)
+
+    def test_rotar_sin_siguiente_no_toca_nada(self):
+        self.assertEqual(self.orden("instalar"), 0, self.salida)
+        self.sis.borrar("/etc/hehermes-pasarela/siguiente/cert.pem")
+        antes = self.sis.foto()
+        self.assertEqual(self.orden("certificado", "rotar", "--si"), 1, self.salida)
+        self.assertIn("no hay certificado siguiente", self.salida)
+        self.assertEqual(self.sis.foto(), antes)
+
+    def test_rotar_sin_terminal_ni_si_pregunta_y_no_toca_nada(self):
+        self.assertEqual(self.orden("instalar"), 0, self.salida)
+        antes = self.sis.foto()
+        self.assertEqual(self.orden("certificado", "rotar", terminal=False), 1, self.salida)
+        self.assertIn("No he cambiado nada", self.salida)
+        self.assertEqual(self.sis.foto(), antes)
+
     def test_el_qr_lleva_la_direccion_el_puerto_la_huella_y_un_token_que_vale(self):
         from hehermes_servidor import qr
         vistos = []
@@ -218,7 +294,7 @@ class ConRoot(Base):
 
     def test_comprobar_ve_lo_que_esta_mal(self):
         self.assertEqual(self.orden("instalar", "--si", terminal=False), 0, self.salida)
-        self.falso.sonda = lambda puerto, maxima=None: {"tls": "TLSv1.3", "huella": "otra",
+        self.falso.sonda = lambda puerto, maxima=None, **_: {"tls": "TLSv1.3", "huella": "otra",
                                                          "respuesta": b"HTTP/1.1 404 Not Found\r\nServer: x\r\n\r\n"}
         self.sis._sonda = self.falso.sonda
         self.sis.poner("/etc/hehermes-pasarela/tokens.json", '{"v": 1, "tokens": []}', modo=0o644)
@@ -229,6 +305,78 @@ class ConRoot(Base):
         self.assertIn("MAL   secretos que se pueden leer sin ser su dueño: /etc/hehermes-pasarela/tokens.json",
                       self.salida)
 
+    def test_comprobar_avisa_de_lo_que_quedo_de_la_vpn(self):
+        """strongSwan escuchando en UDP 500/4500 y los sitios de nginx del túnel (auditoría §13.8): se dicen, con la
+        orden exacta, y no se quita nada solo. Un sitio del túnel habilitado ya es un mal."""
+        self.assertEqual(self.orden("instalar", "--si", terminal=False), 0, self.salida)
+        self.falso.udp += [("0.0.0.0:500", "charon-systemd"), ("0.0.0.0:4500", "charon-systemd")]
+        self.falso.activos.add("strongswan")
+        self.falso.habilitados.add("nginx")
+        for nombre in ("hehermes", "hehermes-tunel.antes-de-gzip", "hermes-dash"):
+            self.sis.poner("/etc/nginx/sites-available/" + nombre, "server { listen 80; }\n")
+        antes = self.sis.foto()
+        self.assertEqual(self.orden("comprobar"), 0, self.salida)
+        self.assertIn("aviso restos de la VPN: strongSwan (charon) sigue escuchando en UDP 500 y 4500", self.salida)
+        self.assertIn("sudo systemctl disable --now strongswan.service", self.salida)
+        self.assertIn("sudo rm /etc/nginx/sites-available/hehermes /etc/nginx/sites-available/hehermes-tunel.antes-de-gzip",
+                      self.salida)
+        self.assertIn("sudo systemctl disable --now nginx", self.salida)
+        self.assertNotIn("hermes-dash", self.salida, "lo que no es de HeHermes no se nombra")
+        self.assertEqual(self.sis.foto(), antes, "no quita nada")
+        self.assertFalse([o for o in self.sis.ordenes if o[:2] in (["systemctl", "disable"], ["rm"])])
+        self.sis.enlazar("/etc/nginx/sites-enabled/hehermes", "/etc/nginx/sites-available/hehermes")
+        self.assertEqual(self.orden("comprobar"), 1)
+        self.assertIn("MAL   restos de la VPN: nginx tiene habilitado /etc/nginx/sites-enabled/hehermes", self.salida)
+        # Sin restos, nada.
+        self.falso.udp.clear()
+        for ruta in ("/etc/nginx/sites-enabled/hehermes", "/etc/nginx/sites-available/hehermes",
+                     "/etc/nginx/sites-available/hehermes-tunel.antes-de-gzip"):
+            self.sis.borrar(ruta)
+        self.assertEqual(self.orden("comprobar"), 0, self.salida)
+        self.assertNotIn("restos de la VPN", self.salida)
+
+    def test_el_alcance_por_la_direccion_del_qr(self):
+        """Además de 127.0.0.1, la dirección del QR, como la vería la app (auditoría §7)."""
+        self.assertEqual(self.orden("instalar", "--si", terminal=False), 0, self.salida)
+        self.assertIn((61234, None, sf.IP_PUBLICA), self.falso.sondas, "se asoma también por la dirección del QR")
+        self.assertIn("bien  alcance: 198.51.100.23:61234 contesta, con el certificado del QR", "\n".join(
+            self.texto) if self.orden("comprobar") == 0 else self.salida)
+        self.assertIn("cortafuegos de tu proveedor", self.salida)
+        # La dirección es de este servidor y no contesta por ella: mal (y por chat no se daría el enlace).
+        sonda = self.falso.sonda
+        self.sis._sonda = lambda puerto, maxima=None, anfitrion=None, plazo=None: (
+            None if anfitrion else sonda(puerto, maxima))
+        self.assertEqual(self.orden("comprobar"), 1)
+        self.assertIn("MAL   alcance: la pasarela no contesta en 198.51.100.23:61234, que es una dirección de este",
+                      self.salida)
+        self.sis._sonda = sonda
+
+    def test_el_alcance_detras_de_un_nat(self):
+        """La dirección del QR no es de este servidor: si el NAT reenvía (y deja probar desde dentro), bien; si no, no
+        se sabe, y se dice qué abrir; si lleva a otra máquina, mal."""
+        self.falso.direccion_salida = "10.0.0.5"
+        self.falso.enlaces_ip = {"eth0": {"ifname": "eth0", "addr": ["10.0.0.5/24"]}}
+        self.assertEqual(self.orden("instalar", "--si", "--direccion", "203.0.113.50", terminal=False), 0,
+                         self.salida)
+        self.assertIn("alcance (aviso): no llego a 203.0.113.50:61234 desde dentro", self.salida)
+        self.assertIn("Tu router o tu proveedor tienen que llevar el TCP 61234 a este servidor", self.salida)
+        self.falso.alcance = "reenvía"
+        self.assertEqual(self.orden("comprobar"), 0, self.salida)
+        self.assertIn("alcance: 203.0.113.50:61234 contesta a través de tu NAT", self.salida)
+        self.falso.alcance = "otro"
+        self.assertEqual(self.orden("comprobar"), 1)
+        self.assertIn("MAL   alcance: en 203.0.113.50:61234 contesta otro certificado", self.salida)
+
+    def test_por_chat_si_la_direccion_lleva_a_otra_maquina_no_hay_enlace(self):
+        self.falso.direccion_salida = "10.0.0.5"
+        self.falso.enlaces_ip = {"eth0": {"ifname": "eth0", "addr": ["10.0.0.5/24"]}}
+        self.falso.alcance = "otro"
+        codigo = self.orden("instalar", "--por-chat", "--activar-api", "--iphone", "mi-iphone", "--llave", LLAVE,
+                            "--direccion", "203.0.113.50", terminal=False)
+        self.assertEqual(codigo, 1, self.salida)
+        self.assertIn("contesta otro certificado", self.salida)
+        self.assertNotIn("hehermes-canje:", self.salida)
+
     def test_la_clave_nueva_de_hermes_llega_a_la_pasarela(self):
         self.assertEqual(self.orden("instalar", "--si", terminal=False), 0, self.salida)
         env = self.sis.leer_texto("/root/.hermes/.env").replace(sf.CLAVE, "clave-nueva-de-hermes")
@@ -237,7 +385,11 @@ class ConRoot(Base):
         self.assertIn("su copia de la clave de Hermes es vieja", self.salida)
         self.assertEqual(self.orden("pasarela-clave"), 0, self.salida)
         self.assertEqual(self.sis.leer_texto("/etc/hehermes-pasarela/clave-hermes"), "clave-nueva-de-hermes\n")
-        self.assertIn("hehermes-pasarela", self.falso.reinicios)
+        self.assertEqual(self.sis.modo("/etc/hehermes-pasarela/clave-hermes"), 0o600)
+        self.assertEqual(self.falso.dueños.get("/etc/hehermes-pasarela/clave-hermes"), "hh-pasarela:hh-pasarela")
+        # Sin reiniciarla: la lee sola (y los SSE abiertos siguen).
+        self.assertNotIn("hehermes-pasarela", self.falso.reinicios)
+        self.assertIn("sin reiniciarla", self.salida)
         self.assertNotIn("clave-nueva-de-hermes", self.salida)
 
     def test_desinstalar_lo_deja_como_estaba(self):
@@ -378,6 +530,38 @@ class SinRoot(Base):
         self.falso.linger = False
         self.assertEqual(self.orden("instalar", "--plan"), 0, self.salida)
         self.assertIn("sudo loginctl enable-linger hermes", self.salida)
+
+    def test_por_chat_sin_linger_no_da_el_enlace(self):
+        """El iPhone quedaría emparejado con una pasarela que se para al cerrarse la sesión: por chat no se da el
+        enlace, se para antes de tocar nada y la última línea es la que lee la app."""
+        self.falso.linger = False
+        antes = self.sis.foto()
+        codigo = self.orden("instalar", "--por-chat", "--activar-api", "--iphone", "mi-iphone", "--llave", LLAVE,
+                            terminal=False)
+        self.assertEqual(codigo, 1, self.salida)
+        self.assertEqual(self.texto[-1], "\nhehermes-error:linger")
+        self.assertIn("sudo loginctl enable-linger hermes", self.salida)
+        self.assertIn("No he tocado nada", self.salida)
+        self.assertNotIn("hehermes-canje:", self.salida)
+        self.assertEqual(self.falso.lingers_pedidos, ["hermes"], "antes de pararse, prueba a encenderlo")
+        self.assertEqual(self.sis.foto(), antes)
+
+    def test_por_chat_sin_linger_lo_enciende_si_le_dejan(self):
+        self.falso.linger = False
+        self.falso.puede_linger = True
+        codigo = self.orden("instalar", "--por-chat", "--activar-api", "--iphone", "mi-iphone", "--llave", LLAVE,
+                            terminal=False)
+        self.assertEqual(codigo, 0, self.salida)
+        self.assertIn("He encendido linger para hermes", self.salida)
+        self.assertTrue(self.texto[-1].startswith("hehermes-canje:1?"), self.texto[-1])
+
+    def test_por_chat_con_plan_no_enciende_nada(self):
+        self.falso.linger = False
+        self.falso.puede_linger = True
+        self.assertEqual(self.orden("instalar", "--plan", "--por-chat", "--iphone", "mi-iphone", "--llave", LLAVE,
+                                    terminal=False), 0, self.salida)
+        self.assertEqual(self.falso.lingers_pedidos, [])
+        self.assertIn("probaré a encenderlo", self.salida)
 
     def test_sin_gestor_de_usuario_se_para_y_lo_dice(self):
         self.falso.linger = False

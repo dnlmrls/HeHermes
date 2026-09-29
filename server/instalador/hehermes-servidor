@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -IB
-"""hehermes-servidor: instala, comprueba, actualiza o desinstala lo de HeHermes Mensajes en este servidor.
+"""hehermes-servidor: instala, comprueba, actualiza o desinstala lo de HeHermes en este servidor.
 
 Uso (como root, o sin root en la casa del usuario de Hermes):
   hehermes-servidor instalar [--plan] [--iphone <nombre>] [--direccion <IP o nombre>] [--hermes-home <carpeta>]

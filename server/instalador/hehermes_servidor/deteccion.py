@@ -46,6 +46,28 @@ _CGNAT = ipaddress.ip_network("100.64.0.0/10")
 _DOCUMENTACION = tuple(ipaddress.ip_network(r) for r in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"))
 
 
+class Bloqueo(str):
+    """Lo que impide instalar, con el código que la app sabe leer (`hehermes-error:<código>`, la última línea por chat).
+    Es un texto: se pinta y se compara como siempre."""
+
+    codigo = "bloqueo"
+
+
+def bloqueo(codigo: str, texto: str) -> Bloqueo:
+    hecho = Bloqueo(texto)
+    hecho.codigo = codigo
+    return hecho
+
+
+def etiquetar(bloqueos: list, codigo: str) -> None:
+    """Le pone su código al último bloqueo de la lista (el que se acaba de añadir)."""
+    bloqueos[-1] = bloqueo(codigo, bloqueos[-1])
+
+
+#: La línea que lee la app (`ErrorDelInstalador`): sola, la última, y solo por chat.
+PREFIJO_ERROR = "hehermes-error:"
+
+
 class Hermes:
     """Un Hermes encontrado. La clave va aparte y no sale en `repr`."""
 
@@ -147,7 +169,7 @@ def _distro(sis, det) -> bool:
                   "nombre": datos.get("PRETTY_NAME", "?")}
     familia, base, derivada = _base(datos)
     if familia is None:
-        det.bloqueos.append(derivada)
+        det.bloqueos.append(bloqueo("sistema", derivada))
         return False
     det.familia = familia
     if base is not None:
@@ -168,14 +190,15 @@ def _distro(sis, det) -> bool:
         maquina = r.salida.strip() or "?"
         det.distro["arquitectura"] = MAQUINAS.get(maquina, maquina)
     if det.distro["arquitectura"] not in ARQUITECTURAS:
-        det.bloqueos.append("la arquitectura %s no está entre las que sé instalar (amd64 y arm64)"
-                            % det.distro["arquitectura"])
+        det.bloqueos.append(bloqueo("sistema", "la arquitectura %s no está entre las que sé instalar (amd64 y arm64)"
+                            % det.distro["arquitectura"]))
     # 3.9 y no 3.10: es el python3 de RHEL 9 y sus reconstrucciones, y el instalador no usa nada más nuevo.
     if tuple(sis.version_python[:2]) < (3, 9):
         det.bloqueos.append("hace falta Python 3.9 o más nuevo, y este es %s" % ".".join(map(str, sis.version_python)))
+        etiquetar(det.bloqueos, "sistema")
     # El núcleo, cualquiera con systemd: la pasarela es un proceso de Python que escucha en un TCP.
     if not sis.es_carpeta("/run/systemd/system"):
-        det.bloqueos.append("este sistema no arranca con systemd")
+        det.bloqueos.append(bloqueo("sistema", "este sistema no arranca con systemd"))
     det.distro["nucleo"] = sis.nucleo
     det.distro["python"] = ".".join(map(str, sis.version_python[:2]))
     return True
@@ -243,7 +266,7 @@ def _carpetas_de_hermes(sis) -> list:
 def _clave_valida(clave) -> bool:
     """Una que se puede poner tal cual en la cabecera `Authorization` que añade la pasarela, y en su copia de la clave:
     ASCII imprimible, sin espacios, comillas ni barras invertidas."""
-    return bool(re.match(r"^[\x21-\x7e]+$", clave)) and '"' not in clave and "\\" not in clave
+    return bool(re.fullmatch(r"[\x21-\x7e]+", clave)) and '"' not in clave and "\\" not in clave
 
 
 def _hermes(sis, det, hermes_home, activar_api=False, corregir_exposicion=False):
@@ -257,13 +280,15 @@ def _hermes(sis, det, hermes_home, activar_api=False, corregir_exposicion=False)
         if carpetas:
             det.bloqueos.append("Hermes parece instalado (%s), pero no está en marcha: no encuentro ni la unidad "
                                 "hermes-gateway ni su proceso. Arráncalo y vuelve a lanzarme" % ", ".join(carpetas))
+            etiquetar(det.bloqueos, "hermes-parado")
         else:
             det.bloqueos.append("No encuentro Hermes (ni la unidad hermes-gateway ni su proceso). Este instalador no "
                                 "instala Hermes: instálalo y arráncalo antes")
+            etiquetar(det.bloqueos, "sin-hermes")
         return
     elif len(candidatos) > 1:
-        det.bloqueos.append("Hay varios Hermes; dime cuál con --hermes-home:\n" + "\n".join(
-            "      %s (de %s, por %s)" % (c.home, c.usuario, c.origen) for c in candidatos))
+        det.bloqueos.append(bloqueo("varios-hermes", "Hay varios Hermes; dime cuál con --hermes-home:\n" + "\n".join(
+            "      %s (de %s, por %s)" % (c.home, c.usuario, c.origen) for c in candidatos)))
         return
     else:
         elegido = candidatos[0]
@@ -271,10 +296,11 @@ def _hermes(sis, det, hermes_home, activar_api=False, corregir_exposicion=False)
     if elegido.en_marcha is False:
         det.bloqueos.append("Hermes está instalado (la unidad hermes-gateway), pero parado. Arráncalo (systemctl start "
                             "hermes-gateway) y vuelve a lanzarme")
+        etiquetar(det.bloqueos, "hermes-parado")
         return
     texto = sis.leer_texto(elegido.env)
     if texto is None:
-        det.bloqueos.append("no puedo leer %s, el .env de Hermes" % elegido.env)
+        det.bloqueos.append(bloqueo("clave-hermes", "no puedo leer %s, el .env de Hermes" % elegido.env))
         return
     env = leer_env(texto)
     elegido.habilitada = env.get("API_SERVER_ENABLED", "").lower() in ("1", "true", "yes", "on")
@@ -286,7 +312,7 @@ def _hermes(sis, det, hermes_home, activar_api=False, corregir_exposicion=False)
         if not 0 < elegido.puerto < 65536:
             raise ValueError
     except ValueError:
-        det.bloqueos.append("API_SERVER_PORT de %s no es un puerto" % elegido.env)
+        det.bloqueos.append(bloqueo("api-hermes", "API_SERVER_PORT de %s no es un puerto" % elegido.env))
         return
     if activar_api and not (elegido.habilitada and elegido.clave):
         _activar_api(det, elegido, env)
@@ -294,16 +320,20 @@ def _hermes(sis, det, hermes_home, activar_api=False, corregir_exposicion=False)
     if not elegido.habilitada:
         det.bloqueos.append("La API de Hermes está apagada (API_SERVER_ENABLED en %s). Enciéndela y reinicia Hermes, "
                             "o vuelve a lanzarme con --activar-api" % elegido.env)
+        etiquetar(det.bloqueos, "api-apagada")
         return
     if not elegido.clave:
         det.bloqueos.append("Hermes no tiene API_SERVER_KEY en %s: sin clave, la API no se puede proteger" % elegido.env)
+        etiquetar(det.bloqueos, "clave-hermes")
         return
     if not _clave_valida(elegido.clave):
         det.bloqueos.append("la API_SERVER_KEY de %s tiene caracteres que no pueden ir en una cabecera HTTP"
                             % elegido.env)
+        etiquetar(det.bloqueos, "clave-hermes")
         return
     if elegido.host not in TODAS and elegido.host not in ("127.0.0.1", "localhost"):
         det.bloqueos.append("Hermes escucha en %s y no en 127.0.0.1: la pasarela no lo alcanzaría" % elegido.host)
+        etiquetar(det.bloqueos, "api-hermes")
         return
     _exposicion(sis, det, elegido, env, corregir_exposicion)
     base = "http://127.0.0.1:%d" % elegido.puerto
@@ -311,18 +341,21 @@ def _hermes(sis, det, hermes_home, activar_api=False, corregir_exposicion=False)
     if estado is None:
         det.bloqueos.append("Hermes está en marcha, pero su API no contesta en 127.0.0.1:%d: ¿la tiene encendida "
                             "(API_SERVER_ENABLED) y en ese puerto (API_SERVER_PORT)?" % elegido.puerto)
+        etiquetar(det.bloqueos, "api-hermes")
         return
     if estado != 200:
         det.bloqueos.append("En 127.0.0.1:%d contesta algo que no es la API de Hermes (/health da %s): mira qué usa "
                             "ese puerto, o el API_SERVER_PORT de %s" % (elegido.puerto, estado, elegido.env))
+        etiquetar(det.bloqueos, "api-hermes")
         return
     estado, _ = sis.http_get(base + "/api/sessions?limit=1", {"Authorization": "Bearer " + elegido.clave})
     elegido.clave_vale = estado == 200
     if estado in (401, 403):
         det.bloqueos.append("Hermes no la acepta: la API_SERVER_KEY de %s no es la que usa (¿falta reiniciarlo?)"
                             % elegido.env)
+        etiquetar(det.bloqueos, "clave-hermes")
     elif estado != 200:
-        det.bloqueos.append("Hermes contesta %s a /api/sessions con su clave" % estado)
+        det.bloqueos.append(bloqueo("api-hermes", "Hermes contesta %s a /api/sessions con su clave" % estado))
 
 
 TODAS = ("0.0.0.0", "::", "[::]", "*")
@@ -359,12 +392,14 @@ def _exposicion(sis, det, elegido, env, corregir):
         det.bloqueos.append("Con --corregir-exposicion tendría que reiniciar Hermes, y no corre como la unidad "
                             "hermes-gateway (lo encuentro por %s): no sé reiniciarlo. Añade tú API_SERVER_HOST=127.0.0.1 "
                             "a %s y reinícialo" % (elegido.origen, elegido.env))
+        etiquetar(det.bloqueos, "api-hermes")
     elif corregir and puede:
         elegido.exposicion_pendiente = "API_SERVER_HOST=127.0.0.1"
         det.avisos.append("La API de Hermes escucha en %s: la cierro a 127.0.0.1 (--corregir-exposicion)" % donde)
         return
     elif corregir:
         det.bloqueos.append("Con --corregir-exposicion no puedo cerrarla desde el .env. %s" % como)
+        etiquetar(det.bloqueos, "api-hermes")
     det.avisos.append(ROJO + "%s. %s" % (riesgo, como) + NORMAL)
 
 
@@ -375,14 +410,17 @@ def _activar_api(det, elegido, env):
         det.bloqueos.append("La API de Hermes está apagada y Hermes no corre como la unidad hermes-gateway (lo encuentro "
                             "por %s): no sé reiniciarlo. Enciende tú la API en %s y reinícialo" % (elegido.origen,
                                                                                                elegido.env))
+        etiquetar(det.bloqueos, "api-apagada")
         return
     if elegido.host not in ("127.0.0.1", "localhost"):
         det.bloqueos.append("API_SERVER_HOST de %s es %s: no enciendo una API que no escuche solo en 127.0.0.1"
                             % (elegido.env, elegido.host))
+        etiquetar(det.bloqueos, "api-hermes")
         return
     if elegido.clave and not _clave_valida(elegido.clave):
         det.bloqueos.append("la API_SERVER_KEY de %s tiene caracteres que no pueden ir en una cabecera HTTP"
                             % elegido.env)
+        etiquetar(det.bloqueos, "clave-hermes")
         return
     if not elegido.habilitada:
         elegido.api_pendiente.append("API_SERVER_ENABLED=true")
@@ -406,8 +444,8 @@ def _es_privada(ip):
 
 def _direccion(sis, det, direccion):
     if direccion is not None:
-        if not DIRECCION_VALIDA.match(direccion):
-            det.bloqueos.append("--direccion tiene que ser una IP o un nombre de host")
+        if not DIRECCION_VALIDA.fullmatch(direccion):
+            det.bloqueos.append(bloqueo("direccion", "--direccion tiene que ser una IP o un nombre de host"))
             return
         det.direccion = direccion
         return
@@ -416,12 +454,13 @@ def _direccion(sis, det, direccion):
         salida = json.loads(r.salida)[0]["prefsrc"]
         ip = ipaddress.ip_address(salida)
     except (ValueError, KeyError, IndexError, TypeError):
-        det.bloqueos.append("no sé la dirección pública de este servidor: dímela con --direccion")
+        det.bloqueos.append(bloqueo("direccion", "no sé la dirección pública de este servidor: dímela con --direccion"))
         return
     if _es_privada(ip):
         det.direccion_privada = True
         det.bloqueos.append("la dirección de salida de este servidor es privada (%s): parece que está detrás de un NAT. "
                             "Dime la pública con --direccion <IP o nombre>" % ip)
+        etiquetar(det.bloqueos, "nat")
         return
     det.direccion = str(ip)
 
@@ -555,6 +594,7 @@ def _cortafuegos(sis, det, a_mano, puerto_pasarela):
         det.bloqueos.append("Tu cortafuegos cierra el paso, pero no sé abrirlo sin riesgo: %s. No he tocado nada. Abre "
                             "tú, en él, %s. Luego vuelve a lanzarme con --cortafuegos-a-mano" % ("; ".join(dudas),
                                                                                                 que_abrir))
+        etiquetar(det.bloqueos, "cortafuegos")
     else:
         det.lugares = lugares
     if not gestor and not lugares and not dudas and det.ufw is None and det.firewalld is None:

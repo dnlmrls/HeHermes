@@ -77,7 +77,7 @@ def orden_relanzada(programa: str, argv: list, python: bool = True) -> list:
 
 
 def linea_sudoers(usuario: str) -> str:
-    return "%s ALL=(root) NOPASSWD: %s" % (usuario if _USUARIO.match(usuario or "") else "<tu-usuario>", INSTALADO)
+    return "%s ALL=(root) NOPASSWD: %s" % (usuario if _USUARIO.fullmatch(usuario or "") else "<tu-usuario>", INSTALADO)
 
 
 def comando_del_administrador(aqui: str, argv: list) -> str:

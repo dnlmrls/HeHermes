@@ -330,7 +330,7 @@ def huella_de_la_pasarela(p):
 def pintar_qr_tls(p, nombre, token, huella):
     texto = p["modulo_tokens"].texto_qr(p["direccion"], p["puerto"], huella, token)
     sys.stdout.write(p["modulo_qr"].terminal(texto))
-    print("Escanéalo desde la app HeHermes Mensajes. Lleva el token de «%s»: ni lo compartas ni le hagas captura. "
+    print("Escanéalo desde la app HeHermes. Lleva el token de «%s»: ni lo compartas ni le hagas captura. "
           "No se puede volver a pintar: si hace falta otro, hehermes-dispositivo rotar %s (y el de antes deja de "
           "valer)." % (nombre, nombre))
 
@@ -414,7 +414,7 @@ def cmd_alta(args):
     if not args:
         fallar("falta el nombre")
     nombre = args[0]
-    if not NOMBRE_VALIDO.match(nombre):
+    if not NOMBRE_VALIDO.fullmatch(nombre):
         fallar("nombre no válido (minúsculas, números y guiones, hasta 31)")
     resto = args[1:]
     if "--ikev2" in resto or "--vpn" in resto:

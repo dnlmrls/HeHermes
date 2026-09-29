@@ -1,6 +1,6 @@
 # hehermes-servidor: el instalador de un solo comando
 
-En un Linux que ya tiene Hermes (Debian, Ubuntu y sus derivadas, o la familia Red Hat: [más abajo](#los-sistemas)), deja lo que necesita la app HeHermes Mensajes para hablar con él y acaba pintando el QR
+En un Linux que ya tiene Hermes (Debian, Ubuntu y sus derivadas, o la familia Red Hat: [más abajo](#los-sistemas)), deja lo que necesita la app HeHermes para hablar con él y acaba pintando el QR
 del iPhone en el terminal: **la conexión directa**, la pasarela (`hehermes-pasarela`). Un puerto TCP alto con TLS 1.3,
 un certificado propio cuya huella ancla la app y un token por iPhone. **No necesita root**: sin él se instala en la casa
 del usuario de Hermes. Es `docs/superpowers/specs/2026-09-26-pasarela-tls-design.md`, con su plan en
@@ -10,6 +10,14 @@ del usuario de Hermes. Es `docs/superpowers/specs/2026-09-26-pasarela-tls-design
 el vigía sin credencial, y la app le da en cada alta el permiso de su iPhone para el relé de Daniel (App Attest); y el
 lector de los ficheros que Hermes marca con `MEDIA:`. Con un código de avisos (la 0.7.0), el vigía va con su credencial,
 como antes ([abajo](#los-avisos-push-y-el-lector-de-ficheros-siempre-desde-la-080)).
+
+**La 0.9.0 es la de la auditoría del 2026-09-29** ([abajo](#decisiones-de-la-090)): el lector de ficheros solo lee de
+una lista de permitidas (las caches de Hermes y `<HERMES_HOME>/exports`, sin ninguna capacidad); la pasarela vuelve a
+leer la clave de Hermes sin reiniciarse, no castiga a los iPhone de un CGNAT por los fallos de otros, tiene un
+certificado siguiente para rotar sin volver a emparejar (`certificado rotar`) y apunta lo que la app borra de Hermes
+para compactarlo de noche (`hehermes-borrado.timer`); por chat, la última línea vuelve a ser `hehermes-error:<código>`
+cuando no se puede instalar, y sin linger no se da el enlace; `comprobar` se asoma también por la dirección del QR y
+avisa de lo que quedó de la VPN.
 
 **Desde la 0.6.0 la pasarela es lo único que instala para conectar.** La VPN IKEv2 de las versiones anteriores ya no se instala, ni se repara,
 ni se actualiza, y la app ya no la usa: `instalar --modo vpn` se para y dice que ya no existe. La de un servidor que la
@@ -21,6 +29,7 @@ sudo ./hehermes-servidor instalar --iphone mi-iphone          # lo mismo, pregun
 ./hehermes-servidor instalar --iphone mi-iphone               # sin root: la pasarela, en la casa de este usuario
 sudo hehermes-servidor instalar                               # repetirlo: «Todo al día: 0 cambios», o repara
 sudo hehermes-servidor comprobar                              # lo que tiene que estar en marcha, y «Seguridad»
+sudo hehermes-servidor certificado rotar                      # el certificado siguiente pasa a ser el de la pasarela
 sudo hehermes-servidor desinstalar [--quitar-paquetes]        # enseña lo que quita, pregunta y lo quita
 sudo hehermes-servidor desinstalar --modo vpn                 # solo la VPN de una versión anterior
 sudo hehermes-dispositivo alta otro-iphone                    # otro iPhone, con el instalador ya puesto
@@ -58,9 +67,10 @@ rutas y los errores.
 |---|---|
 | El usuario | `hh-pasarela`, de sistema, sin casa ni shell |
 | Código | `/opt/hehermes-servidor/` (con `hehermes-pasarela` y la clave pública de las firmas), `/usr/local/sbin/hehermes-servidor` y `/usr/local/sbin/hehermes-dispositivo` (si no hay ya uno ajeno) |
-| La pasarela | `/etc/hehermes-pasarela/` (0750, `root:hh-pasarela`): `pasarela.ini` y `tokens.json` (0640, del grupo), `cert.pem` (0644), `clave.pem` y `clave-hermes` (0600, de root). **No** escribe `/etc/hehermes/servidor.ini`, que era de la VPN |
-| La unidad | `hehermes-pasarela.service`: `User=hh-pasarela`, sin capacidades, `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `ProtectKernel*`, `ProtectProc=invisible`, `RestrictNamespaces`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, `MemoryDenyWriteExecute`, `SystemCallFilter=@system-service` sin `@privileged` ni `@resources` y `UMask=0077`. La clave del certificado, la de Hermes y (si están los avisos) el secreto del vigía le llegan con `LoadCredential` |
-| La clave de Hermes | `hehermes-pasarela-clave.path` vigila el `.env` y, si cambia, `hehermes-servidor pasarela-clave` pone al día `clave-hermes` y reinicia la pasarela |
+| La pasarela | `/etc/hehermes-pasarela/` (0750, `root:hh-pasarela`): `pasarela.ini` y `tokens.json` (0640, del grupo), `cert.pem` (0644), `clave.pem` (0600, de root), `clave-hermes` (0600, de `hh-pasarela`, que la lee sola), `siguiente/` (el certificado que viene después: su `cert.pem` 0644 y su `clave.pem` 0600 de root, sin usar hasta rotar) y, tras rotar, `anterior/`. **No** escribe `/etc/hehermes/servidor.ini`, que era de la VPN |
+| La unidad | `hehermes-pasarela.service`: `User=hh-pasarela`, sin capacidades, `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `ProtectKernel*`, `ProtectProc=invisible`, `RestrictNamespaces`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, `MemoryDenyWriteExecute`, `SystemCallFilter=@system-service` sin `@privileged` ni `@resources` y `UMask=0077`. La clave del certificado y (si están los avisos) el secreto del vigía le llegan con `LoadCredential`. Solo escribe en su `StateDirectory` (`/var/lib/hehermes-pasarela`: el borrado pendiente y su actividad). Un error de configuración sale con 78, que no se reinicia en bucle (`RestartPreventExitStatus=78`, `StartLimitBurst=5`) |
+| La clave de Hermes | `hehermes-pasarela-clave.path` vigila el `.env` y, si cambia, `hehermes-servidor pasarela-clave` pone al día `clave-hermes`; desde la 0.9.0 la pasarela la vuelve a leer sola, **sin reiniciarse** (los SSE abiertos siguen) |
+| El borrado de verdad | `hehermes-borrado.timer` (cada 15 minutos de 2:00 a 6:00): si la app ha borrado algo de Hermes, lo compacta con Hermes parado unos segundos ([abajo](#el-borrado-de-verdad)) |
 | Cortafuegos | Solo el TCP de la pasarela: `ufw allow proto tcp … port P comment hehermes`, `--add-port=P/tcp` en firewalld, o su regla en las cadenas de nftables o iptables, con `hehermes-cortafuegos.service` para después de un reinicio ([abajo](#los-cortafuegos)). **No enciende ninguno** |
 | Paquetes | Ninguno, salvo `python3-venv` en Debian si a su Python le falta `ensurepip` |
 | El manifiesto | `/etc/hehermes/instalacion.json` (0600): lo que es suyo ([abajo](#cómo-no-pisa-nada)) |
@@ -136,8 +146,9 @@ Hermes marca con `MEDIA:` (`GET /avisos/v1/fichero`; sin él, 503).
 |---|---|---|
 | El lector | `/usr/local/libexec/hehermes-leer-media` (root 0755), el mismo que pone `instalar.sh` en el VPS de Daniel | La copia que va con el instalador en su casa (`~/.local/share/hehermes-servidor/hehermes-leer-media`) |
 | Su socket | `hehermes-leer-media.socket`: `/run/hehermes-leer-media.sock`, `root:hh-vigia` 0660, `Accept=yes` | Una unidad de usuario: `%t/hehermes-leer-media.sock` (en `/run/user/<uid>`), 0600 |
-| Cada lectura | `hehermes-leer-media@.service`: un lector **de root** por conexión, con la jaula del VPS de Daniel (solo `CAP_DAC_READ_SEARCH`, todo de solo lectura, sin red), la carpeta de Hermes (`--hermes-home`) prohibida salvo sus caches y tapada, y también `/etc/hehermes-pasarela` | Un lector **como el usuario de Hermes** por conexión, con `--usuario`: solo atiende a su propio uid (`SO_PEERCRED`). Lo que una unidad de usuario no puede ponerse (`ProtectSystem`, `ProtectHome`, `InaccessiblePaths`, `PrivateNetwork`, `IPAddressDeny`, capacidades), no lo lleva, y la unidad lo dice: ahí lo que no se lee lo decide solo el lector (su lista de prohibidas, que incluye lo de `hehermes` en `~/.config` y `~/.local`); sin red lo deja `RestrictAddressFamilies=AF_UNIX` |
+| Cada lectura | `hehermes-leer-media@.service`: un lector por conexión, con la jaula del VPS de Daniel: desde la 0.9.0 **como el dueño de la casa de Hermes y sin ninguna capacidad** (root si Hermes es root), todo de solo lectura, sin red, las casas tapadas (`ProtectHome=tmpfs`) salvo las carpetas permitidas (`BindReadOnlyPaths`: `image_cache/`, `audio_cache/` y `exports/` de `--hermes-home`), y los secretos del sistema y de `/etc/hehermes-pasarela`, tapados | Un lector **como el usuario de Hermes** por conexión, con `--usuario`: solo atiende a su propio uid (`SO_PEERCRED`). Lo que una unidad de usuario no puede ponerse (`ProtectSystem`, `ProtectHome`, `InaccessiblePaths`, `PrivateNetwork`, `IPAddressDeny`, capacidades), no lo lleva, y la unidad lo dice: ahí lo que se lee lo decide solo el lector (su lista de permitidas, y la de prohibidas como segunda red); sin red lo deja `RestrictAddressFamilies=AF_UNIX` |
 | El vigía | `[ficheros] lector = /run/hehermes-leer-media.sock` y su unidad lo quiere (`Wants=`) | `lector = /run/user/<uid>/hehermes-leer-media.sock` |
+| Lo que se puede descargar | Solo lo que Hermes deja en sus caches o en **`<HERMES_HOME>/exports`**, que crea el instalador (0700, del dueño de Hermes; desinstalar la quita solo si está vacía). Un `MEDIA:/tmp/…` o `MEDIA:/root/informe.pdf` ya no se descarga: el mismo 404 que lo que no está marcado. A Hermes hay que decirle que deje ahí lo que quiera mandar al iPhone | Lo mismo, en `~/.hermes/exports` |
 | La red del vigía sin credencial | Esta máquina e internet; las redes de dentro, no: `IPAddressDeny=` 10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10, fc00::/7 y fe80::/10 (el relé no se sabe al instalar) | Una unidad de usuario no puede filtrar direcciones: se lo impide el propio vigía, que resuelve la dirección del relé de cada permiso y no se conecta si no es pública |
 
 Lo del código de avisos (la 0.7.0), que sigue valiendo: el código lo da Daniel (`sudo hehermes-rele credencial alta
@@ -221,13 +232,13 @@ VPN montada como la dejaba la 0.5.1 (`tests/vpn_antigua.py`): la pasarela sobre 
 Para un servidor con la VPN del instalador (`mi-iphone` por IKEv2):
 
 1. **Añadir la pasarela, sin tocar la VPN.** Primero el plan, que no cambia nada:
-   `sudo ./hehermes-servidor-0.8.0/hehermes-servidor instalar --plan --iphone iphone-tls`. Tiene que decir «Aquí sigue
+   `sudo ./hehermes-servidor-0.9.0/hehermes-servidor instalar --plan --iphone iphone-tls`. Tiene que decir «Aquí sigue
    la VPN IKEv2 que instaló una versión anterior», el TCP elegido y ningún «No puedo seguir».
 2. **Instalarla:** lo mismo sin `--plan`, en un terminal (pinta el QR del token, que no se puede volver a pintar).
 3. **Abrir el TCP de la pasarela en el cortafuegos del proveedor**, si tiene uno en su panel (el plan lo dice con su
    número): el del servidor ya lo abre el instalador.
 4. **Comprobar:** `sudo hehermes-servidor comprobar`. La pasarela, toda `bien`, y un aviso de que la VPN sigue ahí.
-5. **En el iPhone,** escanear el QR con la app HeHermes Mensajes.
+5. **En el iPhone,** escanear el QR con la app HeHermes.
 6. **Quitar la VPN:** `sudo hehermes-servidor desinstalar --modo vpn`. Enseña lo que quita (solo lo de la VPN, y
    `mi-iphone`), pregunta y lo quita. Con `--quitar-paquetes`, también strongSwan, nginx y qrencode, si los instaló él.
 7. **Comprobar otra vez:** `sudo hehermes-servidor comprobar` ya solo habla de la pasarela, y `sudo hehermes-servidor
@@ -252,7 +263,7 @@ Hay que saber:
   - /usr/local/sbin/hehermes-dispositivo no es mío: no lo toco. Para los iPhone de la pasarela usa el mío: sudo /opt/hehermes-servidor/hehermes-dispositivo alta <nombre>
   - Aquí ya hay unos avisos puestos a mano (/opt/hehermes-avisos, los de server/avisos/despliegue/instalar.sh): ni el vigía ni el lector de ficheros los pongo yo, y lo suyo no lo toco
 
-45 cambios.
+50 cambios.
 ```
 <!-- /pasarela-de-daniel -->
 
@@ -272,7 +283,7 @@ Con el instalador ya puesto, otro iPhone no necesita el comando entero: `sudo he
 `server/instalador/empaquetar` genera el paquete, su `.sha256` y esa línea ya rellena:
 
 ```bash
-server/instalador/empaquetar                                   # dist/hehermes-servidor-0.8.0.tar.gz y .sha256
+server/instalador/empaquetar                                   # dist/hehermes-servidor-0.9.0.tar.gz y .sha256
 server/instalador/empaquetar --url-base https://ejemplo.org/hehermes --iphone mi-iphone
 server/instalador/empaquetar --firmar hehermes-firma.pem       # y el .sig (hace falta OpenSSL 3)
 ```
@@ -365,6 +376,22 @@ salidas, en este orden:
 
 **`hehermes-error:sin-permisos` ya no sale nunca.** Hasta la 0.6.0 era la última línea de ese mensaje por chat con
 `--modo vpn`, para que la app la reconociera; sin VPN, un alta por chat sin root se instala como el usuario.
+
+**Desde la 0.9.0, por chat, lo que no deja instalar acaba en `hehermes-error:<código>`**, sola y la última, y solo
+antes de tocar nada (la app dice «No se ha cambiado nada», y es verdad). El texto de encima es para la persona; el
+código, para la app (`ErrorDelInstalador`), que hoy los explica todos igual:
+
+| Código | Qué pasa |
+|---|---|
+| `nat` | La dirección de salida es privada: hace falta `--direccion <IP o nombre>` (no se descubre con un servicio de fuera) |
+| `direccion` | No se sabe la dirección pública, o la dada no vale |
+| `linger` | Sin root y sin linger (y no se ha podido encender): la pasarela se pararía al cerrarse la sesión. `sudo loginctl enable-linger <usuario>` |
+| `sin-hermes`, `hermes-parado`, `varios-hermes` | No hay Hermes, está parado, o hay varios (`--hermes-home`) |
+| `api-apagada`, `api-hermes`, `clave-hermes` | La API de Hermes apagada, que no contesta o no en 127.0.0.1, o su `API_SERVER_KEY` que falta o no vale |
+| `ensurepip`, `sin-disco`, `puerto`, `sistema`, `paquete` | Sin `python3-venv`, sin sitio (150 MB), sin puerto libre, un sistema que no sabe, o un paquete incompleto |
+| `cortafuegos` | El cortafuegos cierra el paso y no se sabe abrir sin riesgo |
+| `por-chat`, `nombre-iphone`, `ficheros-ajenos`, `avisos-a-mano`, `avisos-credencial` | Lo de siempre de cada uno (el texto lo dice) |
+| `bloqueo` | Cualquier otro |
 
 **El canje** (`hehermes_servidor/canje.py`) es una unidad temporal, `hehermes-canje`, lanzada con `systemd-run` para que
 sobreviva al comando de Hermes:
@@ -519,6 +546,49 @@ Seguridad
 El `MAL` del agujero es el del sitio escrito a mano (`server/vpn/hehermes-tunel.nginx`), que el doble copia tal cual.
 Lo arregla quitar esa VPN (a mano: no es del instalador), o cerrarlo con `deny 10.77.0.1;` al principio de su
 `location /`.
+
+## Decisiones de la 0.9.0
+
+La auditoría del 2026-09-29 (§5, §7, §13, §14.5, §14.9), comprobada antes en el código:
+
+- **El lector, con lista de permitidas.** La lista negra dejaba salir `/root/.bash_history`, `/var/log` o el cron si
+  Hermes escribía la línea `MEDIA:`. Ahora solo las caches y `exports/` (lo pedido y lo resuelto en la misma permitida,
+  la lista negra como segunda red), sin `CAP_DAC_READ_SEARCH` y con el núcleo tapando el resto de las casas.
+- **La clave de Hermes sin reiniciar.** La copia es de `hh-pasarela` y la pasarela la vuelve a leer al cambiar;
+  rotarla ya no corta los SSE.
+- **CGNAT.** El cupo por IP (16) es solo de conexiones sin autenticar: las de un iPhone con su token no lo ocupan. El
+  segundo del 404 se espera fuera del cupo (16 por IP y 256 en total). Una IP bloqueada por sus fallos ya no se queda
+  sin pasarela: con token pasa, sin token se cierra al momento y solo 4 sin autenticar a la vez. Con el cupo lleno, una
+  conexión sin autenticar de más de 3 s deja su sitio (slowloris).
+- **El fuzz del HTTP** (`tests/test_pasarela_fuzz.py`) encontró que `$` casa delante de un «\n» final: con un token,
+  una ruta o una cabecera con un salto suelto llegaba a Hermes. Ahora `fullmatch`, también en los validadores del
+  instalador.
+- **Rotar el certificado sin volver a emparejar.** `siguiente/` hecho de antemano, su huella en
+  `GET /hehermes/v1/huellas` (con token) y `hehermes-servidor certificado rotar`. La app aún ancla una sola huella: lo
+  que le falta está en `server/API-CONTRACT.md`, §12.7. Volver atrás: `anterior/cert.pem` y `anterior/clave.pem`
+  encima de los de ahora, y `systemctl restart hehermes-pasarela`.
+- **Por chat, los códigos y linger** (arriba, «Los permisos»).
+- **El alcance, por la dirección del QR.** Desde dentro se distingue: otra máquina detrás de la dirección (mal), la
+  dirección propia sin contestar (mal), la propia contestando (si la app no llega, es el cortafuegos del proveedor,
+  que desde dentro no se ve), o un NAT (reenvía, o no se sabe y se dice qué abrir). La regla de ufw, aparte. La IP
+  pública detrás de un NAT no se descubre sola: un servicio de eco de fuera sería una dependencia (y una fuga de que
+  este servidor instala HeHermes) sin una forma robusta en la biblioteca estándar; por chat se para con
+  `hehermes-error:nat` y se pide `--direccion`.
+- **Los restos de la VPN**, en «Seguridad»: strongSwan en UDP 500/4500 y los sitios de nginx del túnel, con la orden
+  exacta; nada se quita solo.
+- **El borrado de verdad** (abajo).
+
+### El borrado de verdad
+
+«Eliminar también de Hermes» borra filas, pero SQLite deja lo borrado en páginas libres de `state.db` y en el índice
+FTS, recuperable del disco. La pasarela apunta en su carpeta de estado que hay algo pendiente (solo desde cuándo) cuando
+Hermes contesta 2xx a `DELETE /api/sessions/{id}`, y `hehermes-borrado.timer` lanza `hehermes-servidor borrado-seguro`
+cada 15 minutos de 2:00 a 6:00. Con algo pendiente y un rato tranquilo (ninguna petición con Hermes, ni escrituras en
+su `state.db`, en 10 minutos), para `hermes-gateway`, ejecuta `hermes sessions optimize` como el usuario de Hermes (o,
+si ese Hermes no lo sabe, `optimize` de cada índice FTS5 y `VACUUM` con sqlite), lo vuelve a arrancar y espera a su
+`/health`. Tope duro de 15 minutos; Hermes arrancado pase lo que pase; un intento por noche; a los tres fallos, para.
+Si Hermes no es una unidad de systemd, o sin root lo es del sistema, no se intenta: `comprobar` dice cómo hacerlo a mano
+(con Hermes parado, `HERMES_HOME=<su casa> hermes sessions optimize`). El estado, en `GET /hehermes/v1/mantenimiento`.
 
 ## Decisiones de la 0.8.0
 

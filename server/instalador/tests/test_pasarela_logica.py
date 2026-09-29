@@ -142,20 +142,41 @@ class LosLimites(unittest.TestCase):
         self.l = pa.Limites(reloj=self.reloj, contar_locales=True)
 
     def test_diez_fallos_en_diez_minutos_bloquean_quince(self):
+        """Bloqueada no es sin pasarela (un CGNAT tiene muchos iPhone detrás): menos conexiones sin autenticar a la vez,
+        y lo que no traiga un token se cierra al momento (eso es de la pasarela, `ElBloqueo` en las de red)."""
         for _ in range(pa.MAX_FALLOS - 1):
             self.l.fallo("198.51.100.1")
         self.assertFalse(self.l.bloqueada("198.51.100.1"))
-        self.assertTrue(self.l.admitir("198.51.100.1"))
-        self.l.soltar("198.51.100.1")
+        self.assertEqual(self.l.tope_de("198.51.100.1"), pa.CONEXIONES_POR_IP)
         self.l.fallo("198.51.100.1")
         self.assertTrue(self.l.bloqueada("198.51.100.1"))
+        self.assertEqual(self.l.tope_de("198.51.100.1"), pa.CONEXIONES_POR_IP_BLOQUEADA)
+        for _ in range(pa.CONEXIONES_POR_IP_BLOQUEADA):
+            self.assertTrue(self.l.admitir("198.51.100.1"))
         self.assertFalse(self.l.admitir("198.51.100.1"))
+        self.assertTrue(self.l.llena("198.51.100.1"))
         self.assertTrue(self.l.admitir("198.51.100.2"))
         self.reloj.t += pa.BLOQUEO - 1
         self.assertTrue(self.l.bloqueada("198.51.100.1"))
         self.reloj.t += 2
         self.assertFalse(self.l.bloqueada("198.51.100.1"))
         self.assertTrue(self.l.admitir("198.51.100.1"))
+
+    def test_las_castigadas_van_aparte_y_con_su_tope(self):
+        for _ in range(pa.CONEXIONES_POR_IP):
+            self.assertTrue(self.l.admitir("198.51.100.1"))
+        for _ in range(pa.CASTIGADAS_POR_IP):
+            self.assertTrue(self.l.castigar("198.51.100.1"), "no dependen de las abiertas")
+        self.assertFalse(self.l.castigar("198.51.100.1"))
+        self.l.perdonar("198.51.100.1")
+        self.assertTrue(self.l.castigar("198.51.100.1"))
+        for i in range(pa.CASTIGADAS_EN_TOTAL - pa.CASTIGADAS_POR_IP):
+            self.assertTrue(self.l.castigar("10.1.%d.%d" % (i // 200, i % 200)))
+        self.assertFalse(self.l.castigar("198.51.100.9"))
+        self.assertEqual(self.l.castigadas, pa.CASTIGADAS_EN_TOTAL)
+        for _ in range(pa.CASTIGADAS_EN_TOTAL + 5):
+            self.l.perdonar("198.51.100.1")
+        self.assertEqual(self.l.castigadas, pa.CASTIGADAS_EN_TOTAL - pa.CASTIGADAS_POR_IP, "no baja de cero por IP")
 
     def test_los_de_este_servidor_no_cuentan(self):
         """`comprobar` se asoma sin token desde 127.0.0.1: si contara, diez comprobaciones la bloquearían."""
@@ -176,6 +197,8 @@ class LosLimites(unittest.TestCase):
     def test_los_numeros_son_los_del_contrato(self):
         self.assertEqual((pa.MAX_FALLOS, pa.VENTANA_FALLOS, pa.BLOQUEO), (10, 600, 900))
         self.assertEqual((pa.CONEXIONES_POR_IP, pa.CONEXIONES_EN_TOTAL), (16, 128))
+        self.assertEqual((pa.CONEXIONES_POR_IP_BLOQUEADA, pa.CASTIGADAS_POR_IP, pa.CASTIGADAS_EN_TOTAL), (4, 16, 256))
+        self.assertEqual(pa.PLAZO_DESALOJO, 3.0)
         self.assertEqual((pa.PLAZO_CABECERAS, pa.PLAZO_PARADA, pa.RETRASO_404), (10, 75, 1.0))
         self.assertEqual((pa.MAX_CUERPO, pa.MAX_CUERPO_AVISOS), (25 * 1024 * 1024, 64 * 1024))
         self.assertEqual((pa.MAX_CABECERAS, pa.MAX_LINEAS_CABECERA), (16 * 1024, 100))
@@ -308,6 +331,21 @@ class ElSecreto(unittest.TestCase):
             self.assertEqual(s.valor(), "dos-mas-larga")
             os.unlink(ruta)
             self.assertIsNone(s.valor())
+
+    @unittest.skipIf(os.geteuid() == 0, "root lo lee todo")
+    def test_uno_que_no_se_deja_leer_se_vuelve_a_probar(self):
+        """Con root, `pasarela-clave` escribe la copia y se la da a hh-pasarela: si la pasarela llega en medio y no la
+        puede leer, no puede quedarse con «ya la he visto» (el chown no cambia ni el inodo, ni la fecha, ni el
+        tamaño) y sin clave hasta el próximo cambio."""
+        with tempfile.TemporaryDirectory() as carpeta:
+            ruta = os.path.join(carpeta, "clave-hermes")
+            with open(ruta, "w") as f:
+                f.write("clave-nueva\n")
+            os.chmod(ruta, 0)
+            s = pa.Secreto(ruta, pa.leer_clave_hermes)
+            self.assertIsNone(s.valor())
+            os.chmod(ruta, 0o600)
+            self.assertEqual(s.valor(), "clave-nueva")
 
 
 if __name__ == "__main__":

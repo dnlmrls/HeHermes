@@ -111,6 +111,11 @@ class ConfigPublico:
         # revocados y el App ID. Sin la sección [permisos], no hay oficina (sus rutas dan el 404 de siempre).
         self.permisos_clave = self.permisos_base = self.permisos_revocados = None
         self.permisos_app = None
+        #: El certificado que viene después ([siguiente] certificado, que pone `preparar`): su huella se da a quien
+        #: trae una credencial o un permiso (`GET /hehermes/v1/huellas`), para rotar sin dejar a nadie fuera.
+        self.certificado_siguiente = None
+        #: La carpeta de credenciales de systemd de este servicio, si llegó alguna por ahí.
+        self.credenciales_systemd = None
         # Lo que la maquinaria de la pasarela espera encontrar y aquí no hay.
         self.tokens = self.clave_hermes = self.secreto_vigia = self.vigia = None
         self.puerto_hermes = None
@@ -134,6 +139,8 @@ class ConfigPublico:
                 raise ValueError("el relé tiene que estar en 127.0.0.1, no en %s" % host)
             c.rele = (host.strip("[]"), int(puerto))
             c.direccion = ini.get("publico", "direccion", fallback="").strip() or None
+            siguiente = ini.get("siguiente", "certificado", fallback="").strip()
+            c.certificado_siguiente = _absoluta(siguiente) if siguiente else None
             if ini.has_section("permisos"):
                 c.permisos_clave = _absoluta(ini.get("permisos", "clave"))
                 c.permisos_base = _absoluta(ini.get("permisos", "base_de_datos"))
@@ -141,6 +148,7 @@ class ConfigPublico:
                 c.permisos_app = ini.get("permisos", "app", fallback="").strip() or None
         except (OSError, configparser.Error, ValueError) as error:
             raise ValueError("%s: %s" % (ruta, error)) from None
+        c.credenciales_systemd = credenciales_systemd or None
         if credenciales_systemd and os.path.exists(os.path.join(credenciales_systemd, "clave")):
             c.clave = os.path.join(credenciales_systemd, "clave")
         if c.permisos_clave and credenciales_systemd and os.path.exists(os.path.join(credenciales_systemd, "permisos")):
@@ -206,8 +214,10 @@ class FrenteDelRele(base.Pasarela):
             self.oficina.comprobar_permiso(permiso)
         except modulo_permisos.ErrorDePermiso as error:
             if error.motivo == "permiso_invalido":
+                bloqueada = self.limites.bloqueada(ip)
                 self.limites.fallo(ip)
-                await asyncio.sleep(self.retraso_404)
+                if not await self.castigo(ip, bloqueada):
+                    return False
             return await self._contestar(escritor, ip, peticion, 401, {"resultado": "permiso", "motivo": error.motivo})
         return None
 
@@ -273,10 +283,11 @@ def oficina_de(config: ConfigPublico):
     """La oficina de permisos de esta configuración, o None si no tiene la sección [permisos]."""
     if not config.permisos_clave:
         return None
-    # Llega por LoadCredential: systemd la deja en la carpeta de credenciales del servicio, solo suya pero con modo 0440
-    # (como la clave del certificado, que tampoco pasa por `leer_secreto`). Fuera de systemd, la del ini (root 0600).
-    with open(config.permisos_clave, "rb") as fichero:
-        privada = modulo_permisos.cargar_privada(fichero.read())
+    # Llega por LoadCredential: systemd la deja en la carpeta de credenciales del servicio, solo suya, con modo 0440, y
+    # `leer_secreto` lo acepta ahí (y solo ahí). Fuera de systemd, la del ini: 0600 u 0400, solo para su dueño.
+    from ..comun import leer_secreto
+    privada = modulo_permisos.cargar_privada(leer_secreto(config.permisos_clave,
+                                                          credenciales=config.credenciales_systemd or ""))
     return modulo_permisos.Oficina(privada, modulo_permisos.Claves(config.permisos_base),
                                    modulo_permisos.Revocados(config.permisos_revocados),
                                    app_id=config.permisos_app or modulo_permisos.appattest.APP_ID)
@@ -284,14 +295,16 @@ def oficina_de(config: ConfigPublico):
 
 def servir(config: ConfigPublico, tls_minimo=None) -> int:
     import logging
-    from ..comun import ErrorDeSecreto, configurar_registro
+    from ..comun import SALIDA_CONFIGURACION, ErrorDeSecreto, configurar_registro
     configurar_registro("INFO")
     try:
         oficina = oficina_de(config)
         frente = FrenteDelRele(config, Almacen(config.credenciales), oficina=oficina, tls_minimo=tls_minimo)
     except (OSError, ssl.SSLError, ValueError, ErrorDeSecreto) as error:
-        print("error: %s" % error, flush=True)
-        return 1
+        # Un secreto que no se lee, o con otros permisos, no se arregla reiniciando: se dice una vez, con el remedio, y
+        # la unidad no vuelve a arrancar (RestartPreventExitStatus=78) hasta que alguien lo arregle.
+        print("error: no arranco: %s. Arréglalo y: systemctl restart hehermes-rele-publico" % error, flush=True)
+        return SALIDA_CONFIGURACION
     logging.getLogger("rele.permisos").info("oficina de permisos: %s", "en marcha (%s)" % config.permisos_app
                                             if oficina else "sin configurar")
     print("%d credenciales en %s; al relé, en %s:%d" % (len(frente.tokens), config.credenciales, *config.rele),
@@ -415,6 +428,51 @@ def preparar_permisos(ruta_ini: str, carpeta: str, publica: str = PERMISOS_PUBLI
     return {"nueva_clave": nueva_clave, "nueva_seccion": nueva_seccion}
 
 
+def preparar_siguiente(ruta_ini: str, carpeta: str) -> dict:
+    """El certificado que viene después, en ``<carpeta>/siguiente`` (la clave, 0600 de root y sin usar hasta rotar; el
+    certificado, 0644), y la sección [siguiente] del ini. Se puede repetir. Devuelve ``{huella, nuevo}``."""
+    from hehermes_servidor.canje import preparar as certificado
+    siguiente = os.path.join(carpeta, "siguiente")
+    cert = os.path.join(siguiente, "cert.pem")
+    nuevo = not (os.path.exists(cert) and os.path.exists(os.path.join(siguiente, "clave.pem")))
+    if nuevo:
+        os.makedirs(siguiente, mode=0o755, exist_ok=True)
+        certificado(siguiente, 3650)
+        os.chmod(cert, 0o644)
+    ini = configparser.ConfigParser(interpolation=None)
+    with open(ruta_ini, encoding="utf-8") as fichero:
+        ini.read_file(fichero)
+    if not ini.has_section("siguiente"):
+        with open(ruta_ini, "a", encoding="utf-8") as fichero:
+            fichero.write("\n# El certificado que viene después: su huella se da a los vigías y a las apps con credencial o\n"
+                          "# permiso (GET /hehermes/v1/huellas). `rotar` lo pone en lugar del de ahora.\n"
+                          "[siguiente]\ncertificado = %s\n" % cert)
+    return {"huella": huella_del_certificado(cert), "nuevo": nuevo}
+
+
+def rotar(ruta_ini: str, carpeta: str) -> dict:
+    """El siguiente pasa a ser el de la entrada pública; el de ahora queda en ``<carpeta>/anterior`` (para volver atrás
+    a mano) y se hace otro siguiente. Después, ``systemctl restart hehermes-rele-publico``. Devuelve las tres huellas.
+    Los vigías y las apps que ya anclaban la huella siguiente siguen sin hacer nada; los demás, no."""
+    config = ConfigPublico.leer(ruta_ini)
+    siguiente = os.path.join(carpeta, "siguiente")
+    if not (os.path.exists(os.path.join(siguiente, "cert.pem")) and os.path.exists(os.path.join(siguiente, "clave.pem"))):
+        raise ValueError("no hay certificado siguiente en %s: primero `preparar`, y espera a que los clientes anclen "
+                         "su huella" % siguiente)
+    anterior = os.path.join(carpeta, "anterior")
+    os.makedirs(anterior, mode=0o700, exist_ok=True)
+    antes = huella_del_certificado(config.certificado)
+    ahora = huella_del_certificado(os.path.join(siguiente, "cert.pem"))
+    os.replace(config.clave, os.path.join(anterior, "clave.pem"))
+    os.replace(config.certificado, os.path.join(anterior, "cert.pem"))
+    os.replace(os.path.join(siguiente, "clave.pem"), config.clave)
+    os.replace(os.path.join(siguiente, "cert.pem"), config.certificado)
+    os.chmod(config.clave, 0o600)
+    os.chmod(config.certificado, 0o644)
+    nueva = preparar_siguiente(ruta_ini, carpeta)["huella"]
+    return {"antes": antes, "ahora": ahora, "siguiente": nueva}
+
+
 def sondear(puerto: int, anfitrion: str = "127.0.0.1", tls_maxima=None, plazo: float = 5.0) -> dict | None:
     """Lo que ve cualquiera que se asome sin credencial: la versión de TLS, la huella y lo que contesta a un GET. None
     si no negocia (o si no negocia con ``tls_maxima``)."""
@@ -459,6 +517,12 @@ def comprobar(config: ConfigPublico, salida=print) -> int:
     decir(sonda["huella"] == esperada, "sirve el certificado de los códigos (huella %s)" % esperada)
     decir(sonda["respuesta"] == base.NO_ENCONTRADO, "sin credencial, el 404 de siempre, sin Server ni nada más")
     decir(bool(config.direccion), "la dirección de los códigos: %s" % (config.direccion or "ninguna"))
+    if config.certificado_siguiente:
+        decir(True, "la huella siguiente, para rotar sin dejar fuera a nadie: %s"
+              % huella_del_certificado(config.certificado_siguiente))
+    else:
+        decir(True, "sin certificado siguiente (rotar el de ahora dejaría fuera a los vigías y a la app; lo pone "
+                    "`preparar`)")
     return 1 if fallos else 0
 
 
@@ -468,7 +532,7 @@ def comprobar(config: ConfigPublico, salida=print) -> int:
 def main(argv: list | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m hehermes_avisos.rele.publico",
                                      description=__doc__.splitlines()[0])
-    parser.add_argument("orden", choices=("servir", "preparar", "comprobar"))
+    parser.add_argument("orden", choices=("servir", "preparar", "comprobar", "rotar"))
     parser.add_argument("--config", default="/etc/hehermes-avisos/rele-publico.ini")
     parser.add_argument("--carpeta", default="/etc/hehermes-avisos/rele-publico")
     parser.add_argument("--direccion")
@@ -485,12 +549,22 @@ def main(argv: list | None = None) -> int:
             permisos = preparar_permisos(argumentos.config, argumentos.carpeta)
             print("oficina de permisos: %s" % ("preparada" if permisos["nueva_clave"] or permisos["nueva_seccion"]
                                                else "ya estaba"))
+            siguiente = preparar_siguiente(argumentos.config, argumentos.carpeta)
+            print("certificado siguiente: %s, huella %s" % ("preparado" if siguiente["nuevo"] else "ya estaba",
+                                                            siguiente["huella"]))
             print("PUERTO=%d" % hecho["puerto"])
+            return 0
+        if argumentos.orden == "rotar":
+            hecho = rotar(argumentos.config, argumentos.carpeta)
+            print("rotado: antes %s (en %s/anterior), ahora %s, siguiente %s. Reinicia la entrada pública: systemctl "
+                  "restart hehermes-rele-publico" % (hecho["antes"], argumentos.carpeta, hecho["ahora"],
+                                                    hecho["siguiente"]))
             return 0
         config = ConfigPublico.leer(argumentos.config, os.environ.get("CREDENTIALS_DIRECTORY"))
     except (ValueError, OSError) as error:
         print("error: %s" % error, flush=True)
-        return 1
+        from ..comun import SALIDA_CONFIGURACION
+        return SALIDA_CONFIGURACION if argumentos.orden == "servir" else 1
     if argumentos.orden == "comprobar":
         return comprobar(config)
     return servir(config)
