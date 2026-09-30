@@ -370,6 +370,16 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
             det = detectar_ya()
     plan = modo_tls.calcular_plan_tls(sis, det, man, opciones, aqui)
     salida(pintar(plan, color=terminal).rstrip("\n"))
+    if not op.plan and plan.bloqueos and all(getattr(b, "codigo", None) == "reinicia-hermes" for b in plan.bloqueos):
+        # Lo único que falta es que Hermes se reinicie, y eso no lo sé hacer (no es una unidad ni un contenedor): se
+        # enciende su API en el .env y se para. La vez siguiente, con Hermes reiniciado, ya la encuentra encendida.
+        try:
+            porchat.encender_para_reiniciar_a_mano(sis, det, plan, ambito, salida, por_chat=opciones.por_chat)
+        except (OSError, ValueError) as error:
+            salida("\nerror: no he podido encender la API de Hermes: %s" % error)
+            if opciones.por_chat:
+                salida("\n" + PREFIJO_ERROR + "api-apagada")
+            return 1
     if op.plan or not plan.puede_seguir:
         if opciones.por_chat and not plan.puede_seguir:
             # Lo último, sola: la app lo reconoce (`ErrorDelInstalador`) donde se pega el enlace, y sabe que no se ha
@@ -406,7 +416,7 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
                                                                        else ambito.orden))
     if any(a.tipo in ("env", "exposicion") and a.cambia for a in plan.acciones):
         # Lo último: reiniciar Hermes antes de acabar le cortaría el turno en el que contesta con el enlace.
-        porchat.reiniciar_hermes_luego(sis, salida)
+        porchat.reiniciar_hermes_luego(sis, salida, det.hermes.gestor, ambito)
     if el_enlace:
         salida("\nEl enlace para la app (caduca en 10 minutos y no lleva ninguna clave):")
         salida(el_enlace)

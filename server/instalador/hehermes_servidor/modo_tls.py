@@ -20,6 +20,7 @@ import ssl
 import time
 
 from . import ambito as amb
+from . import gestor as gestores
 from . import manifiesto as m
 from . import piezas as p
 from .aplicar import (Parada, Transaccion, _con_unidad, _escribir, _ficheros, _firewalld, _orden, _paquetes, _propio,
@@ -52,8 +53,9 @@ def detectar_tls(sis, man, ambito, direccion=None, hermes_home=None, activar_api
     det.venv_listo = False
     if not _distro(sis, det):
         return det
-    _hermes(sis, det, hermes_home, activar_api, corregir_exposicion)
-    if not ambito.root and det.hermes is not None and (det.hermes.api_pendiente or det.hermes.exposicion_pendiente):
+    _hermes(sis, det, hermes_home, activar_api, corregir_exposicion, ambito=ambito)
+    if not ambito.root and det.hermes is not None and (det.hermes.api_pendiente or det.hermes.exposicion_pendiente) \
+            and not gestores.puede_reiniciar(det.hermes.gestor, ambito):
         det.bloqueos.append("Para encender la API de Hermes o cerrarla a 127.0.0.1 hay que reiniciarlo, y sin root no "
                             "sé. Hazlo tú en %s (API_SERVER_ENABLED=true, API_SERVER_HOST=127.0.0.1 y una "
                             "API_SERVER_KEY) y reinicia Hermes; luego vuelve a lanzarme" % det.hermes.env)
@@ -380,10 +382,16 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
     man.anadir_modo("tls")
     man.datos["pasarela"] = {"puerto": det.puerto_pasarela, "root": ambito.root}
     # Lo que la limpieza de noche necesita saber de Hermes para pararlo, compactarlo y volver a arrancarlo.
+    # Desde la 0.10.2, quién lo lleva (`gestor_hermes`: su unidad, del sistema o de usuario, o su contenedor), que es lo
+    # que para y arranca la limpieza de noche. `unidad_hermes` sigue siendo la del sistema, como la leía la 0.10.1.
+    gestor = det.hermes.gestor
     man.datos["mantenimiento"] = {
-        "unidad_hermes": "hermes-gateway.service" if det.hermes.origen == "la unidad hermes-gateway" else None,
+        "unidad_hermes": gestor.nombre if gestor is not None and gestor.tipo == "sistema" else None,
+        "gestor_hermes": gestor.a_dict() if gestor is not None else None,
         "origen": det.hermes.origen, "casa": det.hermes.home.rstrip("/"), "usuario": det.hermes.usuario,
         "puerto": det.hermes.puerto}
+    from .porchat import adoptar_api_pendiente
+    adoptar_api_pendiente(sis, man, ambito)
     vigia = getattr(det, "vigia", None)
     from . import avisos as vigias
     if vigia:
@@ -397,10 +405,10 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
 
     for a in de("env"):
         from .porchat import activar_api
-        activar_api(sis, man, a, salida)
+        activar_api(sis, man, a, salida, ambito)
     for a in de("exposicion"):
         from .porchat import corregir_exposicion
-        corregir_exposicion(sis, man, a, salida)
+        corregir_exposicion(sis, man, a, salida, ambito)
     _paquetes(sis, man, de("paquete"), salida, det.familia)
     for a in de("usuario"):
         if a.cambia:

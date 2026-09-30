@@ -80,23 +80,70 @@ def bloqueos(sis, man, op, ahora=None, activos=None) -> list:
 # MARK: --activar-api
 
 
-def activar_api(sis, man, accion, salida) -> None:
-    """Añade al final del .env las líneas que faltan, con una copia antes. Una que ya estuviera con otro valor
-    (`API_SERVER_ENABLED=false`) se queda donde está: la de detrás es la que cuenta, en python-dotenv y en la shell."""
+def _anadir_al_env(sis, ruta, lineas, ambito=None) -> dict:
+    """Añade `lineas` al final del .env de Hermes, con una copia antes. Devuelve la copia."""
     from . import manifiesto as m
-    ruta, lineas = accion.objeto, list(accion.datos)
     actual = sis.leer_texto(ruta)
     if actual is None:
         raise ValueError("no puedo leer %s" % ruta)
-    copia = m.guardar_copia(sis, ruta)
+    copia = m.guardar_copia(sis, ruta, None if ambito is None or ambito.root else ambito.carpeta_config)
     nuevo = actual + ("" if actual.endswith("\n") or not actual else "\n") + "".join(l + "\n" for l in lineas)
     sis.escribir(ruta, nuevo.encode("utf-8"), modo=sis.modo(ruta) or 0o600, mismo_dueno=True)
+    return copia
+
+
+def activar_api(sis, man, accion, salida, ambito=None) -> None:
+    """Añade al final del .env las líneas que faltan, con una copia antes. Una que ya estuviera con otro valor
+    (`API_SERVER_ENABLED=false`) se queda donde está: la de detrás es la que cuenta, en python-dotenv y en la shell."""
+    ruta, lineas = accion.objeto, list(accion.datos)
+    copia = _anadir_al_env(sis, ruta, lineas, ambito)
     man.datos["activar_api"] = {"env": ruta, "lineas": lineas, "copia": copia}
     man.guardar(sis)
     salida("==> la API de Hermes: %s en %s" % (", ".join(l.split("=", 1)[0] for l in lineas), ruta))
 
 
-def corregir_exposicion(sis, man, accion, salida) -> None:
+#: Lo que queda apuntado de un --activar-api que se paró para que se reiniciara Hermes a mano (`reinicia-hermes`): sin
+#: instalación todavía no hay manifiesto, y uno a medias se leería como una instalación. La siguiente pasada lo pasa al
+#: manifiesto (`adoptar_api_pendiente`), para que desinstalar quite esas líneas.
+API_PENDIENTE = "api-pendiente.json"
+
+
+def encender_para_reiniciar_a_mano(sis, det, plan, ambito, salida, por_chat=False) -> None:
+    """`reinicia-hermes`: Hermes no lo lleva nada que se sepa reiniciar, así que se añaden al .env las líneas de la API
+    (con una copia antes), se apunta y se para. Lo único que se toca: el .env (y su copia)."""
+    import json
+    accion = next((a for a in plan.acciones if a.tipo == "env"), None)
+    if accion is None:
+        raise ValueError("no sé qué añadir a su .env")
+    ruta, lineas = accion.objeto, list(accion.datos)
+    copia = _anadir_al_env(sis, ruta, lineas, ambito)
+    sis.escribir(ambito.carpeta_config + "/" + API_PENDIENTE,
+                 json.dumps({"env": ruta, "lineas": lineas, "copia": copia}).encode("utf-8"), modo=0o600)
+    salida("==> la API de Hermes: %s en %s" % (", ".join(l.split("=", 1)[0] for l in lineas), ruta))
+    salida("\nHe encendido la API en %s; reinicia Hermes y vuelve a %s." % (
+        ruta, "mandarme la misma frase" if por_chat else "lanzar el mismo comando"))
+
+
+def adoptar_api_pendiente(sis, man, ambito) -> None:
+    """Lo que dejó apuntado `encender_para_reiniciar_a_mano`, al manifiesto (si no hay ya un --activar-api suyo)."""
+    import json
+    ruta = ambito.carpeta_config + "/" + API_PENDIENTE
+    texto = sis.leer_texto(ruta)
+    if texto is None:
+        return
+    try:
+        datos = json.loads(texto)
+    except ValueError:
+        datos = None
+    if isinstance(datos, dict) and isinstance(datos.get("env"), str) and isinstance(datos.get("lineas"), list) \
+            and "activar_api" not in man.datos:
+        man.datos["activar_api"] = {"env": datos["env"], "lineas": [str(l) for l in datos["lineas"]],
+                                    "copia": datos.get("copia")}
+        man.guardar(sis)
+    sis.borrar(ruta)
+
+
+def corregir_exposicion(sis, man, accion, salida, ambito=None) -> None:
     """--corregir-exposicion: `API_SERVER_HOST=127.0.0.1` al final del .env (la de detrás es la que cuenta), con una copia
     antes. Desinstalar no lo quita: volvería a abrir la API a quien llegue al servidor."""
     from . import manifiesto as m
@@ -104,7 +151,7 @@ def corregir_exposicion(sis, man, accion, salida) -> None:
     actual = sis.leer_texto(ruta)
     if actual is None:
         raise ValueError("no puedo leer %s" % ruta)
-    copia = m.guardar_copia(sis, ruta)
+    copia = m.guardar_copia(sis, ruta, None if ambito is None or ambito.root else ambito.carpeta_config)
     nuevo = actual + ("" if actual.endswith("\n") or not actual else "\n") + linea + "\n"
     sis.escribir(ruta, nuevo.encode("utf-8"), modo=sis.modo(ruta) or 0o600, mismo_dueno=True)
     man.datos["exposicion"] = {"env": ruta, "linea": linea, "copia": copia}
@@ -112,16 +159,19 @@ def corregir_exposicion(sis, man, accion, salida) -> None:
     salida("==> la API de Hermes: %s en %s (se cierra al reiniciarse Hermes)" % (linea, ruta))
 
 
-def reiniciar_hermes_luego(sis, salida) -> None:
+def reiniciar_hermes_luego(sis, salida, gestor=None, ambito=None) -> None:
     """A los 90 s, y lanzado lo último: si Hermes se reiniciara antes de acabar el comando, se cortaría el turno en el
-    que tiene que contestar con el enlace."""
-    r = sis.ejecutar(["systemd-run", "--on-active=90", "--timer-property=AccuracySec=1s", "--collect", "--quiet",
-                      "systemctl", "restart", "hermes-gateway.service"])
+    que tiene que contestar con el enlace. Lo que se reinicia es lo que lleva su proceso (`gestor`): su unidad, se llame
+    como se llame y sea del sistema o de usuario, o su contenedor."""
+    from . import gestor as gestores
+    gestor = gestor or gestores.Gestor("sistema", "hermes-gateway.service")
+    root = ambito is None or ambito.root
+    r = sis.ejecutar(gestores.orden_reiniciar_luego(gestor, root))
     if r.bien:
         salida("Hermes se reinicia dentro de 90 s para encender su API.")
     else:
-        salida("No he podido programar el reinicio de Hermes: reinícialo tú (systemctl restart hermes-gateway) para "
-               "que encienda su API.")
+        salida("No he podido programar el reinicio de Hermes: reinícialo tú (%s) para que encienda su API."
+               % gestores.como_se_reinicia(gestor, root))
 
 
 def quitar_lineas_api(sis, man, quedan, salida) -> None:

@@ -177,7 +177,7 @@ def planear(sis, det, man, op, origen, acciones, bloqueos, fichero, avisos=None)
     secreto = sis.leer(ambito.secreto_vigia)
     propias = [
         fichero(ambito.vigia_ini, p.vigia_ini(ambito, det.hermes.puerto, det.hermes.env,
-                                              os.path.dirname(det.hermes.home.rstrip("/")) or "/",
+                                              det.hermes.casa_de_rutas,
                                               vigia["direccion"], vigia["puerto"], vigia["huella"],
                                               lector=ambito.socket_lector if lector else None,
                                               respaldo=ambito.socket_respaldo if respaldo else None),
@@ -229,6 +229,16 @@ def planear_lector(sis, det, origen, acciones, bloqueos, avisos, fichero) -> boo
     return True
 
 
+def _unidad_para_el_respaldo(hermes, ambito) -> str:
+    """La unidad de Hermes que para y arranca el ayudante al restaurar: la suya (la de su perfil, desde la 0.10.2) si el
+    ayudante la puede manejar (con root, una del sistema; sin root, una de usuario suya); si no, la de siempre, que el
+    ayudante no encuentra y por eso no restaura (lo dice)."""
+    gestor = hermes.gestor
+    suya = gestor is not None and re.fullmatch(r"[A-Za-z0-9:_.@-]{1,200}\.service", gestor.nombre) and (
+        gestor.tipo == "sistema" if ambito.root else (gestor.tipo == "usuario" and gestor.usuario == ambito.usuario))
+    return gestor.nombre if suya else "hermes-gateway.service"
+
+
 def planear_respaldo(sis, det, origen, acciones, bloqueos, avisos, fichero) -> bool:
     """El ayudante de la copia en iCloud (desde la 0.10.0): el script (con root, en /usr/local/libexec; sin root, el que
     ya va en su casa con el instalador), su socket y su plantilla. Devuelve si se pone: sin él, el vigía va igual y
@@ -250,7 +260,8 @@ def planear_respaldo(sis, det, origen, acciones, bloqueos, avisos, fichero) -> b
             fichero(ambito.respaldo, f.read(), 0o755)
     unidades = [fichero(ambito.unidad_respaldo_socket, p.unidad_respaldo_socket(ambito)),
                 fichero(ambito.unidad_respaldo, p.unidad_respaldo(ambito, casa,
-                                                                  det.hermes.usuario if ambito.root else None))]
+                                                                  det.hermes.usuario if ambito.root else None,
+                                                                  _unidad_para_el_respaldo(det.hermes, ambito)))]
     _unidad(sis, acciones, p.SOCKET_RESPALDO, unidades, "la copia de Hermes en iCloud (/avisos/v1/respaldo), %s"
             % ("un ayudante de root, enjaulado, por conexión" if ambito.root
                else "como %s, uno por conexión" % ambito.usuario), "restart", ambito.systemctl)

@@ -267,7 +267,7 @@ class LaLimpieza(Base):
     def test_si_no_puede_parar_hermes_no_lo_intenta_y_comprobar_lo_dice(self):
         from hehermes_servidor.manifiesto import Manifiesto
         man = Manifiesto.leer(self.sis)
-        man.datos["mantenimiento"].update(unidad_hermes=None, origen="el proceso 4242")
+        man.datos["mantenimiento"].update(unidad_hermes=None, gestor_hermes=None, origen="el proceso 4242")
         man.guardar(self.sis)
         self.pendiente()
         self.assertEqual(self.limpiar(), 0)

@@ -208,18 +208,20 @@ def sin_tocar(sis, man: Manifiesto, ruta: str) -> bool:
 # Copias de lo que se reemplaza
 
 
-def guardar_copia(sis, ruta: str) -> dict:
-    """Guarda lo que hay en `ruta` antes de reemplazarlo. Un enlace se apunta por su destino."""
+def guardar_copia(sis, ruta: str, carpeta: str | None = None) -> dict:
+    """Guarda lo que hay en `ruta` antes de reemplazarlo. Un enlace se apunta por su destino. `carpeta`: donde va la
+    copia si no es la de root (sin root, la de la configuración del usuario, `ambito.carpeta_config`)."""
     destino = sis.enlace(ruta)
     if destino is not None:
         return {"tipo": "enlace", "destino": destino}
     datos = sis.leer(ruta)
     if datos is None:
         raise ValueError("%s no es un fichero ni un enlace: no sé guardarlo" % ruta)
-    sis.carpeta(CARPETA, 0o700)
-    sis.carpeta(CARPETA_COPIAS, 0o700)
+    copias = CARPETA_COPIAS if carpeta is None or carpeta == CARPETA else carpeta + "/copias"
+    sis.carpeta(copias.rsplit("/", 1)[0], 0o700)
+    sis.carpeta(copias, 0o700)
     nombre = ruta.strip("/").replace("/", "%")
-    copia = CARPETA_COPIAS + "/" + nombre
+    copia = copias + "/" + nombre
     sis.escribir(copia, datos, modo=0o600)
     return {"tipo": "fichero", "ruta": copia, "modo": sis.modo(ruta) or 0o644}
 

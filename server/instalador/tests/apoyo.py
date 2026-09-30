@@ -44,6 +44,9 @@ class SistemaFalso(Sistema):
         opciones.setdefault("version_python", (3, 11, 2))
         opciones.setdefault("nucleo", "6.1.0-25-amd64")
         super().__init__(raiz=self._carpeta, ejecutor=self._ejecutar, http=self._http, **opciones)
+        # Ni el proceso de las pruebas ni su entorno: los pone cada prueba que los quiera.
+        self.pid = None
+        self.entorno = {}
 
     def limpiar(self):
         shutil.rmtree(self._carpeta, ignore_errors=True)

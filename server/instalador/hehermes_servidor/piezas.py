@@ -861,7 +861,8 @@ _JAULA_RESPALDO_USUARIO = (
 )
 
 
-def unidad_respaldo(ambito, hermes_home: str, usuario_hermes: str | None = None) -> str:
+def unidad_respaldo(ambito, hermes_home: str, usuario_hermes: str | None = None,
+                    unidad_hermes: str = "hermes-gateway.service") -> str:
     """Un ayudante por conexión (`Accept=yes`). Con root, de root (restaurar para y arranca `hermes-gateway`, y ejecuta
     `hermes import` como el dueño de Hermes), con la jaula del VPS de Daniel. Sin root, como el usuario de Hermes, con
     `--usuario` (solo atiende a su propio uid, y para y arranca con `systemctl --user`: si Hermes es una unidad del
@@ -870,6 +871,8 @@ def unidad_respaldo(ambito, hermes_home: str, usuario_hermes: str | None = None)
     usuario = usuario_hermes or "root"
     if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", usuario):
         raise ValueError("usuario de Hermes no válido para una unidad: %r" % usuario)
+    if not re.fullmatch(r"[A-Za-z0-9:_.@-]{1,200}\.service", unidad_hermes):
+        raise ValueError("unidad de Hermes no válida para una unidad: %r" % unidad_hermes)
     comun = (
         "StandardInput=socket\n"
         "StandardOutput=socket\n"
@@ -893,10 +896,10 @@ def unidad_respaldo(ambito, hermes_home: str, usuario_hermes: str | None = None)
             "[Service]\n"
             "Type=simple\n"
             "ExecStart=/usr/bin/python3 -I -S -B %s --usuario --hermes-home=%s --trabajo=%s "
-            "--unidad-hermes=hermes-gateway.service --conexion\n"
+            "--unidad-hermes=%s --conexion\n"
             "%s"
             "%s"
-        ) % (_ruta_segura(ambito.respaldo), casa, _ruta_segura(ambito.carpeta_respaldo), comun,
+        ) % (_ruta_segura(ambito.respaldo), casa, _ruta_segura(ambito.carpeta_respaldo), unidad_hermes, comun,
              _JAULA_RESPALDO_USUARIO)
     return (
         CABECERA
@@ -908,7 +911,7 @@ def unidad_respaldo(ambito, hermes_home: str, usuario_hermes: str | None = None)
         "\n"
         "[Service]\n"
         "Type=simple\n"
-        "ExecStart=/usr/bin/python3 -I -S -B %s --hermes-home=%s --trabajo=%s --unidad-hermes=hermes-gateway.service "
+        "ExecStart=/usr/bin/python3 -I -S -B %s --hermes-home=%s --trabajo=%s --unidad-hermes=%s "
         "--usuario-hermes=%s --conexion\n"
         "StateDirectory=hehermes-respaldo\n"
         "StateDirectoryMode=0700\n"
@@ -920,5 +923,5 @@ def unidad_respaldo(ambito, hermes_home: str, usuario_hermes: str | None = None)
         "InaccessiblePaths=-/etc/hehermes -/etc/hehermes-avisos -/etc/hehermes-pasarela -/var/lib/hehermes-vigia "
         "-/var/lib/hehermes-pasarela -/var/lib/hehermes-rele-publico\n"
         "InaccessiblePaths=-/etc/nginx -/etc/swanctl -/etc/strongswan -/etc/ipsec.secrets -/etc/ipsec.d -/etc/wireguard\n"
-    ) % (_ruta_segura(ambito.respaldo), casa, _ruta_segura(ambito.carpeta_respaldo), usuario, comun,
+    ) % (_ruta_segura(ambito.respaldo), casa, _ruta_segura(ambito.carpeta_respaldo), unidad_hermes, usuario, comun,
          _JAULA_RESPALDO)

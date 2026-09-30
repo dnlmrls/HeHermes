@@ -86,7 +86,10 @@ class Plan:
     @property
     def codigo_de_error(self) -> str | None:
         """El código del primer bloqueo (el que se arregla primero), o None si no hay."""
-        return next((getattr(b, "codigo", Bloqueo.codigo) for b in self.bloqueos), None)
+        codigos = [getattr(b, "codigo", Bloqueo.codigo) for b in self.bloqueos]
+        # `reinicia-hermes` solo si es lo único: con otra cosa que pare, no se ha encendido nada, y lo que hay que
+        # arreglar primero es eso otro.
+        return next((c for c in codigos if c != "reinicia-hermes"), codigos[0] if codigos else None)
 
 
 def ficheros_propios(origen: str, prefijo: str = p.PREFIJO) -> list:
@@ -283,7 +286,12 @@ def pintar(plan: Plan, color: bool = False) -> str:
         lineas += ["", "Hay que saber:"] + ["  - " + a for a in plan.avisos]
     if plan.bloqueos:
         lineas += ["", "No puedo seguir:"] + ["  - " + b for b in plan.bloqueos]
-        lineas += ["", "No sigo: no he cambiado nada. Arregla lo de arriba y vuelve a lanzarme."]
+        if all(getattr(b, "codigo", None) == "reinicia-hermes" for b in plan.bloqueos) and \
+                not getattr(plan.opciones, "solo_plan", False):
+            # Lo único que falta es reiniciar Hermes: se enciende su API (`cli._instalar`), y nada más.
+            lineas += ["", "Solo toco su .env: lo demás, cuando Hermes vuelva con la API encendida."]
+        else:
+            lineas += ["", "No sigo: no he cambiado nada. Arregla lo de arriba y vuelve a lanzarme."]
     elif plan.cambios:
         lineas += ["", "%d cambios." % len(plan.cambios)]
     else:

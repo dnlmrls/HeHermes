@@ -113,6 +113,11 @@ class ServidorFalso:
         self.habilitados: set = set()
         self.unidades_hermes: dict = {}
         self.procesos: list = []  # (pid, usuario, orden)
+        #: El proceso de Hermes (si no es la unidad de siempre) y, si va en un contenedor, su id, sus montajes y su red.
+        self.pid_hermes = None
+        self.contenedor = None
+        self.montajes: list = []
+        self.red_docker = "host"
         self.tcp: list = [("0.0.0.0:22", "sshd")]
         #: Las direcciones locales de las conexiones TCP que no escuchan (las de salida, las establecidas).
         self.tcp_conexiones: list = []
@@ -240,11 +245,18 @@ class ServidorFalso:
         self.udp += [p for p in efectos.get("puertos_udp", []) if p not in self.udp]
 
     def con_hermes(self, usuario="root", home=None, como="unidad", puerto=8642, clave=CLAVE, habilitada=True,
-                   host=None, env_extra="", hermes_home=None):
+                   host=None, env_extra="", hermes_home=None, perfil=None, orden=None, entorno_extra=""):
+        """`como`: «unidad» (la de siempre, hermes-gateway), «proceso» (un proceso suelto, en tmux o nohup), o lo que
+        hace `hermes gateway install` con un perfil (hermes_cli/gateway.py): «unidad-perfil» (del sistema,
+        `hermes-gateway-<perfil>`, con root) o «unidad-usuario» (de usuario, sin root), con HERMES_HOME en su entorno y
+        su proceso en el cgroup de la unidad; o «docker» (el contenedor de Hermes, con su casa en /opt/data montada de
+        la del servidor). `perfil`: la casa es `<raíz>/profiles/<perfil>`. Devuelve la ruta de su .env."""
         home = home or ("/root" if usuario == "root" else "/home/" + usuario)
         self.usuarios[usuario] = home
         self._escribir_passwd()
-        carpeta = hermes_home or home + "/.hermes"
+        carpeta = hermes_home or home + "/.hermes" + ("/profiles/%s" % perfil if perfil else "")
+        if perfil and not hermes_home and como in ("unidad-perfil", "unidad-usuario", "docker"):
+            hermes_home = carpeta
         lineas = ["# .env de Hermes"]
         if habilitada is not None:
             lineas.append("API_SERVER_ENABLED=%s" % ("true" if habilitada else "false"))
@@ -262,9 +274,33 @@ class ServidorFalso:
             self.activos.add("hermes-gateway")
         else:
             pid = 4000 + len(self.procesos)
-            self.procesos.append((pid, usuario, "/usr/bin/python3 -m hermes gateway run"))
+            if orden is None:
+                orden = "/usr/bin/python3 -m hermes_cli.main %sgateway run" % ("--profile %s " % perfil if perfil else "")
+            self.procesos.append((pid, usuario, orden))
             entorno = "PATH=/usr/bin\0HOME=%s\0" % home + ("HERMES_HOME=%s\0" % hermes_home if hermes_home else "")
-            self.sis.poner("/proc/%d/environ" % pid, entorno)
+            if como in ("unidad-perfil", "unidad-usuario"):
+                entorno += "HERMES_SUPERVISED_CHILD=1\0INVOCATION_ID=0123abcd\0"
+            self.sis.poner("/proc/%d/environ" % pid, entorno + entorno_extra)
+            uid = sorted(self.usuarios).index(usuario)
+            nombre = "hermes-gateway-%s.service" % (perfil or "3f2a9c1b")
+            if como == "unidad-perfil":
+                self.sis.poner("/proc/%d/cgroup" % pid, "0::/system.slice/%s\n" % nombre)
+                self.unidades_hermes[nombre] = {"User": "" if usuario == "root" else usuario,
+                                                "Environment": "HERMES_HOME=%s" % hermes_home}
+                self.activos.add(nombre[:-len(".service")])
+            elif como == "unidad-usuario":
+                self.sis.poner("/proc/%d/cgroup" % pid, "0::/user.slice/user-%d.slice/user@%d.service/app.slice/%s\n"
+                               % (uid, uid, nombre))
+                self.activos_usuario.add(nombre[:-len(".service")])
+            elif como == "docker":
+                self.programa("/usr/bin/docker")
+                self.contenedor = "c0ffee" * 10 + "abcd"
+                self.sis.poner("/proc/%d/cgroup" % pid, "0::/system.slice/docker-%s.scope\n" % self.contenedor)
+                # Dentro, /opt/data; en el servidor, la carpeta de Hermes, montada.
+                self.sis.poner("/proc/%d/environ" % pid, "HOME=/opt/data\0HERMES_HOME=/opt/data\0"
+                               "HERMES_S6_SUPERVISED_CHILD=1\0")
+                self.montajes = [{"Type": "bind", "Source": home + "/.hermes", "Destination": "/opt/data"}]
+            self.pid_hermes = pid
         if habilitada:
             self.hermes[puerto] = clave
             self.tcp.append(("%s:%d" % ("0.0.0.0" if host == "0.0.0.0" else "127.0.0.1", puerto), "python3"))
@@ -308,7 +344,7 @@ class ServidorFalso:
             return Resultado(2, "", "hermes: error: invalid choice")
         if args[2:] == ["--help"]:
             return Resultado(0, "usage: hermes sessions optimize [--force]\n")
-        if "hermes-gateway" in self.activos:
+        if any(u.startswith("hermes-gateway") for u in self.activos | self.activos_usuario):
             return Resultado(1, "", "refusing: the gateway is running (use --force)")
         self.compactados.append("hermes sessions optimize")
         return Resultado(0 if self.optimiza_bien else 1, "", "" if self.optimiza_bien else "database is locked")
@@ -355,6 +391,8 @@ class ServidorFalso:
         if orden == "show":
             unidad = unidades[0]
             datos = self.unidades_hermes.get(unidad)
+            if "--value" in resto:
+                return Resultado(0, ((datos or {}).get("ExecStart") or "") + "\n")
             if datos is None:
                 return Resultado(0, "LoadState=not-found\nUser=\nEnvironment=\n")
             activo = "active" if base(unidad) in self.activos else "inactive"
@@ -488,6 +526,15 @@ class ServidorFalso:
             self.enlaces_ip.pop("hh-ipsec", None)
             self.rutas = [r for r in self.rutas if r[1] != "hh-ipsec"]
         return Resultado(0)
+
+    def _docker(self, args, entrada):
+        """`docker inspect` del contenedor de Hermes (sus montajes y su red) y `docker restart`."""
+        if args[:1] == ["inspect"] and args[-1] == self.contenedor:
+            return Resultado(0, "%s\t%s\n" % (json.dumps(self.montajes), self.red_docker))
+        if args[:1] == ["restart"]:
+            self.reinicios.append("docker:" + args[1])
+            return Resultado(0)
+        return Resultado(1, "", "Error: No such object: %s" % args[-1])
 
     def _ps(self, args, entrada):
         return Resultado(0, "".join("%d %s %s\n" % p for p in self.procesos))
