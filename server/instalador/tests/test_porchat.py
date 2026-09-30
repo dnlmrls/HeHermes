@@ -116,10 +116,27 @@ class SoloElPrimero(Base):
         self.assertIn("no se dio de alta por chat", texto)
         self.assertIn("Por SSH: hehermes-dispositivo rotar mi-iphone", texto)
 
-    def test_ya_canjeado_se_para(self):
+    def test_ya_canjeado_otro_iphone_se_para(self):
+        """Otro nombre es otro iPhone, aunque el canjeado ya no esté dado de alta."""
         self.assertEqual(self.por_chat(), 0, self.salida)
         self.instalado_hace(60, por_chat={"iphone": "mi-iphone", "canjeado": time.time()})
-        self.assertIn("ya se canjeó", "\n".join(self.plan().bloqueos))
+        tokens = json.loads(self.sis.leer(TOKENS))
+        tokens["tokens"] = []
+        self.sis.escribir(TOKENS, json.dumps(tokens).encode(), modo=0o600)
+        texto = "\n".join(self.plan(iphone="iphone-b2c3").bloqueos)
+        self.assertIn("El alta por chat de «mi-iphone» ya se canjeó: por chat solo se conecta ese iPhone", texto)
+
+    def test_ya_canjeado_el_mismo_iphone_pasa(self):
+        """El fallo de un probador (0.10.2): la app canjeó el enlace mientras Hermes se reiniciaba y se quedó sin
+        conexión; la misma frase otra vez acababa en «ya se canjeó», y por chat no había otra salida."""
+        self.assertEqual(self.por_chat(), 0, self.salida)
+        self.instalado_hace(60, por_chat={"iphone": "mi-iphone", "canjeado": time.time()})
+        self.assertTrue(self.plan().puede_seguir, self.plan().bloqueos)
+
+    def test_ya_canjeado_el_mismo_iphone_pasada_la_media_hora_se_para(self):
+        self.assertEqual(self.por_chat(), 0, self.salida)
+        self.instalado_hace(MEDIA_HORA + 60, por_chat={"iphone": "mi-iphone", "canjeado": time.time()})
+        self.assertIn("de hace más de media hora", "\n".join(self.plan().bloqueos))
 
     def test_repetirlo_sin_canjear_pasa(self):
         self.assertEqual(self.por_chat(), 0, self.salida)
@@ -321,7 +338,7 @@ class ElCanje(Base):
                           "ProtectHome=yes", "PrivateTmp=yes", "PrivateDevices=yes", "ProtectKernelTunables=yes",
                           "ProtectKernelModules=yes", "ProtectControlGroups=yes", "RestrictNamespaces=yes",
                           "RestrictSUIDSGID=yes", "LockPersonality=yes", "SystemCallArchitectures=native",
-                          "UMask=0077", "RuntimeMaxSec=660",
+                          "UMask=0077", "RuntimeMaxSec=780",
                           "ExecStopPost=+/usr/bin/python3 -I -B /opt/hehermes-servidor/hehermes-servidor canje-limpiar"):
             with self.subTest(propiedad=propiedad):
                 self.assertIn(propiedad, orden)
@@ -490,11 +507,29 @@ class Limpiar(Base):
         self.assertFalse([r for r in self.falso.reglas_ufw if "hehermes-canje" in r])
         self.assertNotIn("canjeado", Manifiesto.leer(self.sis).datos["por_chat"])
 
-    def test_canjeado_se_apunta_y_el_siguiente_por_chat_se_para(self):
+    def test_canjeado_se_apunta_y_el_mismo_iphone_recibe_otra_clave(self):
+        token = self.carga()["t"]
         self.limpiar(SERVICE_RESULT="success", EXIT_CODE="exited", EXIT_STATUS="0")
         self.assertIn("canjeado", Manifiesto.leer(self.sis).datos["por_chat"])
-        self.assertEqual(self.por_chat(), 1)
-        self.assertIn("ya se canjeó", self.salida)
+        # La misma frase otra vez, con la llave nueva de la misma app: otro enlace y otra clave; la de antes, fuera.
+        otra = base64.urlsafe_b64encode(bytes(range(80, 112))).rstrip(b"=").decode()
+        self.assertEqual(self.por_chat(llave=otra), 0, self.salida)
+        self.assertTrue(self.texto[-1].startswith("hehermes-canje:1?"), self.texto[-1])
+        self.assertIn("«mi-iphone» ya se había conectado por chat: le doy una clave nueva", self.salida)
+        tokens = pa.Tokens(self.sis.ruta(TOKENS))
+        self.assertIsNone(tokens.quien(token))
+        self.assertEqual(tokens.quien(self.carga()["t"]), "mi-iphone")
+        self.assertEqual(json.loads(self.sis.leer_texto(porchat.RUN + "/canje.json"))["llave"], otra)
+        por_chat = Manifiesto.leer(self.sis).datos["por_chat"]
+        self.assertEqual(por_chat["iphone"], "mi-iphone")
+        self.assertNotIn("canjeado", por_chat, "el canje nuevo lo vuelve a apuntar al acabar")
+        self.assertNotIn(token, self.salida)
+
+    def test_canjeado_otro_iphone_por_chat_se_para(self):
+        self.limpiar(SERVICE_RESULT="success", EXIT_CODE="exited", EXIT_STATUS="0")
+        self.assertEqual(self.por_chat(iphone="iphone-b2c3"), 1)
+        self.assertIn("solo se conecta el primer iPhone, y aquí ya hay: mi-iphone", self.salida)
+        self.assertEqual(self.texto[-1].strip(), "hehermes-error:por-chat")
 
     def test_caducado_no_cuenta_como_canjeado(self):
         self.limpiar(SERVICE_RESULT="exit-code", EXIT_CODE="exited", EXIT_STATUS="3")

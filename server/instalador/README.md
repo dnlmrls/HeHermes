@@ -35,6 +35,11 @@ proceso de Hermes, leído de su `/proc/<pid>/cgroup` (`hehermes_servidor/gestor.
 y se llame como se llame, o su contenedor; y todo lo de Hermes (su `.env`, su clave, su `exports/`, su `state.db`) es lo
 de la casa de su perfil. Uno suelto (tmux, nohup) acaba en `reinicia-hermes`: [abajo](#el-alta-por-chat---por-chat).
 
+**La 0.10.3 no deja a nadie sin salida por chat.** Con la 0.10.2, un probador canjeó el enlace mientras Hermes se
+reiniciaba para encender su API; la app no se quedó con la conexión, y la misma frase otra vez acababa en «ya se canjeó».
+Ahora el mismo iPhone (el mismo `--iphone`) puede volver a pedirla en la media hora siguiente a instalar: otro enlace,
+otro token, y el de antes deja de valer. El canje dura 12 minutos y el reinicio de Hermes no lo toca: [abajo](#el-alta-por-chat---por-chat).
+
 **Desde la 0.6.0 la pasarela es lo único que instala para conectar.** La VPN IKEv2 de las versiones anteriores ya no se instala, ni se repara,
 ni se actualiza, y la app ya no la usa: `instalar --modo vpn` se para y dice que ya no existe. La de un servidor que la
 tenga **se quita** con `desinstalar --modo vpn`, sin tocar la pasarela: [abajo](#la-vpn-de-antes), paso a paso.
@@ -372,9 +377,15 @@ llavero, 30 minutos y sin salir del iPhone). Hermes la ejecuta con su terminal:
   el token), en ese orden, y nada más: el canje se niega a arrancar con otra cosa. Lo fija `tests/datos/canje-tls.json`,
   que comparte la app.
 - **Solo el primer iPhone, y en la media hora siguiente a instalar** (decisión 7): se para si hay otro dado de alta (en
-  la pasarela o en una VPN de antes), si este no se dio por chat, si ya se canjeó o si la instalación es de hace más de
-  30 minutos (una sin fecha cuenta como vieja). Repetirlo dentro de la media hora, sin haberse canjeado, da un enlace
-  nuevo con un token nuevo (el de antes no se puede recuperar, y deja de valer).
+  la pasarela o en una VPN de antes), si este no se dio por chat, si ya se canjeó el de otro iPhone o si la instalación
+  es de hace más de 30 minutos (una sin fecha cuenta como vieja). Repetirlo dentro de la media hora **para el mismo
+  iPhone**, se canjeara o no, da un enlace nuevo con un token nuevo (el de antes no se puede recuperar, y deja de
+  valer): desde la 0.10.3, también después de canjearse, porque una app que se quedó sin la conexión (Hermes
+  reiniciándose al comprobarla) no tenía otra salida. Cada app pone su propio nombre en `--iphone` (`iphone-` y cuatro
+  cifras hexadecimales; la que ya se había conectado antes, `mi-iphone`), así que otro iPhone es otro nombre.
+- **El canje dura 12 minutos** (la frase promete diez; el enlace sale después de arrancarlo) y **es su propia unidad**
+  (`systemd-run --unit=hehermes-canje`, ni `--scope` ni atada a Hermes): el reinicio de Hermes de `--activar-api`, a los
+  90 s, no lo toca.
 - **Sin root sí sigue:** el canje es una unidad de usuario (`systemd-run --user`, sin `DynamicUser` ni cortafuegos) con
   sus secretos en `/run/user/<uid>/hehermes-canje`.
 - **`--activar-api`** (decisión 6): si la API de Hermes está apagada o sin clave, añade al final de su `.env` solo las
@@ -449,15 +460,15 @@ sobreviva al comando de Hermes:
 
 | | |
 |---|---|
-| Quién | Con root, `DynamicUser=yes`, **sin ninguna capacidad** (`CapabilityBoundingSet=` vacío: un puerto alto no la pide), `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `ProtectKernel*`, `ProtectControlGroups`, `RestrictNamespaces`, `RestrictSUIDSGID`, `SystemCallFilter=@system-service`, `UMask=0077` y `RuntimeMaxSec=660`. Sin root, una unidad de usuario |
+| Quién | Con root, `DynamicUser=yes`, **sin ninguna capacidad** (`CapabilityBoundingSet=` vacío: un puerto alto no la pide), `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `ProtectKernel*`, `ProtectControlGroups`, `RestrictNamespaces`, `RestrictSUIDSGID`, `SystemCallFilter=@system-service`, `UMask=0077` y `RuntimeMaxSec=780`. Sin root, una unidad de usuario |
 | Con qué | El venv de la pasarela (`/opt/hehermes-canje/venv`, o `~/.local/share/hehermes-venv` sin root), con `cryptography` fijada por hash (`requirements-canje.txt`) y el código por un `.pth` |
 | Secretos | El token, el código, la llave y la clave del certificado del canje, en `/run/hehermes-canje` (0700, en memoria), y al canje por `LoadCredential` |
 | Puerto | **Uno al azar entre el 58000 y el 65500** (los dos entran), de `secrets.randbelow`, libre en `ss -tan` (ni escuchando ni en una conexión); si está ocupado, el siguiente libre. En ufw, si está activo, `allow … port P comment hehermes-canje`; en firewalld, si está en marcha y el puerto no estaba abierto, `--add-port=P/tcp` solo en la configuración de ahora (nunca en la permanente); en nftables o iptables a pelo, en las mismas cadenas que las de siempre, con el comentario `hehermes-canje`. Solo mientras dure |
 | TLS | 1.3, con un certificado ECDSA P-256 autofirmado para ese canje, con un nombre al azar y sin ningún dato (ni «hehermes»). La huella del enlace es el SHA-256 de su SPKI, y la app no acepta otra |
 | Protocolo | `POST /canje/v1/reto {c}` devuelve un reto cifrado para la llave (el código no se gasta); `POST /canje/v1/canjear {c, reto}` devuelve `{h, p, f, t}` cifrado para la llave, y se cierra |
-| Límites | 10 minutos, 5 fallos (o 3 de una IP), una petición por segundo y por IP, 20 conexiones por IP (la siguiente ni llega al TLS) y 1024 IP recordadas |
+| Límites | 12 minutos, 5 fallos (o 3 de una IP), una petición por segundo y por IP, 20 conexiones por IP (la siguiente ni llega al TLS) y 1024 IP recordadas |
 | A un escáner | Lo que no es un POST del protocolo (otra ruta, otro método, una petición rota, un cuerpo de más) recibe siempre el mismo `404` sin cuerpo y sin cabecera `Server`, y no gasta intentos |
-| Al cerrarse | Por lo que sea, `ExecStopPost=+… canje-limpiar`, como root: fuera su regla (ufw, firewalld, nftables o iptables) y `/run/hehermes-canje`; si salió con 0 por sí mismo (se canjeó), lo apunta en el manifiesto y no hay otro alta por chat. Si no llega a arrancar, lo mismo antes de salir |
+| Al cerrarse | Por lo que sea, `ExecStopPost=+… canje-limpiar`, como root: fuera su regla (ufw, firewalld, nftables o iptables) y `/run/hehermes-canje`; si salió con 0 por sí mismo (se canjeó), lo apunta en el manifiesto, y por chat solo ese iPhone puede volver a pedirla (en la media hora). Si no llega a arrancar, lo mismo antes de salir |
 
 El sobre es el de los avisos, pero para una clave pública: una X25519 efímera por sobre, HKDF-SHA256 con la huella, el
 código, el paso y las dos claves públicas dentro, y ChaCha20-Poly1305. Un sobre de otro servidor, de otro canje o del

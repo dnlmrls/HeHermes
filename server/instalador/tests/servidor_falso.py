@@ -137,6 +137,10 @@ class ServidorFalso:
         self.reinicios: list = []
         self.usuarios: dict = {"root": "/root"}
         self.lanzados: list = []  # las órdenes de systemd-run
+        #: Lo que un `systemd-run` dejó dentro del cgroup de Hermes (`--scope`, que se queda en el de quien lo lanza, y
+        #: por chat quien lo lanza es Hermes) o atado a su unidad (`PartOf=`, `BindsTo=`, `Requisite=`): reiniciar Hermes
+        #: se lo lleva por delante. Lo que se lanza como su propia unidad, no.
+        self.atados_a_hermes: set = set()
         self.pip: list = []
         self.pngs: dict = {}
         #: Lo que contesta `sudo -n true` a quien no es root: «sin-sudo» (no hay sudo), «sin-contrasena»,
@@ -417,6 +421,7 @@ class ServidorFalso:
                 if orden == "restart":
                     self.reinicios.append(u)
                     self._arrancar(u)
+                    self._matar_lo_atado(u)
                 if orden == "reload":
                     if u not in self.activos:
                         return Resultado(1, "", "%s is not active, cannot reload." % unidad)
@@ -424,6 +429,12 @@ class ServidorFalso:
                         self._xfrm(["subir"], None)
             return Resultado(0)
         return Resultado(127, "", "systemctl %s" % args)
+
+    def _matar_lo_atado(self, unidad):
+        """Reiniciar la unidad de Hermes mata todo lo de su cgroup y lo atado a ella (`atados_a_hermes`)."""
+        if unidad.startswith("hermes-gateway"):
+            self.activos -= self.atados_a_hermes
+            self.activos_usuario -= self.atados_a_hermes
 
     def _systemctl_usuario(self, args):
         """El systemd de usuario: solo si hay uno en marcha (linger o una sesión)."""
@@ -453,6 +464,7 @@ class ServidorFalso:
                 self._escucha_la_pasarela(u, False)
             if orden == "restart":
                 self.reinicios.append("usuario:" + u)
+                self._matar_lo_atado(u)
         return Resultado(0) if orden in ("enable", "disable", "start", "stop", "restart", "try-restart") else \
             Resultado(127, "", "systemctl --user %s" % args)
 
@@ -786,6 +798,9 @@ class ServidorFalso:
 
     def _systemd_run(self, args, entrada):
         self.lanzados.append(args)
+        if "--unit=hehermes-canje" in args and ("--scope" in args or any(
+                a.split("=", 1)[0] in ("PartOf", "BindsTo", "Requisite") and "hermes-gateway" in a for a in args)):
+            self.atados_a_hermes.add("hehermes-canje")
         if "--user" in args and "--unit=hehermes-canje" in args:
             if not self.gestor_usuario:
                 return Resultado(1, "", "Failed to connect to bus")

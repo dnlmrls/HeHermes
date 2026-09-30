@@ -149,7 +149,9 @@ def abrir_con(privada: bytes, proposito: str, huella: bytes, codigo: str, sobre:
 # MARK: El canje
 
 
-DURACION = 600.0
+#: Diez minutos prometidos y dos de margen, desde que arranca: el enlace sale después y aún tiene que llegar al chat
+#: (`porchat.DURACION_CANJE`, que es la misma).
+DURACION = 720.0
 MAX_FALLOS = 5
 MAX_FALLOS_POR_IP = 3
 PAUSA_POR_IP = 1.0

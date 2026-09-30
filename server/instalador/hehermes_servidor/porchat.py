@@ -47,7 +47,9 @@ def activos_del_servidor(sis, man, ambito=None) -> list:
 
 def bloqueos(sis, man, op, ahora=None, activos=None) -> list:
     """Lo que impide un alta por chat (decisión 7). Una web o un correo que lea Hermes pueden llevar escondida la orden
-    de dar un alta con la llave de otro: por eso solo vale para el primer iPhone, una vez, y recién instalado.
+    de dar un alta con la llave de otro: por eso solo vale para el primer iPhone y recién instalado (la media hora de
+    `VENTANA`, contada desde la instalación, que repetir no alarga). Dentro de esa media hora, el mismo iPhone puede
+    volver a pedirla aunque ya se canjeara: se le da otra clave y la de antes deja de valer (`reemitir`).
     `activos`, los iPhone del servidor (`activos_del_servidor`)."""
     ahora = time.time() if ahora is None else ahora
     salida = []
@@ -63,9 +65,12 @@ def bloqueos(sis, man, op, ahora=None, activos=None) -> list:
         salida.append("«%s» ya está dado de alta y no se dio de alta por chat: por chat solo se conecta el primer "
                       "iPhone. Por SSH: hehermes-dispositivo rotar %s" % (op.iphone, op.iphone))
         etiquetar(salida, "por-chat")
-    if por_chat.get("canjeado"):
-        salida.append("El alta por chat de «%s» ya se canjeó: por chat solo se conecta una vez. Otro iPhone, desde la "
-                      "app o por SSH" % por_chat.get("iphone", "?"))
+    if por_chat.get("canjeado") and por_chat.get("iphone") != op.iphone:
+        # El mismo iPhone que ya se conectó por chat sí puede volver a pedirlo (`reemitir`): es quien lo pidió la
+        # primera vez, con una llave nueva de la misma app, y si la app perdió la conexión (Hermes reiniciándose al
+        # comprobarla, la app cerrada a medias) no le quedaba otra salida que un terminal. Otro nombre es otro iPhone.
+        salida.append("El alta por chat de «%s» ya se canjeó: por chat solo se conecta ese iPhone. Otro iPhone, desde "
+                      "la app o por SSH" % por_chat.get("iphone", "?"))
         etiquetar(salida, "por-chat")
     if man.en_disco:
         instalado = man.datos.get("instalado")
@@ -75,6 +80,20 @@ def bloqueos(sis, man, op, ahora=None, activos=None) -> list:
                           "SSH: %s" % alta)
             etiquetar(salida, "por-chat")
     return salida
+
+
+def reemitir(sis, man, iphone, ruta_tokens, salida) -> str:
+    """Otra alta por chat para un iPhone que ya la tenía (repetida antes de canjearse, o ya canjeada): del token solo
+    queda su hash, así que va uno nuevo, y el de antes deja de valer en ese momento (`tokens.rotar`). Lo canjeado se
+    olvida: el canje nuevo lo vuelve a apuntar al acabar (`limpiar`). Devuelve el token."""
+    from . import tokens
+    anterior = man.datos.get("por_chat") or {}
+    token = tokens.rotar(ruta_tokens, iphone)
+    man.datos["por_chat"] = {"iphone": iphone, "alta": time.time()}
+    man.guardar(sis)
+    if anterior.get("canjeado"):
+        salida("==> «%s» ya se había conectado por chat: le doy una clave nueva, y la de antes deja de valer" % iphone)
+    return token
 
 
 # MARK: --activar-api
@@ -211,6 +230,13 @@ PUERTO_MINIMO, PUERTO_MAXIMO = 58000, 65500
 #: El generador del puerto: el criptográfico del sistema. Las pruebas lo sustituyen para fijarlo.
 _azar = secrets.randbelow
 COMENTARIO_UFW = "hehermes-canje"
+#: Lo que dura el canje desde que arranca (el `DURACION` de `canje.py`, que se ejecuta con el venv y no se importa aquí;
+#: `test_canje_limites` los ata). La frase y el enlace prometen diez minutos, y se dan doce: el enlace sale después de
+#: arrancar el canje y todavía tiene que llegar al chat en la respuesta de Hermes. No depende de Hermes: el canje es su
+#: propia unidad (`_systemd_run`), y el reinicio de Hermes que programa `--activar-api` a los 90 s no lo toca.
+DURACION_CANJE = 12 * 60
+#: `RuntimeMaxSec`: la duración y un minuto de margen, por si algo se cuelga; systemd lo para igual.
+TOPE_DE_LA_UNIDAD = DURACION_CANJE + 60
 LIMPIAR = "/usr/bin/python3 -I -B %s/hehermes-servidor canje-limpiar" % p.PREFIJO
 
 
@@ -334,7 +360,9 @@ def _qr_png(sis, ruta, el_enlace, run=RUN) -> str:
 
 
 def _systemd_run() -> list:
-    """Una unidad temporal, para que el canje sobreviva al comando de Hermes; un usuario de usar y tirar, que no ve más
+    """Una unidad temporal, para que el canje sobreviva al comando de Hermes y al reinicio de Hermes que programa
+    `--activar-api` a los 90 s: es su propia unidad, en su propio cgroup (ni `--scope`, que se quedaría en el de Hermes,
+    ni `PartOf=` ni `BindsTo=` con la suya), así que reiniciar Hermes no la toca; un usuario de usar y tirar, que no ve más
     que sus credenciales (copiadas por systemd desde /run, en memoria); y la limpieza como root al pararse por lo que
     sea: canjeado, caducado, por los intentos, por `RuntimeMaxSec` o a mano."""
     propiedades = [
@@ -364,8 +392,8 @@ def _systemd_run() -> list:
         "SystemCallFilter=@system-service",
         "UMask=0077",
         "RestrictAddressFamilies=AF_INET AF_INET6",
-        # Diez minutos del canje y un margen: si algo se cuelga, systemd lo para igual.
-        "RuntimeMaxSec=660",
+        # Lo que dura el canje y un margen: si algo se cuelga, systemd lo para igual.
+        "RuntimeMaxSec=%d" % TOPE_DE_LA_UNIDAD,
         "ExecStopPost=+" + LIMPIAR,
     ]
     orden = ["systemd-run", "--unit=" + UNIDAD, "--collect", "--quiet"]
@@ -388,7 +416,7 @@ def _systemd_run_usuario(ambito) -> list:
         "RestrictRealtime=yes",
         "SystemCallArchitectures=native",
         "SystemCallFilter=@system-service",
-        "RuntimeMaxSec=660",
+        "RuntimeMaxSec=%d" % TOPE_DE_LA_UNIDAD,
         "ExecStopPost=" + limpiar_orden,
     ]
     orden = ["systemd-run", "--user", "--unit=" + UNIDAD, "--collect", "--quiet"]

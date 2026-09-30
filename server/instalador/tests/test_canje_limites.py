@@ -144,6 +144,26 @@ class Caducidad(Base):
         self.assertTrue(self.canje.vencido())
 
 
+    def test_dura_al_menos_diez_minutos_y_no_depende_de_hermes(self):
+        """El enlace promete diez minutos, y sale después de arrancar el canje: hace falta margen. El reinicio de
+        Hermes (a los 90 s, con `--activar-api`) no cuenta para nada: el reloj es el del canje."""
+        self.assertGreaterEqual(canje.DURACION, 10 * 60 + 60)
+        self.reloj.pasa(90 + 10 * 60)
+        self.assertEqual(self.pedir("/canje/v1/reto", {"c": CODIGO})[0], 200)
+
+    def test_systemd_no_lo_para_antes_de_tiempo(self):
+        """`porchat` no importa este módulo (corre con el Python del sistema): su duración tiene que ser la misma, y el
+        `RuntimeMaxSec` de las dos unidades, con root y sin él, más largo."""
+        from hehermes_servidor import ambito as amb
+        from hehermes_servidor import porchat
+        self.assertEqual(porchat.DURACION_CANJE, canje.DURACION)
+        for orden in (porchat._systemd_run(), porchat._systemd_run_usuario(amb.de_usuario("hermes", "/home/hermes",
+                                                                                           1000))):
+            tope = [int(a.split("=", 1)[1]) for a in orden if a.startswith("RuntimeMaxSec=")]
+            self.assertEqual(len(tope), 1, orden)
+            self.assertGreater(tope[0], canje.DURACION + 30)
+
+
 class Intentos(Base):
     def test_cinco_fallos_lo_cierran_y_cuatro_no(self):
         for i in range(canje.MAX_FALLOS - 1):
