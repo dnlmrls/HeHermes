@@ -616,5 +616,144 @@ class SinRoot(Base):
         self.assertNotIn("hehermes-pasarela", self.falso.activos_usuario)
 
 
+class ElCodigoNuevo(Base):
+    """Actualizar sobre una instalación de antes: el código que cambia reinicia, una vez, el servicio que lo tiene
+    cargado (la pasarela, el vigía), con root y sin él. En el VPS de Daniel, la 0.10.0 sobre la 0.9.0 reescribió
+    /opt/hehermes-servidor y dejó la pasarela corriendo con el código de antes (el tope de 64 KiB del respaldo)."""
+
+    def prefijo(self):
+        return "/opt/hehermes-servidor"
+
+    def manifiesto_de(self):
+        return "/etc/hehermes/instalacion.json"
+
+    def reinicios(self, unidad):
+        return [o for o in self.sis.ordenes if [a for a in o if a != "--user"][:2] == ["systemctl", "restart"]
+                and o[-1] == unidad]
+
+    def de_antes(self, relativa):
+        """Deja en disco (y en el manifiesto, como suyo) una versión anterior de un fichero de código: lo que hay
+        tras una instalación de la versión de antes."""
+        from hehermes_servidor.sistema import sha256
+        ruta = self.prefijo() + "/" + relativa
+        viejo = self.sis.leer(ruta) + b"\n# la version de antes\n"
+        self.sis.escribir(ruta, viejo, modo=self.sis.modo(ruta))
+        man = self.manifiesto(self.manifiesto_de())
+        man["ficheros"][ruta]["sha256"] = sha256(viejo)
+        self.sis.escribir(self.manifiesto_de(), json.dumps(man).encode(), modo=self.sis.modo(self.manifiesto_de()))
+
+    def instalado(self):
+        self.assertEqual(self.orden("instalar", "--si", terminal=False), 0, self.salida)
+        return len(self.sis.ordenes)
+
+    def test_el_codigo_de_la_pasarela_cambia_y_se_reinicia_una_vez(self):
+        self.instalado()
+        self.de_antes("hehermes_servidor/pasarela.py")
+        self.assertEqual(self.orden("instalar", "--plan"), 0, self.salida)
+        self.assertIn("se reinicia la pasarela: su código cambia", self.salida)
+        desde = len(self.sis.ordenes)
+        self.assertEqual(self.orden("instalar", "--si", terminal=False), 0, self.salida)
+        self.assertEqual(len([o for o in self.reinicios("hehermes-pasarela.service")
+                              if o in self.ordenes_de(desde)]), 1)
+        self.assertIn("se reinicia la pasarela: su código cambia", self.salida)
+        # El vigía también carga hehermes_servidor (la clave de Hermes, de hehermes_servidor.pasarela).
+        self.assertEqual(len([o for o in self.reinicios("hehermes-vigia.service") if o in self.ordenes_de(desde)]), 1)
+        self.assertNotIn("reinicios_pendientes", self.manifiesto(self.manifiesto_de()))
+        # Y repetir: nada que reiniciar.
+        desde = len(self.sis.ordenes)
+        self.assertEqual(self.orden("instalar", "--si", terminal=False), 0, self.salida)
+        self.assertIn("Todo al día: 0 cambios", self.salida)
+        self.assertFalse([o for o in self.ordenes_de(desde) if cambia(o)])
+
+    def test_el_del_vigia_solo_reinicia_el_vigia(self):
+        self.instalado()
+        self.de_antes("hehermes_avisos/vigia/respaldo.py")
+        desde = len(self.sis.ordenes)
+        self.assertEqual(self.orden("instalar", "--si", terminal=False), 0, self.salida)
+        self.assertIn("se reinicia el vigía: su código cambia", self.salida)
+        self.assertEqual(len([o for o in self.reinicios("hehermes-vigia.service") if o in self.ordenes_de(desde)]), 1)
+        self.assertFalse([o for o in self.reinicios("hehermes-pasarela.service") if o in self.ordenes_de(desde)])
+
+    def test_lo_que_arranca_uno_por_conexion_no_reinicia_nada(self):
+        # El lector, el ayudante de la copia y hehermes-dispositivo se lanzan de nuevo cada vez: cogen el código solos.
+        self.instalado()
+        for relativa in ("hehermes-leer-media", "hehermes-respaldo", "hehermes-dispositivo"):
+            if self.sis.existe(self.prefijo() + "/" + relativa):
+                self.de_antes(relativa)
+        desde = len(self.sis.ordenes)
+        self.assertEqual(self.orden("instalar", "--si", terminal=False), 0, self.salida)
+        self.assertFalse([o for o in self.ordenes_de(desde)
+                          if [a for a in o if a != "--user"][:2] == ["systemctl", "restart"]])
+
+    def test_parada_en_medio_repetir_la_reinicia_igual(self):
+        # El código se escribe y luego falla otro paso antes de reiniciar: el código ya «está», pero la pasarela sigue
+        # con el de antes. Lo recuerda el manifiesto.
+        self.instalado()
+        self.de_antes("hehermes_servidor/pasarela.py")
+        with mock.patch.object(porchat, "_venv", side_effect=porchat.ParadaDelCanje("sin pip")):
+            self.assertNotEqual(self.orden("instalar", "--si", terminal=False), 0, self.salida)
+        self.assertFalse(self.reinicios("hehermes-pasarela.service"))
+        self.assertIn("hehermes-pasarela.service", self.manifiesto(self.manifiesto_de())["reinicios_pendientes"])
+        desde = len(self.sis.ordenes)
+        self.assertEqual(self.orden("instalar", "--si", terminal=False), 0, self.salida)
+        self.assertEqual(len([o for o in self.reinicios("hehermes-pasarela.service")
+                              if o in self.ordenes_de(desde)]), 1)
+        self.assertNotIn("reinicios_pendientes", self.manifiesto(self.manifiesto_de()))
+
+    def test_parada_no_arranca_la_que_estaba_parada(self):
+        # Parada (y habilitada o no): se arranca, como siempre, y ya con el código nuevo; nada de reiniciar.
+        self.instalado()
+        self.de_antes("hehermes_servidor/pasarela.py")
+        self.parar("hehermes-pasarela")
+        desde = len(self.sis.ordenes)
+        self.assertEqual(self.orden("instalar", "--si", terminal=False), 0, self.salida)
+        self.assertFalse([o for o in self.reinicios("hehermes-pasarela.service") if o in self.ordenes_de(desde)])
+        self.assertTrue(self.en_marcha("hehermes-pasarela"))
+
+    def test_en_marcha_sin_habilitar_se_habilita_y_se_reinicia(self):
+        self.instalado()
+        self.de_antes("hehermes_servidor/pasarela.py")
+        self.deshabilitar("hehermes-pasarela")
+        desde = len(self.sis.ordenes)
+        self.assertEqual(self.orden("instalar", "--si", terminal=False), 0, self.salida)
+        self.assertEqual(len([o for o in self.reinicios("hehermes-pasarela.service")
+                              if o in self.ordenes_de(desde)]), 1)
+
+    def parar(self, unidad):
+        self.falso.activos.discard(unidad)
+
+    def deshabilitar(self, unidad):
+        self.falso.habilitados.discard(unidad)
+
+    def en_marcha(self, unidad):
+        return unidad in self.falso.activos
+
+
+class ElCodigoNuevoSinRoot(ElCodigoNuevo):
+    euid = 1000
+    cuenta = ("hermes", "/home/hermes", 1000)
+
+    def servidor(self):
+        return SinRoot.servidor(self)
+
+    def prefijo(self):
+        return "/home/hermes/.local/share/hehermes-servidor"
+
+    def manifiesto_de(self):
+        return "/home/hermes/.config/hehermes/instalacion.json"
+
+    def reinicios(self, unidad):
+        return [o for o in self.sis.ordenes if o[:3] == ["systemctl", "--user", "restart"] and o[-1] == unidad]
+
+    def parar(self, unidad):
+        self.falso.activos_usuario.discard(unidad)
+
+    def deshabilitar(self, unidad):
+        self.falso.habilitados_usuario.discard(unidad)
+
+    def en_marcha(self, unidad):
+        return unidad in self.falso.activos_usuario
+
+
 if __name__ == "__main__":
     unittest.main()

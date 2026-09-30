@@ -36,7 +36,7 @@ import urllib.parse
 
 from . import manifiesto as m
 from . import piezas as p
-from .plan import Accion, _unidad, bloqueo, buscar_en_origen, etiquetar, fuente_del_lector
+from .plan import Accion, _unidad, bloqueo, buscar_en_origen, codigo_de, etiquetar, fuente_del_lector
 
 ESQUEMA = "hehermes-avisos:1"
 _HUELLA = re.compile(r"[A-Za-z0-9_-]{43}")
@@ -195,8 +195,10 @@ def planear(sis, det, man, op, origen, acciones, bloqueos, fichero, avisos=None)
         socket_ = [fichero(ambito.socket_vigia, p.unidad_vigia_socket())]
         _unidad(sis, acciones, p.SOCKET_VIGIA, socket_, "el puerto del vigía, 127.0.0.1:8790", "restart")
     servicio = fichero(ambito.unidad_vigia, p.unidad_vigia(ambito, vigia["direccion"]))
+    # Su código: el de los avisos y, por la clave de Hermes, el del instalador (`hehermes_servidor.pasarela`).
     _unidad(sis, acciones, p.UNIDAD_VIGIA, propias + [servicio], "el vigía de avisos: " + detalle, "restart",
-            ambito.systemctl)
+            ambito.systemctl, codigo=codigo_de(acciones, ambito.prefijo, "hehermes_avisos/", "hehermes_servidor/"),
+            quien="el vigía", man=man)
     return vigia
 
 

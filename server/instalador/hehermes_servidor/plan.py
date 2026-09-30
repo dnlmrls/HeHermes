@@ -12,6 +12,7 @@ import re
 from . import VERSION
 from . import manifiesto as m
 from . import piezas as p
+from .aplicar import REINICIOS_PENDIENTES
 from .deteccion import NORMAL, PREFIJO_ERROR, ROJO, Bloqueo, bloqueo, etiquetar  # noqa: F401
 
 NOMBRE_VALIDO = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
@@ -52,6 +53,10 @@ class Accion:
     """Una cosa que el instalador deja. `tipo`: paquete, fichero, gestionado, enlace, unidad, regla, firewalld, propio,
     usuario, venv, certificado, env, exposicion, dispositivo o canje. `datos`: el contenido (fichero), el destino
     (enlace) o los argumentos (regla)."""
+
+    #: Solo las de una unidad (`_unidad`): se reinicia por su código, y en marcha sin habilitar, tras habilitarla.
+    por_codigo = False
+    reiniciar = False
 
     def __init__(self, tipo, objeto, estado, detalle="", datos=None, modo=0o644, grupo=None):
         self.tipo, self.objeto, self.estado, self.detalle = tipo, objeto, estado, detalle
@@ -146,20 +151,53 @@ def registro_de_dispositivos(sis) -> list:
         return []
 
 
-def _unidad(sis, acciones, unidad, ficheros, detalle, como_recargar, systemctl=("systemctl",)):
+def codigo_de(acciones, prefijo, *partes) -> list:
+    """Las acciones de los ficheros de código que carga un servicio que no se para (la pasarela, el vigía): los de
+    `prefijo` + cada parte (una ruta, o una carpeta acabada en «/», con todo lo de dentro). Python los lee al arrancar:
+    si cambian, el servicio sigue con los de antes hasta que se reinicia."""
+    rutas = tuple(prefijo + "/" + parte for parte in partes)
+    return [a for a in acciones if a.tipo == "fichero" and any(
+        a.objeto.startswith(r) if r.endswith("/") else a.objeto == r for r in rutas)]
+
+
+def _unidad(sis, acciones, unidad, ficheros, detalle, como_recargar, systemctl=("systemctl",), codigo=(), quien=None,
+            man=None):
     """Una unidad se habilita y arranca si no lo está; si solo cambian sus ficheros, se recarga (`reload`, si la unidad
     lo sabe hacer sin cortar nada) o se reinicia (una `.path`, que no se puede recargar, o la pasarela). Sin root,
-    `systemctl --user`."""
+    `systemctl --user`.
+
+    `codigo`: las acciones del código que carga (`codigo_de`), para un servicio que no se para. Si cambia, o quedó un
+    reinicio pendiente de una pasada que se paró a medias (`REINICIOS_PENDIENTES`), y está en marcha, se reinicia una
+    vez: antes de la 0.10.1 solo se reiniciaba si cambiaban su unidad o su configuración, y una actualización dejaba la
+    pasarela corriendo con el código de antes. Los que arrancan uno por conexión o por temporizador (el lector, el
+    ayudante de la copia, el borrado, el canje) cogen el código nuevo solos."""
     activa = sis.ejecutar(list(systemctl) + ["is-active", unidad]).bien
     habilitada = sis.ejecutar(list(systemctl) + ["is-enabled", unidad]).bien
+    configuracion = any(f.cambia for f in ficheros)
+    pendiente = man is not None and unidad in (man.datos.get(REINICIOS_PENDIENTES) or [])
+    su_codigo = bool(codigo) and (pendiente or any(f.cambia for f in codigo))
+    reiniciar = False
     if not (activa and habilitada):
         estado, que = m.NUEVO, "habilitar y arrancar: " + detalle
-    elif any(f.cambia for f in ficheros):
+        if activa and (configuracion or su_codigo):
+            # En marcha sin habilitar: `enable --now` no la reinicia, y seguiría con lo de antes.
+            reiniciar, que = True, "habilitar y reiniciar: " + detalle
+    elif configuracion:
         estado, que = m.CAMBIA, ("recargar (reload, sin cortar nada)" if como_recargar == "reload"
                                  else "reiniciar (es solo suya)")
+        if su_codigo:
+            que += "; su código también cambia"
+        reiniciar = True
+    elif su_codigo:
+        estado, que, reiniciar = m.CAMBIA, "se reinicia %s: su código cambia" % (quien or unidad), True
     else:
         estado, que = m.YA_ESTA, detalle
-    acciones.append(Accion("unidad", unidad, estado, que, como_recargar))
+    accion = Accion("unidad", unidad, estado, que, como_recargar)
+    # Con el código nuevo ya escrito: `aplicar_tls` lo apunta como pendiente antes de escribirlo.
+    accion.por_codigo = reiniciar and su_codigo
+    # En marcha sin habilitar: tras `enable --now`, un reinicio.
+    accion.reiniciar = reiniciar and estado == m.NUEVO
+    acciones.append(accion)
 
 
 # MARK: Pintar

@@ -9,6 +9,11 @@ from __future__ import annotations
 
 from . import manifiesto as m
 
+#: En el manifiesto: los servicios cuyo código nuevo ya está en disco y que aún no se han reiniciado. Si el comando se
+#: para entre escribir el código y reiniciar (otro paso falla), al repetirlo el código ya «está», pero el servicio
+#: sigue con el de antes en memoria: esta lista es lo que se acuerda de reiniciarlo (`plan._unidad`).
+REINICIOS_PENDIENTES = "reinicios_pendientes"
+
 
 class Parada(Exception):
     """El instalador se para aquí: lo de este paso ya ha vuelto a como estaba."""
@@ -127,6 +132,16 @@ def _propio(sis, man, det, acciones, salida):
         salida("==> %s: %s (%s)" % (lugar.nombre, " y ".join(r.nombre for r in reglas), lugar.donde))
 
 
+def apuntar_reinicios(sis, man, acciones) -> None:
+    """Antes de escribir el código: los servicios que se reiniciarán por él quedan pendientes en el manifiesto hasta que
+    se reinicien (`_con_unidad`). Si algo se para entre medias, repetir el comando los reinicia igual."""
+    nuevos = [a.objeto for a in acciones if a.tipo == "unidad" and a.por_codigo]
+    pendientes = man.datos.get(REINICIOS_PENDIENTES) or []
+    if any(u not in pendientes for u in nuevos):
+        man.datos[REINICIOS_PENDIENTES] = pendientes + [u for u in nuevos if u not in pendientes]
+        man.guardar(sis)
+
+
 def _ficheros(sis, man, acciones, que, salida, etiquetar=False):
     tx = Transaccion(sis, man, etiquetar)
     try:
@@ -155,6 +170,8 @@ def _con_unidad(sis, man, acciones, unidad, salida, etiquetar=False, systemctl=(
             _orden(sis, systemctl + ["daemon-reload"], "systemctl daemon-reload")
         if accion.estado == m.NUEVO:
             _orden(sis, systemctl + ["enable", "--now", unidad], "arrancar %s" % unidad)
+            if accion.reiniciar:
+                _orden(sis, systemctl + [accion.datos, unidad], "%s %s" % (accion.datos, unidad))
         elif accion.estado == m.CAMBIA:
             _orden(sis, systemctl + [accion.datos, unidad], "%s %s" % (accion.datos, unidad))
     except Parada:
@@ -164,6 +181,12 @@ def _con_unidad(sis, man, acciones, unidad, salida, etiquetar=False, systemctl=(
         raise
     if unidad not in man.unidades:
         man.unidades.append(unidad)
+    # Ya corre con el código que hay en disco (arrancada, reiniciada o sin nada pendiente).
+    pendientes = man.datos.get(REINICIOS_PENDIENTES)
+    if pendientes and unidad in pendientes:
+        pendientes.remove(unidad)
+        if not pendientes:
+            del man.datos[REINICIOS_PENDIENTES]
     if accion.cambia:
         salida("==> %s: %s" % (unidad, accion.detalle))
     man.guardar(sis)

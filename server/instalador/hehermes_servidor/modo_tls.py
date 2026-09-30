@@ -22,10 +22,11 @@ import time
 from . import ambito as amb
 from . import manifiesto as m
 from . import piezas as p
-from .aplicar import Parada, Transaccion, _con_unidad, _escribir, _ficheros, _firewalld, _orden, _paquetes, _propio, _ufw
+from .aplicar import (Parada, Transaccion, _con_unidad, _escribir, _ficheros, _firewalld, _orden, _paquetes, _propio,
+                      _ufw, apuntar_reinicios)
 from .deteccion import Deteccion, bloqueo, etiquetar, _cortafuegos, _direccion, _distro, _escuchan, _hermes, regla_ufw_canonica
 from .entorno import leer_env
-from .plan import Accion, Plan, _unidad, buscar_en_origen, ficheros_propios
+from .plan import Accion, Plan, _unidad, buscar_en_origen, codigo_de, ficheros_propios
 
 TOKENS_VACIO = b'{\n  "v": 1,\n  "tokens": []\n}\n'
 #: En la familia Debian, `venv` sin `ensurepip` viene aparte.
@@ -269,7 +270,9 @@ def calcular_plan_tls(sis, det, man, op, origen) -> Plan:
     pasarela.append(fichero(ambito.unidad, p.unidad_pasarela(ambito, det.con_vigia)))
     _unidad(sis, acciones, p.UNIDAD_PASARELA, pasarela + [a for a in acciones if a.tipo in ("certificado",
                                                                                         "certificado_siguiente")],
-            "la pasarela, en el TCP %d" % det.puerto_pasarela, "restart", ambito.systemctl)
+            "la pasarela, en el TCP %d" % det.puerto_pasarela, "restart", ambito.systemctl,
+            codigo=codigo_de(acciones, ambito.prefijo, "hehermes-pasarela", "hehermes_servidor/"), quien="la pasarela",
+            man=man)
     # El borrado de verdad de lo que la app borra de Hermes, de noche (`mantenimiento.py`).
     borrado = [fichero(ambito.unidad_borrado, p.unidad_borrado(ambito)),
                fichero(ambito.temporizador_borrado, p.temporizador_borrado())]
@@ -414,6 +417,8 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
                 ambito.unidad_borrado, ambito.temporizador_borrado}
     sueltos = [a for a in acciones if a.tipo in ("fichero", "enlace")
                and a.objeto not in pasarela | unidades | vigias.rutas(ambito)]
+    # El código de la pasarela y del vigía va aquí: antes de escribirlo, se apunta que hay que reiniciarlos.
+    apuntar_reinicios(sis, man, acciones)
     _ficheros(sis, man, sueltos, "ficheros", salida)
 
     # La carpeta de la pasarela: con root, 0750 y del grupo hh-pasarela, que tiene que llegar a pasarela.ini, al
