@@ -22,6 +22,12 @@ avisa de lo que quedó de la VPN.
 **La 0.10.0 trae la copia de Hermes en iCloud** ([abajo](#la-copia-de-hermes-en-icloud-desde-la-0100)): el ayudante
 `hehermes-respaldo`, con su socket, como el lector, y la pasarela deja pasar trozos de 4 MiB en `/avisos/v1/respaldo/`.
 
+**La 0.10.1 reinicia lo que corre con código viejo.** Hasta la 0.10.0, actualizar solo reiniciaba la pasarela si
+cambiaban su unidad, su configuración o sus certificados: la 0.10.0 sobre la 0.9.0 reescribió `/opt/hehermes-servidor`
+y la pasarela siguió con el código de antes (el tope de 64 KiB en vez de 4 MiB en `/avisos/v1/respaldo/`). Ahora, si
+cambia el código de un servicio que no se para, y está en marcha, se reinicia una vez, con root y sin él, y el plan lo
+dice («se reinicia la pasarela: su código cambia»): [abajo](#cómo-no-pisa-nada).
+
 **Desde la 0.6.0 la pasarela es lo único que instala para conectar.** La VPN IKEv2 de las versiones anteriores ya no se instala, ni se repara,
 ni se actualiza, y la app ya no la usa: `instalar --modo vpn` se para y dice que ya no existe. La de un servidor que la
 tenga **se quita** con `desinstalar --modo vpn`, sin tocar la pasarela: [abajo](#la-vpn-de-antes), paso a paso.
@@ -460,6 +466,14 @@ también el siguiente `instalar --por-chat` y `desinstalar`). La app acepta cual
   hash, porque cambian.
 - **Cada paso deja el manifiesto al día**, y uno que falla vuelve a como estaba: tras un fallo basta con repetir el
   comando.
+- **El código nuevo, con el servicio reiniciado** (desde la 0.10.1). La pasarela carga `hehermes-pasarela` y
+  `hehermes_servidor/`, y el vigía, `hehermes_avisos/` y `hehermes_servidor/` (la clave de Hermes): si alguno de esos
+  ficheros cambia y el servicio está en marcha, se reinicia una vez (`systemctl [--user] restart`); si no hay nada que
+  cambie, nada. Antes de escribir el código, los que se van a reiniciar quedan en el manifiesto
+  (`reinicios_pendientes`) hasta que se reinician: si el comando se para entre medias, repetirlo los reinicia igual. El
+  lector, el ayudante de la copia (`Accept=yes`, uno por conexión), el borrado (lo lanza su temporizador), la clave de
+  Hermes (su `.path`) y el canje (uno nuevo cada vez) arrancan de cero y cogen el código nuevo solos: ni se reinician
+  ni se cortan (el borrado puede estar compactando la base de Hermes).
 - **Ningún cortafuegos se enciende.** ufw, firewalld, nftables e iptables reciben las reglas justas y marcadas; el del
   proveedor, un aviso. Una regla de ufw o firewalld que ya estaba (de otro) se queda como «ya está*» y desinstalar no
   la quita.
