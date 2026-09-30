@@ -16,6 +16,7 @@ import re
 import secrets
 import shlex
 
+from . import gestor as gestores
 from .entorno import leer_env
 
 SOPORTADAS = {("debian", "12"), ("debian", "13"), ("ubuntu", "22.04"), ("ubuntu", "24.04"), ("ubuntu", "26.04")}
@@ -90,6 +91,25 @@ class Hermes:
         self.expuesta = None
         #: Con --corregir-exposicion: la línea que cierra la API a 127.0.0.1, si se puede poner en el .env.
         self.exposicion_pendiente = None
+        #: El proceso (si se ha visto) y quién lo lleva (`gestor.Gestor`: su unidad de systemd o su contenedor), que es
+        #: lo que se reinicia. None: no se sabe reiniciar (tmux, screen, nohup).
+        self.pid = None
+        self.gestor = None
+        #: Con --activar-api y un Hermes que no se sabe reiniciar: se enciende la API en su .env y se para, para que lo
+        #: reinicie quien lo lleva (`reinicia-hermes`).
+        self.reinicio_a_mano = False
+        #: Un Hermes en un contenedor: su red («host», «bridge»…), si se sabe.
+        self.red = None
+
+    @property
+    def casa_de_rutas(self) -> str:
+        """Desde dónde se leen las rutas con «~/» que manda Hermes (el vigía): la casa de su usuario. La de un perfil
+        (`<raíz>/profiles/<perfil>`) es la de la raíz; la de siempre (`~/.hermes`), su carpeta de arriba."""
+        casa = self.home.rstrip("/")
+        partes = casa.rsplit("/", 2)
+        if len(partes) == 3 and partes[1] == "profiles":
+            casa = partes[0]
+        return casa.rsplit("/", 1)[0] or "/"
 
     @property
     def clave(self):
@@ -219,7 +239,52 @@ def _propiedades(texto):
     return dict(linea.split("=", 1) for linea in texto.splitlines() if "=" in linea)
 
 
-def _candidatos(sis):
+#: Un nombre de perfil de Hermes (`hermes_cli/main.py`, `_PROFILE_NAME_RE`).
+_PERFIL = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+#: Lo que marca un gateway lanzado por un supervisor (`hermes_cli/main.py`, `_under_gateway_supervisor`): ese no sigue
+#: el perfil «pegajoso» (`active_profile`).
+_SUPERVISADO = ("HERMES_SUPERVISED_CHILD", "HERMES_S6_SUPERVISED_CHILD", "INVOCATION_ID")
+
+
+def _perfil_de(argv) -> str | None:
+    """El perfil de `-p <perfil>`, `--profile <perfil>` o `--profile=<perfil>` en la orden de un proceso."""
+    for i, trozo in enumerate(argv):
+        if trozo == "--":
+            break
+        if trozo in ("-p", "--profile") and i + 1 < len(argv):
+            valor = argv[i + 1].strip().lower()
+            return valor if _PERFIL.fullmatch(valor) else None
+        if trozo.startswith("--profile="):
+            valor = trozo.split("=", 1)[1].strip().lower()
+            return valor if _PERFIL.fullmatch(valor) else None
+    return None
+
+
+def casa_del_proceso(sis, usuario, argv, entorno) -> str:
+    """La casa de Hermes (su HERMES_HOME) de un proceso, como la decide Hermes al arrancar (`hermes_cli/main.py`,
+    `_apply_profile_override`): el perfil de su orden (`-p trabajo`) manda; si no, un HERMES_HOME que ya es la carpeta de un
+    perfil; si no, y no lo lanzó un supervisor, el perfil activo (`<raíz>/active_profile`, el de `hermes profile use`);
+    y si no, su HERMES_HOME o `~/.hermes`. `/proc/<pid>/environ` solo tiene el entorno con el que arrancó, no el que se
+    pone Hermes después: por eso hay que repetir su cuenta."""
+    propio = (entorno.get("HERMES_HOME") or "").rstrip("/")
+    raiz = propio or _home(sis, usuario) + "/.hermes"
+    arriba = raiz.rsplit("/", 2)
+    if len(arriba) == 3 and arriba[1] == "profiles":
+        raiz = arriba[0]
+    perfil = _perfil_de(argv)
+    if perfil:
+        return raiz if perfil == "default" else raiz + "/profiles/" + perfil
+    if propio and propio != raiz:
+        return propio
+    externo = (entorno.get("HERMES_GATEWAY_EXTERNAL_SUPERVISOR") or "").strip().lower() in ("1", "true", "yes", "on")
+    if not externo and not any(entorno.get(marca) for marca in _SUPERVISADO):
+        activo = (sis.leer_texto(raiz + "/active_profile") or "").strip().lower()
+        if activo and activo != "default" and _PERFIL.fullmatch(activo) and sis.es_carpeta(raiz + "/profiles/" + activo):
+            return raiz + "/profiles/" + activo
+    return propio or raiz
+
+
+def _candidatos(sis, root=True, usuario_actual=None):
     candidatos = []
     r = sis.ejecutar(["systemctl", "show", "hermes-gateway.service", "-p", "LoadState", "-p", "ActiveState",
                       "-p", "User", "-p", "Environment"])
@@ -231,11 +296,18 @@ def _candidatos(sis):
                         "la unidad hermes-gateway")
         hermes.entorno = entorno
         hermes.en_marcha = props.get("ActiveState") in ("active", "reloading", "activating")
+        hermes.gestor = gestores.Gestor("sistema", "hermes-gateway.service")
         candidatos.append(hermes)
     r = sis.ejecutar(["ps", "-eo", "pid=,user=,args="])
     for linea in r.salida.splitlines():
         partes = linea.split(None, 2)
-        if len(partes) < 3 or not re.search(r"\bhermes\b", partes[2]) or "gateway" not in partes[2]:
+        # `hermes gateway run`, su lanzador (`…/.hermes/bin/hermes`) o `python -m hermes_cli.main` (hermes_cli/
+        # _launchers.py).
+        if len(partes) < 3 or not re.search(r"\bhermes(_cli)?\b", partes[2]) or "gateway" not in partes[2]:
+            continue
+        # Y que lo ejecutado sea Python o el `hermes` de Hermes: un `tail -f ~/.hermes/profiles/x/logs/gateway.log`
+        # también lleva «hermes» y «gateway», y contaría como otro Hermes (`varios-hermes`).
+        if not re.fullmatch(r"(python[0-9.]*|hermes[A-Za-z0-9._-]*)", partes[2].split()[0].rsplit("/", 1)[-1]):
             continue
         pid, usuario = partes[0], partes[1]
         entorno = {}
@@ -243,18 +315,53 @@ def _candidatos(sis):
             if b"=" in par:
                 clave, _, valor = par.decode("utf-8", "replace").partition("=")
                 entorno[clave] = valor
-        hermes = Hermes(usuario, entorno.get("HERMES_HOME") or _home(sis, usuario) + "/.hermes", "el proceso %s" % pid)
-        hermes.entorno = entorno
+        gestor = gestores.detectar(sis, pid, root=root, usuario_actual=usuario_actual)
+        red = None
+        casa = casa_del_proceso(sis, usuario, partes[2].split(), entorno)
+        if gestor is not None and gestor.tipo in gestores.CONTENEDORES:
+            # Su casa es la de dentro del contenedor (`/opt/data`): la del servidor es la del montaje que la lleva.
+            datos = gestores.contenedor(sis, gestor)
+            red = datos.get("red")
+            casa = gestores.ruta_en_el_servidor(datos.get("montajes", []), casa) or casa
+        origen = "el proceso %s" % pid if gestor is None else "%s, proceso %s" % (gestor.describir(), pid)
+        hermes = Hermes(usuario, casa, origen)
+        hermes.entorno, hermes.pid, hermes.gestor, hermes.red, hermes.en_marcha = entorno, pid, gestor, red, True
         candidatos.append(hermes)
     vistos, unicos = set(), []
     for c in candidatos:
         if c.home.rstrip("/") not in vistos:
             vistos.add(c.home.rstrip("/"))
             unicos.append(c)
-        elif c.origen.startswith("el proceso"):
+        elif c.pid is not None:
             # La unidad y su proceso son el mismo Hermes: si el proceso está, está en marcha.
-            next(u for u in unicos if u.home.rstrip("/") == c.home.rstrip("/")).en_marcha = True
+            primero = next(u for u in unicos if u.home.rstrip("/") == c.home.rstrip("/"))
+            primero.en_marcha = True
+            primero.pid = primero.pid or c.pid
+    if any(c.pid is not None for c in unicos):
+        # La unidad hermes-gateway parada no cuenta si hay otro Hermes en marcha (el de un perfil, con su unidad): es el
+        # que corre el que hay que conectar.
+        unicos = [c for c in unicos if c.en_marcha is not False]
     return unicos
+
+
+def _el_que_me_lanza(sis, candidatos):
+    """Con varios Hermes, el que ha lanzado el instalador (por chat, lo lanza su herramienta de terminal): el que es
+    antepasado de este proceso o, si no, el del HERMES_HOME que hereda este proceso (el de su perfil). None si no."""
+    por_pid = {str(c.pid): c for c in candidatos if c.pid is not None}
+    pid, vistos = getattr(sis, "pid", None), set()
+    while pid is not None and str(pid) not in vistos and str(pid) not in ("0", "1"):
+        if str(pid) in por_pid:
+            return por_pid[str(pid)]
+        vistos.add(str(pid))
+        estado = sis.leer_texto("/proc/%s/status" % pid) or ""
+        padre = re.search(r"^PPid:\s*(\d+)\s*$", estado, re.M)
+        pid = padre.group(1) if padre else None
+    propia = ((getattr(sis, "entorno", None) or {}).get("HERMES_HOME") or "").rstrip("/")
+    if propia:
+        iguales = [c for c in candidatos if c.home.rstrip("/") == propia]
+        if len(iguales) == 1:
+            return iguales[0]
+    return None
 
 
 def _carpetas_de_hermes(sis) -> list:
@@ -269,9 +376,14 @@ def _clave_valida(clave) -> bool:
     return bool(re.fullmatch(r"[\x21-\x7e]+", clave)) and '"' not in clave and "\\" not in clave
 
 
-def _hermes(sis, det, hermes_home, activar_api=False, corregir_exposicion=False):
-    candidatos = _candidatos(sis)
+def _hermes(sis, det, hermes_home, activar_api=False, corregir_exposicion=False, ambito=None):
+    root = ambito is None or ambito.root
+    candidatos = _candidatos(sis, root=root, usuario_actual=None if root else ambito.usuario)
     det.hermes_encontrados = candidatos
+    if len(candidatos) > 1 and not hermes_home:
+        # Varios perfiles en marcha: el que ha lanzado el instalador es el que hay que conectar.
+        el_mio = _el_que_me_lanza(sis, candidatos)
+        candidatos = [el_mio] if el_mio else candidatos
     if hermes_home:
         elegido = next((c for c in candidatos if c.home.rstrip("/") == hermes_home.rstrip("/")), None)
         elegido = elegido or Hermes("?", hermes_home, "--hermes-home")
@@ -315,7 +427,7 @@ def _hermes(sis, det, hermes_home, activar_api=False, corregir_exposicion=False)
         det.bloqueos.append(bloqueo("api-hermes", "API_SERVER_PORT de %s no es un puerto" % elegido.env))
         return
     if activar_api and not (elegido.habilitada and elegido.clave):
-        _activar_api(det, elegido, env)
+        _activar_api(det, elegido, env, ambito)
         return
     if not elegido.habilitada:
         det.bloqueos.append("La API de Hermes está apagada (API_SERVER_ENABLED en %s). Enciéndela y reinicia Hermes, "
@@ -335,8 +447,8 @@ def _hermes(sis, det, hermes_home, activar_api=False, corregir_exposicion=False)
         det.bloqueos.append("Hermes escucha en %s y no en 127.0.0.1: la pasarela no lo alcanzaría" % elegido.host)
         etiquetar(det.bloqueos, "api-hermes")
         return
-    _exposicion(sis, det, elegido, env, corregir_exposicion)
-    base = "http://127.0.0.1:%d" % elegido.puerto
+    _exposicion(sis, det, elegido, env, corregir_exposicion, ambito)
+    base ="http://127.0.0.1:%d" % elegido.puerto
     estado, _ = sis.http_get(base + "/health")
     if estado is None:
         det.bloqueos.append("Hermes está en marcha, pero su API no contesta en 127.0.0.1:%d: ¿la tiene encendida "
@@ -361,7 +473,7 @@ def _hermes(sis, det, hermes_home, activar_api=False, corregir_exposicion=False)
 TODAS = ("0.0.0.0", "::", "[::]", "*")
 
 
-def _exposicion(sis, det, elegido, env, corregir):
+def _exposicion(sis, det, elegido, env, corregir, ambito=None):
     """La API de Hermes escuchando en todas las interfaces: se mira lo que dice su configuración y lo que de verdad
     escucha (`ss`). Se avisa muy claro; solo con --corregir-exposicion se cambia, y solo en el .env."""
     donde = None
@@ -388,10 +500,10 @@ def _exposicion(sis, det, elegido, env, corregir):
                 "API_SERVER_HOST=127.0.0.1 al final de %s (con una copia antes) y reinicio Hermes 90 s después"
                 % elegido.env)
         puede = True
-    if corregir and puede and elegido.origen != "la unidad hermes-gateway":
-        det.bloqueos.append("Con --corregir-exposicion tendría que reiniciar Hermes, y no corre como la unidad "
-                            "hermes-gateway (lo encuentro por %s): no sé reiniciarlo. Añade tú API_SERVER_HOST=127.0.0.1 "
-                            "a %s y reinícialo" % (elegido.origen, elegido.env))
+    if corregir and puede and not gestores.puede_reiniciar(elegido.gestor, ambito):
+        det.bloqueos.append("Con --corregir-exposicion tendría que reiniciar Hermes, y no sé reiniciarlo (lo encuentro "
+                            "por %s, que no es una unidad de systemd ni un contenedor que pueda reiniciar). Añade tú "
+                            "API_SERVER_HOST=127.0.0.1 a %s y reinícialo" % (elegido.origen, elegido.env))
         etiquetar(det.bloqueos, "api-hermes")
     elif corregir and puede:
         elegido.exposicion_pendiente = "API_SERVER_HOST=127.0.0.1"
@@ -403,13 +515,18 @@ def _exposicion(sis, det, elegido, env, corregir):
     det.avisos.append(ROJO + "%s. %s" % (riesgo, como) + NORMAL)
 
 
-def _activar_api(det, elegido, env):
+def _activar_api(det, elegido, env, ambito=None):
     """Decisión 6: solo las líneas que faltan, y Hermes se reinicia 90 s después de acabar, para no cortarle el turno
-    en el que contesta con el enlace. Hermes aún no escucha: no hay nada que probar hasta entonces."""
-    if elegido.origen != "la unidad hermes-gateway":
-        det.bloqueos.append("La API de Hermes está apagada y Hermes no corre como la unidad hermes-gateway (lo encuentro "
-                            "por %s): no sé reiniciarlo. Enciende tú la API en %s y reinícialo" % (elegido.origen,
-                                                                                               elegido.env))
+    en el que contesta con el enlace. Hermes aún no escucha: no hay nada que probar hasta entonces.
+
+    Lo que se reinicia es lo que lleva su proceso (`gestor`): su unidad, se llame como se llame (la de un perfil,
+    `hermes-gateway-trabajo`, o una de usuario), o su contenedor. Si no lo lleva nada que se sepa reiniciar (tmux, nohup),
+    con root se enciende igual y se para con `reinicia-hermes`: lo reinicia quien lo arrancó y se vuelve a lanzar."""
+    if elegido.gestor is not None and elegido.gestor.tipo in gestores.CONTENEDORES and elegido.red != "host":
+        det.bloqueos.append("La API de Hermes está apagada, y Hermes corre en %s con su propia red (%s): una API que "
+                            "solo escuche en su 127.0.0.1 no la alcanza la pasarela. Enciéndela tú en %s y publica su "
+                            "puerto solo en el 127.0.0.1 del servidor (o arráncalo con --network host)"
+                            % (elegido.gestor.describir(), elegido.red or "no sé cuál", elegido.env))
         etiquetar(det.bloqueos, "api-apagada")
         return
     if elegido.host not in ("127.0.0.1", "localhost"):
@@ -431,6 +548,16 @@ def _activar_api(det, elegido, env):
         elegido._clave = secrets.token_urlsafe(32)
         elegido.api_pendiente.append("API_SERVER_KEY=" + elegido.clave)
     elegido.habilitada = True
+    if gestores.puede_reiniciar(elegido.gestor, ambito) or not (ambito is None or ambito.root):
+        # Sin root y sin una unidad suya, lo dice `modo_tls.detectar_tls` (no puede ni escribir la copia en /etc).
+        return
+    elegido.reinicio_a_mano = True
+    det.bloqueos.append("Hermes no corre como una unidad de systemd ni en un contenedor (lo encuentro por %s), así que "
+                        "no sé reiniciarlo para que encienda su API. Si no hay nada más que me pare, añado a %s lo que "
+                        "falta (%s, con una copia antes) y me paro: reinicia tú Hermes y vuelve a lanzar el mismo "
+                        "comando" % (elegido.origen, elegido.env,
+                                     ", ".join(linea.split("=", 1)[0] for linea in elegido.api_pendiente)))
+    etiquetar(det.bloqueos, "reinicia-hermes")
 
 
 # MARK: La dirección

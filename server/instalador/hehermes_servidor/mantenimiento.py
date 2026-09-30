@@ -31,6 +31,7 @@ import json
 import os
 import time
 
+from . import gestor as gestores
 from . import piezas as p
 from .pasarela import ACTIVIDAD, BORRADO_PENDIENTE, MANTENIMIENTO, pendiente_desde
 
@@ -114,38 +115,51 @@ def _cambio(sis, ruta):
         return None
 
 
-def como_parar(man, ambito) -> tuple:
-    """(unidad de Hermes, None) si se puede parar y arrancar; (None, por qué) si no."""
+def gestor_de_hermes(man):
+    """Quién lleva a Hermes, del manifiesto: `gestor_hermes` desde la 0.10.2; antes, solo `unidad_hermes` (del sistema)."""
     datos = man.datos.get("mantenimiento") or {}
-    unidad = datos.get("unidad_hermes")
-    if not unidad:
+    gestor = gestores.desde_dict(datos.get("gestor_hermes"))
+    if gestor is None and "gestor_hermes" not in datos and datos.get("unidad_hermes"):
+        gestor = gestores.desde_dict({"tipo": "sistema", "nombre": datos["unidad_hermes"]})
+    return gestor
+
+
+def como_parar(man, ambito) -> tuple:
+    """(gestor de Hermes, None) si se puede parar y arrancar; (None, por qué) si no. Su unidad, se llame como se llame
+    (la de un perfil, `hermes-gateway-trabajo`) y sea del sistema o de usuario; un contenedor no: su `state.db` puede no
+    estar en el servidor, y su `hermes` no está fuera."""
+    datos = man.datos.get("mantenimiento") or {}
+    gestor = gestor_de_hermes(man)
+    if gestor is None or gestor.tipo in gestores.CONTENEDORES:
         return None, ("Hermes no corre como una unidad de systemd (%s): no sé pararlo y volver a arrancarlo"
                       % (datos.get("origen") or "?"))
-    if not ambito.root:
-        return None, "Hermes es la unidad del sistema %s, y sin root no la puedo parar" % unidad
-    return unidad, None
+    if not gestores.puede_reiniciar(gestor, ambito):
+        return None, "Hermes es %s, y sin root no la puedo parar" % gestor.describir()
+    return gestor, None
 
 
-def _hermes_que_sabe_optimizar(sis, datos) -> list | None:
+def _hermes_que_sabe_optimizar(sis, datos, gestor=None, root=True) -> list | None:
     """La orden de `hermes` de ese Hermes (la de su unidad, o la del PATH) si sabe `sessions optimize`; None si no."""
     candidatas = []
-    r = sis.ejecutar(["systemctl", "show", datos["unidad_hermes"], "-p", "ExecStart", "--value"])
+    gestor = gestor or gestores.Gestor("sistema", datos["unidad_hermes"])
+    r = sis.ejecutar(gestores.systemctl(gestor, root, "show", gestor.nombre, "-p", "ExecStart", "--value"))
     for trozo in r.salida.replace(";", " ").split():
         if trozo.startswith("path=") and "/" in trozo:
             candidatas.append(os.path.dirname(trozo[5:]) + "/hermes")
     candidatas.append(sis.cual("hermes"))
     for hermes in dict.fromkeys(c for c in candidatas if c):
-        orden = _como_hermes(datos) + [hermes, "sessions", "optimize", "--help"]
+        orden = _como_hermes(datos, root) + [hermes, "sessions", "optimize", "--help"]
         if sis.existe(hermes) and sis.ejecutar(orden).bien:
             return [hermes, "sessions", "optimize"]
     return None
 
 
-def _como_hermes(datos) -> list:
-    """Lo que va delante de una orden para que corra como el usuario de Hermes y con su casa."""
+def _como_hermes(datos, root=True) -> list:
+    """Lo que va delante de una orden para que corra como el usuario de Hermes y con su casa (la de su perfil, si
+    corre con uno). Sin root ya se es ese usuario (`como_parar` solo deja su propia unidad)."""
     entorno = ["env", "HERMES_HOME=%s" % datos["casa"]]
     usuario = datos.get("usuario") or "root"
-    return (["runuser", "-u", usuario, "--"] if usuario != "root" else []) + entorno
+    return (["runuser", "-u", usuario, "--"] if usuario != "root" and root else []) + entorno
 
 
 def borrado_seguro(sis, man, ambito, salida=print, ahora=None, hora_local=None, esperar=time.sleep) -> int:
@@ -177,7 +191,7 @@ def borrado_seguro(sis, man, ambito, salida=print, ahora=None, hora_local=None, 
         salida("borrado de verdad: pendiente; espero a un rato tranquilo (%s)" % porque)
         return 0
     estado.update(ultimo_intento=int(ahora), no_puede=None)
-    fallo, metodo = _compactar(sis, datos, unidad, salida, esperar)
+    fallo, metodo = _compactar(sis, datos, unidad, salida, esperar, root=ambito.root)
     if fallo is None:
         sis.borrar(carpeta + "/" + BORRADO_PENDIENTE)
         estado.update(ultimo_borrado=int(ahora), fallo=None, fallos_seguidos=0, metodo=metodo)
@@ -190,19 +204,20 @@ def borrado_seguro(sis, man, ambito, salida=print, ahora=None, hora_local=None, 
     return 0 if fallo is None else 1
 
 
-def _compactar(sis, datos, unidad, salida, esperar) -> tuple:
+def _compactar(sis, datos, gestor, salida, esperar, root=True) -> tuple:
     """Para Hermes, compacta y lo vuelve a arrancar, pase lo que pase. (fallo o None, cómo se hizo)."""
-    if not sis.ejecutar(["systemctl", "stop", unidad]).bien:
+    unidad = gestor.nombre
+    if not sis.ejecutar(gestores.systemctl(gestor, root, "stop", unidad)).bien:
         return "no he podido parar %s" % unidad, None
     fallo, metodo = None, None
     try:
-        orden = _hermes_que_sabe_optimizar(sis, datos)
+        orden = _hermes_que_sabe_optimizar(sis, datos, gestor, root)
         if orden is not None:
             metodo = "hermes sessions optimize"
-            r = sis.ejecutar(["timeout", "--kill-after=30", str(PLAZO_COMPACTAR)] + _como_hermes(datos) + orden)
+            r = sis.ejecutar(["timeout", "--kill-after=30", str(PLAZO_COMPACTAR)] + _como_hermes(datos, root) + orden)
         else:
             metodo = "sqlite (optimize de FTS5 y VACUUM)"
-            r = sis.ejecutar(["timeout", "--kill-after=30", str(PLAZO_COMPACTAR)] + _como_hermes(datos)
+            r = sis.ejecutar(["timeout", "--kill-after=30", str(PLAZO_COMPACTAR)] + _como_hermes(datos, root)
                              + ["/usr/bin/python3", "-I", "-c", COMPACTAR_CON_SQLITE,
                                 datos["casa"].rstrip("/") + "/state.db"])
         if r.codigo in (124, 137):
@@ -210,7 +225,7 @@ def _compactar(sis, datos, unidad, salida, esperar) -> tuple:
         elif not r.bien:
             fallo = "compactar ha fallado (%s): %s" % (r.codigo, (r.error or r.salida).strip()[-200:])
     finally:
-        arrancado = sis.ejecutar(["systemctl", "start", unidad]).bien
+        arrancado = sis.ejecutar(gestores.systemctl(gestor, root, "start", unidad)).bien
     salud = _esperar_salud(sis, datos.get("puerto") or 8642, esperar) if arrancado else False
     if not arrancado:
         fallo = (fallo + "; " if fallo else "") + "¡no he podido volver a arrancar %s!" % unidad

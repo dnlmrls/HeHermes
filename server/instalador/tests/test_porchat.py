@@ -236,10 +236,12 @@ class ActivarApi(Base):
         self.assertEqual(self.sis.leer_texto(self.env), self.antes)
 
     def test_un_hermes_suelto_no_se_sabe_reiniciar(self):
+        """Desde la 0.10.2 se enciende igual y se para para que lo reinicie quien lo arrancó (`test_perfiles`)."""
         self.montar(habilitada=False, como="proceso")
         self.assertEqual(self.orden("instalar", "--si", "--activar-api", "--iphone", "mi-iphone"), 1)
         self.assertIn("no sé reiniciarlo", self.salida)
-        self.assertEqual(self.sis.leer_texto(self.env), self.antes)
+        self.assertEqual(self.sis.leer_texto(self.env), self.antes + "API_SERVER_ENABLED=true\nAPI_SERVER_HOST=127.0.0.1\n")
+        self.assertEqual(self.reinicios(), [])
 
     def test_el_plan_dice_lo_que_hara_sin_hacerlo(self):
         self.montar(habilitada=False)

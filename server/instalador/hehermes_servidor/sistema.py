@@ -103,6 +103,10 @@ class Sistema:
         self._sonda = sonda or _sondear_de_verdad
         self.version_python = tuple(version_python or sys.version_info[:3])
         self.nucleo = nucleo or os.uname().release
+        #: Este proceso y su entorno: por chat, lo lanza Hermes, y con varios perfiles en marcha es lo que dice cuál
+        #: (`deteccion._el_que_me_lanza`).
+        self.pid = os.getpid()
+        self.entorno = dict(os.environ)
 
     # Rutas
 

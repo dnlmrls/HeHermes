@@ -28,6 +28,13 @@ y la pasarela siguió con el código de antes (el tope de 64 KiB en vez de 4 MiB
 cambia el código de un servicio que no se para, y está en marcha, se reinicia una vez, con root y sin él, y el plan lo
 dice («se reinicia la pasarela: su código cambia»): [abajo](#cómo-no-pisa-nada).
 
+**La 0.10.2 conecta cualquier Hermes bajo systemd, con perfiles o sin ellos.** Hasta la 0.10.1, `--activar-api` solo
+sabía reiniciar la unidad `hermes-gateway`, y un probador con un perfil (`hermes-gateway-<perfil>.service`, como la
+llama `hermes gateway install`) se quedó en `hehermes-error:api-apagada`. Ahora lo que se reinicia es lo que lleva el
+proceso de Hermes, leído de su `/proc/<pid>/cgroup` (`hehermes_servidor/gestor.py`): su unidad, del sistema o de usuario
+y se llame como se llame, o su contenedor; y todo lo de Hermes (su `.env`, su clave, su `exports/`, su `state.db`) es lo
+de la casa de su perfil. Uno suelto (tmux, nohup) acaba en `reinicia-hermes`: [abajo](#el-alta-por-chat---por-chat).
+
 **Desde la 0.6.0 la pasarela es lo único que instala para conectar.** La VPN IKEv2 de las versiones anteriores ya no se instala, ni se repara,
 ni se actualiza, y la app ya no la usa: `instalar --modo vpn` se para y dice que ya no existe. La de un servidor que la
 tenga **se quita** con `desinstalar --modo vpn`, sin tocar la pasarela: [abajo](#la-vpn-de-antes), paso a paso.
@@ -288,7 +295,7 @@ Hay que saber:
   - /usr/local/sbin/hehermes-dispositivo no es mío: no lo toco. Para los iPhone de la pasarela usa el mío: sudo /opt/hehermes-servidor/hehermes-dispositivo alta <nombre>
   - Aquí ya hay unos avisos puestos a mano (/opt/hehermes-avisos, los de server/avisos/despliegue/instalar.sh): ni el vigía ni el lector de ficheros los pongo yo, y lo suyo no lo toco
 
-51 cambios.
+52 cambios.
 ```
 <!-- /pasarela-de-daniel -->
 
@@ -372,9 +379,24 @@ llavero, 30 minutos y sin salir del iPhone). Hermes la ejecuta con su terminal:
   sus secretos en `/run/user/<uid>/hehermes-canje`.
 - **`--activar-api`** (decisión 6): si la API de Hermes está apagada o sin clave, añade al final de su `.env` solo las
   líneas que faltan (`API_SERVER_ENABLED=true`, `API_SERVER_HOST=127.0.0.1`, una `API_SERVER_KEY` nueva que no se
-  imprime), con una copia antes y sin cambiarle el dueño, y reinicia `hermes-gateway` **90 s después de acabar**, para
-  no cortarle a Hermes el turno en el que contesta. Solo si Hermes es esa unidad. Desinstalar quita esas líneas si
-  siguen tal cual.
+  imprime), con una copia antes y sin cambiarle el dueño, y reinicia Hermes **90 s después de acabar**, para no cortarle
+  el turno en el que contesta. Desinstalar quita esas líneas si siguen tal cual. Lo que se reinicia (desde la 0.10.2)
+  es lo que lleva su proceso, según su `/proc/<pid>/cgroup`:
+  - **una unidad del sistema**, se llame como se llame (`hermes-gateway`, la de un perfil `hermes-gateway-trabajo`, o
+    cualquiera cuyo nombre o `ExecStart` sea de Hermes: una que no lo es, como `cron.service`, no se reinicia):
+    `systemctl restart <unidad>`;
+  - **una de usuario** (`hermes gateway install` sin `--system`): con root, `runuser -u <su usuario> -- env
+    XDG_RUNTIME_DIR=/run/user/<uid> systemctl --user restart <unidad>`; sin root, si es suya, `systemd-run --user`;
+  - **un contenedor** de Docker o Podman con la red del servidor (`--network host`): `docker restart <id>`; su casa es
+    la del servidor que va montada en su `HERMES_HOME`. Con su propia red no se puede (`api-apagada`): una API en el
+    127.0.0.1 del contenedor no la alcanza la pasarela;
+  - **nada que se sepa reiniciar** (tmux, screen, nohup; con root): se añaden igual las líneas al `.env` (con su copia,
+    y un apunte en `/etc/hehermes/api-pendiente.json` que la vez siguiente pasa al manifiesto, para que desinstalar las
+    quite) y se para con `hehermes-error:reinicia-hermes`. La app le dice a la persona que le mande `/restart` a Hermes
+    (su orden del chat, que lo reinicia también suelto) y le vuelva a pegar la frase: la API ya está encendida y sigue.
+    Si además hay otra cosa que para, no se toca nada y el código es el de esa otra.
+- **Con varios perfiles en marcha**, el que ha lanzado el instalador: por chat, el Hermes que es su antepasado (lo
+  lanza su terminal), o el del `HERMES_HOME` que hereda. Si no se sabe, se enumeran (`varios-hermes`).
 - **`--qr-png <fichero>`** deja además el enlace en un PNG con su QR, por si Hermes puede mandar imágenes (con
   `qrencode`, si está).
 
@@ -404,8 +426,10 @@ salidas, en este orden:
 `--modo vpn`, para que la app la reconociera; sin VPN, un alta por chat sin root se instala como el usuario.
 
 **Desde la 0.9.0, por chat, lo que no deja instalar acaba en `hehermes-error:<código>`**, sola y la última, y solo
-antes de tocar nada (la app dice «No se ha cambiado nada», y es verdad). El texto de encima es para la persona; el
-código, para la app (`ErrorDelInstalador`), que hoy los explica todos igual:
+antes de tocar nada (la app dice «No se ha cambiado nada», y es verdad), salvo `reinicia-hermes` (0.10.2), que sale
+después de encender la API en el `.env` y que la app explica aparte. El texto de encima es para la persona; el
+código, para la app (`ErrorDelInstalador`). La frase le pide a Hermes que acabe con esa línea; el instalador no le da
+instrucciones a Hermes (la spec, «La frase», dice por qué):
 
 | Código | Qué pasa |
 |---|---|
@@ -413,7 +437,8 @@ código, para la app (`ErrorDelInstalador`), que hoy los explica todos igual:
 | `direccion` | No se sabe la dirección pública, o la dada no vale |
 | `linger` | Sin root y sin linger (y no se ha podido encender): la pasarela se pararía al cerrarse la sesión. `sudo loginctl enable-linger <usuario>` |
 | `sin-hermes`, `hermes-parado`, `varios-hermes` | No hay Hermes, está parado, o hay varios (`--hermes-home`) |
-| `api-apagada`, `api-hermes`, `clave-hermes` | La API de Hermes apagada, que no contesta o no en 127.0.0.1, o su `API_SERVER_KEY` que falta o no vale |
+| `api-apagada`, `api-hermes`, `clave-hermes` | La API de Hermes apagada (y no se puede encender: sin `--activar-api`, o en un contenedor con su propia red), que no contesta o no en 127.0.0.1, o su `API_SERVER_KEY` que falta o no vale |
+| `reinicia-hermes` | Hermes no corre bajo systemd ni en un contenedor: su API ya está encendida en el `.env`, y hay que reiniciarlo (`/restart`) y volver a lanzar lo mismo |
 | `ensurepip`, `sin-disco`, `puerto`, `sistema`, `paquete` | Sin `python3-venv`, sin sitio (150 MB), sin puerto libre, un sistema que no sabe, o un paquete incompleto |
 | `cortafuegos` | El cortafuegos cierra el paso y no se sabe abrir sin riesgo |
 | `por-chat`, `nombre-iphone`, `ficheros-ajenos`, `avisos-a-mano`, `avisos-credencial` | Lo de siempre de cada uno (el texto lo dice) |
@@ -483,7 +508,10 @@ también el siguiente `instalar --por-chat` y `desinstalar`). La app acepta cual
 
 - **El sistema:** los de [la lista](#los-sistemas), en amd64 o arm64, con systemd y Python 3.9 o más (el de RHEL 9).
   En otro, se para al empezar sin haber ejecutado nada.
-- **Hermes, de verdad:** la unidad `hermes-gateway` (y si está en marcha) o su proceso, su usuario y su `HERMES_HOME`;
+- **Hermes, de verdad:** la unidad `hermes-gateway` (y si está en marcha) o su proceso, quién lo lleva (su cgroup: su
+  unidad o su contenedor, arriba), su usuario y su `HERMES_HOME`, como lo decide Hermes al arrancar (el perfil de su
+  orden, `-p trabajo`; un `HERMES_HOME` que ya es de un perfil; el perfil activo de `hermes profile use`, si no lo lanza un
+  supervisor; o `~/.hermes`);
   del `.env` (con `export`, comillas y comentarios) y del entorno de la unidad, que manda sobre él, `API_SERVER_ENABLED`,
   `API_SERVER_KEY`, `API_SERVER_HOST` y `API_SERVER_PORT`; que `GET /health` conteste 200 en `127.0.0.1` y que la clave
   valga en `GET /api/sessions?limit=1`. Cada fallo con su mensaje: no está, está instalado pero parado (la unidad, o
@@ -501,7 +529,7 @@ o `*`), cualquiera que llegue al servidor habla con ella sin pasar por la pasare
 en rojo y **no se cambia sin permiso**, porque puede que otra cosa del usuario la use así:
 
 - `--corregir-exposicion` añade `API_SERVER_HOST=127.0.0.1` al final del `.env` (con una copia antes, sin cambiarle el
-  dueño) y reinicia `hermes-gateway` 90 s después de acabar, como `--activar-api`. Solo si Hermes es esa unidad.
+  dueño) y reinicia Hermes 90 s después de acabar, como `--activar-api` (su unidad o su contenedor). Suelto, no.
 - Si lo fija el entorno de la unidad (`Environment=`), o el `.env` ya dice 127.0.0.1, no se toca: se dice dónde está.
 - Desinstalar **no** lo deshace (volvería a abrir la API) y lo dice.
 
@@ -618,10 +646,10 @@ La auditoría del 2026-09-29 (§5, §7, §13, §14.5, §14.9), comprobada antes 
 FTS, recuperable del disco. La pasarela apunta en su carpeta de estado que hay algo pendiente (solo desde cuándo) cuando
 Hermes contesta 2xx a `DELETE /api/sessions/{id}`, y `hehermes-borrado.timer` lanza `hehermes-servidor borrado-seguro`
 cada 15 minutos de 2:00 a 6:00. Con algo pendiente y un rato tranquilo (ninguna petición con Hermes, ni escrituras en
-su `state.db`, en 10 minutos), para `hermes-gateway`, ejecuta `hermes sessions optimize` como el usuario de Hermes (o,
+su `state.db`, en 10 minutos), para la unidad de Hermes (la de su perfil, o una de usuario, desde la 0.10.2), ejecuta `hermes sessions optimize` como el usuario de Hermes (o,
 si ese Hermes no lo sabe, `optimize` de cada índice FTS5 y `VACUUM` con sqlite), lo vuelve a arrancar y espera a su
 `/health`. Tope duro de 15 minutos; Hermes arrancado pase lo que pase; un intento por noche; a los tres fallos, para.
-Si Hermes no es una unidad de systemd, o sin root lo es del sistema, no se intenta: `comprobar` dice cómo hacerlo a mano
+Si Hermes no es una unidad de systemd (o va en un contenedor), o sin root no es una unidad suya, no se intenta: `comprobar` dice cómo hacerlo a mano
 (con Hermes parado, `HERMES_HOME=<su casa> hermes sessions optimize`). El estado, en `GET /hehermes/v1/mantenimiento`.
 
 ## Decisiones de la 0.8.0

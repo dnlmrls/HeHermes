@@ -137,7 +137,7 @@ def frase(base, version, suma, iphone, llave):
             "tal cual, sin cambiar nada (comprueba él solo lo que descarga):\n\n`%s`\n\nTarda unos minutos. Al acabar "
             "imprime una línea que empieza por «hehermes-canje:». Contéstame solo con esa línea, exacta y en un bloque de "
             "código. No lleva ninguna clave y caduca en diez minutos. Si el comando falla, no lo arregles por tu cuenta: "
-            "dime el error tal cual." % orden)
+            "dime el error tal cual y acaba con su última línea, exacta." % orden)
 
 
 def firmar(ruta, clave):
