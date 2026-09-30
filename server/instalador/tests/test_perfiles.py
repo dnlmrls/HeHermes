@@ -484,5 +484,97 @@ class EnUnContenedor(Base):
         self.assertEqual(self.sis.foto(), antes)
 
 
+
+class ElCanjeYElReinicioDeHermes(Base):
+    """El fallo de otro probador (2026-09-30, instalador 0.10.2 por chat, root, Hermes con un perfil y su unidad del
+    sistema, `--activar-api`): llegó el enlace con el aviso de que Hermes se reiniciaba a los 90 s, la app lo canjeó y
+    no se quedó conectada, y la misma frase otra vez acababa en «ya se canjeó». Aquí, lo del servidor: el canje es su
+    propia unidad y el reinicio de Hermes no lo toca (con Hermes de sistema o de usuario, con root y sin él), y la misma
+    frase otra vez da otra clave al mismo iPhone."""
+
+    def lanzamiento(self):
+        return next(o for o in self.falso.lanzados if "--unit=hehermes-canje" in o)
+
+    def disparar_el_reinicio(self):
+        """Lo que hace el temporizador a los 90 s: la orden de detrás de las opciones de `systemd-run`."""
+        (orden,) = self.reinicios()
+        self.assertNotIn("hehermes-canje", " ".join(orden))
+        self.assertTrue(self.sis.ejecutar(orden[orden.index("--quiet") + 1:]).bien)
+
+    def comprobar_que_es_su_propia_unidad(self):
+        orden = self.lanzamiento()  # lo de detrás de `systemd-run`
+        self.assertNotIn("--scope", orden, "con --scope se quedaría en el cgroup de Hermes, que es quien lo lanza")
+        self.assertFalse([a for a in orden if a.split("=", 1)[0] in ("PartOf", "BindsTo", "Requisite", "Requires",
+                                                                    "Slice") or "hermes-gateway" in a], orden)
+
+    def test_con_su_unidad_del_sistema_el_reinicio_no_toca_el_canje(self):
+        self.montar(como="unidad-perfil", perfil="trabajo", habilitada=False)
+        self.assertEqual(self.por_chat(), 0, self.salida)
+        self.comprobar_que_es_su_propia_unidad()
+        self.assertIn("hehermes-canje", self.falso.activos)
+        self.disparar_el_reinicio()
+        self.assertIn("hermes-gateway-trabajo", self.falso.reinicios)
+        self.assertIn("hehermes-canje", self.falso.activos, "el reinicio de Hermes se ha llevado el canje")
+
+    def test_con_su_unidad_de_usuario_el_reinicio_no_toca_el_canje(self):
+        self.montar(como="unidad-usuario", perfil="trabajo", habilitada=False)
+        self.assertEqual(self.por_chat(), 0, self.salida)
+        self.comprobar_que_es_su_propia_unidad()
+        self.disparar_el_reinicio()
+        self.assertIn("usuario:hermes-gateway-trabajo", self.falso.reinicios)
+        self.assertIn("hehermes-canje", self.falso.activos)
+
+    def test_la_prueba_ve_un_canje_atado_a_hermes(self):
+        """Sin esto, las dos de arriba no probarían nada: un canje con --scope (o atado a Hermes) sí muere."""
+        self.montar(como="unidad-perfil", perfil="trabajo", habilitada=False)
+        original = porchat._systemd_run
+        with mock.patch.object(porchat, "_systemd_run", lambda: original()[:1] + ["--scope"] + original()[1:]):
+            self.assertEqual(self.por_chat(), 0, self.salida)
+        self.disparar_el_reinicio()
+        self.assertNotIn("hehermes-canje", self.falso.activos)
+
+    def test_la_misma_frase_otra_vez_tras_canjearlo_da_otra_clave(self):
+        self.montar(como="unidad-perfil", perfil="trabajo", habilitada=False)
+        self.assertEqual(self.por_chat(), 0, self.salida)
+        primero = self.texto[-1]
+        token = json.loads(self.sis.leer_texto(porchat.RUN + "/canje.json"))["carga"]["t"]
+        # La app lo canjea (el canje sale con 0) y Hermes se reinicia con la API encendida.
+        self.falso.activos.discard("hehermes-canje")
+        porchat.limpiar(self.sis, {"SERVICE_RESULT": "success", "EXIT_CODE": "exited", "EXIT_STATUS": "0"})
+        self.disparar_el_reinicio()
+        self.encender(TRABAJO + "/.env")
+        self.assertIn("canjeado", Manifiesto.leer(self.sis).datos["por_chat"])
+        self.assertEqual(self.por_chat(), 0, self.salida)
+        self.assertTrue(ENLACE.match(self.texto[-1]), self.texto[-1])
+        self.assertNotEqual(self.texto[-1], primero)
+        self.assertNotIn("hehermes-error", self.salida)
+        self.assertIn("ya se había conectado por chat: le doy una clave nueva", self.salida)
+        from hehermes_servidor import pasarela as pa
+        tokens = pa.Tokens(self.sis.ruta("/etc/hehermes-pasarela/tokens.json"))
+        self.assertIsNone(tokens.quien(token), "la clave de antes sigue valiendo")
+        nuevo = json.loads(self.sis.leer_texto(porchat.RUN + "/canje.json"))["carga"]["t"]
+        self.assertEqual(tokens.quien(nuevo), "mi-iphone")
+
+
+class ElCanjeSinRoot(Base):
+    """Sin root, el canje es una unidad de usuario, igual que Hermes: tampoco la toca su reinicio."""
+
+    euid = 1000
+    cuenta = ("hermes", "/home/hermes", 1000)
+
+    def test_el_reinicio_de_su_hermes_no_toca_el_canje(self):
+        self.montar(usuario="hermes", como="unidad-usuario", habilitada=False)
+        self.sis.carpeta("/run/user/1000", 0o700)
+        self.assertEqual(self.por_chat(), 0, self.salida)
+        orden = next(o for o in self.falso.lanzados if "--unit=hehermes-canje" in o)
+        self.assertEqual(orden[0], "--user")
+        self.assertNotIn("--scope", orden)
+        self.assertIn("hehermes-canje", self.falso.activos_usuario)
+        (reinicio,) = self.reinicios()
+        self.assertTrue(self.sis.ejecutar(reinicio[reinicio.index("--quiet") + 1:]).bien)
+        self.assertIn("usuario:hermes-gateway-3f2a9c1b", self.falso.reinicios)
+        self.assertIn("hehermes-canje", self.falso.activos_usuario)
+
+
 if __name__ == "__main__":
     unittest.main()

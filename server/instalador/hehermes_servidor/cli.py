@@ -401,9 +401,8 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
         if opciones.por_chat:
             token = hecho.get("token")
             if token is None:
-                # Repetido en la media hora, sin canjear: del token solo queda el hash, así que va uno nuevo.
-                from . import tokens
-                token = tokens.rotar(sis.ruta(ambito.tokens), opciones.iphone)
+                # Repetido en la media hora, se canjeara o no: del token solo queda el hash, así que va uno nuevo.
+                token = porchat.reemitir(sis, man, opciones.iphone, sis.ruta(ambito.tokens), salida)
             carga = porchat.carga_tls(det.direccion, det.puerto_pasarela, modo_tls.huella(sis, ambito), token)
             del token
             el_enlace = porchat.lanzar(sis, man, det, opciones, salida, carga=carga, ambito=ambito)
