@@ -169,7 +169,9 @@ leer, así que el reparto es este:
   y sin la marca) y exige una fila `assistant` con una línea que, con las reglas de la app (`ExtraccionMedia.swift`),
   dé esa ruta exacta. Si no la hay, 404, sin mirar el disco. Una marca vista se recuerda 2 minutos. Además limita: 30
   por minuto, contando también las que no estaban marcadas, y 2 a la vez. Desde la 1.4.0, lo que el lector no deja
-  leer es **el mismo 404** que lo que no está marcado.
+  leer es **el mismo 404** que lo que no está marcado, salvo, desde la 1.5.0, lo marcado **fuera de las carpetas
+  permitidas** (el lector lo dice por el texto, `fuera`): un 409 `fichero_fuera_de_la_carpeta` con `"carpeta":
+  "exports"`, para que la app ofrezca pedirle a Hermes que lo copie ahí.
 - **El lector decide qué se puede leer.** Es `/usr/local/libexec/hehermes-leer-media` (`despliegue/`), Python sin
   dependencias:
   - desde la 1.4.0, **solo lee de una lista de permitidas**: `image_cache/`, `audio_cache/` y `exports/` de la carpeta
@@ -214,6 +216,30 @@ que se aplica así es solo el código del lector, sin la jaula de systemd.
 - Lo que pasa, en `journalctl -u 'hehermes-leer-media@*' -u hehermes-vigia`: solo el estado, el tamaño y la
   extensión, nunca la ruta ni el contenido.
 - `sudo server/avisos/despliegue/instalar.sh --desinstalar-lector` lo quita, y la ruta pasa a contestar 503.
+
+## La copia de Hermes en iCloud (desde la 1.5.0)
+
+Spec `docs/superpowers/specs/2026-09-29-respaldo-de-hermes-en-icloud-design.md`, contrato `server/API-CONTRACT.md` §15.
+La app cifra y guarda en iCloud; aquí solo se hace la instantánea, se sirven sus trozos y se restaura.
+
+- **El vigía** atiende `/avisos/v1/respaldo/…` (`vigia/respaldo.py`): comprueba la forma de lo que llega, deja cuatro
+  trozos a la vez y pide una limpieza cada hora. Todo lo demás lo hace el ayudante.
+- **El ayudante** es `/usr/local/libexec/hehermes-respaldo` (`despliegue/`), Python sin dependencias, de root, lanzado
+  por `hehermes-respaldo.socket` (`/run/hehermes-respaldo.sock`, `root:hh-vigia 0660`, `Accept=yes`) en un
+  `hehermes-respaldo@.service` por conexión, con su jaula. **No acepta rutas**: órdenes fijas, ids y números. Qué entra
+  en una copia lo dice su código (`clase_de`). Su carpeta de trabajo es `/var/lib/hehermes-respaldo` (0700, root): las
+  instantáneas (24 h), las restauraciones y la copia de antes de restaurar (7 días).
+- **Restaurar** monta y comprueba todo antes de parar `hermes-gateway`; guarda lo que había; `hermes import --force`
+  como el dueño de Hermes; deja las `API_SERVER_*` de este servidor; arranca, espera a `/health` y a
+  `/api/sessions` y cuenta. Si algo falla, deshace solo. «Deshacer» (7 días) pone lo de antes tal cual.
+- **Si Hermes no vive en `/root/.hermes`** o no es de root, `instalar.sh` deja un añadido
+  (`hehermes-respaldo@.service.d/hermes.conf`) con `--hermes-home=` y `--usuario-hermes=`.
+- **Quitarlo:** `sudo …/instalar.sh --desinstalar-respaldo` (no con una operación en marcha). La carpeta de trabajo se
+  queda.
+
+**Para root, a mano:** `sudo /usr/bin/python3 -I -S /usr/local/libexec/hehermes-respaldo estado` (lo que ve el
+ayudante, sin secretos) y `… limpiar`. Lo que pasa, en `journalctl -u 'hehermes-respaldo@*'`: ids, fases, tamaños y
+resultados; nunca una ruta ni un contenido.
 
 ## Probar de punta a punta
 

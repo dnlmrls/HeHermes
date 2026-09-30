@@ -16,14 +16,17 @@ from . import piezas as p
 from .plan import registro_de_dispositivos
 
 # El lector de ficheros primero: su socket es de root y es lo único de los avisos que lee como root.
-UNIDADES_AVISOS = ("hehermes-leer-media.socket", "hehermes-vigia.socket", "hehermes-vigia.service",
+UNIDADES_AVISOS = ("hehermes-leer-media.socket", "hehermes-respaldo.socket", "hehermes-vigia.socket", "hehermes-vigia.service",
                    "hehermes-rele.socket", "hehermes-rele.service")
 CARPETAS_AVISOS = ("/opt/hehermes-avisos", "/etc/hehermes-avisos", "/etc/nginx/hehermes-avisos", "/var/lib/hehermes-vigia")
 # La plantilla del lector (se para con sus instancias, no se deshabilita: no tiene [Install]), su añadido si Hermes
 # vive fuera de /root/.hermes (el fichero y luego su carpeta, que solo se borra vacía) y el propio lector.
 FICHEROS_AVISOS = ("/etc/systemd/system/hehermes-leer-media@.service",
                    "/etc/systemd/system/hehermes-leer-media@.service.d/hermes-home.conf",
-                   "/etc/systemd/system/hehermes-leer-media@.service.d", "/usr/local/libexec/hehermes-leer-media")
+                   "/etc/systemd/system/hehermes-leer-media@.service.d", "/usr/local/libexec/hehermes-leer-media",
+                   "/etc/systemd/system/hehermes-respaldo@.service",
+                   "/etc/systemd/system/hehermes-respaldo@.service.d/hermes.conf",
+                   "/etc/systemd/system/hehermes-respaldo@.service.d", "/usr/local/libexec/hehermes-respaldo")
 NGINX = (p.SITIO_ENLACE, p.SITIO, p.SITIO_CONF_D, p.BEARER, p.DROP_IN_NGINX)
 
 
@@ -162,12 +165,17 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
     if que.tls:
         salida("==> la pasarela")
         for unidad in (p.UNIDAD_PASARELA, "hehermes-pasarela-clave.path", p.UNIDAD_VIGIA, p.SOCKET_VIGIA,
-                       p.SOCKET_LECTOR):
+                       p.SOCKET_LECTOR, p.SOCKET_RESPALDO):
             if unidad in man.unidades:
                 sis.ejecutar(ambito.systemctl + ["disable", "--now", unidad])
         if p.SOCKET_LECTOR in man.unidades:
             # Los lectores en marcha (uno por conexión): la plantilla no se deshabilita, se paran sus instancias.
             sis.ejecutar(ambito.systemctl + ["stop", "hehermes-leer-media@*.service"])
+        if p.SOCKET_RESPALDO in man.unidades and sis.ejecutar(
+                ambito.systemctl + ["is-active", "hehermes-respaldo@*.service"]).bien:
+            # Una restauración a medias no se corta: la pasarela ya no deja pedir nada nuevo, y se dice.
+            quedan.append("la copia en iCloud: su ayudante tiene una operación en marcha (journalctl %s-u "
+                          "'hehermes-respaldo@*'): la dejo acabar" % ("" if ambito.root else "--user "))
     # 1. Los iPhone: sin esto, las sesiones vivas siguen aunque se borre su conexión.
     if sis.existe(p.DISPOSITIVO) and que.vpn:
         for nombre in de_la_vpn:
@@ -274,7 +282,8 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
     for unidad in reversed(list(man.unidades)):
         if not que.de(md.de_unidad(unidad)):
             continue
-        sis.ejecutar((ambito.systemctl if unidad in (p.UNIDAD_PASARELA, p.UNIDAD_VIGIA, p.SOCKET_LECTOR)
+        sis.ejecutar((ambito.systemctl if unidad in (p.UNIDAD_PASARELA, p.UNIDAD_VIGIA, p.SOCKET_LECTOR,
+                                                     p.SOCKET_RESPALDO)
                       else ["systemctl"]) + ["disable", "--now", unidad])
         if not que.todo:
             man.unidades.remove(unidad)
@@ -295,6 +304,20 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
             man.carpetas.remove(ambito.carpeta_estado_vigia)
         if not que.todo:
             del man.datos["vigia"]
+    #    La carpeta de trabajo de la copia en iCloud: las instantáneas y las restauraciones se van; la copia de antes de
+    #    una restauración (lo que había en Hermes, con sus claves) solo si no queda nada en ella, y si queda se dice.
+    if que.tls and sis.es_carpeta(ambito.carpeta_respaldo):
+        antes = ambito.carpeta_respaldo + "/antes"
+        if sis.es_carpeta(antes) and sis.listar(antes):
+            import shutil
+            # Las instantáneas llevan copias de las bases y de las claves: fuera. (`borrar_arbol` solo borra carpetas
+            # que se llamen hehermes*, y estas están dentro de una que sí.)
+            for sub in ("instantaneas", "restauraciones"):
+                shutil.rmtree(sis.ruta(ambito.carpeta_respaldo + "/" + sub), ignore_errors=True)
+            quedan.append("%s: la copia de lo que había en Hermes antes de la última restauración (con sus claves). "
+                          "No la borro: si no la quieres, bórrala tú" % antes)
+        else:
+            sis.borrar_arbol(ambito.carpeta_respaldo)
     #    La carpeta de estado de la pasarela (el borrado pendiente, su actividad): nada que no sea de HeHermes.
     if que.tls and sis.existe(ambito.carpeta_estado_pasarela):
         sis.borrar_arbol(ambito.carpeta_estado_pasarela)

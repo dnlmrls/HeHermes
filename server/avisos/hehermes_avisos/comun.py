@@ -146,6 +146,8 @@ class ErrorHTTP(Exception):
         self.codigo = codigo
         self.mensaje = mensaje
         self.cabeceras = cabeceras or {}
+        #: Campos de más dentro de `error` (la copia en iCloud, contrato §15: `faltan`, `id`…). Nunca datos del usuario.
+        self.extra = {}
 
 
 def cuerpo_de_error(codigo: str, mensaje: str, tipo: str = "invalid_request_error") -> dict:
@@ -227,7 +229,9 @@ class ManejadorJSON(http.server.BaseHTTPRequestHandler):
         try:
             self.atender()
         except ErrorHTTP as error:
-            self.enviar_json(error.estado, cuerpo_de_error(error.codigo, error.mensaje), error.cabeceras)
+            cuerpo = cuerpo_de_error(error.codigo, error.mensaje)
+            cuerpo["error"].update({k: v for k, v in getattr(error, "extra", {}).items() if k not in cuerpo["error"]})
+            self.enviar_json(error.estado, cuerpo, error.cabeceras)
         except Exception:  # noqa: BLE001 — la petición falla, el servicio no
             logging.getLogger(self.nombre_registro()).exception("fallo inesperado atendiendo una petición")
             self.enviar_json(500, cuerpo_de_error("error_interno", "Error interno", "server_error"))

@@ -13,9 +13,14 @@ su propia jaula. El vigía solo decide **si** se puede pedir, y el lector, **qu�
    marca. Una marca vista se recuerda ``RECUERDO`` segundos (sesión + ruta): abrir la vista previa y luego el visor no
    pide el historial dos veces. Solo se recuerda lo marcado, nunca lo que no: una marca nueva vale al momento.
 2. Que el lector la dé por buena (sus reglas, en su propio fichero: desde la 1.4.0, una lista de permitidas), y los
-   bytes, por partes, de él a la app. Lo que el lector no deja leer (fuera de las permitidas, no es un fichero normal,
-   cambió mientras se abría, no existe) se contesta con **el mismo 404** que lo que no está marcado: la respuesta no
-   dice ni si existe ni si está fuera.
+   bytes, por partes, de él a la app. Lo que el lector no deja leer (de la lista de prohibidas, no es un fichero
+   normal, cambió mientras se abría, no existe) se contesta con **el mismo 404** que lo que no está marcado: la
+   respuesta no dice si existe.
+3. Salvo una cosa, desde la 1.5.0: lo que Hermes marcó **fuera de las carpetas permitidas** (el lector lo dice por el
+   texto de la ruta, sin mirar el disco) es un 409 ``fichero_fuera_de_la_carpeta`` con la carpeta que sí vale
+   (``"carpeta": "exports"``), para que la app le ofrezca a Daniel pedirle a Hermes que lo copie ahí. Solo se llega a
+   preguntarlo con la ruta ya marcada en la sesión, así que no sirve para ir probando rutas: lo no marcado sigue siendo
+   el 404 de siempre, sin preguntar al lector.
 
 En el registro sale el resultado, la extensión y el tamaño: ni la ruta ni nada del contenido.
 """
@@ -78,6 +83,9 @@ POR_ESTADO = {
     "demasiado_grande": (413, "fichero_demasiado_grande", "El fichero pasa de 50 MB"),
     "no_autorizado": (503, "lector_no_disponible", "El lector de ficheros no atiende al vigía"),
 }
+#: La carpeta que sí se descarga, para lo que no se puede dar: se dice por su nombre (``~/.hermes/exports``), no por su
+#: ruta en el disco, que la app no necesita.
+CARPETA_PERMITIDA = "exports"
 # Como los ids de sesión de la ampliación de los turnos (`api.PATRON_ID`).
 PATRON_SESION = re.compile(r"[A-Za-z0-9_.:\-]{1,128}")
 
@@ -85,6 +93,14 @@ PATRON_SESION = re.compile(r"[A-Za-z0-9_.:\-]{1,128}")
 def _no_disponible() -> ErrorHTTP:
     """El mismo 404 para lo que no está marcado, la sesión que no existe y el fichero que ya no está."""
     return ErrorHTTP(404, "fichero_no_disponible", "Ese fichero no está disponible")
+
+
+def _fuera_de_la_carpeta() -> ErrorHTTP:
+    """Lo que Hermes marcó fuera de las carpetas permitidas (contrato §11): la app ofrece pedirle que lo copie."""
+    error = ErrorHTTP(409, "fichero_fuera_de_la_carpeta",
+                      "Hermes lo guardó fuera de la carpeta que se puede descargar (exports)")
+    error.extra = {"carpeta": CARPETA_PERMITIDA}
+    return error
 
 
 def _invalido(que: str) -> ErrorHTTP:
@@ -263,6 +279,8 @@ class ClienteLector:
         if salto and estado == "ok" and tamano.isdigit() and int(tamano) <= TOPE:
             return conexion, int(tamano), resto
         conexion.close()
+        if salto and estado == "fuera" and not tamano:
+            raise _fuera_de_la_carpeta()
         if salto and estado in POR_ESTADO and not tamano:
             raise ErrorHTTP(*POR_ESTADO[estado])
         raise ErrorHTTP(502, "lectura_fallida", "El lector de ficheros no ha podido leerlo")
@@ -345,6 +363,8 @@ class Ficheros:
         return marcada
 
     def _preparar(self, sesion: str, ruta: str) -> Descarga:
+        # Antes que nada, la marca: sin ella no se pregunta al lector, y lo que conteste (también que está fuera de las
+        # permitidas, el 409) no sale nunca para una ruta que Hermes no marcó.
         if not self._marcada(sesion, ruta):
             raise _no_disponible()
         en_disco = self.casa.rstrip("/") + ruta[1:] if ruta == "~" or ruta.startswith("~/") else ruta

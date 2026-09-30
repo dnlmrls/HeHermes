@@ -201,6 +201,7 @@ class LosLimites(unittest.TestCase):
         self.assertEqual(pa.PLAZO_DESALOJO, 3.0)
         self.assertEqual((pa.PLAZO_CABECERAS, pa.PLAZO_PARADA, pa.RETRASO_404), (10, 75, 1.0))
         self.assertEqual((pa.MAX_CUERPO, pa.MAX_CUERPO_AVISOS), (25 * 1024 * 1024, 64 * 1024))
+        self.assertEqual(pa.MAX_CUERPO_RESPALDO, 4 * 1024 * 1024 + 64 * 1024)
         self.assertEqual((pa.MAX_CABECERAS, pa.MAX_LINEAS_CABECERA), (16 * 1024, 100))
 
     def test_dieciseis_conexiones_por_ip(self):

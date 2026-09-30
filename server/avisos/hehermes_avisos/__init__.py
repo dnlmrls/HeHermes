@@ -26,4 +26,8 @@ máquina se lleva este paquete entero y arranca solo su mitad.
 #        y 500 solo si hace falta, y recuerda una marca 2 minutos). Las credenciales de systemd en 0440 valen dentro de
 #        $CREDENTIALS_DIRECTORY, y un secreto mal puesto sale con 78 y no en bucle. La entrada pública del relé tiene
 #        un certificado siguiente y `rotar`, y el vigía ancla varias huellas ([rele] huella_siguiente).
-VERSION = "1.4.0"
+# 1.5.0: la copia de Hermes en iCloud (spec 2026-09-29, contrato §15). El vigía atiende /avisos/v1/respaldo/… y se lo
+#        pasa al ayudante `hehermes-respaldo` (despliegue/), que corre como el dueño de Hermes: instantáneas troceadas
+#        con las bases limpias de lo borrado, y restaurar con `hermes import`, la copia de antes y el deshacer. Cuerpos
+#        de hasta 4 MiB + 64 KiB en esas rutas; `comprobar` mira también el ayudante.
+VERSION = "1.5.0"

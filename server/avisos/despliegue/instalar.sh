@@ -22,7 +22,14 @@
 #   /etc/systemd/system/hehermes-leer-media.socket y hehermes-leer-media@.service   su socket (root:hh-vigia 0660) y
 #                                                   un lector de root, enjaulado, por cada conexión
 #
+#   /usr/local/libexec/hehermes-respaldo            el ayudante de la copia de Hermes en iCloud (root 0755, desde la 1.5.0)
+#   /etc/systemd/system/hehermes-respaldo.socket y hehermes-respaldo@.service   su socket (root:hh-vigia 0660) y un
+#                                                   ayudante de root, enjaulado, por cada conexión; su carpeta de trabajo,
+#                                                   /var/lib/hehermes-respaldo (0700, la crea systemd)
+#
 #   sudo …/instalar.sh --desinstalar-lector         quita solo el lector (y con él, GET /avisos/v1/fichero da 503)
+#   sudo …/instalar.sh --desinstalar-respaldo       quita solo el ayudante de la copia (/avisos/v1/respaldo da 503); su
+#                                                   carpeta de trabajo, con la copia de antes de restaurar, se queda
 #
 # La entrada pública del relé (spec 2026-09-28, «El relé para los probadores»): por donde llegan los avisos de los
 # vigías de otros servidores. Se pone una vez, y desde entonces cada pasada la mantiene:
@@ -204,6 +211,83 @@ desinstalar_lector() {
 }
 # --- fin del lector ----------------------------------------------------------------------------------------------------
 
+# --- El ayudante de la copia en iCloud (funciones) ---------------------------------------------------------------------
+# Lo usan la instalación y --desinstalar-respaldo. Como el lector: un script de root por conexión a su socket.
+RESPALDO=/usr/local/libexec/hehermes-respaldo
+UNIDADES_RESPALDO="hehermes-respaldo.socket hehermes-respaldo@.service"
+ANADIDO_RESPALDO="$SYSTEMD/hehermes-respaldo@.service.d/hermes.conf"
+RESPALDO_CAMBIADO=0
+
+instalar_respaldo() {
+  install -d -m 0755 -o root -g root "$(dirname "$RESPALDO")"
+  if ! cmp -s "$AQUI/hehermes-respaldo" "$RESPALDO"; then
+    install -m 0755 -o root -g root "$AQUI/hehermes-respaldo" "$RESPALDO.nuevo"
+    mv -f "$RESPALDO.nuevo" "$RESPALDO"
+    echo "    ayudante de la copia puesto en $RESPALDO"
+  fi
+  local unidad
+  for unidad in $UNIDADES_RESPALDO; do
+    if ! cmp -s "$AQUI/$unidad" "$SYSTEMD/$unidad"; then
+      install -m 0644 -o root -g root "$AQUI/$unidad" "$SYSTEMD/$unidad"
+      RESPALDO_CAMBIADO=1
+    fi
+  done
+  # Si Hermes no vive en /root/.hermes o no es de root, un añadido le dice al ayudante dónde y de quién.
+  local casa dueno texto
+  casa="$(hermes_del_gateway)"
+  dueno="$(stat -c %U "$casa" 2>/dev/null || echo root)"
+  [[ "$dueno" =~ ^[a-z_][a-z0-9_-]*$ ]] || dueno=root
+  if [[ "$casa" == "$HERMES_DE_SERIE" && "$dueno" == root ]]; then
+    if [[ -e "$ANADIDO_RESPALDO" ]]; then
+      rm -f "$ANADIDO_RESPALDO"
+      rmdir "$(dirname "$ANADIDO_RESPALDO")" 2>/dev/null || true
+      RESPALDO_CAMBIADO=1
+    fi
+    return 0
+  fi
+  texto="# Lo escribe instalar.sh: el HERMES_HOME de hermes-gateway es $casa, de $dueno.
+[Service]
+ExecStart=
+ExecStart=/usr/bin/python3 -I -S -B $RESPALDO --hermes-home=$casa --trabajo=/var/lib/hehermes-respaldo --unidad-hermes=hermes-gateway.service --usuario-hermes=$dueno --conexion"
+  if [[ ! -f "$ANADIDO_RESPALDO" || "$(cat "$ANADIDO_RESPALDO")" != "$texto" ]]; then
+    install -d -m 0755 -o root -g root "$(dirname "$ANADIDO_RESPALDO")"
+    printf '%s\n' "$texto" > "$ANADIDO_RESPALDO.nuevo"
+    chmod 0644 "$ANADIDO_RESPALDO.nuevo"
+    mv -f "$ANADIDO_RESPALDO.nuevo" "$ANADIDO_RESPALDO"
+    RESPALDO_CAMBIADO=1
+  fi
+  echo "    el ayudante de la copia usa la casa de Hermes $casa, de $dueno"
+}
+
+arrancar_respaldo() {
+  # Como el lector: solo el socket. Reiniciarlo no corta una orden larga en marcha (cada una es su propio proceso).
+  systemctl enable --quiet hehermes-respaldo.socket
+  if [[ $RESPALDO_CAMBIADO -eq 1 ]]; then
+    systemctl restart hehermes-respaldo.socket
+  else
+    systemctl start hehermes-respaldo.socket
+  fi
+}
+
+desinstalar_respaldo() {
+  paso "quitando el ayudante de la copia en iCloud"
+  systemctl disable --now --quiet hehermes-respaldo.socket 2>/dev/null || true
+  # Una restauración a medias no se corta: si hay un ayudante en marcha, se espera a que acabe.
+  if systemctl list-units --no-legend --state=active 'hehermes-respaldo@*.service' 2>/dev/null | grep -q .; then
+    fallar "hay una operación de la copia en marcha (journalctl -u 'hehermes-respaldo@*'): espera a que acabe"
+  fi
+  local unidad
+  for unidad in $UNIDADES_RESPALDO; do
+    rm -f "$SYSTEMD/$unidad"
+  done
+  rm -f "$ANADIDO_RESPALDO" "$ANADIDO_RESPALDO.nuevo"
+  rmdir "$(dirname "$ANADIDO_RESPALDO")" 2>/dev/null || true
+  rm -f "$RESPALDO" "$RESPALDO.nuevo"
+  systemctl daemon-reload
+  echo "    quitado. /var/lib/hehermes-respaldo se queda (la copia de antes de una restauración); bórrala tú si quieres"
+}
+# --- fin del ayudante de la copia -------------------------------------------------------------------------------------
+
 # --- La entrada pública del relé (funciones) ---------------------------------------------------------------------------
 PUBLICO_INI="$CONF/rele-publico.ini"
 PUBLICO_CARPETA="$CONF/rele-publico"
@@ -258,12 +342,13 @@ quitar_rele_publico() {
 
 RELE_PUBLICO=0
 if [[ $# -gt 0 ]]; then
-  [[ $# -eq 1 ]] || fallar "uso: instalar.sh [--desinstalar-lector | --rele-publico | --quitar-rele-publico]"
+  [[ $# -eq 1 ]] || fallar "uso: instalar.sh [--desinstalar-lector | --desinstalar-respaldo | --rele-publico | --quitar-rele-publico]"
   case "$1" in
     --desinstalar-lector) desinstalar_lector; exit 0 ;;
+    --desinstalar-respaldo) desinstalar_respaldo; exit 0 ;;
     --quitar-rele-publico) quitar_rele_publico; exit 0 ;;
     --rele-publico) RELE_PUBLICO=1 ;;
-    *) fallar "uso: instalar.sh [--desinstalar-lector | --rele-publico | --quitar-rele-publico]" ;;
+    *) fallar "uso: instalar.sh [--desinstalar-lector | --desinstalar-respaldo | --rele-publico | --quitar-rele-publico]" ;;
   esac
 fi
 # Una vez puesta, cada pasada la mantiene (con el código nuevo): se sabe por su unidad.
@@ -285,9 +370,9 @@ paso "Python"
 command -v "$PY" >/dev/null || fallar "no hay $PY"
 "$PY" -I -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
   || fallar "hace falta Python 3.10 o más nuevo ($("$PY" -I --version 2>&1))"
-# El lector de ficheros corre con el Python del sistema, sin venv (no tiene dependencias).
+# El lector de ficheros y el ayudante de la copia corren con el Python del sistema, sin venv (no tienen dependencias).
 /usr/bin/python3 -I -S -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' \
-  || fallar "el lector de ficheros necesita /usr/bin/python3, 3.9 o más nuevo"
+  || fallar "el lector de ficheros y el ayudante de la copia necesitan /usr/bin/python3, 3.9 o más nuevo"
 if ! "$PY" -I -c 'import ensurepip, venv' 2>/dev/null; then
   # En Debian y Ubuntu, venv sin ensurepip viene aparte.
   paso "instalando python3-venv"
@@ -513,10 +598,11 @@ for unidad in hehermes-vigia hehermes-rele; do
   install -m 0644 -o root -g root "$AQUI/$unidad.service" "/etc/systemd/system/$unidad.service"
 done
 instalar_lector
+instalar_respaldo
 systemctl daemon-reload
 systemd-analyze verify /etc/systemd/system/hehermes-vigia.socket /etc/systemd/system/hehermes-vigia.service \
   /etc/systemd/system/hehermes-rele.socket /etc/systemd/system/hehermes-rele.service \
-  "$SYSTEMD/hehermes-leer-media.socket" \
+  "$SYSTEMD/hehermes-leer-media.socket" "$SYSTEMD/hehermes-respaldo.socket" \
   || echo "    (systemd-analyze avisa de algo en las unidades: míralo arriba)"
 for unidad in hehermes-vigia hehermes-rele; do
   systemctl enable --quiet "$unidad.socket" "$unidad.service"
@@ -530,6 +616,7 @@ done
 # El socket del lector, antes que el vigía: el vigía no lo necesita para arrancar, pero así nunca contesta 503 a un
 # fichero por haber arrancado primero.
 arrancar_lector
+arrancar_respaldo
 # Con los dos puertos ya de systemd, los servicios: con el código nuevo, y el relé con la clave si Daniel ya la ha
 # puesto (sin ella, arranca igual y contesta 503).
 for unidad in hehermes-vigia hehermes-rele; do

@@ -1,0 +1,21 @@
+# /etc/systemd/system/hehermes-respaldo.socket
+# La puerta del ayudante de la copia de Hermes en iCloud (despliegue/hehermes-respaldo, contrato §15). Solo root y el
+# grupo hh-vigia pueden conectarse (0660), y el ayudante lo vuelve a mirar con SO_PEERCRED. Con Accept=yes, systemd
+# lanza un ayudante nuevo, de root y con su jaula (hehermes-respaldo@.service), por cada conexión: el vigía no tiene
+# nada de root, ni sudo, y conserva su NoNewPrivileges.
+[Unit]
+Description=HeHermes: el socket del ayudante de la copia en iCloud
+
+[Socket]
+ListenStream=/run/hehermes-respaldo.sock
+SocketUser=root
+SocketGroup=hh-vigia
+SocketMode=0660
+Accept=yes
+# Cuatro trozos a la vez (el vigía no deja más), la orden larga que esté en marcha y el estado: esto es el tope por si
+# algo va mal, no el límite de la app.
+MaxConnections=8
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

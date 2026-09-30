@@ -8,6 +8,8 @@
 - ``GET    /avisos/v1/salud``                            para ver desde Safari que nginx llega al vigía
 - ``GET    /avisos/v1/fichero?sesion=&ruta=``            un fichero que Hermes marcó con ``MEDIA:`` (``fichero.py``),
   los bytes por partes; es la única que no contesta JSON cuando va bien
+- ``/avisos/v1/respaldo/…``                               la copia de Hermes en iCloud (``respaldo.py``, contrato §15):
+  el estado, las instantáneas y sus trozos, y restaurar; los trozos van en binario, y los cuerpos, hasta 4 MiB + 64 KiB
 
 Todo contesta 204 si va bien, y los errores con el envoltorio del api_server de Hermes, que es el que entiende la app.
 Menos dos (spec 2026-09-28, «Avisos sin comandos», Contrato C): el alta contesta ``200 {"envio": …}``, con qué va a
@@ -42,6 +44,9 @@ from .ajustes import MAX_ID_SESION, Ajustes
 from .almacen import Almacen, Permiso
 from .envio import BAJA, ENVIADO, LIMITADO, PERMISO, REINTENTABLE, SIN_PERMISO, Mensajero
 from .fichero import Descarga, Ficheros, disposicion, parametros
+from .respaldo import PREFIJO as PREFIJO_RESPALDO
+from .respaldo import TOPE_CUERPO as TOPE_RESPALDO
+from .respaldo import Respaldos
 
 registro = logging.getLogger("vigia.api")
 
@@ -109,7 +114,8 @@ class AppVigia:
     """La lógica de la API, sin HTTP: así se prueba llamándola, y el manejador solo traduce."""
 
     def __init__(self, almacen: Almacen, mensajero: Mensajero, *, secreto_tunel: str, caducidad_prueba: int = 300,
-                 reloj=time.time, al_moverse=None, ficheros: Ficheros | None = None):
+                 reloj=time.time, al_moverse=None, ficheros: Ficheros | None = None,
+                 respaldos: Respaldos | None = None):
         if not secreto_tunel:
             raise ValueError("sin el secreto del túnel, la API del vigía quedaría abierta a cualquier proceso local")
         self.almacen = almacen
@@ -122,6 +128,8 @@ class AppVigia:
         self._ultimo_sin_tunel = -REPETIR_SIN_TUNEL
         # Los ficheros que Hermes marca con `MEDIA:` (`fichero.py`). Sin ellos, la ruta contesta 503.
         self.ficheros = ficheros
+        # La copia de Hermes en iCloud (`respaldo.py`). Sin el ayudante, esas rutas contestan 503.
+        self.respaldos = respaldos
 
     def viene_del_tunel(self, valor: str | None) -> bool:
         """Si la petición trae el secreto que pone nginx. Comparado en tiempo constante."""
@@ -268,6 +276,8 @@ class ManejadorVigia(ManejadorJSON):
         elif ruta == "/avisos/v1/salud":
             self._exigir(metodo, "GET")
             return self.enviar_json(200, {"estado": "ok", "servicio": "vigia", "version": VERSION})
+        elif ruta.startswith(PREFIJO_RESPALDO):
+            return self._respaldo(app)
         elif ruta == "/avisos/v1/fichero":
             self._exigir(metodo, "GET")
             sesion, ruta_fichero = parametros(self.path.partition("?")[2])
@@ -289,6 +299,29 @@ class ManejadorVigia(ManejadorJSON):
                 if renovar is not None:
                     return self.enviar_json(200, renovar)
         self.enviar_json(204)
+
+    def _respaldo(self, app: AppVigia) -> None:
+        """La copia en iCloud: cuerpos de hasta 4 MiB + 64 KiB (un trozo o un manifiesto) y, en los trozos, bytes."""
+        if app.respaldos is None:
+            raise ErrorHTTP(503, "respaldo_no_disponible", "Este vigía no tiene el ayudante de la copia")
+        self.tope_cuerpo = TOPE_RESPALDO
+        estado, objeto, datos, cabeceras = app.respaldos.atender(self.command, self.ruta, self.leer_cuerpo,
+                                                                   self.headers)
+        if datos is None:
+            return self.enviar_json(estado, objeto)
+        self.send_response(estado)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(datos)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for nombre, valor in cabeceras.items():
+            self.send_header(nombre, valor)
+        self.end_headers()
+        try:
+            self.wfile.write(datos)
+            self.wfile.flush()
+        except OSError:
+            self.close_connection = True
 
     def _enviar_descarga(self, descarga: Descarga) -> None:
         """Los bytes según llegan del lector, sin juntarlos. Con las cabeceras ya mandadas un fallo no se puede

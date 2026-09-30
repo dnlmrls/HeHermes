@@ -172,13 +172,15 @@ def planear(sis, det, man, op, origen, acciones, bloqueos, fichero, avisos=None)
         fichero(ruta, datos, 0o644, grupo=ambito.prefijo + "/hehermes_avisos/")
     reemplazar = getattr(op, "reemplazar", frozenset())
     lector = planear_lector(sis, det, origen, acciones, bloqueos, avisos, fichero)
+    respaldo = planear_respaldo(sis, det, origen, acciones, bloqueos, avisos, fichero)
     credencial = (vigia["credencial"] + "\n").encode() if vigia["credencial"] else None
     secreto = sis.leer(ambito.secreto_vigia)
     propias = [
         fichero(ambito.vigia_ini, p.vigia_ini(ambito, det.hermes.puerto, det.hermes.env,
                                               os.path.dirname(det.hermes.home.rstrip("/")) or "/",
                                               vigia["direccion"], vigia["puerto"], vigia["huella"],
-                                              lector=ambito.socket_lector if lector else None),
+                                              lector=ambito.socket_lector if lector else None,
+                                              respaldo=ambito.socket_respaldo if respaldo else None),
                 0o640 if ambito.root else 0o600, detalle=detalle),
         _secreto(sis, man, acciones, ambito.secreto_vigia,
                  (secrets.token_urlsafe(32) + "\n").encode() if secreto is None else None, reemplazar,
@@ -225,6 +227,34 @@ def planear_lector(sis, det, origen, acciones, bloqueos, avisos, fichero) -> boo
     return True
 
 
+def planear_respaldo(sis, det, origen, acciones, bloqueos, avisos, fichero) -> bool:
+    """El ayudante de la copia en iCloud (desde la 0.10.0): el script (con root, en /usr/local/libexec; sin root, el que
+    ya va en su casa con el instalador), su socket y su plantilla. Devuelve si se pone: sin él, el vigía va igual y
+    /avisos/v1/respaldo contesta 503."""
+    ambito = det.ambito
+    casa = det.hermes.home.rstrip("/")
+    if not p._RUTA_VALIDA.fullmatch(casa):
+        if avisos is not None:
+            avisos.append("La carpeta de Hermes (%r) no la sé poner en una unidad de systemd: no pongo la copia en "
+                          "iCloud, y /avisos/v1/respaldo contesta 503" % casa)
+        return False
+    from .plan import fuente_del_respaldo
+    fuente = fuente_del_respaldo(origen)
+    if fuente is None:
+        bloqueos.append(bloqueo("paquete", "el paquete no trae el ayudante de la copia en iCloud (hehermes-respaldo)"))
+        return False
+    if ambito.root:
+        with open(fuente, "rb") as f:
+            fichero(ambito.respaldo, f.read(), 0o755)
+    unidades = [fichero(ambito.unidad_respaldo_socket, p.unidad_respaldo_socket(ambito)),
+                fichero(ambito.unidad_respaldo, p.unidad_respaldo(ambito, casa,
+                                                                  det.hermes.usuario if ambito.root else None))]
+    _unidad(sis, acciones, p.SOCKET_RESPALDO, unidades, "la copia de Hermes en iCloud (/avisos/v1/respaldo), %s"
+            % ("un ayudante de root, enjaulado, por conexión" if ambito.root
+               else "como %s, uno por conexión" % ambito.usuario), "restart", ambito.systemctl)
+    return True
+
+
 def _secreto(sis, man, acciones, ruta, deseado, reemplazar, detalle):
     estado = _gestionado(sis, man, ruta, deseado, reemplazar)
     datos = deseado if deseado is not None else sis.leer(ruta)
@@ -235,7 +265,8 @@ def _secreto(sis, man, acciones, ruta, deseado, reemplazar, detalle):
 def rutas(ambito) -> set:
     """Lo del vigía y del lector que `aplicar_tls` deja para su propio paso (y no con los ficheros sueltos)."""
     return {ambito.vigia_ini, ambito.secreto_vigia, ambito.credencial_rele, ambito.clave_hermes_vigia,
-            ambito.unidad_vigia, ambito.socket_vigia, ambito.unidad_lector_socket, ambito.unidad_lector}
+            ambito.unidad_vigia, ambito.socket_vigia, ambito.unidad_lector_socket, ambito.unidad_lector,
+            ambito.unidad_respaldo_socket, ambito.unidad_respaldo}
 
 
 # MARK: Aplicar
@@ -300,6 +331,10 @@ def aplicar_unidades(sis, man, acciones, ambito, salida, hermes=None) -> None:
         crear_exportaciones(sis, man, hermes, ambito, salida)
     if del_lector:
         _con_unidad(sis, man, del_lector, p.SOCKET_LECTOR, salida, systemctl=ambito.systemctl)
+    del_respaldo = [a for a in acciones if a.objeto in (ambito.unidad_respaldo_socket, ambito.unidad_respaldo,
+                                                          p.SOCKET_RESPALDO)]
+    if del_respaldo:
+        _con_unidad(sis, man, del_respaldo, p.SOCKET_RESPALDO, salida, systemctl=ambito.systemctl)
     if ambito.root:
         _con_unidad(sis, man, [a for a in acciones if a.objeto in (ambito.socket_vigia, p.SOCKET_VIGIA)],
                     p.SOCKET_VIGIA, salida)
@@ -330,6 +365,11 @@ def comprobar(sis, man, ambito, mira, hermes_pendiente=False, intentos=3, espera
         mira(lector, "lector de ficheros: su socket está en marcha (%s)" % ambito.socket_lector,
              "lector de ficheros: su socket está parado (%ssystemctl %sstart %s)"
              % ("sudo " if ambito.root else "", "" if ambito.root else "--user ", p.SOCKET_LECTOR))
+    if ambito.unidad_respaldo_socket in man.ficheros:
+        respaldo = sis.ejecutar(ambito.systemctl + ["is-active", p.SOCKET_RESPALDO]).bien
+        mira(respaldo, "copia en iCloud: el socket de su ayudante está en marcha (%s)" % ambito.socket_respaldo,
+             "copia en iCloud: el socket de su ayudante está parado (%ssystemctl %sstart %s)"
+             % ("sudo " if ambito.root else "", "" if ambito.root else "--user ", p.SOCKET_RESPALDO))
     if hermes_pendiente:
         return
     orden = [ambito.python_venv, "-I", "-B", "-m", "hehermes_avisos.vigia", "--config", ambito.vigia_ini, "comprobar"]

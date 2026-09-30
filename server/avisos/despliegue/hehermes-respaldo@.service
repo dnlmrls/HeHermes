@@ -1,0 +1,64 @@
+# /etc/systemd/system/hehermes-respaldo@.service
+# Un ayudante por conexión a /run/hehermes-respaldo.sock (hehermes-respaldo.socket, Accept=yes): lee una orden y
+# contesta por el mismo socket. Las largas (una instantánea, aplicar una restauración, deshacer) contestan al momento
+# y siguen en este mismo proceso, con la conexión ya cerrada.
+#
+# Corre como root porque restaurar tiene que parar y arrancar hermes-gateway y escribir en la casa de Hermes (y, si
+# Hermes es de otro usuario, ejecutar `hermes import` como él: el propio Python cambia de usuario, sin runuser ni
+# PAM). Lo que no necesita, fuera: /usr, /boot y /etc de solo lectura (ProtectSystem=full), su propio /tmp, sin
+# dispositivos, solo 127.0.0.1 (la API de Hermes, para ver que vuelve a contestar), y los secretos de HeHermes y del
+# sistema, tapados. No lleva SystemCallFilter ni
+# MemoryDenyWriteExecute: `hermes import` ejecuta el Python de Hermes, con sus extensiones, y romperlo a medias sería
+# peor (se deshace, pero no restaura).
+[Unit]
+Description=HeHermes: ayudante de la copia de Hermes en iCloud
+Documentation=file:///opt/hehermes-avisos/src/README.md
+# Cada rechazo es una respuesta, no un fallo: que no se acumulen en `systemctl --failed`. Lo que pasó queda en el
+# registro (journalctl -u 'hehermes-respaldo@*'), sin rutas ni contenido.
+CollectMode=inactive-or-failed
+
+[Service]
+Type=simple
+# Python del sistema, sin nada del entorno ni del directorio (-I), sin site (-S) y sin escribir bytecode (-B). La casa
+# de Hermes y su unidad: si hermes-gateway dice otras, instalar.sh deja un añadido
+# (hehermes-respaldo@.service.d/hermes.conf) que cambia esta línea. El puerto de la API lo lee del .env de Hermes.
+ExecStart=/usr/bin/python3 -I -S -B /usr/local/libexec/hehermes-respaldo --hermes-home=/root/.hermes --trabajo=/var/lib/hehermes-respaldo --unidad-hermes=hermes-gateway.service --usuario-hermes=root --conexion
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+# La carpeta de trabajo: instantáneas (24 h), restauraciones y la copia de antes de restaurar (7 días). Solo de root.
+StateDirectory=hehermes-respaldo
+StateDirectoryMode=0700
+# Aplicar una restauración de varios GB, con `hermes import` y esperar a que Hermes conteste, cabe de sobra.
+RuntimeMaxSec=4h
+UMask=0077
+LimitCORE=0
+# Que una instantánea no le quite la máquina a Hermes.
+Nice=10
+IOSchedulingClass=idle
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID CAP_SETUID CAP_SETGID CAP_KILL
+AmbientCapabilities=
+ProtectSystem=full
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+KeyringMode=private
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+IPAddressDeny=any
+IPAddressAllow=localhost
+# Nada de HeHermes ni de los secretos del sistema: la copia nunca lleva una llave para entrar en el servidor.
+InaccessiblePaths=-/etc/shadow -/etc/shadow- -/etc/gshadow -/etc/gshadow- -/etc/sudoers -/etc/sudoers.d
+InaccessiblePaths=-/etc/ssh -/etc/ssl/private -/etc/letsencrypt
+InaccessiblePaths=-/etc/hehermes -/etc/hehermes-avisos -/etc/hehermes-pasarela -/var/lib/hehermes-vigia -/var/lib/hehermes-pasarela -/var/lib/hehermes-rele-publico
+InaccessiblePaths=-/etc/nginx -/etc/swanctl -/etc/strongswan -/etc/ipsec.secrets -/etc/ipsec.d -/etc/wireguard
