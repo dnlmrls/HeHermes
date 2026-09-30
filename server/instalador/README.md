@@ -19,6 +19,9 @@ para compactarlo de noche (`hehermes-borrado.timer`); por chat, la última líne
 cuando no se puede instalar, y sin linger no se da el enlace; `comprobar` se asoma también por la dirección del QR y
 avisa de lo que quedó de la VPN.
 
+**La 0.10.0 trae la copia de Hermes en iCloud** ([abajo](#la-copia-de-hermes-en-icloud-desde-la-0100)): el ayudante
+`hehermes-respaldo`, con su socket, como el lector, y la pasarela deja pasar trozos de 4 MiB en `/avisos/v1/respaldo/`.
+
 **Desde la 0.6.0 la pasarela es lo único que instala para conectar.** La VPN IKEv2 de las versiones anteriores ya no se instala, ni se repara,
 ni se actualiza, y la app ya no la usa: `instalar --modo vpn` se para y dice que ya no existe. La de un servidor que la
 tenga **se quita** con `desinstalar --modo vpn`, sin tocar la pasarela: [abajo](#la-vpn-de-antes), paso a paso.
@@ -148,8 +151,24 @@ Hermes marca con `MEDIA:` (`GET /avisos/v1/fichero`; sin él, 503).
 | Su socket | `hehermes-leer-media.socket`: `/run/hehermes-leer-media.sock`, `root:hh-vigia` 0660, `Accept=yes` | Una unidad de usuario: `%t/hehermes-leer-media.sock` (en `/run/user/<uid>`), 0600 |
 | Cada lectura | `hehermes-leer-media@.service`: un lector por conexión, con la jaula del VPS de Daniel: desde la 0.9.0 **como el dueño de la casa de Hermes y sin ninguna capacidad** (root si Hermes es root), todo de solo lectura, sin red, las casas tapadas (`ProtectHome=tmpfs`) salvo las carpetas permitidas (`BindReadOnlyPaths`: `image_cache/`, `audio_cache/` y `exports/` de `--hermes-home`), y los secretos del sistema y de `/etc/hehermes-pasarela`, tapados | Un lector **como el usuario de Hermes** por conexión, con `--usuario`: solo atiende a su propio uid (`SO_PEERCRED`). Lo que una unidad de usuario no puede ponerse (`ProtectSystem`, `ProtectHome`, `InaccessiblePaths`, `PrivateNetwork`, `IPAddressDeny`, capacidades), no lo lleva, y la unidad lo dice: ahí lo que se lee lo decide solo el lector (su lista de permitidas, y la de prohibidas como segunda red); sin red lo deja `RestrictAddressFamilies=AF_UNIX` |
 | El vigía | `[ficheros] lector = /run/hehermes-leer-media.sock` y su unidad lo quiere (`Wants=`) | `lector = /run/user/<uid>/hehermes-leer-media.sock` |
-| Lo que se puede descargar | Solo lo que Hermes deja en sus caches o en **`<HERMES_HOME>/exports`**, que crea el instalador (0700, del dueño de Hermes; desinstalar la quita solo si está vacía). Un `MEDIA:/tmp/…` o `MEDIA:/root/informe.pdf` ya no se descarga: el mismo 404 que lo que no está marcado. A Hermes hay que decirle que deje ahí lo que quiera mandar al iPhone | Lo mismo, en `~/.hermes/exports` |
+| Lo que se puede descargar | Solo lo que Hermes deja en sus caches o en **`<HERMES_HOME>/exports`**, que crea el instalador (0700, del dueño de Hermes; desinstalar la quita solo si está vacía). Un `MEDIA:/tmp/…` o `MEDIA:/root/informe.pdf` ya no se descarga: un 409 `fichero_fuera_de_la_carpeta` (desde los avisos 1.5.0), y la app ofrece pedirle a Hermes que lo copie a `exports`. A Hermes hay que decirle que deje ahí lo que quiera mandar al iPhone | Lo mismo, en `~/.hermes/exports` |
 | La red del vigía sin credencial | Esta máquina e internet; las redes de dentro, no: `IPAddressDeny=` 10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10, fc00::/7 y fe80::/10 (el relé no se sabe al instalar) | Una unidad de usuario no puede filtrar direcciones: se lo impide el propio vigía, que resuelve la dirección del relé de cada permiso y no se conecta si no es pública |
+
+### La copia de Hermes en iCloud (desde la 0.10.0)
+
+Spec `docs/superpowers/specs/2026-09-29-respaldo-de-hermes-en-icloud-design.md`, contrato `server/API-CONTRACT.md` §15.
+`instalar` pone también el ayudante `hehermes-respaldo` (de `server/avisos/despliegue`): hace las instantáneas de la
+casa de Hermes que la app cifra y sube a iCloud, y restaura una copia (con `hermes import`, la copia de antes y el
+deshacer de 7 días). Sin él, `/avisos/v1/respaldo/…` contesta 503.
+
+| | Con root | Sin root |
+|---|---|---|
+| El ayudante | `/usr/local/libexec/hehermes-respaldo` (root 0755), el mismo que pone `instalar.sh` en el VPS de Daniel | La copia que va con el instalador (`~/.local/share/hehermes-servidor/hehermes-respaldo`) |
+| Su socket | `hehermes-respaldo.socket`: `/run/hehermes-respaldo.sock`, `root:hh-vigia` 0660, `Accept=yes` | `%t/hehermes-respaldo.sock`, 0600, unidad de usuario |
+| Cada orden | `hehermes-respaldo@.service`, **de root** (restaurar para y arranca `hermes-gateway` y escribe en la casa de Hermes; `hermes import` va como el dueño de Hermes): `ProtectSystem=full`, las capacidades justas, solo 127.0.0.1, los secretos del sistema y de HeHermes tapados | Como el usuario de Hermes, con `--usuario` (solo atiende a su uid). Restaurar para Hermes con `systemctl --user`: si Hermes es una unidad del sistema, las copias van y restaurar dice que no puede |
+| Su carpeta | `/var/lib/hehermes-respaldo` (0700, `StateDirectory`) | `~/.local/state/hehermes-respaldo` |
+| El vigía | `[respaldo] ayudante = /run/hehermes-respaldo.sock` y su unidad lo quiere (`Wants=`) | `ayudante = /run/user/<uid>/hehermes-respaldo.sock` |
+| Desinstalar | Quita el ayudante y sus unidades; de su carpeta, las instantáneas. **La copia de antes de una restauración se queda** (lo dice): es lo que había en Hermes | Lo mismo |
 
 Lo del código de avisos (la 0.7.0), que sigue valiendo: el código lo da Daniel (`sudo hehermes-rele credencial alta
 <nombre>`, en su VPS):
@@ -232,7 +251,7 @@ VPN montada como la dejaba la 0.5.1 (`tests/vpn_antigua.py`): la pasarela sobre 
 Para un servidor con la VPN del instalador (`mi-iphone` por IKEv2):
 
 1. **Añadir la pasarela, sin tocar la VPN.** Primero el plan, que no cambia nada:
-   `sudo ./hehermes-servidor-0.9.0/hehermes-servidor instalar --plan --iphone iphone-tls`. Tiene que decir «Aquí sigue
+   `sudo ./hehermes-servidor-0.10.0/hehermes-servidor instalar --plan --iphone iphone-tls`. Tiene que decir «Aquí sigue
    la VPN IKEv2 que instaló una versión anterior», el TCP elegido y ningún «No puedo seguir».
 2. **Instalarla:** lo mismo sin `--plan`, en un terminal (pinta el QR del token, que no se puede volver a pintar).
 3. **Abrir el TCP de la pasarela en el cortafuegos del proveedor**, si tiene uno en su panel (el plan lo dice con su
@@ -263,7 +282,7 @@ Hay que saber:
   - /usr/local/sbin/hehermes-dispositivo no es mío: no lo toco. Para los iPhone de la pasarela usa el mío: sudo /opt/hehermes-servidor/hehermes-dispositivo alta <nombre>
   - Aquí ya hay unos avisos puestos a mano (/opt/hehermes-avisos, los de server/avisos/despliegue/instalar.sh): ni el vigía ni el lector de ficheros los pongo yo, y lo suyo no lo toco
 
-50 cambios.
+51 cambios.
 ```
 <!-- /pasarela-de-daniel -->
 
@@ -283,7 +302,7 @@ Con el instalador ya puesto, otro iPhone no necesita el comando entero: `sudo he
 `server/instalador/empaquetar` genera el paquete, su `.sha256` y esa línea ya rellena:
 
 ```bash
-server/instalador/empaquetar                                   # dist/hehermes-servidor-0.9.0.tar.gz y .sha256
+server/instalador/empaquetar                                   # dist/hehermes-servidor-0.10.0.tar.gz y .sha256
 server/instalador/empaquetar --url-base https://ejemplo.org/hehermes --iphone mi-iphone
 server/instalador/empaquetar --firmar hehermes-firma.pem       # y el .sig (hace falta OpenSSL 3)
 ```
@@ -298,7 +317,8 @@ server/instalador/empaquetar --firmar hehermes-firma.pem       # y el .sig (hace
 - **Lleva:** `hehermes-servidor`, `hehermes-pasarela` y `hehermes_servidor/`, `hehermes-dispositivo` (de `server/vpn`),
   `clave-publica.pem`, `requirements-canje.txt`, este README, desde la 0.7.0 el código de los avisos
   (`hehermes_avisos/`, sus `.py`: el vigía) y, desde la 0.8.0, el lector de ficheros (`hehermes-leer-media`, de
-  `server/avisos/despliegue`). Ni pruebas ni `__pycache__`, ni el resto del despliegue a mano del relé.
+  `server/avisos/despliegue`) y, desde la 0.10.0, el ayudante de la copia en iCloud (`hehermes-respaldo`, de ahí
+  también). Ni pruebas ni `__pycache__`, ni el resto del despliegue a mano del relé.
 
 ### La firma de las actualizaciones
 

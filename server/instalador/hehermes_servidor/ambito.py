@@ -74,6 +74,18 @@ class Ambito:
             self.socket_lector = "/run/user/%d/hehermes-leer-media.sock" % uid
         self.unidad_lector_socket = self.unidades + "/hehermes-leer-media.socket"
         self.unidad_lector = self.unidades + "/hehermes-leer-media@.service"
+        # El ayudante de la copia en iCloud (desde la 0.10.0): como el lector, y su carpeta de trabajo (instantáneas,
+        # restauraciones y la copia de antes de restaurar). Con root la hace systemd (StateDirectory).
+        if root:
+            self.respaldo = "/usr/local/libexec/hehermes-respaldo"
+            self.socket_respaldo = "/run/hehermes-respaldo.sock"
+            self.carpeta_respaldo = "/var/lib/hehermes-respaldo"
+        else:
+            self.respaldo = self.prefijo + "/hehermes-respaldo"
+            self.socket_respaldo = "/run/user/%d/hehermes-respaldo.sock" % uid
+            self.carpeta_respaldo = casa + "/.local/state/hehermes-respaldo"
+        self.unidad_respaldo_socket = self.unidades + "/hehermes-respaldo.socket"
+        self.unidad_respaldo = self.unidades + "/hehermes-respaldo@.service"
         self.manifiesto = self.carpeta_config + "/instalacion.json"
         self.pasarela_ini = self.carpeta_pasarela + "/pasarela.ini"
         self.cert = self.carpeta_pasarela + "/cert.pem"

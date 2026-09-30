@@ -77,3 +77,9 @@ casa = /root
 # Descargas por minuto (cuentan también las que no estaban marcadas) y a la vez.
 por_minuto = 30
 simultaneos = 2
+
+[respaldo]
+# La copia de Hermes en iCloud (/avisos/v1/respaldo/…, contrato §15). La hace el ayudante de root de
+# /usr/local/libexec/hehermes-respaldo, que systemd lanza por cada conexión a este socket (root:hh-vigia 0660).
+# Vacío: sin copia, y esas rutas contestan 503.
+ayudante = /run/hehermes-respaldo.sock

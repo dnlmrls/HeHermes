@@ -20,9 +20,9 @@ ExecStart=/usr/bin/python3 -I -S -B /usr/local/libexec/hehermes-leer-media --her
 StandardInput=socket
 StandardOutput=socket
 StandardError=journal
-# Los rechazos de siempre (ruta inválida, no existe, prohibida, no es un fichero, demasiado grande) no son un fallo
-# del servicio. Una carrera (7), un error de lectura (8) o alguien que no es el vigía (9), sí.
-SuccessExitStatus=2 3 4 5 6
+# Los rechazos de siempre (ruta inválida, no existe, prohibida, no es un fichero, demasiado grande, fuera de las
+# permitidas) no son un fallo del servicio. Una carrera (7), un error de lectura (8) o alguien que no es el vigía (9), sí.
+SuccessExitStatus=2 3 4 5 6 10
 # 50 MB por una conexión lenta caben de sobra.
 RuntimeMaxSec=900
 UMask=0077

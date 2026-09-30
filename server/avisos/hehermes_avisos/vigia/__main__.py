@@ -29,6 +29,7 @@ from .configuracion import ConfigVigia
 from .envio import ClienteRele, Mensajero
 from .fichero import ClienteLector, Ficheros, Limites
 from .hermes import ClienteHermes, ErrorHermes
+from .respaldo import ClienteAyudante, Respaldos, limpiar_cada_hora
 from .vigilante import Vigilante
 
 registro = logging.getLogger("vigia")
@@ -79,14 +80,17 @@ def servir(config: ConfigVigia) -> int:
                           reglas_entrega=config.reglas_de_entrega())
     ficheros = Ficheros(hermes, ClienteLector(config.ficheros_lector),
                         Limites(config.ficheros_por_minuto, config.ficheros_simultaneos), casa=config.ficheros_casa)
+    respaldos = Respaldos(ClienteAyudante(config.respaldo_ayudante)) if config.respaldo_ayudante else None
     app = AppVigia(almacen, mensajero, secreto_tunel=secreto_tunel, caducidad_prueba=config.caducidad_prueba,
-                   al_moverse=vigilante.despertar, ficheros=ficheros)
+                   al_moverse=vigilante.despertar, ficheros=ficheros, respaldos=respaldos)
     servidor = ServidorHTTP(config.escucha, ManejadorVigia, app, heredado=heredado)
     _avisar_si_no_coincide(heredado, config.escucha)
     threading.Thread(target=servidor.serve_forever, name="api", daemon=True).start()
     parar = threading.Event()
     signal.signal(signal.SIGTERM, lambda *_: parar.set())
     signal.signal(signal.SIGINT, lambda *_: parar.set())
+    if respaldos is not None:
+        threading.Thread(target=limpiar_cada_hora, args=(respaldos, parar), name="respaldo", daemon=True).start()
     registro.info("vigía %s escuchando en %s:%d%s; Hermes en %s%s; relé en %s", VERSION, *servidor.server_address[:2],
                   " (socket de systemd)" if heredado else "", config.hermes_base,
                   " (con clave)" if clave_hermes else "",
@@ -174,6 +178,10 @@ def comprobar(config: ConfigVigia) -> int:
         decir(*_comprobar_lector(config.ficheros_lector))
     else:
         decir(True, "sin lector de ficheros ([ficheros] lector vacío): GET /avisos/v1/fichero contesta 503")
+    if config.respaldo_ayudante:
+        decir(*_comprobar_ayudante(config.respaldo_ayudante))
+    else:
+        decir(True, "sin el ayudante de la copia en iCloud ([respaldo] ayudante vacío): /avisos/v1/respaldo contesta 503")
     if not config.con_credencial:
         return 1 if fallos else 0
     base_rele = config.rele_url.rsplit("/v1/", 1)[0]
@@ -207,19 +215,31 @@ def comprobar(config: ConfigVigia) -> int:
 
 
 def _comprobar_lector(ruta_socket: str) -> tuple:
-    """El lector de los ficheros de Hermes, sin leer nada: pedir «/» tiene que dar su rechazo (``prohibida``, fuera de
-    las permitidas; un lector de antes de la 1.4.0 decía ``no_es_fichero``). Se mira la línea del lector tal cual: por
-    HTTP, desde la 1.4.0, los dos son el mismo 404 que lo que no existe."""
+    """El lector de los ficheros de Hermes, sin leer nada: pedir «/» tiene que dar su rechazo (``fuera``, fuera de las
+    permitidas, desde la 1.5.0; ``prohibida`` en la 1.4.0, y un lector de antes decía ``no_es_fichero``). Se mira la
+    línea del lector tal cual."""
     try:
         estado = ClienteLector(ruta_socket, plazo=5).estado_de("/")
     except ErrorHTTP as error:
         return False, f"el lector de ficheros en {ruta_socket}: {error.estado} {error.codigo} (¿está en marcha " \
                       f"hehermes-leer-media.socket?)"
-    if estado in ("prohibida", "no_es_fichero"):
+    if estado in ("fuera", "prohibida", "no_es_fichero"):
         return True, f"el lector de ficheros contesta en {ruta_socket}"
     if estado.startswith("ok"):
         return False, f"el lector de ficheros en {ruta_socket} ha dado «/» por un fichero"
     return False, f"el lector de ficheros en {ruta_socket} contesta «{estado[:40]}» a «/»"
+
+
+def _comprobar_ayudante(ruta_socket: str) -> tuple:
+    """El ayudante de la copia en iCloud, con la orden más barata (``limpiar``: solo mira su carpeta)."""
+    try:
+        respuesta, _ = ClienteAyudante(ruta_socket, plazo=30).pedir({"orden": "limpiar"})
+    except ErrorHTTP as error:
+        return False, f"el ayudante de la copia en {ruta_socket}: {error.estado} {error.codigo} (¿está en marcha " \
+                      f"hehermes-respaldo.socket?)"
+    if respuesta.get("ok"):
+        return True, f"el ayudante de la copia en iCloud contesta en {ruta_socket}"
+    return False, f"el ayudante de la copia en {ruta_socket} contesta «{str(respuesta.get('codigo'))[:40]}»"
 
 
 def _sin_clave(error: urllib.error.HTTPError) -> bool:

@@ -1,0 +1,2107 @@
+#!/usr/bin/python3 -IS
+"""La copia de Hermes en iCloud, del lado del servidor. Va en /usr/local/libexec/hehermes-respaldo.
+
+Spec ``docs/superpowers/specs/2026-09-29-respaldo-de-hermes-en-icloud-design.md`` (§5, §8, §9 y §16.1) y contrato
+``server/API-CONTRACT.md`` §15. La app cifra y guarda en iCloud; esto solo hace la instantánea de la casa de Hermes, la
+sirve en trozos, recibe los trozos de una copia y la pone en su sitio. El vigía (``hh-vigia``) no puede leer la casa de
+Hermes ni pararlo, y no se le da nada de root: este ayudante lo hace por él, lanzado por systemd en cada conexión a
+``/run/hehermes-respaldo.sock`` (``Accept=yes``), como el lector de ficheros.
+
+Lo que hace que no sirva para otra cosa:
+
+- **No acepta rutas.** Órdenes fijas (``ORDENES``), ids de 32 hexadecimales y números de trozo. Qué entra en una copia
+  lo dice este código (``clase_de``), no quien pregunta. Las únicas rutas que le llegan son las relativas de un
+  manifiesto al restaurar, y cada una tiene que ser limpia (sin ``..``, sin absolutas, sin nada raro) y caer, con las
+  mismas reglas, en la parte que dice: un manifiesto no puede escribir ``gateway_state.json`` ni nada de fuera.
+- **Solo atiende al vigía** (root o ``hh-vigia``, por ``SO_PEERCRED``), o con ``--usuario`` solo a su propio uid.
+- **Nunca apunta una ruta ni un contenido**: el id, la fase, los tamaños y el resultado.
+- **Restaurar no deja nada a medias.** Se monta y se comprueba todo antes de parar Hermes; se guarda lo que había; si
+  Hermes no vuelve a contestar o las cuentas no cuadran, se deshace solo.
+
+Las órdenes largas (una instantánea, aplicar, deshacer) contestan al momento y siguen en este mismo proceso con la
+conexión ya cerrada: el vigía no espera, y si se reinicia, lo que estaba en marcha acaba igual. El estado de cada una va
+en un fichero de la carpeta de trabajo, y una sola a la vez (``operacion.lock``).
+
+El protocolo: una línea JSON (``{"orden": …}``) y, si dice ``"bytes": n``, n bytes detrás; la respuesta, igual
+(``{"ok": true, …}`` o ``{"ok": false, "http": …, "codigo": …, "mensaje": …}``).
+
+Sin dependencias, y nada del entorno: ``-IS`` en la primera línea. Corre con el Python del sistema (3.9 o más).
+"""
+
+from __future__ import annotations
+
+import errno
+import fcntl
+import hashlib
+import http.client
+import io
+import json
+import os
+import pwd
+import re
+import secrets
+import shutil
+import socket
+import sqlite3
+import stat
+import struct
+import subprocess
+import sys
+import tarfile
+import time
+import zipfile
+import zlib
+from urllib.parse import quote
+
+FORMATO = 1
+TROZO = 4 * 1024 * 1024
+#: Un fichero de esto o más va solo (troceado); los más pequeños, juntos en el tar de su parte.
+GRANDE = 1024 * 1024
+#: Una carpeta de primer nivel que no se conoce entra solo si pesa menos.
+DESCONOCIDA_MAXIMA = 200 * 1024 * 1024
+GIB = 1024 ** 3
+VIDA_INSTANTANEA = 24 * 3600
+VIDA_RESTAURACION = 24 * 3600
+VIDA_ANTES = 7 * 24 * 3600
+DIA = 24 * 3600
+MAX_INSTANTANEAS_DIA = 6
+MAX_RESTAURACIONES_DIA = 3
+#: Una orden larga que no da señales de vida en este tiempo, con el cerrojo libre, murió (un reinicio, un kill).
+SIN_LATIDO = 600
+#: La línea de una orden (el manifiesto va dentro al restaurar) y el cuerpo de un trozo, comprimido.
+MAX_LINEA = 5 * 1024 * 1024
+MAX_CUERPO = TROZO + 64 * 1024
+PLAZO_ARRANQUE = 120
+PLAZO_PARAR = 90
+PLAZO_IMPORT = 1800
+USUARIO_VIGIA = "hh-vigia"
+#: El de Linux, que es donde corre; en el Mac de las pruebas no existe y se prueba con dobles.
+SO_PEERCRED = getattr(socket, "SO_PEERCRED", 17)
+
+PATRON_ID = re.compile(r"[0-9a-f]{32}")
+PATRON_SHA = re.compile(r"[0-9a-f]{64}")
+PARTES = ("configuracion", "conversaciones")
+CLASES = ("configuracion", "claves", "conversaciones")
+TARES = {"configuracion": "configuracion.tar", "claves": "claves.tar", "conversaciones": "conversaciones.tar"}
+CABECERA_SQLITE = b"SQLite format 3\x00"
+
+# MARK: Qué entra (spec §4 y §16.1; lo de Hermes, de hermes_cli/backup.py a 2026-09-29)
+
+#: En la raíz de la casa (y de cada perfil): lo que se regenera o es de la máquina.
+RAIZ_FUERA = frozenset({
+    # de Hermes: PM_RUNTIME_ROOT_DIRS (menos cache, que va aparte), LOCAL_RUNTIME_ROOT_DIRS, browser_profiles
+    "tools", "installs", "models", "runtimes", "node", "browser_profiles",
+    # nuestras: registros, servidores de lenguaje, entornos del navegador y binarios descargados
+    "logs", "lsp", "environments", "bin", ".curator_backups",
+})
+#: A cualquier profundidad (``_EXCLUDED_DIRS`` de Hermes).
+CARPETAS_FUERA = frozenset({
+    "__pycache__", ".git", "node_modules", "backups", "state-snapshots", "checkpoints", "browser-profiles",
+    "browser-profile", ".venv", "venv", "site-packages", ".cache", ".tox", ".nox", ".pytest_cache", ".mypy_cache",
+    ".ruff_cache",
+})
+#: Dos niveles, desde la raíz de cada perfil.
+SUBCARPETAS_FUERA = frozenset({("skills", ".hub"), ("skills", ".curator_backups"), ("cron", "output")})
+#: Lo de ``cache/`` que sí es del usuario: los medios que el gateway entregó o recibió y las citas.
+CACHE_QUE_QUEDA = frozenset({"images", "audio", "videos", "documents", "screenshots", "citations"})
+NOMBRES_FUERA = frozenset({
+    ".backup.lock", "gateway.pid", "cron.pid", "gateway_state.json", "processes.json", "gateway.lock", "gateway.sock",
+    "install_id", ".hermes_history",
+})
+SUFIJOS_FUERA = (".pyc", ".pyo", ".db-wal", ".db-shm", ".db-journal", ".lock", ".pid", ".partial", ".tmp")
+#: Lo que este ayudante deja un momento en la casa de Hermes al restaurar (el zip para ``hermes import``).
+PREFIJO_PROPIO = ".hehermes"
+#: En la raíz de cada perfil: las bases de las conversaciones y las carpetas de medios.
+BASES_CONVERSACIONES = frozenset({"state.db", "response_store.db", "runs_idempotency.db", "verification_evidence.db"})
+CARPETAS_CONVERSACIONES = frozenset({"image_cache", "audio_cache", "exports"})
+CLAVES_EN_RAIZ = frozenset({"auth.json", "vault.key", "vault.json.enc"})
+CARPETAS_DE_CLAVES = frozenset({"vault", "secrets"})
+#: Las carpetas de primer nivel que entran siempre, pesen lo que pesen. Las demás, solo por debajo de 200 MB.
+CONOCIDAS = frozenset({
+    "skills", "memories", "longterm-memory", "cron", "sessions", "profiles", "platforms", "pairing", "plugins",
+    "hooks", "scripts", "templates", "image_cache", "audio_cache", "exports", "cache", "vault", "secrets",
+    "engagements", "kanban",
+})
+
+
+def _dentro_del_perfil(partes: tuple) -> tuple:
+    """Las partes desde la raíz del perfil: ``profiles/<nombre>/…`` es otra casa de Hermes con las mismas reglas."""
+    if len(partes) >= 2 and partes[0] == "profiles":
+        return partes[2:]
+    return partes
+
+
+def carpeta_fuera(partes: tuple) -> bool:
+    """Si una carpeta (sus partes desde la casa de Hermes) queda fuera entera: no se baja a ella."""
+    if not partes:
+        return False
+    if any(parte in CARPETAS_FUERA for parte in partes):
+        return True
+    if partes[0] == "hermes-agent":
+        return True
+    dentro = _dentro_del_perfil(partes)
+    if not dentro:
+        return False
+    if dentro[0] in RAIZ_FUERA:
+        return True
+    if dentro[0] == "cache" and len(dentro) >= 2 and dentro[1] not in CACHE_QUE_QUEDA:
+        return True
+    return len(dentro) >= 2 and (dentro[0], dentro[1]) in SUBCARPETAS_FUERA
+
+
+def clase_de(partes: tuple) -> str:
+    """``fuera``, ``claves``, ``conversaciones`` o ``configuracion`` para un fichero (sus partes desde la casa)."""
+    if not partes:
+        return "fuera"
+    if carpeta_fuera(partes[:-1]):
+        return "fuera"
+    nombre = partes[-1]
+    dentro = _dentro_del_perfil(partes)
+    if (nombre in NOMBRES_FUERA or nombre.endswith(SUFIJOS_FUERA) or nombre.startswith(".gateway_state")
+            or nombre.startswith(PREFIJO_PROPIO)):
+        return "fuera"
+    en_raiz = len(dentro) == 1
+    if en_raiz and (nombre.startswith("state.db.") or nombre.endswith(("_cache.json", "_cache.etag"))):
+        return "fuera"
+    if nombre == ".env" or nombre.startswith(".env."):
+        return "claves"
+    if en_raiz and nombre in CLAVES_EN_RAIZ:
+        return "claves"
+    if len(dentro) >= 2 and dentro[0] in CARPETAS_DE_CLAVES:
+        return "claves"
+    if en_raiz and nombre in BASES_CONVERSACIONES:
+        return "conversaciones"
+    if len(dentro) >= 2 and dentro[0] in CARPETAS_CONVERSACIONES:
+        return "conversaciones"
+    if len(dentro) >= 3 and dentro[0] == "cache":
+        return "conversaciones"
+    return "configuracion"
+
+
+def partes_de(relativa: str) -> tuple:
+    """Las partes de una ruta relativa limpia, o ``ValueError``: nada absoluto, ni ``.``/``..``, ni vacío, ni
+    caracteres de control, ni barras invertidas, ni más de 4096 bytes."""
+    if not isinstance(relativa, str) or not relativa or len(relativa.encode("utf-8", "surrogatepass")) > 4096:
+        raise ValueError("ruta")
+    if relativa.startswith("/") or "\\" in relativa or any(ord(c) < 0x20 or ord(c) == 0x7F for c in relativa):
+        raise ValueError("ruta")
+    partes = tuple(relativa.split("/"))
+    if any(parte in ("", ".", "..") for parte in partes):
+        raise ValueError("ruta")
+    return partes
+
+
+class Fichero:
+    """Un fichero de la casa de Hermes que entra: su ruta relativa, su clase y lo que se sabe de él."""
+
+    __slots__ = ("relativa", "clase", "tamano", "modo", "mtime", "base", "uid", "gid")
+
+    def __init__(self, relativa, clase, tamano, modo, mtime, base, uid=0, gid=0):
+        self.relativa, self.clase, self.tamano, self.modo = relativa, clase, tamano, modo
+        self.mtime, self.base, self.uid, self.gid = mtime, base, uid, gid
+
+
+def _es_sqlite(ruta: str) -> bool:
+    try:
+        with open(ruta, "rb") as f:
+            return f.read(16) == CABECERA_SQLITE
+    except OSError:
+        return False
+
+
+def recorrer(casa: str, clases, desconocida_maxima: int | None = None) -> tuple:
+    """``([Fichero…], [{"nombre", "tamano", "motivo"}…], enlaces saltados)``: lo que entra de las ``clases`` pedidas,
+    sin seguir ningún enlace ni leer nada que no sea un fichero normal, y lo que se quedó fuera por tamaño."""
+    casa = casa.rstrip("/") or "/"
+    desconocida_maxima = DESCONOCIDA_MAXIMA if desconocida_maxima is None else desconocida_maxima
+    ficheros, fuera, enlaces = [], [], 0
+    tamanos = {}
+    for carpeta, subcarpetas, nombres in os.walk(casa, followlinks=False):
+        relativa = os.path.relpath(carpeta, casa)
+        partes = () if relativa == "." else tuple(relativa.split(os.sep))
+        guardar = []
+        for sub in sorted(subcarpetas):
+            ruta = os.path.join(carpeta, sub)
+            try:
+                if stat.S_ISLNK(os.lstat(ruta).st_mode):
+                    enlaces += 1
+                    continue
+            except OSError:
+                continue
+            if not carpeta_fuera(partes + (sub,)):
+                guardar.append(sub)
+        subcarpetas[:] = guardar
+        for nombre in sorted(nombres):
+            ruta = os.path.join(carpeta, nombre)
+            try:
+                visto = os.lstat(ruta)
+            except OSError:
+                continue
+            if stat.S_ISLNK(visto.st_mode):
+                enlaces += 1
+                continue
+            if not stat.S_ISREG(visto.st_mode):
+                continue
+            clase = clase_de(partes + (nombre,))
+            if clase == "fuera":
+                continue
+            if partes and partes[0] not in CONOCIDAS:
+                tamanos[partes[0]] = tamanos.get(partes[0], 0) + visto.st_size
+            if clase not in clases:
+                continue
+            ficheros.append(Fichero("/".join(partes + (nombre,)), clase, visto.st_size, stat.S_IMODE(visto.st_mode),
+                                    int(visto.st_mtime), _es_sqlite(ruta), visto.st_uid, visto.st_gid))
+    grandes = {nombre for nombre, tamano in tamanos.items() if tamano >= desconocida_maxima}
+    for nombre in sorted(grandes):
+        fuera.append({"nombre": nombre, "tamano": tamanos[nombre], "motivo": "demasiado_grande"})
+    ficheros = [f for f in ficheros if f.relativa.split("/", 1)[0] not in grandes or "/" not in f.relativa]
+    return ficheros, fuera, enlaces
+
+
+# MARK: Las bases de datos: copiar, limpiar y comprobar
+
+
+def copiar_base(origen: str, destino: str) -> None:
+    """Una foto consistente con la API de backup de SQLite, de un solo paso: en WAL, leer no bloquea a Hermes, y por
+    tandas se reiniciaría cada vez que Hermes escribe. Luego la copia pasa a ``journal_mode=DELETE``: sin -wal ni -shm
+    que viajen con ella."""
+    fd = os.open(destino, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    os.close(fd)
+    fuente = sqlite3.connect("file:%s?mode=ro" % _uri(origen), uri=True, timeout=30)
+    try:
+        copia = sqlite3.connect(destino)
+        try:
+            fuente.backup(copia, pages=-1)
+            copia.execute("PRAGMA journal_mode=DELETE")
+            copia.commit()
+        finally:
+            copia.close()
+    finally:
+        fuente.close()
+
+
+def _uri(ruta: str) -> str:
+    return quote(ruta, safe="/")
+
+
+def conectar_quieta(ruta: str) -> sqlite3.Connection:
+    """Una base que nadie más toca (nuestra copia): sin cerrojos ni WAL (``immutable=1``)."""
+    return sqlite3.connect("file:%s?immutable=1" % _uri(ruta), uri=True)
+
+
+def comprobar_base(ruta: str, a_fondo: bool = False) -> bool:
+    try:
+        conexion = conectar_quieta(ruta)
+        try:
+            filas = conexion.execute("PRAGMA integrity_check" if a_fondo else "PRAGMA quick_check").fetchall()
+        finally:
+            conexion.close()
+    except sqlite3.Error:
+        return False
+    return filas == [("ok",)]
+
+
+def _be16(datos, i) -> int:
+    return (datos[i] << 8) | datos[i + 1]
+
+
+def _be32(datos, i) -> int:
+    return struct.unpack_from(">I", datos, i)[0]
+
+
+def limpiar_base(ruta: str) -> dict:
+    """Pone a cero, en la copia, lo que SQLite ya no usa pero sigue en el fichero: las páginas libres enteras, lo que
+    sobra de cada tronco del freelist y, en cada página de los árboles, el hueco sin usar y los bloques libres (menos
+    sus 4 bytes de cabecera). Es lo que haría ``secure_delete``, hecho después. Las páginas no se mueven: las que no
+    cambian dan el mismo trozo de un día a otro. Devuelve cuántas páginas y bytes se han tocado."""
+    raices = {1}
+    conexion = conectar_quieta(ruta)
+    try:
+        raices.update(r for (r,) in conexion.execute(
+            "SELECT rootpage FROM sqlite_master WHERE rootpage IS NOT NULL AND rootpage > 0"))
+    finally:
+        conexion.close()
+    cuentas = {"libres": 0, "troncos": 0, "arboles": 0, "bytes": 0}
+    with open(ruta, "r+b") as f:
+        cabecera = f.read(100)
+        if cabecera[:16] != CABECERA_SQLITE:
+            raise ValueError("no es una base de SQLite")
+        pagina = _be16(cabecera, 16)
+        pagina = 65536 if pagina == 1 else pagina
+        util = pagina - cabecera[20]
+        total = os.fstat(f.fileno()).st_size // pagina
+
+        def leer(n):
+            f.seek((n - 1) * pagina)
+            return bytearray(f.read(pagina))
+
+        def escribir(n, datos):
+            f.seek((n - 1) * pagina)
+            f.write(datos)
+
+        cero = bytes(util)
+        # El freelist: troncos encadenados con la lista de sus hojas.
+        tronco, vistos = _be32(cabecera, 32), set()
+        while tronco:
+            if not 1 < tronco <= total or tronco in vistos:
+                raise ValueError("freelist roto")
+            vistos.add(tronco)
+            datos = leer(tronco)
+            siguiente, hojas = _be32(datos, 0), _be32(datos, 4)
+            if hojas > util // 4 - 2:
+                raise ValueError("freelist roto")
+            for i in range(hojas):
+                hoja = _be32(datos, 8 + 4 * i)
+                if not 1 < hoja <= total:
+                    raise ValueError("freelist roto")
+                if hoja in vistos:
+                    continue
+                vistos.add(hoja)
+                escribir(hoja, cero)
+                cuentas["libres"] += 1
+                cuentas["bytes"] += util
+            fin = 8 + 4 * hojas
+            if any(datos[fin:util]):
+                cuentas["bytes"] += util - fin
+                datos[fin:util] = bytes(util - fin)
+                escribir(tronco, datos)
+            cuentas["troncos"] += 1
+            tronco = siguiente
+        # Los árboles, desde sus raíces.
+        pendientes, hechos = sorted(raices), set()
+        while pendientes:
+            n = pendientes.pop()
+            if n in hechos or not 1 <= n <= total or n in vistos:
+                continue
+            hechos.add(n)
+            datos = leer(n)
+            inicio = 100 if n == 1 else 0
+            tipo = datos[inicio]
+            if tipo not in (2, 5, 10, 13):
+                continue
+            interior = tipo in (2, 5)
+            largo = 12 if interior else 8
+            celdas = _be16(datos, inicio + 3)
+            contenido = _be16(datos, inicio + 5) or 65536
+            punteros = inicio + largo
+            if interior:
+                pendientes.append(_be32(datos, inicio + 8))
+                for i in range(celdas):
+                    celda = _be16(datos, punteros + 2 * i)
+                    if celda + 4 <= util:
+                        pendientes.append(_be32(datos, celda))
+            cambiado = False
+            hueco = punteros + 2 * celdas
+            if hueco < contenido <= util and any(datos[hueco:contenido]):
+                datos[hueco:contenido] = bytes(contenido - hueco)
+                cuentas["bytes"] += contenido - hueco
+                cambiado = True
+            bloque, anterior, vueltas = _be16(datos, inicio + 1), 0, 0
+            while bloque and vueltas < util // 4:
+                vueltas += 1
+                if bloque <= anterior or bloque + 4 > util:
+                    break
+                siguiente, tamano = _be16(datos, bloque), _be16(datos, bloque + 2)
+                if tamano < 4 or bloque + tamano > util:
+                    break
+                if any(datos[bloque + 4:bloque + tamano]):
+                    datos[bloque + 4:bloque + tamano] = bytes(tamano - 4)
+                    cuentas["bytes"] += tamano - 4
+                    cambiado = True
+                anterior, bloque = bloque, siguiente
+            if cambiado:
+                escribir(n, datos)
+                cuentas["arboles"] += 1
+        f.flush()
+        os.fsync(f.fileno())
+    return cuentas
+
+
+def cuentas_de_state(ruta: str) -> dict:
+    """Sesiones y mensajes de un ``state.db`` (la copia, o el de Hermes para ver qué hay)."""
+    try:
+        conexion = sqlite3.connect("file:%s?mode=ro" % _uri(ruta), uri=True, timeout=10)
+        try:
+            sesiones = conexion.execute("SELECT count(*) FROM sessions").fetchone()[0]
+            mensajes = conexion.execute("SELECT count(*) FROM messages").fetchone()[0]
+        finally:
+            conexion.close()
+    except sqlite3.Error:
+        return {"sesiones": None, "mensajes": None}
+    return {"sesiones": sesiones, "mensajes": mensajes}
+
+
+def version_de_state(ruta: str):
+    try:
+        conexion = conectar_quieta(ruta)
+        try:
+            return conexion.execute("SELECT max(version) FROM schema_version").fetchone()[0]
+        finally:
+            conexion.close()
+    except sqlite3.Error:
+        return None
+
+
+# MARK: Lo que se sabe de Hermes
+
+
+def contar_skills(casa: str) -> int:
+    cuenta = 0
+    raiz = os.path.join(casa, "skills")
+    for carpeta, subcarpetas, nombres in os.walk(raiz, followlinks=False):
+        subcarpetas[:] = [s for s in subcarpetas if not s.startswith(".") and s not in CARPETAS_FUERA]
+        if "SKILL.md" in nombres:
+            cuenta += 1
+    return cuenta
+
+
+def contar_tareas(casa: str) -> int:
+    try:
+        with open(os.path.join(casa, "cron", "jobs.json"), "rb") as f:
+            datos = json.loads(f.read(8 * 1024 * 1024).decode("utf-8"))
+    except (OSError, ValueError):
+        return 0
+    if isinstance(datos, dict):
+        datos = datos.get("jobs", datos)
+    return len(datos) if isinstance(datos, (list, dict)) else 0
+
+
+PLATAFORMAS = ("telegram", "discord", "slack", "whatsapp", "signal", "matrix", "email")
+
+
+def plataformas(casa: str) -> list:
+    """Las de mensajería que tiene puestas, por su nombre: las carpetas de ``platforms/`` que lo son y las variables de
+    su ``.env`` que las delatan. Nunca un valor."""
+    vistas = set()
+    try:
+        vistas.update(n for n in os.listdir(os.path.join(casa, "platforms"))
+                      if n in PLATAFORMAS and os.path.isdir(os.path.join(casa, "platforms", n)))
+    except OSError:
+        pass
+    try:
+        with open(os.path.join(casa, ".env"), "rb") as f:
+            texto = f.read(1024 * 1024).decode("utf-8", "replace")
+    except OSError:
+        texto = ""
+    for linea in texto.splitlines():
+        nombre = linea.strip().partition("=")[0].replace("export ", "").strip()
+        for plataforma in PLATAFORMAS:
+            if nombre.startswith(plataforma.upper() + "_") and linea.partition("=")[2].strip():
+                vistas.add(plataforma)
+    return sorted(vistas)
+
+
+def version_de_config(casa: str):
+    try:
+        with open(os.path.join(casa, "config.yaml"), "rb") as f:
+            texto = f.read(1024 * 1024).decode("utf-8", "replace")
+    except OSError:
+        return None
+    encontrada = re.search(r"^_config_version:\s*(\d+)\s*$", texto, re.MULTILINE)
+    return int(encontrada.group(1)) if encontrada else None
+
+
+PATRON_VERSION = re.compile(r"(?<![\d.(])v?(\d+)\.(\d+)\.(\d+)(?:\+(\d+)(?:\.g([0-9a-f]{4,40}))?)?")
+PATRON_FECHA = re.compile(r"\((\d{4})\.(\d{1,2})\.(\d{1,2})\)")
+
+
+def leer_version(texto: str) -> dict:
+    """``{"version", "adelante", "commit", "fecha"}`` de lo que dice ``hermes --version`` (o ``/health``)."""
+    resultado = {"version": None, "adelante": None, "commit": None, "fecha": None}
+    encontrada = PATRON_VERSION.search(texto or "")
+    if encontrada:
+        resultado["version"] = "%s.%s.%s" % encontrada.group(1, 2, 3)
+        resultado["adelante"] = int(encontrada.group(4)) if encontrada.group(4) else 0
+        resultado["commit"] = encontrada.group(5)
+    fecha = PATRON_FECHA.search(texto or "")
+    if fecha:
+        resultado["fecha"] = "%s.%d.%d" % (fecha.group(1), int(fecha.group(2)), int(fecha.group(3)))
+    return resultado
+
+
+def _clave_de_version(version) -> tuple | None:
+    if not isinstance(version, dict) or not isinstance(version.get("version"), str):
+        return None
+    try:
+        numeros = tuple(int(x) for x in version["version"].split("."))
+    except ValueError:
+        return None
+    adelante = version.get("adelante") if isinstance(version.get("adelante"), int) else 0
+    fecha = ()
+    if isinstance(version.get("fecha"), str):
+        try:
+            fecha = tuple(int(x) for x in version["fecha"].split("."))
+        except ValueError:
+            fecha = ()
+    return numeros + (adelante,), fecha
+
+
+def version_suficiente(servidor, copia) -> bool:
+    """Si el Hermes del servidor es igual o más nuevo que el de la copia. Sin saber el de la copia, sí; sin saber el
+    del servidor (y sabiendo el de la copia), no: restaurar datos de un Hermes más nuevo en uno más viejo los rompe."""
+    c = _clave_de_version(copia)
+    if c is None:
+        return True
+    s = _clave_de_version(servidor)
+    if s is None:
+        return False
+    if s[0] != c[0]:
+        return s[0] > c[0]
+    if s[1] and c[1]:
+        return s[1] >= c[1]
+    return True
+
+
+# MARK: El sistema (lo que las pruebas cambian por dobles)
+
+
+class Sistema:
+    """Parar y arrancar Hermes, ejecutar ``hermes`` como su dueño y preguntarle a su API. Las pruebas ponen dobles."""
+
+    def __init__(self, config):
+        self.config = config
+
+    def ejecutar(self, orden, entorno=None, plazo=60, entrada=None, como_hermes=False):
+        """``(código, salida, errores)``. ``como_hermes``: como el dueño de Hermes, si no es root y este proceso sí lo
+        es; lo cambia el propio Python (setgid, setgroups, setuid) antes del exec, sin runuser ni PAM."""
+        extra = {}
+        if como_hermes and os.geteuid() == 0 and self.config.usuario_hermes != "root":
+            usuario = pwd.getpwnam(self.config.usuario_hermes)
+            extra = {"user": usuario.pw_uid, "group": usuario.pw_gid,
+                     "extra_groups": os.getgrouplist(usuario.pw_name, usuario.pw_gid)}
+        try:
+            r = subprocess.run(orden, stdin=subprocess.DEVNULL if entrada is None else None, input=entrada,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=entorno, timeout=plazo,
+                               check=False, **extra)
+        except (OSError, subprocess.SubprocessError):
+            return 127, b"", b""
+        return r.returncode, r.stdout, r.stderr
+
+    def _systemctl(self):
+        return ["systemctl", "--user"] if self.config.usuario else ["systemctl"]
+
+    def unidad_cargada(self) -> bool:
+        unidad = self.config.unidad
+        if not unidad:
+            return False
+        codigo, salida, _ = self.ejecutar(self._systemctl() + ["show", unidad, "-p", "LoadState", "--value"], plazo=20)
+        return codigo == 0 and salida.strip() == b"loaded"
+
+    def en_marcha(self) -> bool:
+        codigo, salida, _ = self.ejecutar(self._systemctl() + ["is-active", self.config.unidad], plazo=20)
+        return salida.strip() in (b"active", b"activating", b"reloading", b"deactivating")
+
+    def parar(self) -> bool:
+        self.ejecutar(self._systemctl() + ["stop", self.config.unidad], plazo=PLAZO_PARAR)
+        return not self.en_marcha()
+
+    def arrancar(self) -> bool:
+        codigo, _, _ = self.ejecutar(self._systemctl() + ["start", self.config.unidad], plazo=PLAZO_PARAR)
+        return codigo == 0
+
+    def hermes(self) -> str | None:
+        if self.config.hermes:
+            return self.config.hermes
+        candidatas = []
+        if self.config.unidad:
+            _, salida, _ = self.ejecutar(self._systemctl() + ["show", self.config.unidad, "-p", "ExecStart",
+                                                              "--value"], plazo=20)
+            for trozo in salida.decode("utf-8", "replace").replace(";", " ").split():
+                if trozo.startswith("path=") and trozo.endswith("/hermes"):
+                    candidatas.append(trozo[5:])
+        casa_usuario = self._casa_del_usuario()
+        candidatas += ["/usr/local/bin/hermes", casa_usuario + "/.local/bin/hermes" if casa_usuario else None,
+                       "/usr/bin/hermes"]
+        for candidata in candidatas:
+            if candidata and os.path.isfile(candidata) and os.access(candidata, os.X_OK):
+                return candidata
+        return None
+
+    def _casa_del_usuario(self) -> str | None:
+        try:
+            return pwd.getpwnam(self.config.usuario_hermes).pw_dir
+        except KeyError:
+            return None
+
+    def entorno_de_hermes(self) -> dict:
+        casa = self._casa_del_usuario() or os.path.dirname(self.config.casa.rstrip("/"))
+        return {"HERMES_HOME": self.config.casa, "HOME": casa, "USER": self.config.usuario_hermes,
+                "LOGNAME": self.config.usuario_hermes, "LANG": "C.UTF-8",
+                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+
+    def version(self) -> dict:
+        hermes = self.hermes()
+        if hermes:
+            codigo, salida, _ = self.ejecutar([hermes, "--version"], self.entorno_de_hermes(), 60, como_hermes=True)
+            if codigo == 0:
+                version = leer_version(salida.decode("utf-8", "replace"))
+                if version["version"]:
+                    return version
+        estado, cuerpo = self.http("/health")
+        if estado == 200:
+            try:
+                return leer_version(str(json.loads(cuerpo.decode("utf-8")).get("version") or ""))
+            except (ValueError, AttributeError):
+                pass
+        return leer_version("")
+
+    def importar(self, zip_: str) -> bool:
+        hermes = self.hermes()
+        if not hermes:
+            return False
+        codigo, _, _ = self.ejecutar([hermes, "import", "--force", zip_], self.entorno_de_hermes(), PLAZO_IMPORT,
+                                     como_hermes=True)
+        return codigo == 0
+
+    def puerto(self) -> int:
+        """El de la API de Hermes: el que se dio, o el ``API_SERVER_PORT`` de su ``.env`` (8642 si no dice)."""
+        if self.config.puerto:
+            return self.config.puerto
+        for linea in lineas_api_server(os.path.join(self.config.casa, ".env")):
+            nombre, _, valor = linea.partition("=")
+            valor = valor.strip().strip("'\"")
+            if nombre.replace("export", "").strip() == "API_SERVER_PORT" and valor.isdigit() and 0 < int(valor) < 65536:
+                return int(valor)
+        return 8642
+
+    def http(self, ruta: str, clave: str | None = None) -> tuple:
+        try:
+            conexion = http.client.HTTPConnection("127.0.0.1", self.puerto(), timeout=5)
+            try:
+                cabeceras = {"Authorization": "Bearer " + clave} if clave else {}
+                conexion.request("GET", ruta, headers=cabeceras)
+                respuesta = conexion.getresponse()
+                return respuesta.status, respuesta.read(64 * 1024)
+            finally:
+                conexion.close()
+        except (OSError, http.client.HTTPException):
+            return None, b""
+
+    def hostname(self) -> str:
+        return socket.gethostname().split(".")[0] or "servidor"
+
+    def libre(self, ruta: str) -> int:
+        return shutil.disk_usage(ruta).free
+
+    def dormir(self, segundos: float) -> None:
+        time.sleep(segundos)
+
+    def ahora(self) -> float:
+        return time.time()
+
+
+class Config:
+    def __init__(self, casa="/root/.hermes", trabajo="/var/lib/hehermes-respaldo", unidad="hermes-gateway.service",
+                 usuario_hermes="root", puerto=None, hermes=None, usuario=False):
+        self.casa, self.trabajo, self.unidad = casa.rstrip("/") or "/", trabajo.rstrip("/"), unidad
+        self.usuario_hermes, self.puerto, self.hermes, self.usuario = usuario_hermes, puerto, hermes, usuario
+
+
+class Rechazo(Exception):
+    def __init__(self, http_: int, codigo: str, mensaje: str, extra: dict | None = None, cabeceras=None):
+        super().__init__(mensaje)
+        self.http, self.codigo, self.mensaje = http_, codigo, mensaje
+        self.extra, self.cabeceras = extra or {}, cabeceras or {}
+
+    def respuesta(self) -> dict:
+        r = {"ok": False, "http": self.http, "codigo": self.codigo, "mensaje": self.mensaje}
+        if self.extra:
+            r["extra"] = self.extra
+        if self.cabeceras:
+            r["cabeceras"] = self.cabeceras
+        return r
+
+
+def _decir(texto: str) -> None:
+    """El registro: fases, ids, tamaños y resultados. Nunca una ruta ni un contenido."""
+    sys.stderr.write("hehermes-respaldo: %s\n" % texto)
+    sys.stderr.flush()
+
+
+# MARK: La carpeta de trabajo
+
+
+def _escribir_json(ruta: str, datos) -> None:
+    temporal = ruta + ".nuevo"
+    with open(os.open(temporal, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600),
+              "w") as f:
+        json.dump(datos, f, sort_keys=True, separators=(",", ":"))
+    os.replace(temporal, ruta)
+
+
+def _leer_json(ruta: str, defecto=None):
+    try:
+        with open(ruta, "rb") as f:
+            return json.loads(f.read().decode("utf-8"))
+    except (OSError, ValueError):
+        return defecto
+
+
+def _borrar_arbol(ruta: str) -> None:
+    shutil.rmtree(ruta, ignore_errors=True)
+
+
+class Trabajo:
+    """La carpeta de trabajo (0700, solo de este ayudante): instantáneas, restauraciones, la copia de antes de
+    restaurar, los límites y el cerrojo de las órdenes largas."""
+
+    def __init__(self, config: Config, sistema: Sistema):
+        self.config, self.sistema = config, sistema
+        self.raiz = config.trabajo
+        os.makedirs(self.raiz, mode=0o700, exist_ok=True)
+        os.chmod(self.raiz, 0o700)
+        for sub in ("instantaneas", "restauraciones", "antes"):
+            os.makedirs(os.path.join(self.raiz, sub), mode=0o700, exist_ok=True)
+        self._cerrojo = None
+
+    def ruta(self, *partes) -> str:
+        return os.path.join(self.raiz, *partes)
+
+    def id_servidor(self) -> str:
+        ruta = self.ruta("id-servidor")
+        try:
+            with open(ruta, "r") as f:
+                valor = f.read().strip()
+            if PATRON_ID.fullmatch(valor):
+                return valor
+        except OSError:
+            pass
+        valor = secrets.token_hex(16)
+        with open(os.open(ruta, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+            f.write(valor + "\n")
+        return valor
+
+    # -- El cerrojo de las órdenes largas
+
+    def tomar(self, tipo: str, id_: str | None) -> bool:
+        """Toma el cerrojo (sin esperar) y apunta qué lo tiene. False si otro proceso lo tiene."""
+        fd = os.open(self.ruta("operacion.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        self._cerrojo = fd
+        _escribir_json(self.ruta("operacion.json"), {"tipo": tipo, "id": id_, "pid": os.getpid(),
+                                                     "desde": int(self.sistema.ahora())})
+        return True
+
+    def soltar(self) -> None:
+        if self._cerrojo is not None:
+            try:
+                os.unlink(self.ruta("operacion.json"))
+            except OSError:
+                pass
+            fcntl.flock(self._cerrojo, fcntl.LOCK_UN)
+            os.close(self._cerrojo)
+            self._cerrojo = None
+
+    def ocupado(self) -> dict | None:
+        """Qué orden larga está en marcha en otro proceso, o None."""
+        if self._cerrojo is not None:
+            return _leer_json(self.ruta("operacion.json"), {"tipo": "?", "id": None})
+        fd = os.open(self.ruta("operacion.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return _leer_json(self.ruta("operacion.json"), {"tipo": "?", "id": None}) or {"tipo": "?", "id": None}
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return None
+        finally:
+            os.close(fd)
+
+    # -- Los límites por día
+
+    def contar(self, tipo: str, maximo: int, apuntar: bool) -> None:
+        ruta = self.ruta("limites.json")
+        ahora = self.sistema.ahora()
+        datos = _leer_json(ruta, {}) or {}
+        vistas = [t for t in datos.get(tipo, []) if isinstance(t, (int, float)) and ahora - t < DIA]
+        if len(vistas) >= maximo:
+            espera = int(DIA - (ahora - min(vistas))) + 1
+            codigo = "demasiadas_instantaneas" if tipo == "instantaneas" else "demasiadas_restauraciones"
+            raise Rechazo(429, codigo, "Ya van %d en 24 horas" % maximo, cabeceras={"Retry-After": str(espera)})
+        if apuntar:
+            vistas.append(int(ahora))
+            datos[tipo] = vistas
+            _escribir_json(ruta, datos)
+
+    # -- La limpieza
+
+    def limpiar(self) -> dict:
+        """Borra las instantáneas y las restauraciones caducadas, la copia de antes pasados sus 7 días, y marca como
+        fallidas las órdenes largas que murieron sin acabar (sin cerrojo y sin latido)."""
+        ahora = self.sistema.ahora()
+        borradas = {"instantaneas": 0, "restauraciones": 0, "antes": 0}
+        libre = self.ocupado() is None
+        for tipo, vida in (("instantaneas", VIDA_INSTANTANEA), ("restauraciones", VIDA_RESTAURACION)):
+            carpeta = self.ruta(tipo)
+            for nombre in os.listdir(carpeta):
+                ruta = os.path.join(carpeta, nombre)
+                estado = _leer_json(os.path.join(ruta, "estado.json"), {}) or {}
+                creada = estado.get("creada") if isinstance(estado.get("creada"), (int, float)) else 0
+                viva = estado.get("estado") in ("preparando", "aplicando")
+                if viva and libre and ahora - (estado.get("latido") or creada) > SIN_LATIDO:
+                    estado.update(estado="fallida", motivo=estado.get("motivo") or "interrumpida", fase=None)
+                    _escribir_json(os.path.join(ruta, "estado.json"), estado)
+                    viva = False
+                    _decir("%s %s: murió sin acabar" % (tipo[:-1], nombre))
+                hecha = estado.get("estado") in ("hecha", "deshecha")
+                if not viva and (ahora - creada > vida or not PATRON_ID.fullmatch(nombre)) and not (
+                        hecha and ahora - creada <= VIDA_ANTES):
+                    _borrar_arbol(ruta)
+                    borradas[tipo] += 1
+        antes = self.leer_antes()
+        if antes and libre and ahora > antes.get("hasta", 0):
+            _borrar_arbol(self.ruta("antes"))
+            os.makedirs(self.ruta("antes"), mode=0o700, exist_ok=True)
+            borradas["antes"] = 1
+        return borradas
+
+    def leer_antes(self) -> dict | None:
+        datos = _leer_json(self.ruta("antes", "antes.json"))
+        return datos if isinstance(datos, dict) and datos.get("estado") in ("disponible", "deshaciendo", "fallida") \
+            else None
+
+
+# MARK: La instantánea
+
+
+def _nuevo_id() -> str:
+    return secrets.token_hex(16)
+
+
+def _validar_id(valor) -> str:
+    if not isinstance(valor, str) or not PATRON_ID.fullmatch(valor):
+        raise Rechazo(400, "parametro_invalido", "El id tiene que ser de 32 hexadecimales")
+    return valor
+
+
+def _validar_numero(valor) -> int:
+    if not isinstance(valor, int) or isinstance(valor, bool) or valor < 0:
+        raise Rechazo(400, "parametro_invalido", "El número de trozo no tiene su forma")
+    return valor
+
+
+def clases_pedidas(partes, claves) -> tuple:
+    if (not isinstance(partes, list) or not partes or len(set(partes)) != len(partes)
+            or any(p not in PARTES for p in partes)):
+        raise Rechazo(400, "parametro_invalido", "Las partes son «configuracion» y/o «conversaciones», sin repetir")
+    if claves is None:
+        claves = True
+    if not isinstance(claves, bool):
+        raise Rechazo(400, "parametro_invalido", "«claves» es true o false")
+    clases = set(partes)
+    if "configuracion" in clases and claves:
+        clases.add("claves")
+    return tuple(c for c in CLASES if c in clases)
+
+
+def _tamano_estimado(casa: str, clases) -> int:
+    ficheros, _, _ = recorrer(casa, clases)
+    return sum(f.tamano for f in ficheros)
+
+
+class Instantaneas:
+    def __init__(self, trabajo: Trabajo, config: Config, sistema: Sistema):
+        self.trabajo, self.config, self.sistema = trabajo, config, sistema
+
+    def carpeta(self, id_: str) -> str:
+        return self.trabajo.ruta("instantaneas", id_)
+
+    def crear(self, partes, claves):
+        """Comprueba, reserva y contesta; lo largo va en la continuación (``(respuesta, continuación)``)."""
+        clases = clases_pedidas(partes, claves)
+        self.trabajo.limpiar()
+        ocupado = self.trabajo.ocupado()
+        if ocupado is not None:
+            raise Rechazo(409, "en_curso", "Ya hay una operación en marcha", {"id": ocupado.get("id")})
+        self.trabajo.contar("instantaneas", MAX_INSTANTANEAS_DIA, apuntar=False)
+        necesita = _tamano_estimado(self.config.casa, clases) + GIB
+        libre = self.sistema.libre(self.trabajo.raiz)
+        if libre < necesita:
+            raise Rechazo(507, "sin_espacio", "No hay sitio en el disco del servidor", {"faltan": necesita - libre})
+        id_ = _nuevo_id()
+        if not self.trabajo.tomar("instantanea", id_):
+            raise Rechazo(409, "en_curso", "Ya hay una operación en marcha")
+        try:
+            self.trabajo.contar("instantaneas", MAX_INSTANTANEAS_DIA, apuntar=True)
+            carpeta = self.carpeta(id_)
+            os.makedirs(carpeta, mode=0o700)
+            ahora = int(self.sistema.ahora())
+            _escribir_json(os.path.join(carpeta, "estado.json"), {
+                "id": id_, "estado": "preparando", "creada": ahora, "caduca": ahora + VIDA_INSTANTANEA,
+                "latido": ahora, "progreso": {"fase": "bases", "hecho": 0, "total": 0}, "motivo": None,
+                "clases": list(clases)})
+        except BaseException:
+            self.trabajo.soltar()
+            raise
+        _decir("instantánea %s: pedida (%s)" % (id_, "+".join(clases)))
+
+        def continuar():
+            try:
+                self.hacer(id_, clases)
+            finally:
+                self.trabajo.soltar()
+
+        return {"ok": True, "http": 202, "id": id_}, continuar
+
+    def _estado(self, id_: str, **cambios) -> dict:
+        ruta = os.path.join(self.carpeta(id_), "estado.json")
+        estado = _leer_json(ruta, {}) or {}
+        estado.update(cambios)
+        estado["latido"] = int(self.sistema.ahora())
+        _escribir_json(ruta, estado)
+        return estado
+
+    def hacer(self, id_: str, clases) -> None:
+        inicio = time.monotonic()
+        carpeta = self.carpeta(id_)
+        try:
+            manifiesto = self._construir(id_, carpeta, clases)
+        except Rechazo as rechazo:
+            self._estado(id_, estado="fallida", motivo=rechazo.codigo, progreso=None)
+            _decir("instantánea %s: fallida (%s)" % (id_, rechazo.codigo))
+            return
+        except Exception as error:  # noqa: BLE001 — la instantánea falla, el ayudante no
+            codigo = "sin_espacio" if isinstance(error, OSError) and error.errno == errno.ENOSPC else "error"
+            self._estado(id_, estado="fallida", motivo=codigo, progreso=None)
+            _decir("instantánea %s: fallida (%s: %s)" % (id_, codigo, type(error).__name__))
+            return
+        _escribir_json(os.path.join(carpeta, "manifiesto.json"), manifiesto)
+        self._estado(id_, estado="lista", progreso=None)
+        total = sum(f["tamano"] for f in manifiesto["ficheros"])
+        _decir("instantánea %s: lista, %d ficheros en %d trozos, %d bytes, %.1f s" % (
+            id_, len(manifiesto["ficheros"]), len(manifiesto["trozos"]), total, time.monotonic() - inicio))
+
+    def _construir(self, id_: str, carpeta: str, clases) -> dict:
+        casa = self.config.casa
+        if not os.path.isdir(casa):
+            raise Rechazo(500, "hermes_no_encontrado", "No encuentro la casa de Hermes")
+        ficheros, fuera, enlaces = recorrer(casa, clases)
+        bases = [f for f in ficheros if f.base]
+        self._estado(id_, progreso={"fase": "bases", "hecho": 0, "total": len(bases)})
+        guardados = []  # (Fichero, ruta en la instantánea, tipo)
+        pequenos = {c: [] for c in CLASES}
+        cuentas = {"sesiones": None, "mensajes": None}
+        esquema = None
+        for i, f in enumerate(bases):
+            destino = os.path.join(carpeta, "b%04d" % i)
+            try:
+                copiar_base(os.path.join(casa, f.relativa), destino)
+            except sqlite3.Error:
+                raise Rechazo(500, "base_de_datos_danada", "No se ha podido copiar una base de datos") from None
+            try:
+                limpiar_base(destino)
+            except ValueError:
+                raise Rechazo(500, "base_de_datos_danada", "Una base de datos tiene el freelist roto") from None
+            if not comprobar_base(destino):
+                raise Rechazo(500, "base_de_datos_danada", "La copia de una base de datos no pasa quick_check")
+            if f.relativa == "state.db":
+                cuentas = cuentas_de_state(destino)
+                esquema = version_de_state(destino)
+            tamano = os.path.getsize(destino)
+            if tamano >= GRANDE:
+                guardados.append((f, destino, "base"))
+            else:
+                with open(destino, "rb") as g:
+                    pequenos[f.clase].append((f, g.read()))
+                os.unlink(destino)
+            self._estado(id_, progreso={"fase": "bases", "hecho": i + 1, "total": len(bases)})
+        resto = [f for f in ficheros if not f.base]
+        self._estado(id_, progreso={"fase": "ficheros", "hecho": 0, "total": len(resto)})
+        for i, f in enumerate(resto):
+            origen = os.path.join(casa, f.relativa)
+            if f.tamano >= GRANDE:
+                destino = os.path.join(carpeta, "f%05d" % i)
+                if _copiar_fichero(origen, destino):
+                    guardados.append((f, destino, "fichero"))
+            else:
+                datos = _leer_fichero(origen, GRANDE)
+                if datos is not None:
+                    pequenos[f.clase].append((f, datos))
+            if i % 200 == 0:
+                self._estado(id_, progreso={"fase": "ficheros", "hecho": i + 1, "total": len(resto)})
+        for clase in CLASES:
+            if pequenos[clase]:
+                destino = os.path.join(carpeta, "t-" + clase)
+                escribir_tar(destino, pequenos[clase])
+                guardados.append((Fichero(TARES[clase], clase, 0, 0o600, 0, False), destino, "tar"))
+        # Los trozos: en el orden del manifiesto, uno detrás de otro.
+        entradas, trozos, indice = [], [], []
+        orden = sorted(guardados, key=lambda g: (CLASES.index(g[0].clase), g[2] != "tar", g[0].relativa))
+        self._estado(id_, progreso={"fase": "trozos", "hecho": 0, "total": len(orden)})
+        for k, (f, ruta, tipo) in enumerate(orden):
+            numeros, total = [], hashlib.sha256()
+            tamano = 0
+            with open(ruta, "rb") as g:
+                while True:
+                    trozo = g.read(TROZO)
+                    if not trozo:
+                        break
+                    total.update(trozo)
+                    numeros.append(len(trozos))
+                    trozos.append({"sha256": hashlib.sha256(trozo).hexdigest(), "tamano": len(trozo)})
+                    indice.append([os.path.basename(ruta), tamano, len(trozo)])
+                    tamano += len(trozo)
+            entradas.append({"nombre": f.relativa, "tipo": tipo, "parte": f.clase, "tamano": tamano,
+                             "sha256": total.hexdigest(), "modo": f.modo if tipo != "tar" else 0o600,
+                             "trozos": numeros})
+            self._estado(id_, progreso={"fase": "trozos", "hecho": k + 1, "total": len(orden)})
+        _escribir_json(os.path.join(carpeta, "indice.json"), indice)
+        version = self.sistema.version()
+        version.update(config_version=version_de_config(casa), esquema_state=esquema)
+        partes = [p for p in PARTES if p in clases]
+        return {
+            "formato": FORMATO, "id": id_, "creada": int(self.sistema.ahora()),
+            "servidor": {"id": self.trabajo.id_servidor(), "nombre": self.sistema.hostname()},
+            "hermes": version, "partes": partes, "claves": "claves" in clases, "tamano_trozo": TROZO,
+            "trozos": trozos, "ficheros": entradas, "fuera": fuera,
+            "cuentas": {"sesiones": cuentas["sesiones"], "mensajes": cuentas["mensajes"],
+                        "skills": contar_skills(casa), "tareas": contar_tareas(casa)},
+            "plataformas": plataformas(casa), "enlaces_saltados": enlaces,
+        }
+
+    def estado(self, id_: str) -> dict:
+        _validar_id(id_)
+        self.trabajo.limpiar()
+        estado = _leer_json(os.path.join(self.carpeta(id_), "estado.json"))
+        if not isinstance(estado, dict):
+            raise Rechazo(404, "instantanea_desconocida", "Esa instantánea no existe o ya caducó")
+        respuesta = {"ok": True, "id": id_, "estado": estado.get("estado"), "caduca": estado.get("caduca"),
+                     "progreso": estado.get("progreso") if estado.get("estado") == "preparando" else None,
+                     "motivo": estado.get("motivo"), "manifiesto": None}
+        if estado.get("estado") == "lista":
+            respuesta["manifiesto"] = _leer_json(os.path.join(self.carpeta(id_), "manifiesto.json"))
+        return respuesta
+
+    def trozo(self, id_: str, n) -> tuple:
+        """``(cabecera, bytes comprimidos)`` del trozo ``n``."""
+        _validar_id(id_)
+        n = _validar_numero(n)
+        carpeta = self.carpeta(id_)
+        estado = _leer_json(os.path.join(carpeta, "estado.json"))
+        if not isinstance(estado, dict) or self.sistema.ahora() > estado.get("caduca", 0):
+            raise Rechazo(404, "instantanea_desconocida", "Esa instantánea no existe o ya caducó")
+        if estado.get("estado") != "lista":
+            raise Rechazo(409, "no_lista", "La instantánea aún no está lista")
+        indice = _leer_json(os.path.join(carpeta, "indice.json"), [])
+        manifiesto = _leer_json(os.path.join(carpeta, "manifiesto.json"), {})
+        if n >= len(indice):
+            raise Rechazo(404, "trozo_desconocido", "Ese trozo no está en el manifiesto")
+        nombre, desde, tamano = indice[n]
+        if not re.fullmatch(r"[a-z0-9-]{1,32}", str(nombre)):
+            raise Rechazo(500, "error", "Índice roto")
+        with open(os.path.join(carpeta, nombre), "rb") as f:
+            f.seek(desde)
+            datos = f.read(tamano)
+        esperado = manifiesto["trozos"][n]["sha256"]
+        if len(datos) != tamano or hashlib.sha256(datos).hexdigest() != esperado:
+            raise Rechazo(500, "error", "El trozo guardado no cuadra")
+        comprimido = comprimir(datos)
+        return {"ok": True, "bytes": len(comprimido), "sha256": esperado, "tamano": tamano}, comprimido
+
+    def borrar(self, id_: str) -> dict:
+        _validar_id(id_)
+        ocupado = self.trabajo.ocupado()
+        if ocupado and ocupado.get("id") == id_:
+            raise Rechazo(409, "en_curso", "Esa instantánea se está preparando: se borra sola al caducar")
+        carpeta = self.carpeta(id_)
+        if not os.path.isdir(carpeta):
+            raise Rechazo(404, "instantanea_desconocida", "Esa instantánea no existe o ya caducó")
+        _borrar_arbol(carpeta)
+        _decir("instantánea %s: borrada" % id_)
+        return {"ok": True, "http": 204}
+
+
+def comprimir(datos: bytes) -> bytes:
+    """DEFLATE en crudo (RFC 1951): lo que lee ``COMPRESSION_ZLIB`` de Apple (sin la cabecera de zlib)."""
+    compresor = zlib.compressobj(6, zlib.DEFLATED, -15)
+    return compresor.compress(datos) + compresor.flush()
+
+
+def descomprimir(datos: bytes, maximo: int) -> bytes:
+    """Lo contrario, con tope: un trozo que se infla de más no llega a ocupar memoria."""
+    descompresor = zlib.decompressobj(-15)
+    try:
+        salida = descompresor.decompress(datos, maximo + 1)
+    except zlib.error:
+        raise Rechazo(400, "trozo_invalido", "El trozo no descomprime") from None
+    if len(salida) > maximo or descompresor.unconsumed_tail or not descompresor.eof or descompresor.unused_data:
+        raise Rechazo(400, "trozo_invalido", "El trozo no descomprime a su tamaño")
+    return salida
+
+
+def _abrir_sin_enlaces(ruta: str) -> int | None:
+    try:
+        fd = os.open(ruta, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK)
+    except OSError:
+        return None
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        return None
+    return fd
+
+
+def _leer_fichero(ruta: str, tope: int) -> bytes | None:
+    fd = _abrir_sin_enlaces(ruta)
+    if fd is None:
+        return None
+    with os.fdopen(fd, "rb") as f:
+        return f.read(tope)
+
+
+def _copiar_fichero(origen: str, destino: str) -> bool:
+    fd = _abrir_sin_enlaces(origen)
+    if fd is None:
+        return False
+    with os.fdopen(fd, "rb") as f, open(os.open(destino, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as g:
+        shutil.copyfileobj(f, g, 1024 * 1024)
+    return True
+
+
+def escribir_tar(destino: str, ficheros: list) -> None:
+    """Un tar sin dueños y en orden: dos días con los mismos ficheros dan el mismo tar."""
+    with open(os.open(destino, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as salida:
+        with tarfile.open(fileobj=salida, mode="w", format=tarfile.PAX_FORMAT) as tar:
+            for f, datos in sorted(ficheros, key=lambda x: x[0].relativa):
+                info = tarfile.TarInfo(f.relativa)
+                info.size, info.mode, info.mtime = len(datos), f.modo & 0o777, f.mtime
+                info.uid = info.gid = 0
+                info.uname = info.gname = ""
+                tar.addfile(info, io.BytesIO(datos))
+
+
+# MARK: Restaurar
+
+
+def validar_manifiesto(manifiesto) -> dict:
+    """El manifiesto que devuelve la app, comprobado entero antes de guardar nada (contrato §15.3)."""
+
+    def mal(texto):
+        return Rechazo(400, "manifiesto_invalido", "El manifiesto no vale: %s" % texto)
+
+    if not isinstance(manifiesto, dict):
+        raise mal("no es un objeto")
+    if manifiesto.get("formato") != FORMATO:
+        raise Rechazo(409, "formato_desconocido", "Este servidor no sabe restaurar ese formato de copia")
+    if manifiesto.get("tamano_trozo") != TROZO:
+        raise mal("tamaño de trozo")
+    trozos = manifiesto.get("trozos")
+    if not isinstance(trozos, list) or len(trozos) > 1_000_000:
+        raise mal("trozos")
+    for t in trozos:
+        if (not isinstance(t, dict) or not isinstance(t.get("sha256"), str) or not PATRON_SHA.fullmatch(t["sha256"])
+                or not isinstance(t.get("tamano"), int) or isinstance(t.get("tamano"), bool)
+                or not 0 < t["tamano"] <= TROZO):
+            raise mal("un trozo")
+    ficheros = manifiesto.get("ficheros")
+    if not isinstance(ficheros, list) or not ficheros:
+        raise mal("ficheros")
+    vistos = set()
+    for f in ficheros:
+        if not isinstance(f, dict):
+            raise mal("un fichero")
+        tipo, parte, nombre = f.get("tipo"), f.get("parte"), f.get("nombre")
+        if tipo not in ("base", "tar", "fichero") or parte not in CLASES:
+            raise mal("tipo o parte")
+        if tipo == "tar":
+            if nombre != TARES[parte]:
+                raise mal("nombre de un tar")
+        else:
+            try:
+                partes = partes_de(nombre)
+            except ValueError:
+                raise mal("una ruta") from None
+            if clase_de(partes) != parte:
+                raise mal("una ruta que no es de su parte")
+        if nombre in vistos:
+            raise mal("un fichero repetido")
+        vistos.add(nombre)
+        numeros = f.get("trozos")
+        if (not isinstance(numeros, list) or not all(isinstance(n, int) and not isinstance(n, bool)
+                                                       and 0 <= n < len(trozos) for n in numeros)):
+            raise mal("los trozos de un fichero")
+        if (not isinstance(f.get("tamano"), int) or f["tamano"] != sum(trozos[n]["tamano"] for n in numeros)
+                or not isinstance(f.get("sha256"), str) or not PATRON_SHA.fullmatch(f["sha256"])):
+            raise mal("un fichero que no es la suma de sus trozos")
+        if any(trozos[n]["tamano"] != TROZO for n in numeros[:-1]):
+            raise mal("un trozo corto en medio de un fichero")
+        modo = f.get("modo")
+        if not isinstance(modo, int) or isinstance(modo, bool) or not 0 <= modo <= 0o7777:
+            raise mal("un modo")
+    cuentas = manifiesto.get("cuentas")
+    if not isinstance(cuentas, dict):
+        raise mal("cuentas")
+    return manifiesto
+
+
+def partes_de_la_copia(manifiesto: dict) -> set:
+    return {f["parte"] for f in manifiesto["ficheros"]}
+
+
+class Restauraciones:
+    def __init__(self, trabajo: Trabajo, config: Config, sistema: Sistema):
+        self.trabajo, self.config, self.sistema = trabajo, config, sistema
+
+    def carpeta(self, id_: str) -> str:
+        return self.trabajo.ruta("restauraciones", id_)
+
+    # -- Lo que hay ahora
+
+    def actual(self) -> dict:
+        casa = self.config.casa
+        cuentas = cuentas_de_state(os.path.join(casa, "state.db")) if os.path.exists(os.path.join(casa, "state.db")) \
+            else {"sesiones": 0, "mensajes": 0}
+        cuentas.update(skills=contar_skills(casa), tareas=contar_tareas(casa))
+        return cuentas
+
+    @staticmethod
+    def vacio(actual: dict) -> bool:
+        return ((actual.get("sesiones") or 0) <= 1 and (actual.get("mensajes") or 0) <= 10
+                and (actual.get("tareas") or 0) == 0)
+
+    def no_puede(self) -> str | None:
+        if not self.config.unidad or not self.sistema.unidad_cargada():
+            if self.config.usuario:
+                return ("Hermes no es una unidad de usuario de systemd que yo pueda parar (sin root). Restaura desde "
+                        "un servidor instalado con root, o para Hermes tú y vuelve a intentarlo")
+            return "Hermes no corre como la unidad de systemd %s: no sé pararlo y volver a arrancarlo" % (
+                self.config.unidad or "hermes-gateway.service")
+        return None
+
+    # -- Crear
+
+    def crear(self, manifiesto, partes) -> dict:
+        manifiesto = validar_manifiesto(manifiesto)
+        tiene = partes_de_la_copia(manifiesto)
+        if (not isinstance(partes, list) or not partes or len(set(partes)) != len(partes)
+                or any(p not in CLASES or p not in tiene for p in partes)):
+            raise Rechazo(400, "parametro_invalido", "Las partes tienen que ser de las que trae la copia")
+        if "claves" in partes and "configuracion" not in partes and "configuracion" in tiene:
+            pass  # las claves solas se pueden restaurar: el .env y el auth.json de la copia
+        self.trabajo.limpiar()
+        no_puede = self.no_puede()
+        if no_puede:
+            raise Rechazo(409, "no_puede_parar_hermes", no_puede)
+        ocupado = self.trabajo.ocupado()
+        if ocupado is not None:
+            raise Rechazo(409, "en_curso", "Ya hay una operación en marcha")
+        servidor = self.sistema.version()
+        if not version_suficiente(servidor, manifiesto.get("hermes")):
+            raise Rechazo(409, "hermes_mas_viejo", "El Hermes de este servidor es más viejo que el de la copia: "
+                                                   "actualízalo (hermes update) antes de restaurar",
+                          {"hermes_servidor": servidor, "hermes_copia": manifiesto.get("hermes")})
+        elegidos = [f for f in manifiesto["ficheros"] if f["parte"] in partes]
+        necesita = 3 * sum(f["tamano"] for f in elegidos) + GIB
+        libre = self.sistema.libre(self.trabajo.raiz)
+        if libre < necesita:
+            raise Rechazo(507, "sin_espacio", "No hay sitio en el disco del servidor", {"faltan": necesita - libre})
+        # Una restauración a medio subir a la vez: la nueva sustituye a la que no se aplicó.
+        for nombre in os.listdir(self.trabajo.ruta("restauraciones")):
+            estado = _leer_json(os.path.join(self.carpeta(nombre), "estado.json"), {}) or {}
+            if estado.get("estado") == "recibiendo":
+                _borrar_arbol(self.carpeta(nombre))
+        id_ = _nuevo_id()
+        carpeta = self.carpeta(id_)
+        os.makedirs(os.path.join(carpeta, "trozos"), mode=0o700)
+        _escribir_json(os.path.join(carpeta, "manifiesto.json"), manifiesto)
+        ahora = int(self.sistema.ahora())
+        actual = self.actual()
+        _escribir_json(os.path.join(carpeta, "estado.json"), {
+            "id": id_, "estado": "recibiendo", "fase": None, "creada": ahora, "latido": ahora, "partes": partes,
+            "motivo": None, "resultado": None})
+        _decir("restauración %s: preparada (%s), %d ficheros" % (id_, "+".join(partes), len(elegidos)))
+        return {"ok": True, "http": 201, "id": id_, "trozos_faltan": self.faltan(id_),
+                "comprobacion": {"vacio": self.vacio(actual), "actual": actual, "hermes_servidor": servidor,
+                                 "hermes_copia": manifiesto.get("hermes"), "necesita": necesita, "libre": libre}}
+
+    def _cargar(self, id_: str) -> tuple:
+        _validar_id(id_)
+        carpeta = self.carpeta(id_)
+        estado = _leer_json(os.path.join(carpeta, "estado.json"))
+        manifiesto = _leer_json(os.path.join(carpeta, "manifiesto.json"))
+        if not isinstance(estado, dict) or not isinstance(manifiesto, dict):
+            raise Rechazo(404, "restauracion_desconocida", "Esa restauración no existe o ya caducó")
+        return carpeta, estado, manifiesto
+
+    def necesarios(self, manifiesto: dict, partes) -> dict:
+        """{sha256: primer n} de los trozos que hacen falta para las partes elegidas."""
+        necesarios = {}
+        for f in manifiesto["ficheros"]:
+            if f["parte"] in partes:
+                for n in f["trozos"]:
+                    necesarios.setdefault(manifiesto["trozos"][n]["sha256"], n)
+        return necesarios
+
+    def faltan(self, id_: str) -> list:
+        carpeta, estado, manifiesto = self._cargar(id_)
+        tiene = set(os.listdir(os.path.join(carpeta, "trozos")))
+        return sorted(n for sha, n in self.necesarios(manifiesto, estado["partes"]).items() if sha not in tiene)
+
+    def recibir(self, id_: str, n, sha, datos: bytes) -> dict:
+        n = _validar_numero(n)
+        carpeta, estado, manifiesto = self._cargar(id_)
+        if estado.get("estado") != "recibiendo":
+            raise Rechazo(409, "en_curso", "Esa restauración ya no recibe trozos")
+        if n >= len(manifiesto["trozos"]):
+            raise Rechazo(404, "trozo_desconocido", "Ese trozo no está en el manifiesto")
+        esperado = manifiesto["trozos"][n]
+        if esperado["sha256"] not in self.necesarios(manifiesto, estado["partes"]):
+            raise Rechazo(404, "trozo_desconocido", "Ese trozo no hace falta para las partes elegidas")
+        if sha is not None and sha != esperado["sha256"]:
+            raise Rechazo(400, "trozo_invalido", "El SHA-256 no es el del manifiesto")
+        destino = os.path.join(carpeta, "trozos", esperado["sha256"])
+        if os.path.exists(destino):
+            return {"ok": True, "http": 204}
+        claro = descomprimir(datos, esperado["tamano"])
+        if len(claro) != esperado["tamano"] or hashlib.sha256(claro).hexdigest() != esperado["sha256"]:
+            raise Rechazo(400, "trozo_invalido", "El trozo no es el del manifiesto")
+        temporal = destino + ".nuevo"
+        with open(os.open(temporal, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+            f.write(claro)
+        os.replace(temporal, destino)
+        return {"ok": True, "http": 204}
+
+    def estado(self, id_: str) -> dict:
+        self.trabajo.limpiar()
+        carpeta, estado, manifiesto = self._cargar(id_)
+        antes = self.trabajo.leer_antes()
+        return {"ok": True, "id": id_, "estado": estado.get("estado"), "fase": estado.get("fase"),
+                "trozos_faltan": self.faltan(id_) if estado.get("estado") == "recibiendo" else [],
+                "motivo": estado.get("motivo"), "resultado": estado.get("resultado"),
+                "deshacer_hasta": antes.get("hasta") if antes and antes.get("restauracion") == id_ else None}
+
+    def borrar(self, id_: str) -> dict:
+        carpeta, estado, _ = self._cargar(id_)
+        if estado.get("estado") == "aplicando":
+            raise Rechazo(409, "en_curso", "Esa restauración se está aplicando")
+        _borrar_arbol(carpeta)
+        return {"ok": True, "http": 204}
+
+    # -- Aplicar
+
+    def aplicar(self, id_: str, confirmacion) -> tuple:
+        carpeta, estado, manifiesto = self._cargar(id_)
+        if estado.get("estado") != "recibiendo":
+            raise Rechazo(409, "en_curso", "Esa restauración ya se ha aplicado o se está aplicando")
+        faltan = self.faltan(id_)
+        if faltan:
+            raise Rechazo(409, "faltan_trozos", "Faltan trozos por subir", {"faltan": faltan})
+        no_puede = self.no_puede()
+        if no_puede:
+            raise Rechazo(409, "no_puede_parar_hermes", no_puede)
+        if not self.vacio(self.actual()):
+            if not isinstance(confirmacion, str) or confirmacion != self.sistema.hostname():
+                raise Rechazo(403, "confirmacion_incorrecta", "Para restaurar encima de lo que hay, escribe el nombre "
+                                                              "del servidor")
+        if self.trabajo.ocupado() is not None:
+            raise Rechazo(409, "en_curso", "Ya hay una operación en marcha")
+        self.trabajo.contar("restauraciones", MAX_RESTAURACIONES_DIA, apuntar=False)
+        if not self.trabajo.tomar("restauracion", id_):
+            raise Rechazo(409, "en_curso", "Ya hay una operación en marcha")
+        try:
+            self.trabajo.contar("restauraciones", MAX_RESTAURACIONES_DIA, apuntar=True)
+            self._estado(id_, estado="aplicando", fase="montando")
+        except BaseException:
+            self.trabajo.soltar()
+            raise
+        _decir("restauración %s: se aplica" % id_)
+
+        def continuar():
+            try:
+                self._aplicar(id_, carpeta, estado["partes"], manifiesto)
+            finally:
+                self.trabajo.soltar()
+
+        return {"ok": True, "http": 202}, continuar
+
+    def _estado(self, id_: str, **cambios) -> dict:
+        ruta = os.path.join(self.carpeta(id_), "estado.json")
+        estado = _leer_json(ruta, {}) or {}
+        estado.update(cambios)
+        estado["latido"] = int(self.sistema.ahora())
+        _escribir_json(ruta, estado)
+        return estado
+
+    def _fallar(self, id_: str, motivo: str) -> None:
+        self._estado(id_, estado="fallida", fase=None, motivo=motivo)
+        _decir("restauración %s: fallida (%s)" % (id_, motivo))
+
+    def _aplicar(self, id_: str, carpeta: str, partes, manifiesto: dict) -> None:
+        montado = os.path.join(carpeta, "montado")
+        try:
+            self._aplicar_montado(id_, carpeta, montado, partes, manifiesto)
+        except Exception as error:  # noqa: BLE001 — pase lo que pase, Hermes tiene que quedar en marcha
+            _decir("restauración %s: error inesperado (%s)" % (id_, type(error).__name__))
+            if not self.sistema.en_marcha():
+                self.sistema.arrancar()
+            self._fallar(id_, "error")
+        finally:
+            # Los trozos y lo montado ya no sirven: una restauración fallida se vuelve a subir entera.
+            _borrar_arbol(montado)
+            _borrar_arbol(os.path.join(carpeta, "trozos"))
+
+    def _aplicar_montado(self, id_: str, carpeta: str, montado: str, partes, manifiesto: dict) -> None:
+        # 1 y 2: montar y comprobar, sin tocar nada de Hermes.
+        try:
+            montar(manifiesto, partes, os.path.join(carpeta, "trozos"), montado)
+        except Rechazo as rechazo:
+            return self._fallar(id_, rechazo.codigo)
+        except OSError as error:
+            return self._fallar(id_, "sin_espacio" if error.errno == errno.ENOSPC else "error")
+        self._estado(id_, fase="comprobando")
+        for ruta in _bases_montadas(montado):
+            if not comprobar_base(ruta):
+                return self._fallar(id_, "base_de_datos_danada")
+        _borrar_arbol(os.path.join(carpeta, "trozos"))
+        importados = relativas_de(os.path.join(montado, "casa"))
+        # 3: parar Hermes.
+        self._estado(id_, fase="parando")
+        if not self.sistema.parar():
+            self.sistema.arrancar()
+            return self._fallar(id_, "no_se_pudo_parar")
+        # 4: guardar lo que hay.
+        self._estado(id_, fase="guardando")
+        try:
+            guardar_antes(self.trabajo, self.config, self.sistema, id_, importados)
+        except Exception as error:  # noqa: BLE001
+            self.sistema.arrancar()
+            return self._fallar(id_, "sin_espacio" if isinstance(error, OSError) and error.errno == errno.ENOSPC
+                                else "error")
+        # 5 a 7: importar, arrancar y comprobar; si algo falla, deshacer.
+        motivo = self._importar_y_arrancar(id_, montado, partes, manifiesto)
+        if motivo is None:
+            resultado = self.actual()
+            antes = self.trabajo.leer_antes() or {}
+            self._estado(id_, estado="hecha", fase=None, resultado={
+                "sesiones": resultado.get("sesiones"), "mensajes": resultado.get("mensajes"),
+                "skills": resultado.get("skills")})
+            _decir("restauración %s: hecha; se puede deshacer hasta %s" % (
+                id_, time.strftime("%Y-%m-%d", time.gmtime(antes.get("hasta", 0)))))
+            return None
+        _decir("restauración %s: %s; se deshace" % (id_, motivo))
+        self._estado(id_, fase="deshaciendo")
+        if not deshacer(self.trabajo, self.config, self.sistema):
+            return self._fallar(id_, "deshacer_fallido")
+        return self._fallar(id_, motivo)
+
+    def _importar_y_arrancar(self, id_: str, montado: str, partes, manifiesto) -> str | None:
+        self._estado(id_, fase="importando")
+        casa = self.config.casa
+        claves_de_antes = lineas_api_server(os.path.join(self.trabajo.ruta("antes", "casa"), ".env"))
+        zip_ = os.path.join(casa, "%s-%s.zip" % (PREFIJO_PROPIO, id_))
+        try:
+            armar_zip(os.path.join(montado, "casa"), zip_)
+            if os.geteuid() == 0 and self.config.usuario_hermes != "root":
+                usuario = pwd.getpwnam(self.config.usuario_hermes)
+                os.chown(zip_, usuario.pw_uid, usuario.pw_gid)
+            if not self.sistema.importar(zip_):
+                return "import_fallido"
+        except OSError:
+            return "import_fallido"
+        finally:
+            try:
+                os.unlink(zip_)
+            except OSError:
+                pass
+        # `hermes import` arranca el gateway si no está en marcha: se vuelve a parar para poner las claves de este
+        # servidor antes de que atienda a nadie.
+        if not self.sistema.parar():
+            return "hermes_no_arranca"
+        if "claves" in partes:
+            poner_api_server(os.path.join(casa, ".env"), claves_de_antes)
+        self._estado(id_, fase="arrancando")
+        if not self.sistema.arrancar() or not esperar_a_hermes(self.sistema, casa):
+            return "hermes_no_arranca"
+        self._estado(id_, fase="verificando")
+        if "conversaciones" in partes:
+            ahora = self.actual()
+            esperadas = manifiesto.get("cuentas") or {}
+            for clave in ("sesiones", "mensajes"):
+                if isinstance(esperadas.get(clave), int) and (ahora.get(clave) is None
+                                                              or ahora[clave] < esperadas[clave]):
+                    return "cuentas_no_cuadran"
+        return None
+
+
+def montar(manifiesto: dict, partes, trozos: str, montado: str) -> None:
+    """Junta cada fichero de las partes elegidas con sus trozos, comprueba su SHA-256 y lo pone en
+    ``montado/casa/<ruta>``; los tar se abren con las mismas reglas: solo ficheros normales, rutas limpias y de su
+    parte. Si algo no cuadra, ``Rechazo`` y no se ha tocado nada de Hermes."""
+    _borrar_arbol(montado)
+    casa = os.path.join(montado, "casa")
+    os.makedirs(casa, mode=0o700)
+    for f in manifiesto["ficheros"]:
+        if f["parte"] not in partes:
+            continue
+        destino = os.path.join(montado, "fichero.nuevo")
+        total = hashlib.sha256()
+        with open(os.open(destino, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as salida:
+            for n in f["trozos"]:
+                sha = manifiesto["trozos"][n]["sha256"]
+                with open(os.path.join(trozos, sha), "rb") as trozo:
+                    datos = trozo.read()
+                if hashlib.sha256(datos).hexdigest() != sha:
+                    raise Rechazo(500, "trozo_danado", "Un trozo guardado no da su SHA-256")
+                total.update(datos)
+                salida.write(datos)
+        if total.hexdigest() != f["sha256"]:
+            raise Rechazo(500, "trozo_danado", "Un fichero montado no da su SHA-256")
+        if f["tipo"] == "tar":
+            abrir_tar(destino, casa, f["parte"])
+            os.unlink(destino)
+        else:
+            _colocar(destino, casa, partes_de(f["nombre"]), f["modo"])
+
+
+def _colocar(origen: str, casa: str, partes: tuple, modo: int) -> None:
+    carpeta = casa
+    for parte in partes[:-1]:
+        carpeta = os.path.join(carpeta, parte)
+        if os.path.lexists(carpeta) and not os.path.isdir(carpeta) or os.path.islink(carpeta):
+            raise Rechazo(500, "ruta_invalida", "Una ruta de la copia choca con otra")
+        os.makedirs(carpeta, mode=0o700, exist_ok=True)
+    destino = os.path.join(carpeta, partes[-1])
+    if os.path.lexists(destino):
+        raise Rechazo(500, "ruta_invalida", "Un fichero repetido en la copia")
+    os.replace(origen, destino)
+    os.chmod(destino, modo & 0o777)
+
+
+def abrir_tar(ruta: str, casa: str, parte: str) -> None:
+    with tarfile.open(ruta, mode="r:") as tar:
+        for miembro in tar:
+            if not miembro.isreg():
+                raise Rechazo(500, "ruta_invalida", "La copia trae algo que no es un fichero normal")
+            try:
+                partes = partes_de(miembro.name)
+            except ValueError:
+                raise Rechazo(500, "ruta_invalida", "La copia trae una ruta que no vale") from None
+            if clase_de(partes) != parte:
+                raise Rechazo(500, "ruta_invalida", "La copia trae un fichero que no es de su parte")
+            temporal = os.path.join(os.path.dirname(casa), "miembro.nuevo")
+            origen = tar.extractfile(miembro)
+            with open(os.open(temporal, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as salida:
+                shutil.copyfileobj(origen, salida, 1024 * 1024)
+            os.utime(temporal, (miembro.mtime, miembro.mtime))
+            _colocar(temporal, casa, partes, miembro.mode)
+
+
+def _bases_montadas(montado: str):
+    for carpeta, _, nombres in os.walk(os.path.join(montado, "casa")):
+        for nombre in nombres:
+            ruta = os.path.join(carpeta, nombre)
+            if _es_sqlite(ruta):
+                yield ruta
+
+
+def armar_zip(casa: str, destino: str) -> None:
+    """El zip con la forma de ``hermes backup`` (rutas relativas a la casa, sin prefijo), sin comprimir: ya viene del
+    disco y ``hermes import`` lo abre enseguida."""
+    with zipfile.ZipFile(destino, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as z:
+        for carpeta, subcarpetas, nombres in os.walk(casa):
+            subcarpetas.sort()
+            for nombre in sorted(nombres):
+                ruta = os.path.join(carpeta, nombre)
+                relativa = os.path.relpath(ruta, casa).replace(os.sep, "/")
+                z.write(ruta, relativa)
+    os.chmod(destino, 0o600)
+
+
+PATRON_API_SERVER = re.compile(r"^\s*(?:export\s+)?API_SERVER_[A-Za-z0-9_]*\s*=")
+
+
+def lineas_api_server(env: str) -> list:
+    try:
+        with open(env, "rb") as f:
+            texto = f.read().decode("utf-8", "surrogateescape")
+    except OSError:
+        return []
+    return [linea for linea in texto.splitlines() if PATRON_API_SERVER.match(linea)]
+
+
+def poner_api_server(env: str, lineas: list) -> None:
+    """Quita del ``.env`` restaurado las ``API_SERVER_*`` que traía la copia y pone las de este servidor: son las que
+    conoce su pasarela. El fichero sigue siendo el mismo (dueño y modo)."""
+    try:
+        with open(env, "rb") as f:
+            texto = f.read().decode("utf-8", "surrogateescape")
+    except OSError:
+        texto = ""
+    quedan = [linea for linea in texto.splitlines() if not PATRON_API_SERVER.match(linea)]
+    nuevo = "\n".join(quedan + list(lineas)) + "\n"
+    try:
+        visto = os.stat(env)
+        modo, dueno = stat.S_IMODE(visto.st_mode), (visto.st_uid, visto.st_gid)
+    except OSError:
+        modo, dueno = 0o600, None
+    temporal = env + ".hehermes-nuevo"
+    with open(os.open(temporal, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600),
+              "wb") as f:
+        f.write(nuevo.encode("utf-8", "surrogateescape"))
+    os.chmod(temporal, modo)
+    if dueno and os.geteuid() == 0:
+        os.chown(temporal, *dueno)
+    os.replace(temporal, env)
+
+
+def clave_de_hermes(env: str) -> str | None:
+    for linea in lineas_api_server(env):
+        nombre, _, valor = linea.partition("=")
+        if nombre.replace("export", "").strip() == "API_SERVER_KEY":
+            return valor.strip().strip("'\"") or None
+    return None
+
+
+def esperar_a_hermes(sistema: Sistema, casa: str, plazo: float = PLAZO_ARRANQUE) -> bool:
+    """``/health`` y ``GET /api/sessions?limit=1`` con la clave del ``.env``, hasta ``plazo`` segundos."""
+    limite = sistema.ahora() + plazo
+    while True:
+        salud, _ = sistema.http("/health")
+        if salud == 200:
+            estado, _ = sistema.http("/api/sessions?limit=1", clave_de_hermes(os.path.join(casa, ".env")))
+            if estado == 200:
+                return True
+        if sistema.ahora() >= limite:
+            return False
+        sistema.dormir(2)
+
+
+# MARK: Lo de antes de restaurar, y deshacer
+
+
+def relativas_de(carpeta: str) -> list:
+    """Las rutas relativas de los ficheros de una carpeta montada: lo que ``hermes import`` va a escribir."""
+    salida = []
+    for actual, subcarpetas, nombres in os.walk(carpeta):
+        subcarpetas.sort()
+        for nombre in sorted(nombres):
+            salida.append(os.path.relpath(os.path.join(actual, nombre), carpeta).replace(os.sep, "/"))
+    return salida
+
+
+def _fichero_existente(casa: str, relativa: str) -> Fichero | None:
+    """Un fichero normal de la casa en esa ruta (sin enlaces por el camino), o None."""
+    try:
+        partes = partes_de(relativa)
+    except ValueError:
+        return None
+    ruta = os.path.join(casa, *partes)
+    if not _dentro_de(os.path.dirname(ruta), casa):
+        return None
+    try:
+        visto = os.lstat(ruta)
+    except OSError:
+        return None
+    if not stat.S_ISREG(visto.st_mode):
+        return None
+    return Fichero(relativa, clase_de(partes), visto.st_size, stat.S_IMODE(visto.st_mode), int(visto.st_mtime),
+                   _es_sqlite(ruta), visto.st_uid, visto.st_gid)
+
+
+def guardar_antes(trabajo: Trabajo, config: Config, sistema: Sistema, id_: str, importados: list) -> None:
+    """Lo que entraría en una copia (las tres partes) más lo que la restauración va a pisar, tal cual, en
+    ``antes/casa``, con Hermes ya parado; y la lista de lo que se va a importar (``importados``), que es lo que deshacer
+    quita. Las bases de datos, con la API de backup (así entra lo que quedara en su WAL). Sustituye a la copia de antes
+    solo cuando acaba."""
+    carpeta = trabajo.ruta("antes.nuevo")
+    _borrar_arbol(carpeta)
+    os.makedirs(os.path.join(carpeta, "casa"), mode=0o700)
+    ficheros, _, _ = recorrer(config.casa, CLASES)
+    vistos = {f.relativa for f in ficheros}
+    for relativa in importados:
+        if relativa not in vistos:
+            existente = _fichero_existente(config.casa, relativa)
+            if existente is not None:
+                ficheros.append(existente)
+                vistos.add(relativa)
+    for f in ficheros:
+        origen = os.path.join(config.casa, f.relativa)
+        destino = os.path.join(carpeta, "casa", *f.relativa.split("/"))
+        os.makedirs(os.path.dirname(destino), mode=0o700, exist_ok=True)
+        if f.base:
+            copiar_base(origen, destino)
+        elif not _copiar_fichero(origen, destino):
+            continue
+        os.chmod(destino, f.modo)
+        os.utime(destino, (f.mtime, f.mtime))
+        if os.geteuid() == 0:
+            os.chown(destino, f.uid, f.gid)
+    ahora = int(sistema.ahora())
+    _escribir_json(os.path.join(carpeta, "importados.json"), importados)
+    _escribir_json(os.path.join(carpeta, "antes.json"), {
+        "estado": "disponible", "restauracion": id_, "restaurada": ahora, "hasta": ahora + VIDA_ANTES,
+        "ficheros": len(ficheros)})
+    viejo = trabajo.ruta("antes.viejo")
+    _borrar_arbol(viejo)
+    os.replace(trabajo.ruta("antes"), viejo)
+    os.replace(carpeta, trabajo.ruta("antes"))
+    _borrar_arbol(viejo)
+
+
+def _dentro_de(ruta: str, casa: str) -> bool:
+    real, base = os.path.realpath(ruta), os.path.realpath(casa)
+    return real == base or real.startswith(base.rstrip("/") + "/")
+
+
+def deshacer(trabajo: Trabajo, config: Config, sistema: Sistema) -> bool:
+    """Deja la casa de Hermes como estaba al guardar ``antes``: con Hermes parado, quita lo que la restauración escribió
+    (``importados``: nada más, ni ``tools/``, ni un enlace, ni lo que no venía en la copia) y pone lo guardado tal cual,
+    las bases sin sus -wal ni -shm. Luego arranca Hermes y espera a que conteste. True si ha quedado bien."""
+    antes = trabajo.leer_antes()
+    guardado = trabajo.ruta("antes", "casa")
+    importados = _leer_json(trabajo.ruta("antes", "importados.json"))
+    if not antes or not os.path.isdir(guardado) or not isinstance(importados, list):
+        return False
+    datos = dict(antes)
+    datos["estado"] = "deshaciendo"
+    _escribir_json(trabajo.ruta("antes", "antes.json"), datos)
+    casa = config.casa
+    bien = sistema.parar()
+    if bien:
+        try:
+            for relativa in importados:
+                existente = _fichero_existente(casa, relativa) if isinstance(relativa, str) else None
+                if existente is None:
+                    continue
+                ruta = os.path.join(casa, *partes_de(relativa))
+                os.unlink(ruta)
+                if existente.base or relativa.endswith(".db"):
+                    for sufijo in ("-wal", "-shm", "-journal"):
+                        try:
+                            os.unlink(ruta + sufijo)
+                        except OSError:
+                            pass
+            for carpeta, _, nombres in os.walk(guardado):
+                for nombre in nombres:
+                    if _es_sqlite(os.path.join(carpeta, nombre)):
+                        ruta = os.path.join(casa, os.path.relpath(os.path.join(carpeta, nombre), guardado))
+                        for sufijo in ("-wal", "-shm", "-journal"):
+                            if _dentro_de(os.path.dirname(ruta), casa) and os.path.isfile(ruta + sufijo) \
+                                    and not os.path.islink(ruta + sufijo):
+                                os.unlink(ruta + sufijo)
+            for carpeta, _, nombres in os.walk(guardado):
+                relativa = os.path.relpath(carpeta, guardado)
+                destino_carpeta = casa if relativa == "." else os.path.join(casa, relativa)
+                if os.path.islink(destino_carpeta) or not _dentro_de(destino_carpeta, casa):
+                    raise OSError(errno.ELOOP, "una carpeta de la casa es un enlace")
+                if not os.path.isdir(destino_carpeta):
+                    os.makedirs(destino_carpeta, mode=0o700)
+                for nombre in nombres:
+                    origen = os.path.join(carpeta, nombre)
+                    destino = os.path.join(destino_carpeta, nombre)
+                    if os.path.lexists(destino):
+                        if os.path.islink(destino) or not os.path.isfile(destino):
+                            raise OSError(errno.EEXIST, "algo que no es un fichero ocupa su sitio")
+                        os.unlink(destino)
+                    shutil.copy2(origen, destino, follow_symlinks=False)
+                    if os.geteuid() == 0:
+                        visto = os.lstat(origen)
+                        os.chown(destino, visto.st_uid, visto.st_gid)
+        except OSError:
+            bien = False
+    arrancado = sistema.arrancar() and esperar_a_hermes(sistema, casa)
+    datos["estado"] = "deshecha" if bien and arrancado else "fallida"
+    if datos["estado"] == "deshecha":
+        _borrar_arbol(trabajo.ruta("antes"))
+        os.makedirs(trabajo.ruta("antes"), mode=0o700, exist_ok=True)
+        restauracion = datos.get("restauracion")
+        if isinstance(restauracion, str) and PATRON_ID.fullmatch(restauracion):
+            ruta = trabajo.ruta("restauraciones", restauracion, "estado.json")
+            estado = _leer_json(ruta)
+            if isinstance(estado, dict) and estado.get("estado") == "hecha":
+                estado["estado"] = "deshecha"
+                _escribir_json(ruta, estado)
+    else:
+        _escribir_json(trabajo.ruta("antes", "antes.json"), datos)
+    _decir("deshacer: %s" % ("hecho" if datos["estado"] == "deshecha" else "fallido"))
+    return datos["estado"] == "deshecha"
+
+
+# MARK: Las órdenes
+
+
+class Ayudante:
+    """Todas las órdenes, sin sockets: el ``atender`` de abajo solo traduce."""
+
+    def __init__(self, config: Config, sistema: Sistema | None = None):
+        self.config = config
+        self.sistema = sistema or Sistema(config)
+        self.trabajo = Trabajo(config, self.sistema)
+        self.instantaneas = Instantaneas(self.trabajo, config, self.sistema)
+        self.restauraciones = Restauraciones(self.trabajo, config, self.sistema)
+
+    def estado(self) -> dict:
+        self.trabajo.limpiar()
+        casa = self.config.casa
+        actual = self.restauraciones.actual()
+        tamanos = {c: 0 for c in CLASES}
+        ficheros, _, _ = recorrer(casa, CLASES)
+        for f in ficheros:
+            tamanos[f.clase] += f.tamano
+        no_puede = self.restauraciones.no_puede()
+        instantanea = restauracion = None
+        for tipo in ("instantaneas", "restauraciones"):
+            carpeta = self.trabajo.ruta(tipo)
+            mas_nueva = None
+            for nombre in os.listdir(carpeta):
+                estado = _leer_json(os.path.join(carpeta, nombre, "estado.json"))
+                if isinstance(estado, dict) and PATRON_ID.fullmatch(nombre):
+                    if mas_nueva is None or estado.get("creada", 0) > mas_nueva.get("creada", 0):
+                        mas_nueva = estado
+            if mas_nueva:
+                resumen = {"id": mas_nueva.get("id"), "estado": mas_nueva.get("estado")}
+                if tipo == "instantaneas":
+                    instantanea = resumen
+                else:
+                    restauracion = resumen
+        antes = self.trabajo.leer_antes()
+        return {
+            "ok": True, "formato": FORMATO,
+            "servidor": {"id": self.trabajo.id_servidor(), "nombre": self.sistema.hostname()},
+            "hermes": self.version_reciente(), "cuentas": actual, "vacio": self.restauraciones.vacio(actual),
+            "tamanos": tamanos, "disco": {"libre": self.sistema.libre(self.trabajo.raiz)},
+            "puede_restaurar": no_puede is None, "no_puede": no_puede,
+            "instantanea": instantanea, "restauracion": restauracion,
+            "deshacer": None if not antes else {"hasta": antes.get("hasta"), "restaurada": antes.get("restaurada"),
+                                                "estado": antes.get("estado")},
+        }
+
+    def version_reciente(self) -> dict:
+        """La versión de Hermes, recordada 10 minutos: ``hermes --version`` tarda, y la pantalla la pide a menudo."""
+        ruta = self.trabajo.ruta("version.json")
+        guardada = _leer_json(ruta)
+        ahora = self.sistema.ahora()
+        if isinstance(guardada, dict) and isinstance(guardada.get("version"), dict) \
+                and 0 <= ahora - guardada.get("cuando", 0) < 600:
+            return guardada["version"]
+        version = self.sistema.version()
+        _escribir_json(ruta, {"cuando": int(ahora), "version": version})
+        return version
+
+    def deshacer(self) -> tuple:
+        self.trabajo.limpiar()
+        antes = self.trabajo.leer_antes()
+        if not antes or antes.get("estado") == "deshaciendo" or self.sistema.ahora() > antes.get("hasta", 0):
+            raise Rechazo(409, "nada_que_deshacer", "No hay ninguna restauración de los últimos 7 días que deshacer")
+        no_puede = self.restauraciones.no_puede()
+        if no_puede:
+            raise Rechazo(409, "no_puede_parar_hermes", no_puede)
+        if not self.trabajo.tomar("deshacer", None):
+            raise Rechazo(409, "en_curso", "Ya hay una operación en marcha")
+        _decir("deshacer: pedido")
+
+        def continuar():
+            try:
+                deshacer(self.trabajo, self.config, self.sistema)
+            finally:
+                self.trabajo.soltar()
+
+        return {"ok": True, "http": 202}, continuar
+
+    def orden(self, peticion: dict, cuerpo: bytes | None = None) -> tuple:
+        """``(respuesta, bytes o None, continuación o None)``."""
+        orden = peticion.get("orden")
+        r = self.instantaneas if orden in ("instantanea", "instantanea-estado", "trozo", "instantanea-borrar") else \
+            self.restauraciones
+        if orden == "estado":
+            return self.estado(), None, None
+        if orden == "limpiar":
+            return dict(self.trabajo.limpiar(), ok=True), None, None
+        if orden == "instantanea":
+            respuesta, seguir = r.crear(peticion.get("partes"), peticion.get("claves"))
+            return respuesta, None, seguir
+        if orden == "instantanea-estado":
+            return r.estado(peticion.get("id")), None, None
+        if orden == "trozo":
+            cabecera, datos = r.trozo(peticion.get("id"), peticion.get("n"))
+            return cabecera, datos, None
+        if orden == "instantanea-borrar":
+            return r.borrar(peticion.get("id")), None, None
+        if orden == "restauracion":
+            return r.crear(peticion.get("manifiesto"), peticion.get("partes")), None, None
+        if orden == "restauracion-estado":
+            return r.estado(peticion.get("id")), None, None
+        if orden == "restauracion-trozo":
+            if cuerpo is None:
+                raise Rechazo(400, "trozo_invalido", "Falta el trozo")
+            sha = peticion.get("sha256")
+            if sha is not None and (not isinstance(sha, str) or not PATRON_SHA.fullmatch(sha)):
+                raise Rechazo(400, "trozo_invalido", "X-HeHermes-SHA256 no tiene su forma")
+            return r.recibir(peticion.get("id"), peticion.get("n"), sha, cuerpo), None, None
+        if orden == "aplicar":
+            respuesta, seguir = r.aplicar(peticion.get("id"), peticion.get("confirmacion"))
+            return respuesta, None, seguir
+        if orden == "restauracion-borrar":
+            return r.borrar(peticion.get("id")), None, None
+        if orden == "deshacer":
+            respuesta, seguir = self.deshacer()
+            return respuesta, None, seguir
+        raise Rechazo(400, "orden_desconocida", "Orden desconocida")
+
+
+ORDENES = ("estado", "limpiar", "instantanea", "instantanea-estado", "trozo", "instantanea-borrar", "restauracion",
+           "restauracion-estado", "restauracion-trozo", "aplicar", "restauracion-borrar", "deshacer")
+
+
+# MARK: El socket
+
+
+def par_del_vigia(conexion, uid_vigia: int | None = None) -> bool:
+    """Si al otro lado del socket está root o el vigía, según el núcleo (``SO_PEERCRED``). Sin eso, nadie."""
+    try:
+        if uid_vigia is None:
+            uid_vigia = pwd.getpwnam(USUARIO_VIGIA).pw_uid
+        credenciales = conexion.getsockopt(socket.SOL_SOCKET, SO_PEERCRED, struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", credenciales)
+    except (OSError, KeyError, AttributeError, struct.error):
+        return False
+    return uid in (0, uid_vigia)
+
+
+def par_del_mismo_usuario(conexion, uid_propio: int | None = None) -> bool:
+    """Con ``--usuario``: solo este mismo usuario (el vigía sin root corre como él). Ni root ni nadie más."""
+    try:
+        if uid_propio is None:
+            uid_propio = os.geteuid()
+        credenciales = conexion.getsockopt(socket.SOL_SOCKET, SO_PEERCRED, struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", credenciales)
+    except (OSError, AttributeError, struct.error):
+        return False
+    return uid_propio != 0 and uid == uid_propio
+
+
+def _leer_exacto(conexion, n: int) -> bytes:
+    partes, quedan = [], n
+    while quedan:
+        trozo = conexion.recv(min(quedan, 1024 * 1024))
+        if not trozo:
+            raise Rechazo(400, "peticion_invalida", "La petición llegó cortada")
+        partes.append(trozo)
+        quedan -= len(trozo)
+    return b"".join(partes)
+
+
+def leer_peticion(conexion, plazo: float = 30.0) -> tuple:
+    conexion.settimeout(plazo)
+    recibido = bytearray()
+    while b"\n" not in recibido:
+        if len(recibido) > MAX_LINEA:
+            raise Rechazo(400, "peticion_invalida", "La petición es demasiado grande")
+        trozo = conexion.recv(256 * 1024)
+        if not trozo:
+            raise Rechazo(400, "peticion_invalida", "La petición llegó cortada")
+        recibido += trozo
+    linea, _, resto = bytes(recibido).partition(b"\n")
+    try:
+        peticion = json.loads(linea.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise Rechazo(400, "peticion_invalida", "La petición no es JSON") from None
+    if not isinstance(peticion, dict) or peticion.get("orden") not in ORDENES:
+        raise Rechazo(400, "orden_desconocida", "Orden desconocida")
+    cuerpo = None
+    largo = peticion.get("bytes")
+    if largo is not None:
+        if not isinstance(largo, int) or isinstance(largo, bool) or not 0 <= largo <= MAX_CUERPO:
+            raise Rechazo(400, "peticion_invalida", "El cuerpo no tiene un tamaño válido")
+        if len(resto) > largo:
+            raise Rechazo(400, "peticion_invalida", "Sobran bytes")
+        cuerpo = resto + _leer_exacto(conexion, largo - len(resto))
+    elif resto:
+        raise Rechazo(400, "peticion_invalida", "Sobran bytes")
+    return peticion, cuerpo
+
+
+def atender(conexion, ayudante_de, par_permitido=par_del_vigia):
+    """Una conexión: la petición y la respuesta. Devuelve la continuación de una orden larga (o None), que se ejecuta
+    con la conexión ya cerrada. ``ayudante_de()`` crea el ``Ayudante`` solo si el par es de fiar."""
+    datos = None
+    seguir = None
+    try:
+        if not par_permitido(conexion):
+            raise Rechazo(403, "no_autorizado", "Este ayudante solo atiende al vigía")
+        peticion, cuerpo = leer_peticion(conexion)
+        respuesta, datos, seguir = ayudante_de().orden(peticion, cuerpo)
+    except Rechazo as rechazo:
+        respuesta = rechazo.respuesta()
+        if rechazo.codigo not in ("instantanea_desconocida", "restauracion_desconocida"):
+            _decir("rechazo: %s %s" % (rechazo.http, rechazo.codigo))
+    except Exception as error:  # noqa: BLE001 — la orden falla, el ayudante contesta
+        _decir("error inesperado: %s" % type(error).__name__)
+        respuesta = Rechazo(500, "error", "Error interno del ayudante").respuesta()
+    try:
+        conexion.settimeout(120)
+        conexion.sendall(json.dumps(respuesta, separators=(",", ":"), sort_keys=True).encode("utf-8") + b"\n")
+        if datos:
+            conexion.sendall(datos)
+    except OSError:
+        pass
+    return seguir
+
+
+def main(argv: list) -> int:
+    opciones, resto = {}, []
+    for argumento in argv:
+        if argumento.startswith("--") and "=" in argumento:
+            clave, _, valor = argumento[2:].partition("=")
+            opciones[clave] = valor
+        else:
+            resto.append(argumento)
+    try:
+        puerto = int(opciones["puerto-hermes"]) if "puerto-hermes" in opciones else None
+    except ValueError:
+        puerto = 0
+    usuario = "--usuario" in resto
+    if usuario and os.geteuid() == 0:
+        sys.stderr.write("hehermes-respaldo: --usuario es para el ayudante sin root\n")
+        return 2
+    casa = opciones.get("hermes-home", "/root/.hermes")
+    trabajo = opciones.get("trabajo", "/var/lib/hehermes-respaldo")
+    for ruta in (casa, trabajo):
+        if not ruta.startswith("/") or ruta.rstrip("/") == "":
+            sys.stderr.write("hehermes-respaldo: --hermes-home y --trabajo tienen que ser carpetas absolutas\n")
+            return 2
+    if puerto is not None and not 0 < puerto < 65536:
+        sys.stderr.write("hehermes-respaldo: --puerto-hermes no vale\n")
+        return 2
+    usuario_hermes = opciones.get("usuario-hermes") or ("root" if os.geteuid() == 0 else
+                                                        pwd.getpwuid(os.geteuid()).pw_name)
+    config = Config(casa=casa, trabajo=trabajo, unidad=opciones.get("unidad-hermes", "hermes-gateway.service") or None,
+                    usuario_hermes=usuario_hermes, puerto=puerto, hermes=opciones.get("hermes"), usuario=usuario)
+    os.umask(0o077)
+    resto = [r for r in resto if r != "--usuario"]
+    if resto == ["--conexion"]:
+        conexion = socket.socket(fileno=0)
+        try:
+            seguir = atender(conexion, lambda: Ayudante(config),
+                             par_del_mismo_usuario if usuario else par_del_vigia)
+            try:
+                conexion.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        finally:
+            conexion.detach()
+        for fd in (0, 1):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if seguir is not None:
+            seguir()
+        return 0
+    if resto == ["limpiar"]:
+        print(json.dumps(Ayudante(config).trabajo.limpiar()))
+        return 0
+    if resto == ["estado"]:
+        print(json.dumps(Ayudante(config).estado(), indent=2, sort_keys=True))
+        return 0
+    sys.stderr.write("uso: hehermes-respaldo [--hermes-home=<carpeta>] [--trabajo=<carpeta>] [--unidad-hermes=<unidad>] "
+                     "[--usuario-hermes=<usuario>] [--puerto-hermes=<n>] [--hermes=<ruta>] [--usuario] "
+                     "--conexion | estado | limpiar\n")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

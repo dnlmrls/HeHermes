@@ -69,6 +69,10 @@ MAX_LINEAS_CABECERA = 100
 #: Una foto va en base64 dentro del JSON de /v1/runs: lo mismo que el `client_max_body_size 25m` del túnel.
 MAX_CUERPO = 25 * 1024 * 1024
 MAX_CUERPO_AVISOS = 64 * 1024
+#: La copia en iCloud (contrato §15, desde la 0.10.0): un trozo de 4 MiB comprimido, que puede pasar un poco de 4 MiB
+#: si no comprime, o el manifiesto de una restauración. Lo mismo que el vigía (`hehermes_avisos.vigia.respaldo`).
+MAX_CUERPO_RESPALDO = 4 * 1024 * 1024 + 64 * 1024
+PREFIJO_RESPALDO = "/avisos/v1/respaldo/"
 #: Cada cuánto se mira si ha cambiado tokens.json (y se cortan las conexiones de un token dado de baja).
 REVISION_TOKENS = 1.0
 
@@ -957,6 +961,8 @@ class Pasarela:
 
     def tope(self, peticion) -> int:
         """El cuerpo más grande que se deja pasar a esa ruta."""
+        if peticion.ruta.startswith(PREFIJO_RESPALDO):
+            return MAX_CUERPO_RESPALDO
         return MAX_CUERPO_AVISOS if peticion.ruta.startswith("/avisos/") else MAX_CUERPO
 
     def destino(self, peticion, ip):

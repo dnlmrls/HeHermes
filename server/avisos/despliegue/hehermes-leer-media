@@ -9,7 +9,10 @@ aunque quien tenga el token de un iPhone consiguiera que Hermes escribiera ``MED
 - **Una lista de permitidas, no de prohibidas** (desde la 1.4.0 de los avisos; auditoría del 2026-09-29, §14.5): solo
   lo que está **dentro** de las caches de Hermes (``image_cache/`` y ``audio_cache/``) y de su carpeta de exportaciones
   (``exports/``, u otra con ``--exportaciones``), donde Hermes deja lo que genera para el iPhone. Todo lo demás, exista
-  o no, es ``prohibida``, y el vigía lo contesta con el mismo 404 que lo que no está marcado. Se mira sobre la ruta
+  o no, es ``fuera`` (desde la 1.5.0; antes, ``prohibida``): solo por el texto, así que no dice nada del disco, y el
+  vigía, que solo pregunta por lo que Hermes marcó, se lo cuenta a la app para que pueda pedirle a Hermes que lo copie
+  a ``exports/``. Lo que además esté en la lista de prohibidas de abajo sigue siendo ``prohibida``, y eso, como lo
+  que no existe o cambia, el vigía lo contesta con el mismo 404 que lo que no está marcado. Se mira sobre la ruta
   pedida y sobre la resuelta (``realpath``): lo pedido en una permitida tiene que estar, resuelto, en **esa misma**
   permitida, así que un enlace de dentro no lleva a ningún otro sitio, ni a otra permitida. Una permitida que sea ella
   misma un enlace no vale (lo resuelto ya no cae dentro de su texto); la casa de Hermes sí puede serlo, porque la da
@@ -76,6 +79,9 @@ SALIDAS = {
     "carrera": 7,
     "error": 8,
     "no_autorizado": 9,
+    # Desde la 1.5.0: fuera de las permitidas (antes era `prohibida`). Un rechazo de siempre, que la unidad no cuenta
+    # como fallo.
+    "fuera": 10,
 }
 
 # La casa de Hermes (HERMES_HOME) de serie. La de otro sitio se pasa con --hermes-home (la pone el instalador en la
@@ -223,8 +229,14 @@ def abrir(ruta: str, *, prohibidas=es_prohibida, hermes: str = HERMES_HOME, expo
     lista = permitidas(validar_casa(hermes), None if exportaciones is None else validar_casa(exportaciones))
     pedida = canonica(ruta)
     donde = permitida_de(pedida, lista)
-    if donde is None or prohibidas(pedida):
+    # Una permitida, o una carpeta que lleva a una, es una carpeta y no algo que Hermes pueda copiar a exports/.
+    if prohibidas(pedida) or any(pedida == carpeta or carpeta.startswith(pedida.rstrip("/") + "/")
+                                 for _, carpeta in lista):
         raise Rechazo("prohibida")
+    if donde is None:
+        # Fuera de las permitidas, solo por el texto (sin mirar el disco): el vigía se lo dice a la app, para que pueda
+        # pedirle a Hermes que lo deje en exports/. Lo que es de la lista de prohibidas se queda en `prohibida`.
+        raise Rechazo("fuera")
     real = canonica(os.path.realpath(ruta))
     # Lo pedido en una permitida tiene que estar de verdad en esa misma: un enlace de dentro (o la permitida misma, si
     # fuera un enlace) no lleva a ningún otro sitio, ni a otra permitida, ni fuera de Hermes.

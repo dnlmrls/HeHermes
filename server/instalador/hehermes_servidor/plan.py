@@ -104,6 +104,11 @@ def ficheros_propios(origen: str, prefijo: str = p.PREFIJO) -> list:
     if fuente is not None:
         with open(fuente, "rb") as f:
             salida.append((prefijo + "/hehermes-leer-media", f.read(), 0o755))
+    # Y el ayudante de la copia en iCloud (desde la 0.10.0), igual.
+    fuente = fuente_del_respaldo(origen)
+    if fuente is not None:
+        with open(fuente, "rb") as f:
+            salida.append((prefijo + "/hehermes-respaldo", f.read(), 0o755))
     carpeta = os.path.join(origen, "hehermes_servidor")
     for nombre in sorted(os.listdir(carpeta)):
         if nombre.endswith(".py"):
@@ -115,6 +120,11 @@ def ficheros_propios(origen: str, prefijo: str = p.PREFIJO) -> list:
 def fuente_del_lector(origen: str) -> str | None:
     """`hehermes-leer-media`: en el paquete, junto al instalador; en el repositorio, en `server/avisos/despliegue`."""
     return buscar_en_origen(origen, "hehermes-leer-media", "../avisos/despliegue/hehermes-leer-media")
+
+
+def fuente_del_respaldo(origen: str) -> str | None:
+    """`hehermes-respaldo`: en el paquete, junto al instalador; en el repositorio, en `server/avisos/despliegue`."""
+    return buscar_en_origen(origen, "hehermes-respaldo", "../avisos/despliegue/hehermes-respaldo")
 
 
 def buscar_en_origen(origen: str, *candidatas: str) -> str | None:

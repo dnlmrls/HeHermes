@@ -86,6 +86,8 @@ class ConfigVigia:
     ficheros_casa: str = "/root"
     ficheros_por_minuto: int = 30
     ficheros_simultaneos: int = 2
+    # La copia de Hermes en iCloud: el socket del ayudante (`hehermes-respaldo.socket`). Vacío: sin copia (503).
+    respaldo_ayudante: str = "/run/hehermes-respaldo.sock"
     # Las entregas de los subagentes que el vigía contesta con el turno de continuación de la app (`entregas`).
     entregas_contestar: bool = True
     entregas_gracia: float = 60.0
@@ -140,6 +142,7 @@ class ConfigVigia:
             ficheros_casa=texto("ficheros", "casa", base.ficheros_casa).strip(),
             ficheros_por_minuto=max(1, int(numero("ficheros", "por_minuto", base.ficheros_por_minuto))),
             ficheros_simultaneos=max(1, int(numero("ficheros", "simultaneos", base.ficheros_simultaneos))),
+            respaldo_ayudante=texto("respaldo", "ayudante", base.respaldo_ayudante).strip(),
             entregas_contestar=contestar,
             # Menos de 30 s no deja a la app, si está delante, lanzar la suya con las instrucciones de la conversación.
             entregas_gracia=max(30.0, numero("entregas", "gracia", base.entregas_gracia)),

@@ -74,6 +74,7 @@ class Paquete(unittest.TestCase):
                              ("hehermes_servidor/modos.py", 0o644),
                              ("hehermes_servidor/plan.py", 0o644), ("clave-publica.pem", 0o644),
                              ("hehermes-dispositivo", 0o755), ("README.md", 0o644), ("hehermes-leer-media", 0o755),
+                             ("hehermes-respaldo", 0o755),
                              ("requirements-canje.txt", 0o644), ("hehermes_servidor/canje.py", 0o644),
                              ("hehermes_servidor/porchat.py", 0o644)):
             with self.subTest(fichero=nombre):
@@ -88,7 +89,8 @@ class Paquete(unittest.TestCase):
                         if "__pycache__" not in p.parts)
         self.assertIn("hehermes_avisos/vigia/__main__.py", avisos)
         self.assertEqual(ficheros, sorted(["README.md", "clave-publica.pem", "hehermes-dispositivo", "hehermes-pasarela",
-                                           "hehermes-servidor", "requirements-canje.txt", "hehermes-leer-media"]
+                                           "hehermes-servidor", "requirements-canje.txt", "hehermes-leer-media",
+                                           "hehermes-respaldo"]
                                           + modulos + avisos))
         # El dispositivo es el de server/vpn, y el lector (desde la 0.8.0), el de server/avisos/despliegue, byte a byte.
         with tarfile.open(ruta) as tar:
