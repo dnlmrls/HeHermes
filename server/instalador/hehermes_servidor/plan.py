@@ -13,7 +13,7 @@ from . import VERSION
 from . import manifiesto as m
 from . import piezas as p
 from .aplicar import REINICIOS_PENDIENTES
-from .deteccion import NORMAL, PREFIJO_ERROR, ROJO, Bloqueo, bloqueo, etiquetar  # noqa: F401
+from .deteccion import NORMAL, PREFIJO_DETALLE, PREFIJO_ERROR, ROJO, Bloqueo, bloqueo, etiquetar  # noqa: F401
 
 NOMBRE_VALIDO = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 # Lo que va en /opt/hehermes-servidor: con eso, `comprobar`, `actualizar` y `desinstalar` siguen ahí después de que se
@@ -24,7 +24,7 @@ EJECUTABLES_PROPIOS = ("hehermes-servidor", "hehermes-pasarela")
 
 class Opciones:
     def __init__(self, iphone=None, direccion=None, hermes_home=None, reemplazar=(), si=False, solo_plan=False,
-                 por_chat=False, llave=None, activar_api=False, qr_png=None, ahora=None, cortafuegos_a_mano=False,
+                 por_chat=False, llave=None, activar_api=False, qr_png=None, cortafuegos_a_mano=False,
                  corregir_exposicion=False, avisos=None):
         #: Si hay alguien delante de un terminal (el QR de la pasarela solo se pinta ahí).
         self.terminal = True
@@ -39,8 +39,6 @@ class Opciones:
         self.llave = llave
         self.activar_api = activar_api
         self.qr_png = qr_png
-        #: La hora con la que se mide la media hora de la decisión 7; las pruebas la fijan.
-        self.ahora = ahora
         #: El cortafuegos lo lleva el usuario: no se toca, aunque cierre (y no se sepa dónde abrirlo).
         self.cortafuegos_a_mano = cortafuegos_a_mano
         #: Permiso para cerrar a 127.0.0.1 una API de Hermes que escucha en todas las interfaces.
@@ -51,8 +49,8 @@ class Opciones:
 
 class Accion:
     """Una cosa que el instalador deja. `tipo`: paquete, fichero, gestionado, enlace, unidad, regla, firewalld, propio,
-    usuario, venv, certificado, env, exposicion, dispositivo o canje. `datos`: el contenido (fichero), el destino
-    (enlace) o los argumentos (regla)."""
+    usuario, venv, certificado, env, exposicion, soul, dispositivo o canje. `datos`: el contenido (fichero, el párrafo
+    del `SOUL.md`), el destino (enlace), los argumentos (regla) o, de un iPhone por chat, a quién sustituye."""
 
     #: Solo las de una unidad (`_unidad`): se reinicia por su código, y en marcha sin habilitar, tras habilitarla.
     por_codigo = False
@@ -90,6 +88,12 @@ class Plan:
         # `reinicia-hermes` solo si es lo único: con otra cosa que pare, no se ha encendido nada, y lo que hay que
         # arreglar primero es eso otro.
         return next((c for c in codigos if c != "reinicia-hermes"), codigos[0] if codigos else None)
+
+    @property
+    def detalle_del_error(self) -> str | None:
+        """Lo que concreta el primer bloqueo con ese código, para la app (`PREFIJO_DETALLE`), si lo lleva."""
+        codigo = self.codigo_de_error
+        return next((getattr(b, "detalle", None) for b in self.bloqueos if getattr(b, "codigo", None) == codigo), None)
 
 
 def ficheros_propios(origen: str, prefijo: str = p.PREFIJO) -> list:
@@ -206,7 +210,7 @@ def _unidad(sis, acciones, unidad, ficheros, detalle, como_recargar, systemctl=(
 # MARK: Pintar
 
 
-SECCIONES = (("Hermes", ("env", "exposicion")), ("Paquetes", ("paquete",)),
+SECCIONES = (("Hermes", ("env", "exposicion", "soul")), ("Paquetes", ("paquete",)),
              ("La pasarela", ("usuario", "venv", "certificado", "certificado_siguiente")),
              ("Ficheros", ("fichero", "gestionado", "enlace")),
              ("Servicios", ("unidad",)), ("Cortafuegos (ufw)", ("regla",)),
@@ -226,8 +230,8 @@ def pintar(plan: Plan, color: bool = False) -> str:
     h = det.hermes
     if h is not None:
         estado_clave = {True: "la clave vale", False: "la clave NO vale", None: "sin probar la clave"}[h.clave_vale]
-        lineas.append("  Hermes     %s (de %s, por %s), API en %s:%d, %s" % (h.env, h.usuario, h.origen, h.host,
-                                                                            h.puerto, estado_clave))
+        lineas.append("  Hermes     %s (de %s, por %s), API en %s:%d, %s%s" % (
+            h.env, h.usuario, h.origen, h.host, h.puerto, estado_clave, _version_de_hermes(h)))
     if det.direccion:
         lineas.append("  Dirección  %s (la que irá en el QR)" % det.direccion)
     ambito = det.ambito
@@ -300,6 +304,15 @@ def pintar(plan: Plan, color: bool = False) -> str:
     if not color:
         texto = texto.replace(ROJO, "").replace(NORMAL, "")
     return texto
+
+
+def _version_de_hermes(h) -> str:
+    """«, versión 0.21.3» (la de su /health), «, versión 0.20.6 (la de su código, en …)» con la API apagada, o
+    «, versión desconocida» si se le ha preguntado y no la dice. Nada si no se ha llegado a preguntar."""
+    if h.version:
+        return ", versión %s%s" % (h.version, "" if h.version_de in (None, "su /health") else " (la de %s)"
+                                   % h.version_de)
+    return ", versión desconocida" if h.sondeo is not None else ""
 
 
 def _estado_de_grupo(acciones) -> str:

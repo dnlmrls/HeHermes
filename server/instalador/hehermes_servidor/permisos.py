@@ -127,7 +127,8 @@ def mensaje(sudo: str, usuario: str, aqui: str, argv: list, por_chat: bool, otra
         "comando de arriba, o con el de la app sin --iphone) y añadir, con «sudo visudo -f %s», esta línea:" % (
             usuario, SUDOERS),
         "       " + linea_sudoers(usuario),
-        "     Después, en la media hora siguiente a instalar, vuelve a lanzarme." if por_chat else
+        "     Después, vuelve a lanzarme (por chat, mientras el iPhone que se dé de alta por chat no haya usado la "
+        "pasarela)." if por_chat else
         "     Después, vuelve a lanzarme.",
     ]
     return lineas

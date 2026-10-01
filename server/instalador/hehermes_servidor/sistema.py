@@ -66,6 +66,25 @@ def _http_de_verdad(url, cabeceras, plazo=5):
         return None, b""
 
 
+def _pedir_de_verdad(metodo, url, cabeceras, plazo=5):
+    """Una petición sin cuerpo con cualquier método (la sonda de las capacidades de Hermes: `TRACE`), sin proxies y sin
+    seguir redirecciones. (estado, cabeceras, cuerpo); (None, {}, b"") si no contesta."""
+
+    class SinRedirecciones(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+
+    abridor = urllib.request.build_opener(urllib.request.ProxyHandler({}), SinRedirecciones)
+    peticion = urllib.request.Request(url, headers=cabeceras, method=metodo)
+    try:
+        with abridor.open(peticion, timeout=plazo) as respuesta:
+            return respuesta.status, dict(respuesta.headers.items()), respuesta.read(65536)
+    except urllib.error.HTTPError as error:
+        return error.code, dict(error.headers.items()) if error.headers else {}, error.read(65536)
+    except (OSError, ValueError):
+        return None, {}, b""
+
+
 def _sondear_de_verdad(puerto, maxima=None, plazo=5, anfitrion="127.0.0.1"):
     """Lo que ve un cliente sin token en <anfitrion>:<puerto> (127.0.0.1, o la dirección pública del QR): la versión de
     TLS, la huella del certificado y los bytes de la respuesta a un GET. None si no hay apretón (o no con esa versión
@@ -96,10 +115,12 @@ def _sondear_de_verdad(puerto, maxima=None, plazo=5, anfitrion="127.0.0.1"):
 
 
 class Sistema:
-    def __init__(self, raiz: str = "/", ejecutor=None, http=None, version_python=None, nucleo=None, sonda=None):
+    def __init__(self, raiz: str = "/", ejecutor=None, http=None, version_python=None, nucleo=None, sonda=None,
+                 pedir=None):
         self.raiz = os.path.realpath(raiz)
         self._ejecutor = ejecutor or _ejecutar_de_verdad
         self._http = http or _http_de_verdad
+        self._pedir = pedir or _pedir_de_verdad
         self._sonda = sonda or _sondear_de_verdad
         self.version_python = tuple(version_python or sys.version_info[:3])
         self.nucleo = nucleo or os.uname().release
@@ -268,6 +289,10 @@ class Sistema:
 
     def http_get(self, url: str, cabeceras: dict | None = None):
         return self._http(url, cabeceras or {})
+
+    def pedir(self, metodo: str, url: str, cabeceras: dict | None = None):
+        """(estado, cabeceras, cuerpo) de una petición sin cuerpo: la usa la sonda de las capacidades de Hermes."""
+        return self._pedir(metodo, url, cabeceras or {})
 
     def sondear_pasarela(self, puerto, maxima=None, anfitrion=None):
         if anfitrion is None:

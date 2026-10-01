@@ -16,6 +16,7 @@ import os
 import json
 import re
 import shlex
+import time
 
 import apoyo
 from hehermes_servidor.sistema import Resultado
@@ -88,6 +89,50 @@ EFECTOS_RPM = {
 }
 AL_ARRANCAR = {"nginx": {"tcp": [("0.0.0.0:80", "nginx")]},
                "strongswan": {"udp": [("0.0.0.0:500", "charon-systemd"), ("0.0.0.0:4500", "charon-systemd")]}}
+
+#: Lo que tiene el api_server de Hermes en cada versión, de lo que miran el instalador y su sonda, con la versión en la
+#: que llegó cada ruta: las etiquetas de NousResearch/hermes-agent, leídas el 2026-10-01 (los `add_get`/`add_post` hasta
+#: la 0.20.6 y `_http_route_table` desde la 0.21.0). No sale de `capacidades.CAPACIDADES`: es la otra mitad de la
+#: comprobación. El Hermes de mentira de una versión tiene las que ya habían llegado, y contesta como aiohttp: a un método
+#: que la ruta no tiene, 405 con `Allow`; a una ruta que no existe, 404.
+RUTAS_HERMES = (
+    ("GET", "/health", "0.4.0"), ("GET", "/v1/models", "0.4.0"), ("GET", "/api/jobs", "0.4.0"),
+    ("POST", "/api/jobs", "0.4.0"), ("GET", "/api/jobs/{job_id}", "0.4.0"), ("PATCH", "/api/jobs/{job_id}", "0.4.0"),
+    ("DELETE", "/api/jobs/{job_id}", "0.4.0"), ("POST", "/api/jobs/{job_id}/pause", "0.4.0"),
+    ("POST", "/api/jobs/{job_id}/resume", "0.4.0"), ("POST", "/api/jobs/{job_id}/run", "0.4.0"),
+    ("GET", "/v1/health", "0.6.0"), ("POST", "/v1/runs", "0.8.0"), ("GET", "/v1/runs/{run_id}/events", "0.8.0"),
+    ("GET", "/health/detailed", "0.10.0"), ("GET", "/v1/runs/{run_id}", "0.12.0"),
+    ("POST", "/v1/runs/{run_id}/stop", "0.12.0"), ("GET", "/v1/capabilities", "0.12.0"),
+    ("POST", "/v1/runs/{run_id}/approval", "0.14.0"), ("GET", "/api/sessions", "0.15.0"),
+    ("POST", "/api/sessions", "0.15.0"), ("GET", "/api/sessions/{session_id}", "0.15.0"),
+    ("PATCH", "/api/sessions/{session_id}", "0.15.0"), ("DELETE", "/api/sessions/{session_id}", "0.15.0"),
+    ("GET", "/api/sessions/{session_id}/messages", "0.15.0"), ("GET", "/api/model/options", "0.19.1"),
+    ("POST", "/v1/runs/{run_id}/steer", "0.20.1"))
+#: El `desde` del registro de usos que deja la pasarela de mentira al arrancar: antes de cualquier alta de las pruebas.
+DESDE_USOS = 1_000_000_000
+#: El `SOUL.md` que deja Hermes en su casa la primera vez que arranca (`hermes_cli/default_soul.py`, su comienzo).
+SOUL_DE_SERIE = ("You are Hermes Agent, built by Nous Research. Be direct: match the length of your reply to the weight "
+                 "of the ask.")
+#: El del Hermes de Daniel, que ya le dice dónde dejar lo que mande al iPhone (puesto a mano, antes de la 0.10.4).
+SOUL_DE_DANIEL = SOUL_DE_SERIE + ("\n\n## El iPhone\n\nLo que quieras mandarme al iPhone, déjalo en ~/.hermes/exports y "
+                                  "márcalo en tu respuesta con una línea MEDIA:<ruta>.\n")
+
+
+def _numeros(texto):
+    hallado = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", texto or "")
+    numeros = tuple(int(x) for x in hallado.groups()) if hallado else None
+    return None if numeros == (0, 0, 0) else numeros
+
+
+def rutas_de_hermes(version):
+    """Las rutas de un Hermes de esa versión. Uno que no dice su versión (el `main` de ahora, «0.0.0») las tiene todas."""
+    numeros = _numeros(version)
+    return [(metodo, ruta) for metodo, ruta, desde in RUTAS_HERMES if numeros is None or _numeros(desde) <= numeros]
+
+
+def _casa(plantilla, ruta):
+    a, b = plantilla.split("/"), ruta.split("/")
+    return len(a) == len(b) and all(x == y or (x.startswith("{") and y) for x, y in zip(a, b))
 
 
 class ServidorFalso:
@@ -185,6 +230,15 @@ class ServidorFalso:
         self.vigia_comprueba = ["bien: Hermes contesta en http://127.0.0.1:8642: 0 conversaciones en la bandeja",
                                 "bien: el relé acepta la credencial de este vigía («probador»)"]
         self.comprobaciones_del_vigia: list = []
+        #: El api_server de Hermes: la versión que dice su /health (None: no la dice) y si contesta como aiohttp a
+        #: `TRACE` (la sonda de `capacidades`); si no, un 501, como un servidor que no lo sabe.
+        self.version_hermes = "0.21.3"
+        self.trace_hermes = True
+        #: Rutas que ese Hermes no tiene aunque su versión las traiga (un fork, una a medias): (método, plantilla).
+        self.rutas_quitadas: set = set()
+        #: El diario de la pasarela (`journalctl -u hehermes-pasarela`): (cuándo, línea). None: no hay diario.
+        self.diario_pasarela: list = []
+        sis.pedir_falso = self.pedir
         self._montar_base()
 
     # Montaje
@@ -209,6 +263,8 @@ class ServidorFalso:
         s.carpeta("/etc")
         os.symlink("../usr/lib/os-release", s.ruta("/etc/os-release"))
         s.carpeta("/run/systemd/system")
+        # Donde systemd pone las carpetas de estado (`StateDirectory`): en un servidor de verdad siempre está.
+        s.carpeta("/var/lib")
         gestores = ("/usr/bin/dnf", "/usr/bin/rpm") if self.familia == "rhel" else ("/usr/bin/apt-get", "/usr/bin/dpkg")
         for programa in gestores + ("/usr/bin/systemctl", "/usr/sbin/ip", "/usr/bin/ss", "/usr/bin/python3"):
             self.programa(programa)
@@ -271,6 +327,8 @@ class ServidorFalso:
         if puerto != 8642:
             lineas.append("API_SERVER_PORT=%d" % puerto)
         self.sis.poner(carpeta + "/.env", "\n".join(lineas) + "\n" + env_extra, modo=0o600)
+        # Lo que deja Hermes al arrancar la primera vez (`_ensure_default_soul_md`): sin salto de línea al final.
+        self.sis.poner(carpeta + "/SOUL.md", SOUL_DE_SERIE, modo=0o600)
         if como == "unidad":
             entorno = "HERMES_HOME=%s" % hermes_home if hermes_home else ""
             self.unidades_hermes["hermes-gateway.service"] = {"User": "" if usuario == "root" else usuario,
@@ -488,6 +546,11 @@ class ServidorFalso:
             self.tcp.append(fila)
         elif not si and fila in self.tcp:
             self.tcp.remove(fila)
+        carpeta = self._estado_pasarela()
+        if si and carpeta and not self.sis.existe(carpeta + "/usos.json"):
+            # Como la de verdad al arrancar (desde la 0.10.4): su registro de usos, desde ahora.
+            self.sis.poner(carpeta + "/usos.json", json.dumps({"v": 1, "desde": DESDE_USOS, "tokens": {}}),
+                           modo=0o600)
 
     def pasarela_en_marcha(self):
         return "hehermes-pasarela" in self.activos or "hehermes-pasarela" in self.activos_usuario
@@ -973,14 +1036,106 @@ class ServidorFalso:
         m = re.match(r"^http://127\.0\.0\.1:(\d+)(/.*)$", url)
         if m and int(m.group(1)) in self.hermes:
             clave = self.hermes[int(m.group(1))]
-            if m.group(2) == "/health":
-                return 200, b'{"status": "ok"}'
+            ruta = m.group(2).split("?", 1)[0]
+            if not any(metodo == "GET" and _casa(plantilla, ruta) for metodo, plantilla in self.rutas_api()):
+                return 404, b"404: Not Found"
+            if ruta == "/health":
+                datos = {"status": "ok", "platform": "hermes-agent"}
+                if self.version_hermes is not None:
+                    datos["version"] = self.version_hermes
+                return 200, json.dumps(datos).encode()
             if cabeceras.get("Authorization") == "Bearer %s" % clave:
                 return 200, b'{"object": "list", "data": []}'
             return 401, b'{"error": {"code": "gateway_auth_failed"}}'
         if url == "http://10.77.0.1/health" and "hh-ipsec" in self.enlaces_ip and "nginx" in self.activos:
             return 403, b"<html>403 Forbidden</html>"
         return None, b""
+
+    def pedir(self, metodo, url, cabeceras):
+        """Lo que contesta el api_server de Hermes a la sonda de `capacidades`, como aiohttp: a `TRACE`, el 405 con los
+        métodos de esa ruta en `Allow`, o el 404 de una ruta que no existe, sin mirar la clave (no llega a ningún
+        manejador). Cualquier otro método es un fallo de la prueba: la sonda no puede lanzar nada."""
+        m = re.match(r"^http://127\.0\.0\.1:(\d+)(/[^?]*)(\?.*)?$", url)
+        if metodo == "GET":
+            estado, cuerpo = self.http(url, cabeceras)
+            return estado, {}, cuerpo
+        if metodo != "TRACE":
+            raise AssertionError("la sonda solo puede usar TRACE: %s %s" % (metodo, url))
+        if "Authorization" in cabeceras:
+            raise AssertionError("la sonda no lleva la clave de Hermes: %s" % url)
+        if not m or int(m.group(1)) not in self.hermes:
+            return None, {}, b""
+        if self.trace_hermes == "eco":
+            # Uno que contesta a TRACE como un servidor genérico: 200, con lo que admite en `Allow` (no es un 405).
+            return 200, {"Allow": "DELETE,GET,HEAD,PATCH,POST,PUT,TRACE"}, b"TRACE " + m.group(2).encode()
+        if not self.trace_hermes:
+            return 501, {}, b"<h1>501 Not Implemented</h1>"
+        metodos = sorted({metodo_ for metodo_, plantilla in self.rutas_api() if _casa(plantilla, m.group(2))})
+        if metodos:
+            return 405, {"Allow": ",".join(metodos), "Content-Type": "text/plain"}, b"405: Method Not Allowed"
+        return 404, {"Content-Type": "text/plain"}, b"404: Not Found"
+
+    def rutas_api(self):
+        """Las rutas del api_server de este Hermes (`rutas` son las de `ip route`)."""
+        return [r for r in rutas_de_hermes(self.version_hermes) if r not in self.rutas_quitadas]
+
+    def codigo_de_hermes(self, version, carpeta=None, donde="pyproject", usuario="root"):
+        """El código de Hermes en el disco, para cuando su API está apagada: un checkout como el que deja su instalador
+        (`<casa>/hermes-agent`), con su versión en su `pyproject.toml`, en el `__version__` de `hermes_cli/__init__.py` o
+        en su sello (`install-stamp.json`, el `main` de ahora)."""
+        carpeta = carpeta or self.usuarios.get(usuario, "/root") + "/.hermes/hermes-agent"
+        init = '"""Hermes CLI."""\n' + ('__version__ = "%s"\n' % version if donde == "init" else "")
+        self.sis.poner(carpeta + "/hermes_cli/__init__.py", init)
+        self.sis.poner(carpeta + "/pyproject.toml", '[project]\nname = "hermes-agent"\nversion = "%s"\n'
+                       % (version if donde == "pyproject" else "0.0.0"))
+        if donde == "sello":
+            self.sis.poner(carpeta + "/install-stamp.json", json.dumps({"baseVersion": version}))
+        return carpeta
+
+    # La pasarela de mentira: su registro de usos y su diario.
+
+    def _estado_pasarela(self):
+        if self.sis.existe("/etc/hehermes-pasarela/pasarela.ini"):
+            return "/var/lib/hehermes-pasarela"
+        for casa in self.usuarios.values():
+            if self.sis.existe("%s/.config/hehermes-pasarela/pasarela.ini" % casa):
+                return casa + "/.local/state/hehermes-pasarela"
+        return None
+
+    def usar(self, nombre, cuando=None):
+        """El iPhone `nombre` usa la pasarela y Hermes le contesta un 2xx: lo apunta su registro de usos (`usos.json`),
+        como la pasarela de verdad (`pasarela.Usos`)."""
+        carpeta = self._estado_pasarela()
+        tokens = json.loads(self.sis.leer_texto(carpeta.replace("/var/lib/hehermes-pasarela", "/etc/hehermes-pasarela")
+                                                .replace("/.local/state/", "/.config/") + "/tokens.json"))
+        hash_ = next(t["sha256"] for t in tokens["tokens"] if t["nombre"] == nombre)
+        usos = json.loads(self.sis.leer_texto(carpeta + "/usos.json"))
+        usos["tokens"].setdefault(hash_, {"nombre": nombre, "primero": int(cuando or time.time())})
+        self.sis.poner(carpeta + "/usos.json", json.dumps(usos), modo=0o600)
+
+    def _journalctl(self, args, entrada):
+        """`journalctl [--user] -u hehermes-pasarela --no-pager -q -o cat|short-unix [--since @t] [--until @t] [-n N]`:
+        lo que haya en `diario_pasarela`."""
+        if self.diario_pasarela is None:
+            return Resultado(1, "", "No journal files were found.")
+        valores = {}
+        resto = list(args)
+        while resto:
+            trozo = resto.pop(0)
+            if trozo in ("-u", "-o", "--since", "--until", "-n"):
+                valores[trozo] = resto.pop(0)
+            elif trozo not in ("--user", "--no-pager", "-q"):
+                return Resultado(127, "", "journalctl %s" % args)
+        if valores.get("-u") not in ("hehermes-pasarela", "hehermes-pasarela.service"):
+            return Resultado(0, "")
+        desde = float(valores["--since"][1:]) if "--since" in valores else float("-inf")
+        hasta = float(valores["--until"][1:]) if "--until" in valores else float("inf")
+        lineas = [(t, l) for t, l in sorted(self.diario_pasarela) if desde <= t <= hasta]
+        if "-n" in valores:
+            lineas = lineas[-int(valores["-n"]):]
+        if valores.get("-o") == "short-unix":
+            return Resultado(0, "".join("%.6f hehermes-pasarela[123]: %s\n" % (t, l) for t, l in lineas))
+        return Resultado(0, "".join(l + "\n" for _, l in lineas))
 
 
 def servidor(distro=("debian", "12"), **hermes) -> "tuple":
@@ -1021,6 +1176,7 @@ def servidor_de_daniel():
     sis.poner("/usr/local/sbin/hehermes-dispositivo", desplegado, modo=0o750)
     sis.poner("/etc/swanctl/conf.d/hehermes-poc.conf", POC, modo=0o600)
     sis.poner("/etc/wireguard/wg0.conf", "[Interface]\nAddress = 10.77.0.1/24\n", modo=0o600)
+    sis.poner("/root/.hermes/SOUL.md", SOUL_DE_DANIEL, modo=0o600)
     sis.poner("/etc/wireguard/hehermes/dispositivos.json", '{"dispositivos": []}\n', modo=0o600)
     falso.enlaces_ip["eth0"]["addr"] = ["203.0.113.7/32"]
     falso.direccion_salida = "203.0.113.7"

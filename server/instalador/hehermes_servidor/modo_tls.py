@@ -219,6 +219,9 @@ def calcular_plan_tls(sis, det, man, op, origen) -> Plan:
         acciones.append(Accion("exposicion", det.hermes.env, m.NUEVO, "añade %s (con una copia antes), para que la API "
                                "de Hermes solo escuche en 127.0.0.1; reinicia Hermes 90 s después de acabar"
                                % det.hermes.exposicion_pendiente, [det.hermes.exposicion_pendiente]))
+    # Cómo mandarle ficheros al iPhone, en su SOUL.md (desde la 0.10.4).
+    from . import alma
+    alma.planear(sis, det, man, acciones, avisos)
 
     # El usuario de la pasarela
     if ambito.root:
@@ -291,6 +294,8 @@ def calcular_plan_tls(sis, det, man, op, origen) -> Plan:
         _plan_cortafuegos(sis, det, man, acciones, fichero)
 
     # El primer iPhone
+    from . import porchat
+    activos = porchat.activos_del_servidor(sis, man, ambito) if op.por_chat else []
     if op.iphone is not None:
         from .plan import NOMBRE_VALIDO
         if not NOMBRE_VALIDO.fullmatch(op.iphone):
@@ -299,18 +304,21 @@ def calcular_plan_tls(sis, det, man, op, origen) -> Plan:
             etiquetar(bloqueos, "nombre-iphone")
         else:
             ya = op.iphone in nombres_de_la_pasarela(sis, ambito)
+            sustituye = porchat.a_sustituir(man, op, activos)
             if op.por_chat:
                 detalle = "ya dado de alta" if ya else "su token, sin QR (se entrega por el canje)"
+                if sustituye:
+                    detalle += ("; en lugar de «%s», que se dio de alta por chat y no ha usado la pasarela: su token deja "
+                                "de valer" % sustituye)
             elif not op.terminal:
                 detalle = "ya dado de alta" if ya else "sin un terminal no pinto su QR: lo dejo para después"
             else:
                 detalle = "ya dado de alta" if ya else "su token y su QR, aquí en el terminal"
-            acciones.append(Accion("dispositivo", op.iphone, m.YA_ESTA if ya else m.NUEVO, detalle))
+            acciones.append(Accion("dispositivo", op.iphone, m.YA_ESTA if ya else m.NUEVO, detalle,
+                                   {"sustituye": sustituye} if sustituye else None))
 
     if op.por_chat:
-        from . import porchat
-        bloqueos.extend(porchat.bloqueos(sis, man, op, op.ahora,
-                                         activos=porchat.activos_del_servidor(sis, man, ambito)))
+        bloqueos.extend(porchat.bloqueos(sis, man, op, activos=activos, ambito=ambito))
         acciones.append(Accion("canje", "hehermes-canje", m.NUEVO,
                                "10 minutos en un TCP al azar del 58000 al 65500, %sde un solo uso; al acabar, la línea "
                                "del enlace" % ("abierto solo mientras dura y " if ambito.root else "")))
@@ -409,6 +417,10 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
     for a in de("exposicion"):
         from .porchat import corregir_exposicion
         corregir_exposicion(sis, man, a, salida, ambito)
+    for a in de("soul"):
+        if a.cambia:
+            from . import alma
+            alma.anadir(sis, man, a, salida, ambito)
     _paquetes(sis, man, de("paquete"), salida, det.familia)
     for a in de("usuario"):
         if a.cambia:
@@ -530,6 +542,14 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
                    % (a.objeto, "sudo " if ambito.root else "", "hehermes-dispositivo", a.objeto))
             continue
         from . import tokens
+        sustituye = (a.datos or {}).get("sustituye") if isinstance(a.datos, dict) else None
+        if plan.opciones.por_chat and sustituye:
+            # El que se dio de alta por chat y no llegó a usar la pasarela: sale para que entre este (decisión 7).
+            tokens.baja(sis.ruta(ambito.tokens), sustituye)
+            if sustituye in man.dispositivos:
+                man.dispositivos.remove(sustituye)
+            man.guardar(sis)
+            salida("==> «%s» deja de valer: se dio de alta por chat y no llegó a usar la pasarela" % sustituye)
         salida("==> el iPhone «%s»" % a.objeto)
         token = tokens.alta(sis.ruta(ambito.tokens), a.objeto)
         if a.objeto not in man.dispositivos:
@@ -690,6 +710,8 @@ def comprobar_tls(sis, man, ambito, hermes_pendiente=False, con_vigia=True) -> l
         estado, _ = sis.http_get("http://127.0.0.1:%s/api/sessions?limit=1" % ini.get("puerto", 8642),
                                  {"Authorization": "Bearer " + clave})
         mira(estado == 200, "Hermes: contesta con su clave", "Hermes: no contesta con su clave (%s)" % estado)
+        if estado in (200, 404):
+            _capacidades_de_hermes(sis, man, ini.get("puerto", 8642), mira, sin_bandeja=estado == 404)
         if ambito.root:
             copia = leer_clave_hermes(sis.leer_texto(ambito.clave_hermes) or "")
             mira(copia == clave, "pasarela: su copia de la clave de Hermes está al día",
@@ -710,6 +732,34 @@ def comprobar_tls(sis, man, ambito, hermes_pendiente=False, con_vigia=True) -> l
             mira(True, "pasarela: sin linger, se para al cerrar tu última sesión (sudo loginctl enable-linger %s)"
                  % ambito.usuario, "")
     return resultados
+
+
+def _capacidades_de_hermes(sis, man, puerto, mira, sin_bandeja=False):
+    """Su versión y lo que la app necesita de su api_server, como al instalar (`capacidades`): lo que falta y es
+    obligatorio es un MAL; lo demás, un aviso."""
+    from . import capacidades
+    from . import gestor as gestores
+    estado, cuerpo = sis.http_get("http://127.0.0.1:%s/health" % puerto)
+    version = capacidades.version_de_health(cuerpo) if estado == 200 else None
+    sondeo = capacidades.sondear(sis, int(puerto), version)
+    if sin_bandeja:
+        sondeo.presentes.discard("bandeja")
+        sondeo.sin_saber.discard("bandeja")
+        sondeo.ausentes.add("bandeja")
+    datos = man.datos.get("mantenimiento") or {}
+    bloqueos, avisos = capacidades.veredicto(sondeo, usuario=datos.get("usuario"),
+                                             gestor=gestores.desde_dict(datos.get("gestor_hermes")))
+    for texto, _ in bloqueos:
+        mira(False, "", texto)
+    for texto in avisos:
+        mira(True, "Hermes (aviso): " + texto, "")
+    if bloqueos:
+        return
+    if sondeo.calibrada:
+        mira(True, "Hermes: versión %s, con todo lo que usa la app" % (version or "desconocida"), "")
+    else:
+        mira(True, "Hermes: versión %s (la app necesita la %s o más nueva)"
+             % (version or "desconocida", capacidades.texto_de(capacidades.MINIMA)), "")
 
 
 def _direcciones_locales(sis) -> set:

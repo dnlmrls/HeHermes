@@ -133,12 +133,16 @@ class Tokens:
 
     def sigue(self, hash_hex: str) -> bool:
         """Si un hash sigue dado de alta: lo que mira cada conexión abierta tras una recarga."""
+        return self.nombre_de(hash_hex) is not None
+
+    def nombre_de(self, hash_hex: str) -> str | None:
+        """El nombre del iPhone de un hash dado de alta, o None. Contra todas las entradas, como `quien`."""
         buscado = hash_hex.encode("ascii")
-        sigue = False
-        for _, guardado in self._entradas:
+        hallado = None
+        for nombre, guardado in self._entradas:
             if hmac.compare_digest(buscado, guardado):
-                sigue = True
-        return sigue
+                hallado = nombre
+        return hallado
 
 
 def _leer_tokens(ruta):
@@ -330,6 +334,83 @@ class Mantenimiento:
             valor = datos.get(campo) if isinstance(datos, dict) else None
             salida[campo] = valor if isinstance(valor, (int, float, str, bool)) or valor is None else None
         return salida
+
+
+#: Desde la 0.10.4: qué token ha servido alguna vez un 2xx. El alta por chat sigue abierta hasta que el iPhone que se
+#: dio de alta por chat usa la pasarela (decisión 7 de la spec del instalador, 2026-10-01): el instalador lo lee de aquí.
+#: Por el hash del token (el de tokens.json), con el nombre del iPhone y cuándo fue el primero; nada de la petición. La
+#: pasarela no puede escribir tokens.json (con root es de root, y systemd le deja /etc de solo lectura), así que va en su
+#: carpeta de estado. `desde` es cuándo empezó a llevar la cuenta (al arrancar la primera vez con esta versión): lo de
+#: antes no está, y el instalador lo sabe.
+USOS = "usos.json"
+#: Lo más que se lee de él: una entrada por token que se ha usado alguna vez.
+TOPE_USOS = 1024 * 1024
+
+
+def leer_usos(datos) -> dict | None:
+    """`{"v": 1, "desde": <segundos>, "tokens": {<sha256>: {"nombre": …, "primero": <segundos>}}}`, o None si no lo es.
+    Las entradas que no tienen esa forma no cuentan."""
+    try:
+        bruto = json.loads(datos or b"")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(bruto, dict) or bruto.get("v") != 1 or not isinstance(bruto.get("tokens"), dict) or \
+            isinstance(bruto.get("desde"), bool) or not isinstance(bruto.get("desde"), int):
+        return None
+    tokens = {}
+    for hash_hex, entrada in bruto["tokens"].items():
+        if isinstance(hash_hex, str) and _HASH_VALIDO.fullmatch(hash_hex) and isinstance(entrada, dict) and \
+                isinstance(entrada.get("nombre"), str) and isinstance(entrada.get("primero"), int) and \
+                not isinstance(entrada.get("primero"), bool):
+            tokens[hash_hex] = {"nombre": entrada["nombre"], "primero": entrada["primero"]}
+    return {"v": 1, "desde": bruto["desde"], "tokens": tokens}
+
+
+class Usos:
+    """El registro de `USOS`, en la carpeta de estado. Si no está (o no se entiende), se empieza uno con `desde` de
+    ahora: lo de antes no se sabe, y así lo dice. Escribe al lado y renombra, 0600, sin seguir enlaces; una vez por
+    token, la primera vez que Hermes (o la pasarela) le contesta un 2xx."""
+
+    def __init__(self, carpeta: str, reloj=time.time):
+        self.ruta = os.path.join(carpeta, USOS)
+        self.reloj = reloj
+        datos = None
+        try:
+            fd = os.open(self.ruta, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except FileNotFoundError:
+            fd = None
+        if fd is not None:
+            with os.fdopen(fd, "rb") as f:
+                datos = leer_usos(f.read(TOPE_USOS))
+        if datos is None:
+            datos = {"v": 1, "desde": int(reloj()), "tokens": {}}
+            self._escribir(datos)
+        self._datos = datos
+
+    @property
+    def datos(self) -> dict:
+        return self._datos
+
+    def apuntar(self, hash_hex: str, nombre: str) -> bool:
+        """El primer 2xx de ese token. True si lo ha apuntado ahora (no lo había)."""
+        if hash_hex in self._datos["tokens"]:
+            return False
+        self._datos["tokens"][hash_hex] = {"nombre": nombre, "primero": int(self.reloj())}
+        self._escribir(self._datos)
+        return True
+
+    def _escribir(self, datos):
+        carpeta = os.path.dirname(self.ruta)
+        temporal = os.path.join(carpeta, ".%s.%d.%s" % (USOS, os.getpid(), secrets.token_hex(4)))
+        fd = os.open(temporal, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(json.dumps(datos, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+            os.replace(temporal, self.ruta)
+        except BaseException:
+            if os.path.exists(temporal):
+                os.unlink(temporal)
+            raise
 
 
 def pendiente_desde(datos) -> int | None:
@@ -684,6 +765,14 @@ class Pasarela:
                         "siguiente": _huella_de_pem(getattr(config, "certificado_siguiente", None))}
         carpeta = getattr(config, "mantenimiento", None)
         self.mantenimiento = Mantenimiento(carpeta) if carpeta else None
+        #: Qué token ha servido alguna vez un 2xx (`Usos`, desde la 0.10.4). Sin carpeta de estado (la entrada pública del
+        #: relé), no se lleva; si no se puede escribir, se dice y se sigue sin él.
+        self.usos = None
+        if carpeta:
+            try:
+                self.usos = Usos(carpeta)
+            except OSError as error:
+                self.diario("no puedo llevar el registro de usos (%s)" % type(error).__name__)
         #: Las peticiones que están ahora con Hermes (un SSE cuenta mientras dura) y cuándo llegó la última con token.
         self._reenviando = 0
         self._ultima = None
@@ -787,6 +876,8 @@ class Pasarela:
     async def _contestar_mantenimiento(self, peticion, escritor, ip) -> bool:
         estado = self.mantenimiento.estado() if self.mantenimiento is not None else {"disponible": False}
         cuerpo = json.dumps(estado, separators=(",", ":")).encode("ascii")
+        # Antes de contestar, como al reenviar: quien recibe el 200 ya lo encuentra apuntado.
+        self._apuntar_uso()
         escritor.write(("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n"
                         "Cache-Control: no-store\r\nConnection: %s\r\n\r\n"
                         % (len(cuerpo), "close" if peticion.version == "HTTP/1.0" else "keep-alive")).encode("ascii")
@@ -927,6 +1018,7 @@ class Pasarela:
 
     async def _contestar_huellas(self, peticion, escritor, ip) -> bool:
         cuerpo = json.dumps(self.huellas, separators=(",", ":")).encode("ascii")
+        self._apuntar_uso()
         escritor.write(("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n"
                         "Cache-Control: no-store\r\nConnection: %s\r\n\r\n"
                         % (len(cuerpo), "close" if peticion.version == "HTTP/1.0" else "keep-alive")).encode("ascii")
@@ -939,6 +1031,25 @@ class Pasarela:
         """Lo que se atiende antes de mirar el token: aquí nada (None). La entrada pública del relé atiende así las
         rutas de los permisos de avisos, que no llevan credencial. Devuelve si la conexión sigue, como `_una`."""
         return None
+
+    def _apuntar_uso(self):
+        """Un 2xx para el token de esta conexión: la primera vez de ese token, a `usos.json` (su hash, su nombre y
+        cuándo). Un fallo al escribirlo se dice y no corta nada."""
+        if self.usos is None:
+            return
+        conexion = self._esta()
+        huella = conexion.huella if conexion is not None else None
+        if not huella or huella in self.usos.datos["tokens"]:
+            return
+        nombre_de = getattr(self.tokens, "nombre_de", None)
+        nombre = nombre_de(huella) if huella and nombre_de is not None else None
+        if nombre is None:
+            return
+        try:
+            if self.usos.apuntar(huella, nombre):
+                self.diario("primer uso de un token")
+        except OSError as error:
+            self.diario("no puedo apuntar el uso de un token (%s)" % type(error).__name__)
 
     def _apuntar_borrado(self, ip):
         """Hermes ha borrado una conversación: queda en su disco (páginas libres de SQLite) hasta que la limpieza de
@@ -1028,6 +1139,8 @@ class Pasarela:
         estado = int(estado_linea[1])
         if peticion.metodo == "DELETE" and 200 <= estado < 300 and BORRAR_SESION.fullmatch(peticion.ruta):
             self._apuntar_borrado(ip)
+        if 200 <= estado < 300:
+            self._apuntar_uso()
         salida, largo, troceada = [], None, False
         for linea in lineas[1:]:
             nombre, _, valor = linea.partition(":")

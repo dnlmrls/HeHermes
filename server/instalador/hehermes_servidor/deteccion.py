@@ -1,8 +1,9 @@
 """La detección: lo que el instalador necesita saber del servidor, sin cambiar nada. La junta `modo_tls.detectar_tls`.
 
-Solo ejecuta órdenes que leen (`systemctl is-active`, `ss`, `ip -j`, `ufw status`…) y dos GET a Hermes en 127.0.0.1.
-Lo que impide instalar va a `bloqueos`; lo que hay que saber pero no impide, a `avisos`. La clave de Hermes se lee para
-probarla, y no sale nunca en ningún texto.
+Solo ejecuta órdenes que leen (`systemctl is-active`, `ss`, `ip -j`, `ufw status`…), dos GET a Hermes en 127.0.0.1 y,
+desde la 0.10.4, la sonda de sus capacidades (`capacidades`: `TRACE`, que no llega a ningún manejador). Lo que impide
+instalar va a `bloqueos`; lo que hay que saber pero no impide, a `avisos`. La clave de Hermes se lee para probarla, y no
+sale nunca en ningún texto.
 
 De la VPN IKEv2 de antes de la 0.6.0 queda aquí solo lo que hace falta para reconocerla (`leer_swanctl`, `SWANCTL`,
 `CABECERA_DISPOSITIVO`), que usa «Seguridad»: la VPN ya no se instala.
@@ -16,6 +17,7 @@ import re
 import secrets
 import shlex
 
+from . import capacidades
 from . import gestor as gestores
 from .entorno import leer_env
 
@@ -67,6 +69,9 @@ def etiquetar(bloqueos: list, codigo: str) -> None:
 
 #: La línea que lee la app (`ErrorDelInstalador`): sola, la última, y solo por chat.
 PREFIJO_ERROR = "hehermes-error:"
+#: Desde la 0.10.4, la que va justo antes con lo que concreta el error para la app, si lo hay (con `hermes-antiguo`: la
+#: versión de Hermes, la mínima y lo que le falta). La última sigue siendo la de `PREFIJO_ERROR`, sin cambiar.
+PREFIJO_DETALLE = "hehermes-detalle:"
 
 
 class Hermes:
@@ -100,6 +105,16 @@ class Hermes:
         self.reinicio_a_mano = False
         #: Un Hermes en un contenedor: su red («host», «bridge»…), si se sabe.
         self.red = None
+        #: La orden de su proceso, troceada (para buscar su código si su API está apagada: `capacidades`).
+        self.orden = []
+        #: Su casa como la ve Hermes: la misma que `home`, salvo en un contenedor, donde `home` es la del servidor que va
+        #: montada en la suya (`/opt/data`). Es la que va en lo que se le dice a Hermes (`alma`).
+        self.casa_de_hermes = None
+        #: Su versión, como la dice (`/health`) o como la dice su código con la API apagada, y de dónde sale; None si no
+        #: se sabe. Y lo que se sabe de lo que tiene (`capacidades.Sondeo`), si se ha podido preguntar.
+        self.version = None
+        self.version_de = None
+        self.sondeo = None
 
     @property
     def casa_de_rutas(self) -> str:
@@ -317,7 +332,7 @@ def _candidatos(sis, root=True, usuario_actual=None):
                 entorno[clave] = valor
         gestor = gestores.detectar(sis, pid, root=root, usuario_actual=usuario_actual)
         red = None
-        casa = casa_del_proceso(sis, usuario, partes[2].split(), entorno)
+        casa = casa_de_hermes = casa_del_proceso(sis, usuario, partes[2].split(), entorno)
         if gestor is not None and gestor.tipo in gestores.CONTENEDORES:
             # Su casa es la de dentro del contenedor (`/opt/data`): la del servidor es la del montaje que la lleva.
             datos = gestores.contenedor(sis, gestor)
@@ -326,6 +341,8 @@ def _candidatos(sis, root=True, usuario_actual=None):
         origen = "el proceso %s" % pid if gestor is None else "%s, proceso %s" % (gestor.describir(), pid)
         hermes = Hermes(usuario, casa, origen)
         hermes.entorno, hermes.pid, hermes.gestor, hermes.red, hermes.en_marcha = entorno, pid, gestor, red, True
+        hermes.orden = partes[2].split()
+        hermes.casa_de_hermes = casa_de_hermes
         candidatos.append(hermes)
     vistos, unicos = set(), []
     for c in candidatos:
@@ -337,6 +354,7 @@ def _candidatos(sis, root=True, usuario_actual=None):
             primero = next(u for u in unicos if u.home.rstrip("/") == c.home.rstrip("/"))
             primero.en_marcha = True
             primero.pid = primero.pid or c.pid
+            primero.orden = primero.orden or c.orden
     if any(c.pid is not None for c in unicos):
         # La unidad hermes-gateway parada no cuenta si hay otro Hermes en marcha (el de un perfil, con su unidad): es el
         # que corre el que hay que conectar.
@@ -427,6 +445,9 @@ def _hermes(sis, det, hermes_home, activar_api=False, corregir_exposicion=False,
         det.bloqueos.append(bloqueo("api-hermes", "API_SERVER_PORT de %s no es un puerto" % elegido.env))
         return
     if activar_api and not (elegido.habilitada and elegido.clave):
+        # Su API no escucha todavía: lo que tiene se sabe por la versión de su código, y uno demasiado viejo para la app
+        # se para aquí, antes de encender nada.
+        _version_sin_api(sis, det, elegido)
         _activar_api(det, elegido, env, ambito)
         return
     if not elegido.habilitada:
@@ -449,7 +470,7 @@ def _hermes(sis, det, hermes_home, activar_api=False, corregir_exposicion=False,
         return
     _exposicion(sis, det, elegido, env, corregir_exposicion, ambito)
     base ="http://127.0.0.1:%d" % elegido.puerto
-    estado, _ = sis.http_get(base + "/health")
+    estado, cuerpo = sis.http_get(base + "/health")
     if estado is None:
         det.bloqueos.append("Hermes está en marcha, pero su API no contesta en 127.0.0.1:%d: ¿la tiene encendida "
                             "(API_SERVER_ENABLED) y en ese puerto (API_SERVER_PORT)?" % elegido.puerto)
@@ -460,14 +481,57 @@ def _hermes(sis, det, hermes_home, activar_api=False, corregir_exposicion=False,
                             "ese puerto, o el API_SERVER_PORT de %s" % (elegido.puerto, estado, elegido.env))
         etiquetar(det.bloqueos, "api-hermes")
         return
+    elegido.version, elegido.version_de = capacidades.version_de_health(cuerpo), "su /health"
     estado, _ = sis.http_get(base + "/api/sessions?limit=1", {"Authorization": "Bearer " + elegido.clave})
     elegido.clave_vale = estado == 200
     if estado in (401, 403):
         det.bloqueos.append("Hermes no la acepta: la API_SERVER_KEY de %s no es la que usa (¿falta reiniciarlo?)"
                             % elegido.env)
         etiquetar(det.bloqueos, "clave-hermes")
-    elif estado != 200:
+    elif estado in (200, 404):
+        # Un 404 a la bandeja con su clave es que no tiene la ruta: un Hermes anterior a la 0.15.0.
+        _capacidades(sis, det, elegido, sin_bandeja=estado == 404)
+    else:
         det.bloqueos.append(bloqueo("api-hermes", "Hermes contesta %s a /api/sessions con su clave" % estado))
+
+
+def _capacidades(sis, det, elegido, sin_bandeja=False):
+    """Lo que la app necesita de su api_server (`capacidades`): lo que falta y es obligatorio para con
+    `hermes-antiguo`; lo demás se avisa."""
+    sondeo = capacidades.sondear(sis, elegido.puerto, elegido.version)
+    if sin_bandeja:
+        sondeo.presentes.discard("bandeja")
+        sondeo.sin_saber.discard("bandeja")
+        sondeo.ausentes.add("bandeja")
+    elegido.sondeo = sondeo
+    _veredicto(det, elegido, sondeo)
+    if sin_bandeja and not any(getattr(b, "codigo", None) == "hermes-antiguo" for b in det.bloqueos):
+        det.bloqueos.append(bloqueo("api-hermes", "Hermes contesta 404 a /api/sessions con su clave"))
+
+
+def _veredicto(det, elegido, sondeo):
+    bloqueos, avisos = capacidades.veredicto(sondeo, usuario=elegido.usuario, gestor=elegido.gestor)
+    for texto, detalle in bloqueos:
+        hecho = bloqueo("hermes-antiguo", texto)
+        hecho.detalle = detalle
+        det.bloqueos.append(hecho)
+    det.avisos.extend(avisos)
+
+
+def _version_sin_api(sis, det, elegido):
+    """Con la API apagada (`--activar-api`), la versión de su código: si es anterior a la que necesita la app, se para
+    antes de encender nada. Si no se encuentra, no se sabe: lo mirará `comprobar` con la API ya encendida."""
+    texto, carpeta = capacidades.version_del_codigo(sis, elegido)
+    if texto is None:
+        det.avisos.append("No sé qué versión de Hermes es (su API está apagada y no encuentro su código): HeHermes "
+                          "necesita la %s o más nueva. «hehermes-servidor comprobar» lo mira cuando Hermes vuelva con "
+                          "la API encendida" % capacidades.texto_de(capacidades.MINIMA))
+        return
+    elegido.version, elegido.version_de = texto, "su código, en %s" % carpeta
+    sondeo = capacidades.Sondeo(texto, elegido.version_de)
+    sondeo.sin_saber = {c.clave for c in capacidades.CAPACIDADES}
+    elegido.sondeo = sondeo
+    _veredicto(det, elegido, sondeo)
 
 
 TODAS = ("0.0.0.0", "::", "[::]", "*")

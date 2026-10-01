@@ -60,8 +60,11 @@ class ConLasDos(Ayudas):
         self.tls()
         self.assertFalse([o for o in self.ordenes_de(desde) if o[0].rsplit("/", 1)[-1] in DE_LA_VPN])
         despues = self.foto()
-        self.assertEqual({r: v for r, v in despues.items() if r in de_la_vpn}, de_la_vpn,
-                         "lo de la VPN, byte a byte como estaba")
+        # El SOUL.md de Hermes no es de la VPN: la pasarela le añade cómo mandar ficheros al iPhone (`alma`).
+        soul = "/root/.hermes/SOUL.md"
+        self.assertEqual({r: v for r, v in despues.items() if r in de_la_vpn and r != soul},
+                         {r: v for r, v in de_la_vpn.items() if r != soul}, "lo de la VPN, byte a byte como estaba")
+        self.assertIn(b"## Ficheros para el iPhone (HeHermes)", despues[soul][2])
         self.assertEqual(self.manifiesto()["modos"], ["vpn", "tls"])
         self.assertEqual([t["nombre"] for t in self.tokens()], ["iphone-tls"])
         self.assertEqual([d["nombre"] for d in json.loads(self.sis.leer(self.falso.dispositivos_json))["dispositivos"]],

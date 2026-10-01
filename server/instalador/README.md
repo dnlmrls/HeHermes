@@ -40,6 +40,19 @@ reiniciaba para encender su API; la app no se quedó con la conexión, y la mism
 Ahora el mismo iPhone (el mismo `--iphone`) puede volver a pedirla en la media hora siguiente a instalar: otro enlace,
 otro token, y el de antes deja de valer. El canje dura 12 minutos y el reinicio de Hermes no lo toca: [abajo](#el-alta-por-chat---por-chat).
 
+**La 0.10.4 mira el Hermes del probador antes de dar nada, y deja el chat abierto hasta que se use.** Tres cosas:
+- **Lo que la app necesita de Hermes, antes del QR o del enlace** ([abajo](#el-hermes-que-necesita-la-app-desde-la-0104)):
+  la sonda de sus capacidades (`hehermes_servidor/capacidades.py`, con `TRACE`, sin lanzar ni tocar nada) y su versión.
+  A uno que no tiene algo que la app necesita (anterior a la **0.20.1**) se le para con `hehermes-error:hermes-antiguo`,
+  su versión, lo que le falta y cómo actualizarlo; lo que la app puede no tener, se avisa. El plan y `comprobar` dicen su
+  versión.
+- **El alta por chat sigue abierta hasta que el iPhone que se dio de alta por chat usa la pasarela** (decisión 7, Daniel,
+  2026-10-01; antes, la media hora siguiente a instalar): la pasarela apunta el primer 2xx de cada token en su
+  `usos.json`. Mientras no la ha usado, la misma frase vuelve a dar un enlace, y uno nuevo (otro nombre) entra en su
+  lugar: [abajo](#el-alta-por-chat---por-chat).
+- **El `SOUL.md` de Hermes** (el de su perfil) lleva, una vez y con una copia antes, cómo mandar ficheros al iPhone
+  (`<su casa>/exports` y una línea `MEDIA:<ruta>`); desinstalar lo quita: [abajo](#el-soulmd-de-hermes-desde-la-0104).
+
 **Desde la 0.6.0 la pasarela es lo único que instala para conectar.** La VPN IKEv2 de las versiones anteriores ya no se instala, ni se repara,
 ni se actualiza, y la app ya no la usa: `instalar --modo vpn` se para y dice que ya no existe. La de un servidor que la
 tenga **se quita** con `desinstalar --modo vpn`, sin tocar la pasarela: [abajo](#la-vpn-de-antes), paso a paso.
@@ -89,7 +102,7 @@ rutas y los errores.
 | El usuario | `hh-pasarela`, de sistema, sin casa ni shell |
 | Código | `/opt/hehermes-servidor/` (con `hehermes-pasarela` y la clave pública de las firmas), `/usr/local/sbin/hehermes-servidor` y `/usr/local/sbin/hehermes-dispositivo` (si no hay ya uno ajeno) |
 | La pasarela | `/etc/hehermes-pasarela/` (0750, `root:hh-pasarela`): `pasarela.ini` y `tokens.json` (0640, del grupo), `cert.pem` (0644), `clave.pem` (0600, de root), `clave-hermes` (0600, de `hh-pasarela`, que la lee sola), `siguiente/` (el certificado que viene después: su `cert.pem` 0644 y su `clave.pem` 0600 de root, sin usar hasta rotar) y, tras rotar, `anterior/`. **No** escribe `/etc/hehermes/servidor.ini`, que era de la VPN |
-| La unidad | `hehermes-pasarela.service`: `User=hh-pasarela`, sin capacidades, `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `ProtectKernel*`, `ProtectProc=invisible`, `RestrictNamespaces`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, `MemoryDenyWriteExecute`, `SystemCallFilter=@system-service` sin `@privileged` ni `@resources` y `UMask=0077`. La clave del certificado y (si están los avisos) el secreto del vigía le llegan con `LoadCredential`. Solo escribe en su `StateDirectory` (`/var/lib/hehermes-pasarela`: el borrado pendiente y su actividad). Un error de configuración sale con 78, que no se reinicia en bucle (`RestartPreventExitStatus=78`, `StartLimitBurst=5`) |
+| La unidad | `hehermes-pasarela.service`: `User=hh-pasarela`, sin capacidades, `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `ProtectKernel*`, `ProtectProc=invisible`, `RestrictNamespaces`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, `MemoryDenyWriteExecute`, `SystemCallFilter=@system-service` sin `@privileged` ni `@resources` y `UMask=0077`. La clave del certificado y (si están los avisos) el secreto del vigía le llegan con `LoadCredential`. Solo escribe en su `StateDirectory` (`/var/lib/hehermes-pasarela`: el borrado pendiente, su actividad y, desde la 0.10.4, `usos.json`: el primer 2xx de cada token, con su hash, su nombre y cuándo, sin nada de la petición). Un error de configuración sale con 78, que no se reinicia en bucle (`RestartPreventExitStatus=78`, `StartLimitBurst=5`) |
 | La clave de Hermes | `hehermes-pasarela-clave.path` vigila el `.env` y, si cambia, `hehermes-servidor pasarela-clave` pone al día `clave-hermes`; desde la 0.9.0 la pasarela la vuelve a leer sola, **sin reiniciarse** (los SSE abiertos siguen) |
 | El borrado de verdad | `hehermes-borrado.timer` (cada 15 minutos de 2:00 a 6:00): si la app ha borrado algo de Hermes, lo compacta con Hermes parado unos segundos ([abajo](#el-borrado-de-verdad)) |
 | Cortafuegos | Solo el TCP de la pasarela: `ufw allow proto tcp … port P comment hehermes`, `--add-port=P/tcp` en firewalld, o su regla en las cadenas de nftables o iptables, con `hehermes-cortafuegos.service` para después de un reinicio ([abajo](#los-cortafuegos)). **No enciende ninguno** |
@@ -300,7 +313,7 @@ Hay que saber:
   - /usr/local/sbin/hehermes-dispositivo no es mío: no lo toco. Para los iPhone de la pasarela usa el mío: sudo /opt/hehermes-servidor/hehermes-dispositivo alta <nombre>
   - Aquí ya hay unos avisos puestos a mano (/opt/hehermes-avisos, los de server/avisos/despliegue/instalar.sh): ni el vigía ni el lector de ficheros los pongo yo, y lo suyo no lo toco
 
-52 cambios.
+54 cambios.
 ```
 <!-- /pasarela-de-daniel -->
 
@@ -376,13 +389,23 @@ llavero, 30 minutos y sin salir del iPhone). Hermes la ejecuta con su terminal:
 - **Lo que entrega el canje** es `{"h", "p", "f", "t"}` (la dirección, el puerto de la pasarela como número, su huella y
   el token), en ese orden, y nada más: el canje se niega a arrancar con otra cosa. Lo fija `tests/datos/canje-tls.json`,
   que comparte la app.
-- **Solo el primer iPhone, y en la media hora siguiente a instalar** (decisión 7): se para si hay otro dado de alta (en
-  la pasarela o en una VPN de antes), si este no se dio por chat, si ya se canjeó el de otro iPhone o si la instalación
-  es de hace más de 30 minutos (una sin fecha cuenta como vieja). Repetirlo dentro de la media hora **para el mismo
-  iPhone**, se canjeara o no, da un enlace nuevo con un token nuevo (el de antes no se puede recuperar, y deja de
-  valer): desde la 0.10.3, también después de canjearse, porque una app que se quedó sin la conexión (Hermes
-  reiniciándose al comprobarla) no tenía otra salida. Cada app pone su propio nombre en `--iphone` (`iphone-` y cuatro
-  cifras hexadecimales; la que ya se había conectado antes, `mi-iphone`), así que otro iPhone es otro nombre.
+- **Hasta que el iPhone que se dio de alta por chat usa la pasarela** (decisión 7, Daniel, 2026-10-01): en cuanto
+  Hermes (o la pasarela) le contesta un 2xx a su token, el chat se cierra, y los demás van por SSH o desde la app. Lo
+  apunta la pasarela, en `usos.json` (su carpeta de estado), el primer 2xx de cada token: su hash, su nombre y cuándo;
+  cuenta un uso de ese nombre desde su alta (también con un token rotado por SSH), y se queda cerrado aunque se dé de
+  baja. Mientras no la ha usado, se canjeara o no y pase el tiempo que pase:
+  - la misma frase **para el mismo iPhone** (el mismo `--iphone`) da un enlace nuevo con un token nuevo (el de antes no
+    se puede recuperar, y deja de valer);
+  - la de **otro nombre** entra **en su lugar**: el token del de chat deja de valer. La app cambia de nombre si se
+    reinstala (`iphone-` y cuatro cifras hexadecimales; la de la 0.10.2 era `mi-iphone` para todos), y el probador al
+    que se le quedó la conexión a medias (su única petición dio un 502, con Hermes reiniciándose) no tenía otra salida.
+
+  Se sigue parando si hay otro iPhone dado de alta por SSH (en la pasarela o en una VPN de antes), o si este nombre lo
+  está y no se dio por chat. **Una pasarela de antes de la 0.10.4 no apuntaba los usos**: lo que falta lo dice su diario
+  (`journalctl -u hehermes-pasarela`, sus líneas «ip método estado bytes»): si llega hasta antes del alta y desde
+  entonces no hay ningún 2xx, sigue abierto; si hay uno, cerrado; y si no llega (un diario solo en memoria y un
+  reinicio) o no hay diario, no se sabe, y no se reabre (`hehermes-error:por-chat`; por SSH, `hehermes-dispositivo
+  rotar`). Hasta la 0.10.3 era «solo en la media hora siguiente a instalar».
 - **El canje dura 12 minutos** (la frase promete diez; el enlace sale después de arrancarlo) y **es su propia unidad**
   (`systemd-run --unit=hehermes-canje`, ni `--scope` ni atada a Hermes): el reinicio de Hermes de `--activar-api`, a los
   90 s, no lo toca.
@@ -430,8 +453,8 @@ salidas, en este orden:
    de la carpeta de otro usuario.
 2. Que le dé al usuario de Hermes sudo **solo para el instalador**, una vez instalado (con 1, o con el comando de la app
    sin `--iphone`), con `sudo visudo -f /etc/sudoers.d/hehermes-servidor` y la línea
-   `<usuario> ALL=(root) NOPASSWD: /usr/local/sbin/hehermes-servidor`. Por chat, dentro de la media hora siguiente a
-   instalar (decisión 7).
+   `<usuario> ALL=(root) NOPASSWD: /usr/local/sbin/hehermes-servidor`. Por chat, mientras el iPhone que se dé de alta
+   por chat no haya usado la pasarela (decisión 7).
 
 **`hehermes-error:sin-permisos` ya no sale nunca.** Hasta la 0.6.0 era la última línea de ese mensaje por chat con
 `--modo vpn`, para que la app la reconociera; sin VPN, un alta por chat sin root se instala como el usuario.
@@ -449,6 +472,7 @@ instrucciones a Hermes (la spec, «La frase», dice por qué):
 | `linger` | Sin root y sin linger (y no se ha podido encender): la pasarela se pararía al cerrarse la sesión. `sudo loginctl enable-linger <usuario>` |
 | `sin-hermes`, `hermes-parado`, `varios-hermes` | No hay Hermes, está parado, o hay varios (`--hermes-home`) |
 | `api-apagada`, `api-hermes`, `clave-hermes` | La API de Hermes apagada (y no se puede encender: sin `--activar-api`, o en un contenedor con su propia red), que no contesta o no en 127.0.0.1, o su `API_SERVER_KEY` que falta o no vale |
+| `hermes-antiguo` | Desde la 0.10.4: a Hermes le falta algo que la app necesita (anterior a la 0.20.1, o uno al que le falta una ruta). Justo antes de la última línea va otra para la app: `hehermes-detalle:version=<la suya, o ?> minima=0.20.1 falta=<claves>` ([abajo](#el-hermes-que-necesita-la-app-desde-la-0104)) |
 | `reinicia-hermes` | Hermes no corre bajo systemd ni en un contenedor: su API ya está encendida en el `.env`, y hay que reiniciarlo (`/restart`) y volver a lanzar lo mismo |
 | `ensurepip`, `sin-disco`, `puerto`, `sistema`, `paquete` | Sin `python3-venv`, sin sitio (150 MB), sin puerto libre, un sistema que no sabe, o un paquete incompleto |
 | `cortafuegos` | El cortafuegos cierra el paso y no se sabe abrir sin riesgo |
@@ -493,7 +517,8 @@ también el siguiente `instalar --por-chat` y `desinstalar`). La app acepta cual
 ## Cómo no pisa nada
 
 - **Solo escribe en lo suyo** (`hehermes-*`, `/etc/hehermes*/`, `/opt/hehermes*`). Nunca Hermes, salvo las líneas
-  de `--activar-api` y `--corregir-exposicion` en su `.env`, con una copia antes.
+  de `--activar-api` y `--corregir-exposicion` en su `.env` y, desde la 0.10.4, el párrafo de su `SOUL.md`
+  ([abajo](#el-soulmd-de-hermes-desde-la-0104)), siempre con una copia antes.
 - **El manifiesto**, `/etc/hehermes/instalacion.json` (0600): cada fichero con su hash (o el destino, si es un enlace),
   las carpetas que creó, los paquetes que instaló, las reglas que puso, las unidades que habilitó y los usuarios que
   creó. Un fichero que no está en él es **ajeno**, y uno que está pero ha cambiado es **cambiado**: los dos paran el
@@ -527,7 +552,45 @@ también el siguiente `instalar --por-chat` y `desinstalar`). La app acepta cual
   `API_SERVER_KEY`, `API_SERVER_HOST` y `API_SERVER_PORT`; que `GET /health` conteste 200 en `127.0.0.1` y que la clave
   valga en `GET /api/sessions?limit=1`. Cada fallo con su mensaje: no está, está instalado pero parado (la unidad, o
   solo su carpeta `.hermes`), su API está apagada, en su puerto contesta otra cosa, su clave no vale (o lleva algo que
-  no puede ir en una cabecera). Varios Hermes se enumeran. La clave no se imprime nunca.
+  no puede ir en una cabecera). Varios Hermes se enumeran. La clave no se imprime nunca. Desde la 0.10.4, también su
+  versión y lo que la app necesita de su api_server (abajo).
+
+### El Hermes que necesita la app (desde la 0.10.4)
+
+La app solo se ha probado contra el Hermes de Daniel (el `main` del 2026-09-17, que dice «0.21.3»), y un probador puede
+tener uno de hace meses: si le falta una ruta que la app usa, el alta sale bien y la app falla después sin decir por qué
+(lo primero que pregunta al conectar, `GET /api/model/options`, no existe antes de la 0.19.1). `instalar` lo mira antes
+de dar el QR o el enlace (`hehermes_servidor/capacidades.py`), y `comprobar` lo vuelve a mirar:
+
+- **Sin efectos.** Con `TRACE` a la ruta de cada cosa, con un id que no existe y sin la clave: aiohttp (el api_server de
+  Hermes) contesta a un método que una ruta no tiene con un 405 cuyo `Allow` dice los que sí tiene, y a una ruta que no
+  existe con su 404, sin llegar a ningún manejador ni mirar la clave. Así se sabe si están `POST /v1/runs` o
+  `PATCH /api/sessions/{id}` sin lanzar ningún turno, ni crear o tocar ninguna sesión, ni mandar nada. `OPTIONS` no
+  sirve (el middleware de CORS de Hermes lo contesta él, con un 403). Antes se calibra con `TRACE /health`: si no da un
+  405 con `GET` (otro servidor, o un Hermes que algún día lo conteste de otra forma), la sonda no vale y queda la
+  versión. Comprobado contra aiohttp de verdad, con las rutas y los middlewares de Hermes (`tests/test_capacidades.py`).
+- **Lo que necesita** (obligatorio: sin ello la app falla de forma confusa), con la versión de Hermes en que llegó, de sus
+  etiquetas de GitHub (`NousResearch/hermes-agent`, la tabla de rutas de cada una): la bandeja, empezar una conversación,
+  su historial y fijarla, archivarla o renombrarla (`GET`/`POST /api/sessions`, `GET …/messages`, `PATCH
+  /api/sessions/{id}`: 0.15.0); mandar un mensaje y ver la respuesta mientras se escribe (`POST /v1/runs`,
+  `GET /v1/runs/{id}/events`: 0.8.0); recuperarla y pararla (`GET /v1/runs/{id}`, `POST …/stop`: 0.12.0); aprobar una
+  orden (`POST …/approval`: 0.14.0); el modelo (`GET /api/model/options`: 0.19.1); y escribir mientras trabaja
+  (`POST …/steer`: **0.20.1**). **La mínima es la 0.20.1.**
+- **Lo que la app puede no tener** (se avisa y sigue): el consumo de la ficha (`GET /api/sessions/{id}`), «Eliminar
+  también de Hermes» (`DELETE /api/sessions/{id}`) y las tareas programadas (`GET /api/jobs`).
+- **Lo que no se ve en las rutas, por la versión:** hasta la **0.21.1** Hermes no lleva a los subagentes en segundo plano
+  (`delegation_id`), y antes de la 0.21.0 no reconoce un mensaje repetido (`Idempotency-Key`): la app funciona, pero se
+  avisa. Lo que no se avisa, porque un `main` dice la versión publicada anterior (el de Daniel dice «0.21.3» y ya lo
+  tiene): hasta la 0.21.3 el keepalive del SSE es cada 30 s, y la app, que corta a los 25 s sin nada, sigue el turno
+  sondeando en los silencios largos.
+- **Con la API apagada** (`--activar-api`) no hay a quién preguntar: vale la versión de su código (desde lo que ejecuta su
+  proceso, su carpeta de trabajo o `<casa>/hermes-agent`, la de su instalador; en un contenedor, dentro de él): su
+  `install-stamp.json`, el `__version__` de `hermes_cli` o su `pyproject.toml`. Uno anterior a la mínima se para antes de
+  encender nada; si no se encuentra, se avisa y lo mira `comprobar`.
+- **Lo que dice:** la versión en el plan (`Hermes … versión 0.21.3`) y en `comprobar`; a uno viejo, `hermes-antiguo` con
+  su versión, lo que le falta (cada cosa con su ruta) y cómo actualizarlo: `hermes update` como su usuario o `/update` en
+  su chat (lo actualiza y lo reinicia); en un contenedor, su imagen nueva. Por chat, antes de la última línea,
+  `hehermes-detalle:version=0.19.0 minima=0.20.1 falta=modelo,desviar`, para la app.
 - **La dirección pública:** la de salida (`ip route get`); si es privada, `--direccion` o se pregunta en un terminal.
 - **Lo que ya hay:** el puerto de la pasarela (uno libre), el cortafuegos (ufw, firewalld, nftables e iptables:
   [abajo](#los-cortafuegos)), `python3-venv`, el gestor de usuario y linger (sin root), y una VPN de HeHermes, hecha a
@@ -543,6 +606,32 @@ en rojo y **no se cambia sin permiso**, porque puede que otra cosa del usuario l
   dueño) y reinicia Hermes 90 s después de acabar, como `--activar-api` (su unidad o su contenedor). Suelto, no.
 - Si lo fija el entorno de la unidad (`Environment=`), o el `.env` ya dice 127.0.0.1, no se toca: se dice dónde está.
 - Desinstalar **no** lo deshace (volvería a abrir la API) y lo dice.
+
+### El SOUL.md de Hermes (desde la 0.10.4)
+
+La app solo descarga lo que Hermes marca con una línea `MEDIA:<ruta>`, y el lector solo sirve sus caches y
+`<su casa>/exports`: Hermes no lo sabe solo (al de Daniel se lo dice su `SOUL.md`, puesto a mano). `instalar` le añade
+al de cada Hermes, al final y una sola vez, este párrafo (`hehermes_servidor/alma.py`), con la carpeta como la ve él (en
+un contenedor, la de dentro):
+
+> ## Ficheros para el iPhone (HeHermes)
+>
+> Cuando quieras mandarme un fichero al iPhone (un PDF, una imagen, un informe…), guárdalo como un fichero normal (no un
+> enlace ni una carpeta) en /root/.hermes/exports y, en tu respuesta, pon una línea aparte con MEDIA: y su ruta
+> absoluta; por ejemplo, MEDIA:/root/.hermes/exports/informe.pdf. La app HeHermes solo descarga lo que está en esa
+> carpeta.
+
+- **El que usa Hermes:** el de su HERMES_HOME, que con un perfil es la casa del perfil (`agent/prompt_builder.py`,
+  `load_soul_md`). El plan lo dice: «añado a SOUL.md cómo mandar ficheros al iPhone».
+- **Con una copia antes** (`/etc/hehermes/copias`, o `~/.config/hehermes/copias` sin root), en bytes (no cambia ni uno de
+  lo que había), sin cambiarle el dueño ni el modo. Lo añadido, tal cual, va al manifiesto: **desinstalar quita
+  exactamente eso** (lo que se escribiera después se queda) y la copia; si alguien lo ha cambiado, no lo quita y lo dice.
+- **No se toca** uno que ya lo dice (el título de arriba, o uno que ya habla de `MEDIA:` y de `exports`, como el de
+  Daniel: «ya está*»), uno que no está o está vacío (Hermes usaría su personalidad de serie, y con solo este párrafo la
+  perdería), uno que es un enlace, ni el de un perfil de una distribución (`distribution.yaml`: `hermes profile update`
+  lo reescribe). Se avisa de cómo decírselo a mano.
+- El texto no casa con ningún patrón del escáner de inyecciones de Hermes (`tools/threat_patterns.py`, de la 0.15.0 a
+  `main`), que en las versiones anteriores a la 0.21.4, o en un perfil de una distribución, bloquea el fichero entero.
 
 ### Los cortafuegos
 
@@ -619,6 +708,23 @@ Seguridad
 El `MAL` del agujero es el del sitio escrito a mano (`server/vpn/hehermes-tunel.nginx`), que el doble copia tal cual.
 Lo arregla quitar esa VPN (a mano: no es del instalador), o cerrarlo con `deny 10.77.0.1;` al principio de su
 `location /`.
+
+## Decisiones de la 0.10.4
+
+- **La sonda, con `TRACE` y sin la clave.** Un `GET` a un run o a una sesión que no existe obligaría a distinguir el 404
+  del recurso del de la ruta (y el `POST`, el `PATCH` o el `DELETE` llegarían a su manejador); el 405 de aiohttp con su
+  `Allow` lo dice todo de una ruta sin que nada corra. La lista de lo que ve la sonda la escribe aparte la historia de
+  Hermes de las pruebas (`servidor_falso.RUTAS_HERMES`), y las dos tienen que decir lo mismo.
+- **La mínima la pone lo que se puede mirar** (la ruta del desvío, la 0.20.1); lo que no (los subagentes en segundo
+  plano, la idempotencia de los turnos), se avisa por la versión, que en un `main` miente hacia abajo.
+- **Por chat, otro nombre entra en lugar del de chat que no ha usado la pasarela.** La decisión de Daniel nombra «el
+  mismo nombre»; pero la app cambia de nombre al reinstalarse, y la del probador de la 0.10.2 se llamaba «mi-iphone»
+  (la de ahora le pondría `iphone-xxxx`): con solo el mismo nombre, el caso que lo motivó seguiría sin salida. Lo que
+  una inyección puede hacer antes del primer uso es lo mismo con un nombre que con otro (`mi-iphone` se adivina).
+- **Sin saber si se usó, cerrado.** Una pasarela de antes no apuntaba los usos: vale su diario solo si llega hasta el
+  alta; si no, el chat no se reabre a ciegas.
+- **El `SOUL.md`, solo si ya existe y dice algo.** Crear uno, o escribir en uno vacío, cambiaría la personalidad de
+  Hermes; uno de una distribución lo reescribe `hermes profile update`.
 
 ## Decisiones de la 0.9.0
 
@@ -703,7 +809,9 @@ Si Hermes no es una unidad de systemd (o va en un contenedor), o sin root no es 
 
 Las del canje (`tests/test_canje_*.py`) necesitan `cryptography` y no importan sin ella; las demás corren también con el
 `python3` del sistema (`-p "test_[!c]*"`). Las del QR (`tests/test_qr.py`) se comparan con `segno` si está en el venv
-(`pip install segno`, solo para las pruebas: al servidor no va); sin él, esas se saltan.
+(`pip install segno`, solo para las pruebas: al servidor no va); sin él, esas se saltan. Igual la sonda de las
+capacidades de Hermes contra aiohttp de verdad (`tests/test_capacidades.py`, `ConAiohttp`), con `aiohttp` en el venv;
+las demás de la sonda van contra Hermes de mentira de cada edad (`servidor_falso.RUTAS_HERMES`).
 
 La pasarela también se prueba de verdad (`tests/test_pasarela_red.py`): TLS en 127.0.0.1 con el certificado de prueba
 (`tests/datos/pasarela-NO-ES-DE-DANIEL.*`), un Hermes y un vigía de mentira detrás y un cliente que hace de iPhone: el
