@@ -17,9 +17,14 @@ import time
 from . import piezas as p
 from .plan import etiquetar, registro_de_dispositivos
 
-#: Decisión 7: por chat, solo en la media hora siguiente a instalar.
-VENTANA = 30 * 60
+# Decisión 7 (Daniel, 2026-10-01): el alta por chat sigue abierta hasta que el iPhone que se dio de alta por chat usa
+# la pasarela (un 2xx con su token, que apunta la pasarela en `usos.json`); desde entonces, los demás por SSH o desde la
+# app. Hasta la 0.10.3 era «solo en la media hora siguiente a instalar» (`VENTANA`, 30 minutos), y un probador cuya
+# única petición dio un 502 (Hermes reiniciándose) se quedó sin salida por chat.
 _LLAVE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+#: Una línea del diario de la pasarela de una petición con token que Hermes (o ella) contestó con un 2xx:
+#: «<ip> <método> <estado> <bytes>» (lo que apunta `Pasarela._ida_y_vuelta`, igual desde la 0.5.0).
+_LINEA_2XX = re.compile(r"\S+ [A-Z]+ 2\d\d \d+")
 
 
 def llave_valida(texto) -> bool:
@@ -45,47 +50,113 @@ def activos_del_servidor(sis, man, ambito=None) -> list:
     return lista + [{"nombre": n} for n in nombres_de_la_pasarela(sis, ambito)]
 
 
-def bloqueos(sis, man, op, ahora=None, activos=None) -> list:
-    """Lo que impide un alta por chat (decisión 7). Una web o un correo que lea Hermes pueden llevar escondida la orden
-    de dar un alta con la llave de otro: por eso solo vale para el primer iPhone y recién instalado (la media hora de
-    `VENTANA`, contada desde la instalación, que repetir no alarga). Dentro de esa media hora, el mismo iPhone puede
-    volver a pedirla aunque ya se canjeara: se le da otra clave y la de antes deja de valer (`reemitir`).
+def leer_usos(sis, ambito) -> dict | None:
+    """El registro de usos de la pasarela (`pasarela.USOS`, desde la 0.10.4), o None si no lo hay o no se entiende."""
+    from .pasarela import TOPE_USOS, USOS, leer_usos as leer
+    datos = sis.leer(ambito.carpeta_estado_pasarela + "/" + USOS)
+    return leer(datos[:TOPE_USOS]) if datos is not None else None
+
+
+def _diario_sin_2xx(sis, ambito, desde) -> bool | None:
+    """Lo que dice el diario de la pasarela desde `desde`: True si llega hasta antes de entonces y no hay ningún 2xx con
+    token (nadie la ha usado), False si lo hay, None si no se sabe (sin diario, o uno que no llega tan atrás: el de un
+    servidor que lo guarda solo en memoria y se ha reiniciado). journald borra lo más viejo primero, así que una entrada
+    de antes de `desde` dice que está todo lo de después."""
+    base = ["journalctl"] + ([] if ambito.root else ["--user"]) + ["-u", p.UNIDAD_PASARELA, "--no-pager", "-q"]
+    r = sis.ejecutar(base + ["-o", "short-unix", "--until", "@%d" % int(desde), "-n", "1"])
+    if not r.bien or not r.salida.strip():
+        return None
+    r = sis.ejecutar(base + ["-o", "cat", "--since", "@%d" % int(desde)])
+    if not r.bien:
+        return None
+    return not any(_LINEA_2XX.fullmatch(linea.strip()) for linea in r.salida.splitlines())
+
+
+def uso_del_iphone_por_chat(sis, man, ambito) -> tuple:
+    """Si el iPhone que se dio de alta por chat (`por_chat` del manifiesto) ha usado la pasarela desde entonces:
+    ("sin-usar", None), ("usado", cuándo o None) o ("no-se", por qué). Sin alta por chat, ("sin-usar", None).
+
+    Lo apunta la pasarela (`usos.json`): un uso de su nombre desde su alta. Si el registro empezó después del alta (una
+    pasarela de antes de la 0.10.4, como la del probador de la 0.10.2), lo que falta lo dice su diario. Si tampoco
+    llega, no se sabe, y no se sabe es «usado»: no se reabre a ciegas."""
+    por_chat = man.datos.get("por_chat") or {}
+    nombre = por_chat.get("iphone")
+    if not nombre:
+        return "sin-usar", None
+    # Desde cuándo cuenta un uso: su alta (o, en un manifiesto que no la tenga, la instalación, que es de antes).
+    alta = next((int(t) for t in (por_chat.get("alta"), man.datos.get("instalado"))
+                 if isinstance(t, (int, float)) and not isinstance(t, bool)), None)
+    usos = leer_usos(sis, ambito)
+    if usos is not None:
+        primeros = [e["primero"] for e in usos["tokens"].values()
+                    if e["nombre"] == nombre and (alta is None or e["primero"] >= alta)]
+        if primeros:
+            return "usado", min(primeros)
+        if alta is not None and usos["desde"] <= alta:
+            return "sin-usar", None
+    if alta is None:
+        return "no-se", "no sé cuándo se dio de alta"
+    diario = _diario_sin_2xx(sis, ambito, alta)
+    if diario is True:
+        return "sin-usar", None
+    if diario is False:
+        return "usado", None
+    return "no-se", ("la pasarela no apuntaba entonces quién la usa y su diario no llega hasta el alta")
+
+
+def bloqueos(sis, man, op, activos=None, ambito=None) -> list:
+    """Lo que impide un alta por chat (decisión 7, Daniel, 2026-10-01). Una web o un correo que lea Hermes pueden llevar
+    escondida la orden de dar un alta con la llave de otro: por eso el chat se cierra en cuanto el iPhone que se dio de
+    alta por chat usa la pasarela (un 2xx con su token), y desde entonces los demás van por SSH o desde la app. Mientras
+    no la ha usado (se canjeara o no), la misma frase vuelve a dar un enlace: al mismo iPhone, con otra clave (la de antes
+    deja de valer, `reemitir`); y a otro nombre, en su lugar (`a_sustituir`): la app cambia de nombre si se reinstala, y
+    la de la 0.10.2 se llamaba «mi-iphone». Un iPhone dado de alta por SSH sigue cerrando el chat, como siempre.
     `activos`, los iPhone del servidor (`activos_del_servidor`)."""
-    ahora = time.time() if ahora is None else ahora
+    from . import ambito as amb
+    ambito = ambito or amb.de_root()
     salida = []
     por_chat = man.datos.get("por_chat") or {}
+    de_chat = por_chat.get("iphone")
     activos = list(activos or [])
-    otros = sorted(d["nombre"] for d in activos if d.get("nombre") != op.iphone)
+    estado, cuando = uso_del_iphone_por_chat(sis, man, ambito)
     alta = "hehermes-dispositivo alta <nombre>"
+    if estado != "sin-usar":
+        if estado == "usado":
+            fecha = "" if cuando is None else " (%s UTC)" % time.strftime("%Y-%m-%d %H:%M", time.gmtime(cuando))
+            texto = "«%s» se dio de alta por chat y ya ha usado la pasarela%s" % (de_chat, fecha)
+        else:
+            texto = "«%s» se dio de alta por chat y no sé si ha llegado a usar la pasarela (%s)" % (de_chat, cuando)
+        salida.append("%s: por chat ya no doy de alta nada más, para que nada que lea Hermes le pueda pedir un alta "
+                      "nueva. Este iPhone (o uno nuevo), desde la app o por SSH: %s, o hehermes-dispositivo rotar %s"
+                      % (texto, alta, de_chat))
+        etiquetar(salida, "por-chat")
+        return salida
+    otros = sorted(d["nombre"] for d in activos if d.get("nombre") not in (op.iphone, de_chat))
     if otros:
         salida.append("Por chat solo se conecta el primer iPhone, y aquí ya hay: %s. El siguiente, desde la app o "
                       "por SSH (%s)" % (", ".join(otros), alta))
         etiquetar(salida, "por-chat")
-    elif any(d.get("nombre") == op.iphone for d in activos) and por_chat.get("iphone") != op.iphone:
+    elif any(d.get("nombre") == op.iphone for d in activos) and de_chat != op.iphone:
         salida.append("«%s» ya está dado de alta y no se dio de alta por chat: por chat solo se conecta el primer "
                       "iPhone. Por SSH: hehermes-dispositivo rotar %s" % (op.iphone, op.iphone))
         etiquetar(salida, "por-chat")
-    if por_chat.get("canjeado") and por_chat.get("iphone") != op.iphone:
-        # El mismo iPhone que ya se conectó por chat sí puede volver a pedirlo (`reemitir`): es quien lo pidió la
-        # primera vez, con una llave nueva de la misma app, y si la app perdió la conexión (Hermes reiniciándose al
-        # comprobarla, la app cerrada a medias) no le quedaba otra salida que un terminal. Otro nombre es otro iPhone.
-        salida.append("El alta por chat de «%s» ya se canjeó: por chat solo se conecta ese iPhone. Otro iPhone, desde "
-                      "la app o por SSH" % por_chat.get("iphone", "?"))
-        etiquetar(salida, "por-chat")
-    if man.en_disco:
-        instalado = man.datos.get("instalado")
-        if not isinstance(instalado, (int, float)) or ahora - instalado > VENTANA:
-            salida.append("Esta instalación es de hace más de media hora: por chat solo se da de alta en la media "
-                          "hora siguiente a instalar, para que nada que lea Hermes le pueda pedir un alta nueva. Por "
-                          "SSH: %s" % alta)
-            etiquetar(salida, "por-chat")
     return salida
 
 
+def a_sustituir(man, op, activos) -> str | None:
+    """El iPhone que se dio de alta por chat y no ha usado la pasarela, si la frase es de otro nombre: el que sale para
+    que entre este (`bloqueos` ya ha mirado que no la ha usado)."""
+    de_chat = (man.datos.get("por_chat") or {}).get("iphone")
+    if op.por_chat and de_chat and de_chat != op.iphone and any(d.get("nombre") == de_chat for d in activos):
+        return de_chat
+    return None
+
+
 def reemitir(sis, man, iphone, ruta_tokens, salida) -> str:
-    """Otra alta por chat para un iPhone que ya la tenía (repetida antes de canjearse, o ya canjeada): del token solo
-    queda su hash, así que va uno nuevo, y el de antes deja de valer en ese momento (`tokens.rotar`). Lo canjeado se
-    olvida: el canje nuevo lo vuelve a apuntar al acabar (`limpiar`). Devuelve el token."""
+    """Otra alta por chat para un iPhone que ya la tenía y no ha usado la pasarela (repetida antes de canjearse, o ya
+    canjeada): del token solo queda su hash, así que va uno nuevo, y el de antes deja de valer en ese momento
+    (`tokens.rotar`). Lo canjeado se olvida (el canje nuevo lo vuelve a apuntar al acabar, `limpiar`), y el alta es de
+    ahora: un uso cuenta desde ella. Devuelve el token."""
     from . import tokens
     anterior = man.datos.get("por_chat") or {}
     token = tokens.rotar(ruta_tokens, iphone)
@@ -540,7 +611,8 @@ def _barrer(sis, ambito=None):
 
 def limpiar(sis, entorno, ambito=None) -> None:
     """`ExecStopPost`: la regla de ufw fuera, /run/hehermes-canje fuera, y si el canje salió con 0 por sí mismo (se
-    canjeó), apuntado: por chat no se da de alta nada más (decisión 7)."""
+    canjeó), apuntado (para el mensaje de `reemitir`; lo que cierra el chat es que ese iPhone use la pasarela, decisión
+    7)."""
     import json
     run = ambito.run_canje if ambito is not None else RUN
     try:

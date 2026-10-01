@@ -146,7 +146,9 @@ class SinPermisos(Base):
         self.assertNotIn("VPN", self.salida)
         self.assertIn("hermes ALL=(root) NOPASSWD: /usr/local/sbin/hehermes-servidor", self.salida)
         self.assertIn("visudo -f /etc/sudoers.d/hehermes-servidor", self.salida)
-        self.assertIn("en la media hora siguiente a instalar", self.salida)
+        # Por chat, mientras no se use la pasarela (decisión 7 desde la 0.10.4; antes, la media hora).
+        self.assertIn("mientras el iPhone que se dé de alta por chat no haya usado la pasarela", self.salida)
+        self.assertNotIn("media hora", self.salida)
         self.sin_linea_de_error()
 
     def test_con_contrasena_ni_se_intenta_y_tiene_su_mensaje(self):

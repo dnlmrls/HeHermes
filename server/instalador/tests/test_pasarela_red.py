@@ -298,6 +298,57 @@ class LoQueSePasaAHermes(ConPasarela):
         self.assertEqual(self.hermes.peticiones[-1]["cabeceras"]["Authorization"], "Bearer otra-clave-mas-larga")
 
 
+class ElRegistroDeUsos(ConPasarela):
+    """Desde la 0.10.4, el primer 2xx de cada token va a `usos.json`, en la carpeta de estado: el alta por chat se cierra
+    en cuanto el iPhone que se dio de alta por chat lo tiene (decisión 7). Un 502 (Hermes reiniciándose), un 404 de
+    Hermes o un rechazo no cuentan."""
+
+    def usos(self):
+        with open(self.c("estado/" + pa.USOS), "rb") as f:
+            return json.loads(f.read())
+
+    def test_empieza_al_arrancar_sin_nada(self):
+        datos = self.usos()
+        self.assertEqual(datos["tokens"], {})
+        self.assertLessEqual(abs(datos["desde"] - time.time()), 60)
+        self.assertEqual(os.stat(self.c("estado/" + pa.USOS)).st_mode & 0o777, 0o600)
+
+    def test_el_primer_2xx_de_cada_token(self):
+        antes = int(time.time())
+        self.assertEqual(self.leer_respuesta(self.peticion(ruta="/api/model/options"))[0], 200)
+        (hash_, entrada), = self.usos()["tokens"].items()
+        self.assertEqual(hash_, pa.hash_token(TOKEN))
+        self.assertEqual(entrada["nombre"], "mi-iphone")
+        self.assertGreaterEqual(entrada["primero"], antes)
+        primero = entrada["primero"]
+        time.sleep(1.1)
+        self.leer_respuesta(self.peticion(ruta="/api/sessions?limit=1"))
+        self.assertEqual(self.usos()["tokens"][hash_]["primero"], primero, "solo el primero")
+        # El del otro iPhone, por el vigía (un 2xx también).
+        self.leer_respuesta(self.peticion(ruta="/avisos/v1/salud", token=OTRO))
+        self.assertEqual(self.usos()["tokens"][pa.hash_token(OTRO)]["nombre"], "otro")
+        self.assertIn("primer uso de un token", self.diario)
+
+    def test_las_huellas_tambien_son_un_uso(self):
+        self.assertEqual(self.leer_respuesta(self.peticion(ruta="/hehermes/v1/huellas"))[0], 200)
+        self.assertIn(pa.hash_token(TOKEN), self.usos()["tokens"])
+
+    def test_lo_que_no_es_un_2xx_no_cuenta(self):
+        self.assertEqual(self.leer_respuesta(self.peticion(ruta="/no-existe"))[0], 404)
+        self.assertEqual(self.todo(self.peticion(ruta="/api/model/options", token=None)), NO_404)
+        self.assertEqual(self.todo(self.peticion(ruta="/api/model/options", token="X" * 43)), NO_404)
+        self.hermes.shutdown()
+        self.hermes.server_close()
+        self.assertEqual(self.leer_respuesta(self.peticion(ruta="/api/model/options"))[0], 502)
+        self.assertEqual(self.usos()["tokens"], {})
+
+    def test_no_lleva_nada_de_la_peticion(self):
+        self.leer_respuesta(self.peticion(ruta="/api/sessions/api_123_abcdef01/messages?order=latest"))
+        texto = json.dumps(self.usos())
+        for nada in ("api_123", "messages", "order", "127.0.0.1", TOKEN, CLAVE_HERMES):
+            self.assertNotIn(nada, texto)
+
+
 class LasHuellas(ConPasarela):
     """`GET /hehermes/v1/huellas`: la pasarela misma le dice a quien trae un token la huella de su certificado y la del
     siguiente, para que la app ancle las dos y rotar no obligue a emparejar (contrato §12.7). No va a Hermes."""

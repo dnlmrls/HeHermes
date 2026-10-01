@@ -38,12 +38,15 @@ class SistemaFalso(Sistema):
         self.respuestas_http: dict = {}
         self.ordenes: list = []
         self.peticiones_http: list = []
+        #: Las de la sonda de las capacidades de Hermes (`Sistema.pedir`): (método, URL, cabeceras).
+        self.peticiones_sonda: list = []
         # Lo que contesta a lo que no está en `responder` (el `ServidorFalso`), y a las URL sin respuesta fija.
         self.resto = None
         self.http_falso = None
+        self.pedir_falso = None
         opciones.setdefault("version_python", (3, 11, 2))
         opciones.setdefault("nucleo", "6.1.0-25-amd64")
-        super().__init__(raiz=self._carpeta, ejecutor=self._ejecutar, http=self._http, **opciones)
+        super().__init__(raiz=self._carpeta, ejecutor=self._ejecutar, http=self._http, pedir=self._pedir, **opciones)
         # Ni el proceso de las pruebas ni su entorno: los pone cada prueba que los quiera.
         self.pid = None
         self.entorno = {}
@@ -73,6 +76,12 @@ class SistemaFalso(Sistema):
         if respuesta is None and self.http_falso is not None:
             return self.http_falso(url, cabeceras)
         return respuesta if respuesta is not None else (None, b"")
+
+    def _pedir(self, metodo, url, cabeceras):
+        self.peticiones_sonda.append((metodo, url, dict(cabeceras)))
+        if self.pedir_falso is not None:
+            return self.pedir_falso(metodo, url, cabeceras)
+        return None, {}, b""
 
     # Ayudas para montar la raíz
 

@@ -89,6 +89,9 @@ def resumen(sis, man, ambito=None, modo=None) -> str:
         lineas.append("  " + ambito.carpeta_venv)
     if man.datos.get("vigia") and que.tls:
         lineas.append("  " + ambito.carpeta_estado_vigia + " (la base de datos del vigía, con las claves de los iPhone)")
+    if que.tls:
+        from . import alma
+        lineas += alma.resumen(man)
     for usuario in man.datos.get("usuarios", []):
         if que.de(md.de_usuario(usuario)):
             lineas.append("  el usuario " + usuario)
@@ -293,6 +296,10 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
         quitar_lineas_api(sis, man, quedan, salida)
         if man.datos.get("exposicion"):
             quedan.append(_EXPOSICION % (man.datos["exposicion"]["linea"], man.datos["exposicion"]["env"]))
+    if que.tls:
+        # Lo que se le dijo a Hermes en su SOUL.md, para el lector de ficheros (que es de la pasarela).
+        from . import alma
+        alma.quitar(sis, man, quedan, salida)
     for ruta in sorted(man.ficheros):
         if ruta not in NGINX and que.fichero(ruta):
             quitar(ruta)

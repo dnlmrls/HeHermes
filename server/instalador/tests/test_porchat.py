@@ -1,6 +1,8 @@
 """`instalar --por-chat`: la decisión 7, `--activar-api` y el canje que se lanza al acabar, sobre el servidor falso.
 
 Desde la 0.6.0 el canje entrega solo el acceso a la pasarela, `{h, p, f, t}`: ya no hay PSK de una VPN que entregar.
+Desde la 0.10.4 (Daniel, 2026-10-01), el chat sigue abierto hasta que el iPhone que se dio de alta por chat usa la
+pasarela (`HastaQueLaUse`, y con una pasarela de antes, `DeAntesDeLa0104`): ya no hay media hora.
 Sin `cryptography`: esto es el instalador, con el Python del sistema. El canje de verdad está en `test_canje_*.py`.
 """
 
@@ -17,15 +19,16 @@ import servidor_falso as sf
 from hehermes_servidor import ambito as amb
 from hehermes_servidor import cli
 from hehermes_servidor import pasarela as pa
-from hehermes_servidor import porchat
+from hehermes_servidor import porchat, tokens
 from hehermes_servidor.manifiesto import Manifiesto
 from hehermes_servidor.modo_tls import calcular_plan_tls, detectar_tls
 from hehermes_servidor.plan import Opciones
 
 ORIGEN = str(apoyo.RAIZ)
 LLAVE = base64.urlsafe_b64encode(bytes(range(40, 72))).rstrip(b"=").decode()
-MEDIA_HORA = 30 * 60
+DIA = 24 * 3600
 TOKENS = "/etc/hehermes-pasarela/tokens.json"
+USOS = "/var/lib/hehermes-pasarela/usos.json"
 
 
 class Base(unittest.TestCase):
@@ -43,13 +46,24 @@ class Base(unittest.TestCase):
     def por_chat(self, *extra, iphone="mi-iphone", llave=LLAVE):
         return self.orden("instalar", "--por-chat", "--iphone", iphone, "--llave", llave, *extra)
 
-    def plan(self, ahora=None, **opciones):
+    def plan(self, **opciones):
         opciones.setdefault("iphone", "mi-iphone")
         opciones.setdefault("por_chat", True)
         opciones.setdefault("llave", LLAVE)
         man = Manifiesto.leer(self.sis)
         det = detectar_tls(self.sis, man, amb.de_root(), activar_api=opciones.get("activar_api", False))
-        return calcular_plan_tls(self.sis, det, man, Opciones(ahora=ahora, **opciones), ORIGEN)
+        return calcular_plan_tls(self.sis, det, man, Opciones(**opciones), ORIGEN)
+
+    def por_chat_de(self, segundos, canjeado=True, iphone="mi-iphone"):
+        """Una instalación por chat de hace `segundos` (su alta, lo mismo), canjeada o no."""
+        self.assertEqual(self.por_chat(iphone=iphone), 0, self.salida)
+        cuando = time.time() - segundos
+        datos = {"iphone": iphone, "alta": cuando}
+        if canjeado:
+            datos["canjeado"] = cuando + 60
+        self.instalado_hace(segundos, por_chat=datos)
+        self.falso.activos.discard("hehermes-canje")
+        return cuando
 
     def alta_por_ssh(self, nombre):
         """Un iPhone dado de alta desde un terminal, con su QR: no por chat."""
@@ -116,31 +130,29 @@ class SoloElPrimero(Base):
         self.assertIn("no se dio de alta por chat", texto)
         self.assertIn("Por SSH: hehermes-dispositivo rotar mi-iphone", texto)
 
-    def test_ya_canjeado_otro_iphone_se_para(self):
-        """Otro nombre es otro iPhone, aunque el canjeado ya no esté dado de alta."""
-        self.assertEqual(self.por_chat(), 0, self.salida)
-        self.instalado_hace(60, por_chat={"iphone": "mi-iphone", "canjeado": time.time()})
-        tokens = json.loads(self.sis.leer(TOKENS))
-        tokens["tokens"] = []
-        self.sis.escribir(TOKENS, json.dumps(tokens).encode(), modo=0o600)
-        texto = "\n".join(self.plan(iphone="iphone-b2c3").bloqueos)
-        self.assertIn("El alta por chat de «mi-iphone» ya se canjeó: por chat solo se conecta ese iPhone", texto)
+    def test_ya_canjeado_y_sin_usar_otro_nombre_entra_en_su_lugar(self):
+        """La app cambia de nombre si se reinstala (y la de la 0.10.2 se llamaba «mi-iphone»): mientras el de chat no ha
+        usado la pasarela, el nuevo entra en su lugar, y el token de antes deja de valer."""
+        self.por_chat_de(60)
+        plan = self.plan(iphone="iphone-b2c3")
+        self.assertTrue(plan.puede_seguir, plan.bloqueos)
+        (alta,) = [a for a in plan.acciones if a.tipo == "dispositivo"]
+        self.assertEqual(alta.datos, {"sustituye": "mi-iphone"})
+        self.assertIn("en lugar de «mi-iphone», que se dio de alta por chat y no ha usado la pasarela", alta.detalle)
 
     def test_ya_canjeado_el_mismo_iphone_pasa(self):
         """El fallo de un probador (0.10.2): la app canjeó el enlace mientras Hermes se reiniciaba y se quedó sin
         conexión; la misma frase otra vez acababa en «ya se canjeó», y por chat no había otra salida."""
-        self.assertEqual(self.por_chat(), 0, self.salida)
-        self.instalado_hace(60, por_chat={"iphone": "mi-iphone", "canjeado": time.time()})
+        self.por_chat_de(60)
         self.assertTrue(self.plan().puede_seguir, self.plan().bloqueos)
 
-    def test_ya_canjeado_el_mismo_iphone_pasada_la_media_hora_se_para(self):
-        self.assertEqual(self.por_chat(), 0, self.salida)
-        self.instalado_hace(MEDIA_HORA + 60, por_chat={"iphone": "mi-iphone", "canjeado": time.time()})
-        self.assertIn("de hace más de media hora", "\n".join(self.plan().bloqueos))
+    def test_ya_canjeado_el_mismo_iphone_dias_despues_pasa(self):
+        """Hasta la 0.10.3, a la media hora se cerraba aunque nadie hubiera llegado a usar nada."""
+        self.por_chat_de(10 * DIA)
+        self.assertTrue(self.plan().puede_seguir, self.plan().bloqueos)
 
     def test_repetirlo_sin_canjear_pasa(self):
-        self.assertEqual(self.por_chat(), 0, self.salida)
-        self.instalado_hace(60)
+        self.por_chat_de(60, canjeado=False)
         self.assertTrue(self.plan().puede_seguir, self.plan().bloqueos)
 
     def test_una_alta_de_la_vpn_de_antes_cuenta_como_primer_iphone(self):
@@ -152,19 +164,80 @@ class SoloElPrimero(Base):
         self.assertNotIn("--ikev2", texto)
 
 
-class LaMediaHora(Base):
-    def test_a_los_veintinueve_minutos_pasa_y_a_los_treinta_y_uno_no(self):
-        self.instalado_hace(0)
-        ahora = Manifiesto.leer(self.sis).datos["instalado"]
-        self.assertTrue(self.plan(ahora=ahora + MEDIA_HORA - 60).puede_seguir)
-        plan = self.plan(ahora=ahora + MEDIA_HORA + 60)
-        self.assertFalse(plan.puede_seguir)
-        self.assertIn("media hora", "\n".join(plan.bloqueos))
+class HastaQueLaUse(Base):
+    """Decisión 7 desde el 2026-10-01: el chat se cierra en cuanto el iPhone que se dio de alta por chat usa la pasarela
+    (un 2xx con su token, que apunta la pasarela en su `usos.json`), y no antes."""
 
-    def test_una_instalacion_sin_fecha_es_vieja(self):
+    def bloqueo(self, plan):
+        self.assertFalse(plan.puede_seguir)
+        self.assertEqual([getattr(b, "codigo", None) for b in plan.bloqueos], ["por-chat"])
+        return "\n".join(plan.bloqueos)
+
+    def test_en_cuanto_lo_usa_se_cierra_para_el_y_para_otro(self):
+        alta = self.por_chat_de(60)
+        self.falso.usar("mi-iphone", cuando=alta + 120)
+        for iphone in ("mi-iphone", "iphone-b2c3"):
+            with self.subTest(iphone=iphone):
+                texto = self.bloqueo(self.plan(iphone=iphone))
+                self.assertIn("«mi-iphone» se dio de alta por chat y ya ha usado la pasarela (%s UTC)"
+                              % time.strftime("%Y-%m-%d %H:%M", time.gmtime(int(alta) + 120)), texto)
+                self.assertIn("por chat ya no doy de alta nada más", texto)
+                self.assertIn("hehermes-dispositivo rotar mi-iphone", texto)
+
+    def test_sigue_cerrado_aunque_se_de_de_baja(self):
+        self.por_chat_de(60)
+        self.falso.usar("mi-iphone")
+        tokens = json.loads(self.sis.leer(TOKENS))
+        tokens["tokens"] = []
+        self.sis.escribir(TOKENS, json.dumps(tokens).encode(), modo=0o600)
+        self.assertIn("ya ha usado la pasarela", self.bloqueo(self.plan(iphone="iphone-b2c3")))
+
+    def test_rotado_por_ssh_y_usado_tambien_cierra(self):
+        """El uso cuenta por su nombre: un token nuevo de ese iPhone (hehermes-dispositivo rotar) también es él."""
+        self.por_chat_de(60)
+        tokens.rotar(self.sis.ruta(TOKENS), "mi-iphone")
+        self.falso.usar("mi-iphone")
+        self.assertIn("ya ha usado la pasarela", self.bloqueo(self.plan()))
+
+    def test_un_uso_de_antes_de_su_alta_no_cuenta(self):
+        """Uno que se llamaba igual y usó la pasarela antes (por SSH, y se dio de baja) no es este."""
+        alta = self.por_chat_de(60)
+        usos = json.loads(self.sis.leer(USOS))
+        usos["tokens"]["0" * 64] = {"nombre": "mi-iphone", "primero": int(alta) - 3600}
+        self.sis.escribir(USOS, json.dumps(usos).encode(), modo=0o600)
+        self.assertTrue(self.plan().puede_seguir, self.plan().bloqueos)
+
+    def test_el_uso_de_otro_iphone_no_lo_cierra(self):
+        alta = self.por_chat_de(60)
+        usos = json.loads(self.sis.leer(USOS))
+        usos["tokens"]["1" * 64] = {"nombre": "el-de-otro", "primero": int(alta) + 60}
+        self.sis.escribir(USOS, json.dumps(usos).encode(), modo=0o600)
+        self.assertTrue(self.plan().puede_seguir, self.plan().bloqueos)
+
+    def test_un_registro_que_no_se_entiende_no_cuenta_como_vacio(self):
+        """Sin un registro que se entienda, lo que diga el diario (aquí, nada): no se reabre a ciegas."""
+        self.por_chat_de(60)
+        self.sis.escribir(USOS, b"{no es json", modo=0o600)
+        self.assertIn("no sé si ha llegado a usar la pasarela", self.bloqueo(self.plan()))
+
+    def test_sin_su_alta_cuenta_desde_la_instalacion_y_sin_ninguna_no_se_sabe(self):
+        self.por_chat_de(60)
         man = Manifiesto.leer(self.sis)
+        del man.datos["por_chat"]["alta"]
         man.guardar(self.sis)
-        self.assertIn("media hora", "\n".join(self.plan().bloqueos))
+        self.assertTrue(self.plan().puede_seguir, self.plan().bloqueos)
+        self.falso.usar("mi-iphone")
+        self.assertIn("ya ha usado la pasarela", self.bloqueo(self.plan()))
+        man = Manifiesto.leer(self.sis)
+        del man.datos["instalado"]
+        man.guardar(self.sis)
+        self.sis.escribir(USOS, json.dumps({"v": 1, "desde": 1, "tokens": {}}).encode(), modo=0o600)
+        self.assertIn("no sé si ha llegado a usar la pasarela (no sé cuándo se dio de alta)", self.bloqueo(self.plan()))
+
+    def test_una_instalacion_vieja_sin_iphones_por_ssh_sigue_abierta(self):
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+        self.instalado_hace(30 * DIA)
+        self.assertTrue(self.plan().puede_seguir, self.plan().bloqueos)
 
     def test_instalar_apunta_cuando_y_repetir_no_lo_mueve(self):
         antes = time.time()
@@ -186,9 +259,66 @@ class LaMediaHora(Base):
         self.assertNotIn("instalado", Manifiesto.leer(self.sis).datos)
 
     def test_sin_por_chat_no_hay_limite(self):
-        self.instalado_hace(10 * MEDIA_HORA)
-        plan = self.plan(por_chat=False, llave=None)
+        self.por_chat_de(DIA)
+        self.falso.usar("mi-iphone")
+        plan = self.plan(por_chat=False, llave=None, iphone="otro")
         self.assertTrue(plan.puede_seguir, plan.bloqueos)
+
+
+class DeAntesDeLa0104(Base):
+    """Una pasarela de antes de la 0.10.4 no apuntaba quién la usa (como la del probador de la 0.10.2, que canjeó y cuya
+    única petición dio un 502 con Hermes reiniciándose). Lo que falta lo dice su diario, si llega hasta el alta; si no,
+    no se sabe, y no se reabre."""
+
+    def setUp(self):
+        super().setUp()
+        self.alta = self.por_chat_de(3 * DIA)
+        self.sis.borrar(USOS)
+        self.falso.diario_pasarela = [(self.alta - 600, "pasarela escuchando en el puerto 61234"),
+                                      (self.alta + 90, "198.51.100.7 GET 502"),
+                                      (self.alta + 95, "198.51.100.7 rechazada: 404"),
+                                      (self.alta + 99, "primer uso de otra cosa: 200 OK")]
+
+    def test_sin_ningun_2xx_desde_el_alta_sigue_abierto(self):
+        self.assertTrue(self.plan().puede_seguir, self.plan().bloqueos)
+        plan = self.plan(iphone="iphone-b2c3")
+        self.assertTrue(plan.puede_seguir, plan.bloqueos)
+        miradas = [o for o in self.sis.ordenes if o[:1] == ["journalctl"]]
+        self.assertIn(["journalctl", "-u", "hehermes-pasarela.service", "--no-pager", "-q", "-o", "short-unix",
+                       "--until", "@%d" % int(self.alta), "-n", "1"], miradas)
+        self.assertIn(["journalctl", "-u", "hehermes-pasarela.service", "--no-pager", "-q", "-o", "cat",
+                       "--since", "@%d" % int(self.alta)], miradas)
+
+    def test_un_2xx_en_el_diario_lo_cierra(self):
+        self.falso.diario_pasarela.append((self.alta + 300, "198.51.100.7 GET 200 1534"))
+        self.assertIn("«mi-iphone» se dio de alta por chat y ya ha usado la pasarela:",
+                      "\n".join(self.plan().bloqueos))
+
+    def test_un_2xx_de_antes_del_alta_no_cuenta(self):
+        self.falso.diario_pasarela.append((self.alta - 300, "198.51.100.7 GET 200 1534"))
+        self.assertTrue(self.plan().puede_seguir, self.plan().bloqueos)
+
+    def test_un_diario_que_no_llega_hasta_el_alta_no_lo_sabe(self):
+        self.falso.diario_pasarela = [(t, l) for t, l in self.falso.diario_pasarela if t > self.alta]
+        self.assertIn("no sé si ha llegado a usar la pasarela", "\n".join(self.plan().bloqueos))
+
+    def test_sin_diario_no_lo_sabe(self):
+        self.falso.diario_pasarela = None
+        texto = "\n".join(self.plan().bloqueos)
+        self.assertIn("no sé si ha llegado a usar la pasarela (la pasarela no apuntaba entonces quién la usa y su "
+                      "diario no llega hasta el alta)", texto)
+
+    def test_un_registro_que_empezo_despues_tambien_mira_el_diario(self):
+        """La pasarela de la 0.10.4 empieza su registro al arrancar: lo de antes, en el diario."""
+        self.sis.escribir(USOS, json.dumps({"v": 1, "desde": int(self.alta) + DIA, "tokens": {}}).encode(), modo=0o600)
+        self.assertTrue(self.plan().puede_seguir, self.plan().bloqueos)
+        self.falso.diario_pasarela.append((self.alta + 300, "198.51.100.7 POST 202 87"))
+        self.assertFalse(self.plan().puede_seguir)
+
+    def test_sin_root_mira_su_diario_de_usuario(self):
+        ambito = amb.de_usuario("hermes", "/home/hermes", 1000)
+        self.assertTrue(porchat._diario_sin_2xx(self.sis, ambito, self.alta))
+        self.assertTrue([o for o in self.sis.ordenes if o[:3] == ["journalctl", "--user", "-u"]])
 
 
 class ActivarApi(Base):
@@ -525,11 +655,28 @@ class Limpiar(Base):
         self.assertNotIn("canjeado", por_chat, "el canje nuevo lo vuelve a apuntar al acabar")
         self.assertNotIn(token, self.salida)
 
-    def test_canjeado_otro_iphone_por_chat_se_para(self):
+    def test_canjeado_y_sin_usar_otro_nombre_entra_en_su_lugar(self):
+        token = self.carga()["t"]
         self.limpiar(SERVICE_RESULT="success", EXIT_CODE="exited", EXIT_STATUS="0")
+        self.assertEqual(self.por_chat(iphone="iphone-b2c3"), 0, self.salida)
+        self.assertTrue(self.texto[-1].startswith("hehermes-canje:1?"), self.texto[-1])
+        self.assertIn("«mi-iphone» deja de valer: se dio de alta por chat y no llegó a usar la pasarela", self.salida)
+        tokens_ = pa.Tokens(self.sis.ruta(TOKENS))
+        self.assertIsNone(tokens_.quien(token))
+        self.assertEqual(tokens_.quien(self.carga()["t"]), "iphone-b2c3")
+        self.assertEqual([t["nombre"] for t in json.loads(self.sis.leer(TOKENS))["tokens"]], ["iphone-b2c3"])
+        man = Manifiesto.leer(self.sis)
+        self.assertEqual(man.datos["por_chat"]["iphone"], "iphone-b2c3")
+        self.assertEqual(man.dispositivos, ["iphone-b2c3"])
+
+    def test_canjeado_y_usado_otro_iphone_por_chat_se_para(self):
+        self.limpiar(SERVICE_RESULT="success", EXIT_CODE="exited", EXIT_STATUS="0")
+        self.falso.usar("mi-iphone")
+        antes = self.sis.foto()
         self.assertEqual(self.por_chat(iphone="iphone-b2c3"), 1)
-        self.assertIn("solo se conecta el primer iPhone, y aquí ya hay: mi-iphone", self.salida)
+        self.assertIn("«mi-iphone» se dio de alta por chat y ya ha usado la pasarela", self.salida)
         self.assertEqual(self.texto[-1].strip(), "hehermes-error:por-chat")
+        self.assertEqual(self.sis.foto(), antes, "no se ha tocado nada")
 
     def test_caducado_no_cuenta_como_canjeado(self):
         self.limpiar(SERVICE_RESULT="exit-code", EXIT_CODE="exited", EXIT_STATUS="3")

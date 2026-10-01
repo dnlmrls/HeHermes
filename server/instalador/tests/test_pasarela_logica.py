@@ -316,6 +316,68 @@ class LaConfiguracion(unittest.TestCase):
                     pa.Configuracion.leer(self.ini(texto), credenciales=None)
 
 
+class ElRegistroDeUsos(unittest.TestCase):
+    """`usos.json` (desde la 0.10.4): qué token ha servido alguna vez un 2xx. Lo lee el instalador para cerrar el alta
+    por chat (decisión 7); sin nada de la petición."""
+
+    def setUp(self):
+        self.carpeta = tempfile.TemporaryDirectory()
+        self.addCleanup(self.carpeta.cleanup)
+        self.ruta = os.path.join(self.carpeta.name, pa.USOS)
+        self.reloj = Reloj()
+
+    def leer(self):
+        with open(self.ruta, "rb") as f:
+            return json.loads(f.read())
+
+    def test_sin_registro_empieza_uno_desde_ahora_y_0600(self):
+        usos = pa.Usos(self.carpeta.name, reloj=self.reloj)
+        self.assertEqual(self.leer(), {"v": 1, "desde": 1000, "tokens": {}})
+        self.assertEqual(os.stat(self.ruta).st_mode & 0o777, 0o600)
+        self.assertEqual(usos.datos["desde"], 1000)
+
+    def test_el_primero_de_cada_token_y_solo_el_primero(self):
+        usos = pa.Usos(self.carpeta.name, reloj=self.reloj)
+        uno, dos = pa.hash_token(token(1)), pa.hash_token(token(2))
+        self.reloj.t = 1500.7
+        self.assertTrue(usos.apuntar(uno, "mi-iphone"))
+        self.reloj.t = 1600
+        self.assertFalse(usos.apuntar(uno, "mi-iphone"))
+        self.assertTrue(usos.apuntar(dos, "otro"))
+        self.assertEqual(self.leer()["tokens"], {uno: {"nombre": "mi-iphone", "primero": 1500},
+                                                 dos: {"nombre": "otro", "primero": 1600}})
+        # Al arrancar otra vez, sigue lo de antes (y su `desde`).
+        self.reloj.t = 9000
+        self.assertEqual(pa.Usos(self.carpeta.name, reloj=self.reloj).datos["desde"], 1000)
+        self.assertFalse(pa.Usos(self.carpeta.name, reloj=self.reloj).apuntar(uno, "mi-iphone"))
+
+    def test_uno_que_no_se_entiende_empieza_de_nuevo_y_lo_dice_su_desde(self):
+        with open(self.ruta, "w") as f:
+            f.write("{roto")
+        self.reloj.t = 5000
+        pa.Usos(self.carpeta.name, reloj=self.reloj)
+        self.assertEqual(self.leer()["desde"], 5000)
+
+    def test_no_sigue_un_enlace(self):
+        otro = os.path.join(self.carpeta.name, "otro.json")
+        with open(otro, "w") as f:
+            f.write(json.dumps({"v": 1, "desde": 1, "tokens": {}}))
+        os.symlink(otro, self.ruta)
+        with self.assertRaises(OSError):
+            pa.Usos(self.carpeta.name, reloj=self.reloj)
+
+    def test_leer_solo_lo_que_tiene_su_forma(self):
+        bueno = "a" * 64
+        self.assertEqual(pa.leer_usos(json.dumps({"v": 1, "desde": 7, "tokens": {
+            bueno: {"nombre": "x", "primero": 9, "otra": "cosa"}, "no-es-un-hash": {"nombre": "y", "primero": 1},
+            "b" * 64: {"nombre": "z", "primero": True}, "c" * 64: {"nombre": 3, "primero": 1}}}).encode()),
+            {"v": 1, "desde": 7, "tokens": {bueno: {"nombre": "x", "primero": 9}}})
+        for malo in (b"", b"[]", b'{"v": 2, "desde": 1, "tokens": {}}', b'{"v": 1, "desde": true, "tokens": {}}',
+                     b'{"v": 1, "desde": "1", "tokens": {}}', b'{"v": 1, "desde": 1, "tokens": []}', b"\xff"):
+            with self.subTest(malo=malo):
+                self.assertIsNone(pa.leer_usos(malo))
+
+
 class ElSecreto(unittest.TestCase):
     """La clave de Hermes y el secreto del vigía se vuelven a leer si su fichero cambia: sin root, el .env de Hermes."""
 

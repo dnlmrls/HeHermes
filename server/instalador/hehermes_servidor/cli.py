@@ -21,7 +21,7 @@ from .aplicar import Parada
 from .desinstalar import desinstalar, resumen
 from .deteccion import DIRECCION_VALIDA
 from .manifiesto import Manifiesto, ManifiestoRoto
-from .plan import PREFIJO_ERROR, Opciones, pintar
+from .plan import PREFIJO_DETALLE, PREFIJO_ERROR, Opciones, pintar
 from .sistema import Sistema
 
 SI = ("s", "si", "sí")
@@ -383,8 +383,10 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
     if op.plan or not plan.puede_seguir:
         if opciones.por_chat and not plan.puede_seguir:
             # Lo último, sola: la app lo reconoce (`ErrorDelInstalador`) donde se pega el enlace, y sabe que no se ha
-            # tocado nada. Por un terminal no hace falta: quien lo lee es una persona.
-            salida("\n" + PREFIJO_ERROR + plan.codigo_de_error)
+            # tocado nada. Por un terminal no hace falta: quien lo lee es una persona. Justo antes, lo que lo concreta
+            # (con `hermes-antiguo`, la versión de Hermes y lo que le falta), para una app que lo sepa leer.
+            detalle = plan.detalle_del_error
+            salida("\n" + (PREFIJO_DETALLE + detalle + "\n" if detalle else "") + PREFIJO_ERROR + plan.codigo_de_error)
         return 0 if plan.puede_seguir else 1
     if not plan.cambios:
         if opciones.iphone:
@@ -401,7 +403,8 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
         if opciones.por_chat:
             token = hecho.get("token")
             if token is None:
-                # Repetido en la media hora, se canjeara o no: del token solo queda el hash, así que va uno nuevo.
+                # Repetido antes de que ese iPhone use la pasarela, se canjeara o no: del token solo queda el hash, así
+                # que va uno nuevo.
                 token = porchat.reemitir(sis, man, opciones.iphone, sis.ruta(ambito.tokens), salida)
             carga = porchat.carga_tls(det.direccion, det.puerto_pasarela, modo_tls.huella(sis, ambito), token)
             del token
