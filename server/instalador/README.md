@@ -45,6 +45,8 @@ lleva los avisos 1.5.2 y el ayudante `hehermes-entrada`, con su socket, como el 
 (como `exports/`), y la pasarela deja pasar trozos de 4 MiB en `/avisos/v1/entrada/`. Una pasarela de antes los corta
 con un 413, y la app dice que hay que actualizar el servidor.
 
+**La 0.10.7 solo quita del paquete nombres de personas que se habían colado en un comentario y en el README de los avisos.** No cambia nada de lo que hace.
+
 **La 0.10.5 lleva el vigía 1.5.1.** Lo que cambia está en los avisos (`server/avisos`): las marcas de un fichero se buscan en la conversación entera (también lo compactado), un fichero nuevo en `exports/` se avisa en cuanto deja de crecer y se puede descargar sin esperar a su `MEDIA:`, y un cliente que se corta a media petición deja una línea en el registro, no una traza. El instalador en sí no cambia.
 
 **La 0.10.4 mira el Hermes del probador antes de dar nada, y deja el chat abierto hasta que se use.** Tres cosas:

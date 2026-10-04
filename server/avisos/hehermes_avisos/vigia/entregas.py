@@ -4,8 +4,9 @@
 historial (``display_kind: async_delegation_complete``) y **no lanza ningún turno**: el cliente es dueño del turno
 siguiente (``gateway/wake.py`` del VPS, #85957; no hay ajuste que lo cambie). La app lo lanza cuando está viva
 (``⟦hehermes:continuar⟧``, contrato §6), pero con la pantalla apagada iOS la suspende, y un subagente puede tardar
-horas (``delegation.child_timeout_seconds: 7200``). El 2026-09-27, en una conversación de Daniel, la entrega llegó a las 02:36 y
-nadie la contestó hasta que Daniel preguntó «¿cómo vas?» a las 08:43. El vigía corre siempre y ya lee ese historial.
+horas (``delegation.child_timeout_seconds: 7200``). El 2026-09-27, en una conversación de Daniel, la entrega llegó a
+las 02:36 y nadie la contestó hasta que Daniel preguntó «¿cómo vas?» a las 08:43. El vigía corre siempre y ya lee ese
+historial.
 
 **Qué lanza.** El mismo turno que la app (``TEXTO_CONTINUAR``), con la misma ``Idempotency-Key``
 (``continuar-<delegation_id>`` de la entrega más reciente sin atender): la app lo reconoce en el historial como una
