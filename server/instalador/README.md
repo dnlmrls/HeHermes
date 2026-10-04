@@ -40,6 +40,8 @@ reiniciaba para encender su API; la app no se quedó con la conexión, y la mism
 Ahora el mismo iPhone (el mismo `--iphone`) puede volver a pedirla en la media hora siguiente a instalar: otro enlace,
 otro token, y el de antes deja de valer. El canje dura 12 minutos y el reinicio de Hermes no lo toca: [abajo](#el-alta-por-chat---por-chat).
 
+**La 0.10.5 lleva el vigía 1.5.1.** Lo que cambia está en los avisos (`server/avisos`): las marcas de un fichero se buscan en la conversación entera (también lo compactado), un fichero nuevo en `exports/` se avisa en cuanto deja de crecer y se puede descargar sin esperar a su `MEDIA:`, y un cliente que se corta a media petición deja una línea en el registro, no una traza. El instalador en sí no cambia.
+
 **La 0.10.4 mira el Hermes del probador antes de dar nada, y deja el chat abierto hasta que se use.** Tres cosas:
 - **Lo que la app necesita de Hermes, antes del QR o del enlace** ([abajo](#el-hermes-que-necesita-la-app-desde-la-0104)):
   la sonda de sus capacidades (`hehermes_servidor/capacidades.py`, con `TRACE`, sin lanzar ni tocar nada) y su versión.

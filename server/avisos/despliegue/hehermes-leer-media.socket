@@ -12,7 +12,8 @@ SocketUser=root
 SocketGroup=hh-vigia
 SocketMode=0660
 Accept=yes
-# El vigía no pasa de dos a la vez; esto es el tope por si algo va mal, no el límite de la app.
+# El vigía no pasa de dos descargas a la vez, más la vigilancia de exports/ (desde la 1.5.1); esto es el tope por
+# si algo va mal, no el límite de la app.
 MaxConnections=4
 RemoveOnStop=yes
 

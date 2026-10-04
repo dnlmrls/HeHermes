@@ -6,12 +6,22 @@ Hermes corre como root y el vigía no puede leer sus ficheros. Tampoco se le da 
 un lector aparte (``despliegue/hehermes-leer-media``), de root, lanzado por systemd en cada conexión a su socket y con
 su propia jaula. El vigía solo decide **si** se puede pedir, y el lector, **qué** se puede leer:
 
-1. Que la ruta esté marcada: una fila ``assistant`` de esa sesión, entre las 500 últimas, con una línea ``MEDIA:``
-   que, con las mismas reglas que la app (``ExtraccionMedia.swift``), dé exactamente esa ruta. Si no, 404 sin mirar
-   el disco: la respuesta no dice si el fichero existe. Primero se piden las 50 últimas (casi siempre es un mensaje
-   reciente: una foto paga así unos KB de historial y no 1–2 MB), y las 500 solo si esas 50 vuelven llenas y sin la
-   marca. Una marca vista se recuerda ``RECUERDO`` segundos (sesión + ruta): abrir la vista previa y luego el visor no
-   pide el historial dos veces. Solo se recuerda lo marcado, nunca lo que no: una marca nueva vale al momento.
+0. Lo de ``exports/``, la carpeta de Hermes para el iPhone, se da sin buscar su marca (desde la 1.5.1,
+   ``Ficheros.en_exportaciones``): un subagente que trabaja horas deja ahí sus ficheros mucho antes de escribir ninguna
+   línea ``MEDIA:``, y el vigía avisa de ellos en cuanto están (``exportaciones.py``). Solo por el texto limpio de la
+   ruta; el lector sigue mirando todo lo demás. Lo de cualquier otro sitio, por el punto 1.
+1. Que la ruta esté marcada: una fila ``assistant`` de esa sesión (no oculta) con una línea ``MEDIA:`` que, con las
+   mismas reglas que la app (``ExtraccionMedia.swift``), dé exactamente esa ruta. Si no, 404 sin mirar el disco: la
+   respuesta no dice si el fichero existe. Se lee la conversación **entera**, con lo que Hermes compactó
+   (``include_compacted=true``, contrato §7): desde la 1.5.1, porque tras una compactación lo de antes ya no sale en lo
+   activo, y lo que la app sigue enseñando se quedaba en «No disponible» para siempre. Primero las 50 últimas (casi
+   siempre es un mensaje reciente: una foto paga así unos KB de historial y no 1–2 MB), las 500 solo si esas 50 vuelven
+   llenas y sin la marca, y después, de 500 en 500, hacia atrás hasta ``FILAS_MAXIMAS``: lo que la app ha enseñado puede
+   venir de más atrás (lo que pasó en una conversación con la app abierta días). Toda marca que se ve por el camino se
+   recuerda ``RECUERDO`` segundos (sesión + ruta): abrir la vista previa y luego el visor no pide el historial dos veces,
+   ni los demás ficheros de un mensaje viejo vuelven a recorrerla. Solo se recuerda lo marcado, nunca lo que no: una
+   marca nueva vale al momento, y lo que no está marcado se vuelve a mirar, aunque sin repetir el recorrido hacia atrás
+   de una conversación recorrida hace menos de ``RECUERDO`` (lo que tenía detrás ya quedó recordado).
 2. Que el lector la dé por buena (sus reglas, en su propio fichero: desde la 1.4.0, una lista de permitidas), y los
    bytes, por partes, de él a la app. Lo que el lector no deja leer (de la lista de prohibidas, no es un fichero
    normal, cambió mientras se abría, no existe) se contesta con **el mismo 404** que lo que no está marcado: la
@@ -44,12 +54,19 @@ registro = logging.getLogger("vigia.fichero")
 
 TOPE = 50 * 1024 * 1024
 MAX_RUTA = 4096
+#: Las filas de cada lectura del historial después de las primeras: las mismas que pide la app al abrir una conversación.
 FILAS = 500
 #: Las filas que se piden primero: si vuelven menos, la sesión entera ya estaba dentro.
 FILAS_PRIMERO = 50
+#: Hasta dónde se mira hacia atrás, como mucho: diez lecturas de 500. Cada una son 1–2 MB por la red local; sin tope, una
+#: ruta sin marcar en una conversación enorme costaría lo que la conversación entera, y cuenta para los límites igual.
+FILAS_MAXIMAS = 5000
 #: Cuánto se recuerda una marca vista, y cuántas como mucho.
 RECUERDO = 120.0
 MAX_RECORDADAS = 256
+#: Las filas que no son para nadie: el resumen de una compactación, los relevos (contrato §7). La app no las pinta, y lo
+#: que nombran no cuenta como marcado.
+TIPO_OCULTO = "hidden"
 TROZO = 64 * 1024
 PREFIJO = "MEDIA:"
 # Lo que `CharacterSet.whitespaces` de Swift quita de los bordes: el tabulador y los espacios de Unicode (Zs).
@@ -119,14 +136,25 @@ def ruta_de_linea(linea: str) -> str | None:
     return ruta if ruta.startswith(("/", "~")) else None
 
 
-def esta_marcada(filas: list, ruta: str) -> bool:
+def marcadas(filas: list) -> set:
+    """Las rutas que marcan las filas: las líneas ``MEDIA:`` de las filas ``assistant`` que no están ocultas, con las
+    reglas de la app. También las de los pasos intermedios (``tool_calls``): la app las enseña con la respuesta del
+    turno (contrato §7). Lo que escribe Daniel (una fila ``user``) no marca nada."""
+    rutas = set()
     for fila in filas:
         contenido = fila.get("content")
-        if fila.get("role") != "assistant" or not isinstance(contenido, str) or PREFIJO not in contenido:
+        if (fila.get("role") != "assistant" or fila.get("display_kind") == TIPO_OCULTO
+                or not isinstance(contenido, str) or PREFIJO not in contenido):
             continue
-        if any(ruta_de_linea(linea) == ruta for linea in contenido.split("\n")):
-            return True
-    return False
+        for linea in contenido.split("\n"):
+            ruta = ruta_de_linea(linea)
+            if ruta is not None:
+                rutas.add(ruta)
+    return rutas
+
+
+def esta_marcada(filas: list, ruta: str) -> bool:
+    return ruta in marcadas(filas)
 
 
 def tipo_por_extension(nombre: str) -> str:
@@ -312,15 +340,47 @@ class Marcas:
             self._vistas[(sesion, ruta)] = self.reloj() + self.recuerdo
 
 
+class Recorridas:
+    """Las conversaciones recorridas hacia atrás hace menos de ``RECUERDO`` segundos (``Ficheros._marcada``): lo marcado
+    que tenían detrás quedó en las ``Marcas``, y volver a recorrerlas por una ruta que no está marcada solo costaría."""
+
+    def __init__(self, recuerdo: float = RECUERDO, maximo: int = MAX_RECORDADAS, reloj=time.monotonic):
+        self.recuerdo, self.maximo, self.reloj = recuerdo, maximo, reloj
+        self._hasta: collections.OrderedDict = collections.OrderedDict()
+        self._candado = threading.Lock()
+
+    def reciente(self, sesion: str) -> bool:
+        with self._candado:
+            hasta = self._hasta.get(sesion)
+            if hasta is None:
+                return False
+            if self.reloj() >= hasta:
+                del self._hasta[sesion]
+                return False
+            return True
+
+    def apuntar(self, sesion: str) -> None:
+        with self._candado:
+            self._hasta.pop(sesion, None)
+            while len(self._hasta) >= self.maximo:
+                self._hasta.popitem(last=False)
+            self._hasta[sesion] = self.reloj() + self.recuerdo
+
+
 class Ficheros:
     """Lo que hace la ruta, sin HTTP."""
 
-    def __init__(self, hermes, lector: ClienteLector, limites: Limites, casa: str = "/root", marcas: Marcas = None):
+    def __init__(self, hermes, lector: ClienteLector, limites: Limites, casa: str = "/root", marcas: Marcas = None,
+                 recorridas: Recorridas = None, exportaciones=None):
         self.hermes = hermes
         self.lector = lector
         self.limites = limites
         self.casa = casa.rstrip("/") or "/"
         self.marcas = marcas if marcas is not None else Marcas()
+        self.recorridas = recorridas if recorridas is not None else Recorridas(reloj=self.marcas.reloj)
+        # La vigilancia de `exports/` (`exportaciones.py`), que sabe dónde está de verdad esa carpeta (se lo dice el
+        # lector). Sin ella, la de la casa de Hermes.
+        self.exportaciones = exportaciones
 
     def preparar(self, sesion: object, ruta: object) -> Descarga:
         if not (isinstance(sesion, str) and PATRON_SESION.fullmatch(sesion)):
@@ -342,35 +402,65 @@ class Ficheros:
         return descarga
 
     def _marcada(self, sesion: str, ruta: str) -> bool:
-        """Las 50 últimas filas y, si vuelven llenas y sin la marca, las 500 (las mismas que pinta la app)."""
+        """Las 50 últimas filas de la conversación entera (con lo compactado); si vuelven llenas y sin la marca, las 500
+        (las mismas que pinta la app al abrirla); y si tampoco, de 500 en 500 hacia atrás hasta ``FILAS_MAXIMAS``, salvo
+        que se acabe de recorrer (``Recorridas``). Todo lo marcado que se ve se recuerda (``Marcas``)."""
         if self.marcas.vista(sesion, ruta):
             return True
-        marcada = False
-        for limite in (FILAS_PRIMERO, FILAS):
-            try:
-                filas = self.hermes.mensajes(sesion, limite)
-            except ErrorHermes as error:
-                if error.estado == 404:
-                    raise _no_disponible() from None
-                raise ErrorHTTP(502, "hermes_no_disponible", "No se ha podido leer el historial de Hermes") from None
-            if esta_marcada(filas, ruta):
-                marcada = True
-                break
+        lecturas = [(FILAS_PRIMERO, 0), (FILAS, 0)]
+        if not self.recorridas.reciente(sesion):
+            lecturas += [(FILAS, desde) for desde in range(FILAS, FILAS_MAXIMAS, FILAS)]
+        recorrida = True
+        for limite, desde in lecturas:
+            filas = self._leer(sesion, limite, desde)
+            vistas = marcadas(filas)
+            for vista in vistas:
+                self.marcas.apuntar(sesion, vista)
+            if ruta in vistas:
+                return True
             if len(filas) < limite:
                 break
-        if marcada:
-            self.marcas.apuntar(sesion, ruta)
-        return marcada
+        else:
+            # Se llegó al tope sin acabar la conversación: lo de más atrás no se ha visto.
+            recorrida = len(lecturas) > 2
+        if recorrida:
+            self.recorridas.apuntar(sesion)
+        return False
+
+    def _leer(self, sesion: str, limite: int, desde: int) -> list:
+        try:
+            return self.hermes.mensajes(sesion, limite, desde=desde, compactadas=True)
+        except ErrorHermes as error:
+            if error.estado == 404:
+                raise _no_disponible() from None
+            raise ErrorHTTP(502, "hermes_no_disponible", "No se ha podido leer el historial de Hermes") from None
 
     def _preparar(self, sesion: str, ruta: str) -> Descarga:
         # Antes que nada, la marca: sin ella no se pregunta al lector, y lo que conteste (también que está fuera de las
-        # permitidas, el 409) no sale nunca para una ruta que Hermes no marcó.
-        if not self._marcada(sesion, ruta):
+        # permitidas, el 409) no sale nunca para una ruta que Hermes no marcó. Salvo lo de `exports/`, que es para el
+        # iPhone por contrato (`en_exportaciones`).
+        if not self.en_exportaciones(ruta) and not self._marcada(sesion, ruta):
             raise _no_disponible()
         en_disco = self.casa.rstrip("/") + ruta[1:] if ruta == "~" or ruta.startswith("~/") else ruta
         conexion, tamano, adelantado = self.lector.abrir(en_disco)
         return Descarga(conexion, tamano, adelantado, os.path.basename(en_disco.rstrip("/")) or "fichero",
                         self.limites.salir)
+
+
+    def en_exportaciones(self, ruta: str) -> bool:
+        """Si la ruta está, por su texto, dentro de la carpeta de Hermes para el iPhone (``exports/``). Lo de ahí se da
+        sin buscar su marca (desde la 1.5.1): Hermes lo deja para el iPhone, y un subagente que trabaja horas lo deja
+        mucho antes de escribir ninguna línea ``MEDIA:`` (``exportaciones.py``). Solo con la ruta limpia —sin ``.``, ``..``
+        ni barras de más—, y el lector sigue mirando todo lo demás: que esté de verdad dentro, sin enlaces que salgan, un
+        solo enlace duro, el tamaño. Lo de cualquier otro sitio, también las caches de Hermes, sigue necesitando su
+        marca."""
+        if "//" in ruta or any(parte in (".", "..") for parte in ruta.split("/")[1:]):
+            return False
+        carpetas = {"~/.hermes/" + CARPETA_PERMITIDA, self.casa.rstrip("/") + "/.hermes/" + CARPETA_PERMITIDA}
+        vista = getattr(self.exportaciones, "carpeta", None)
+        if vista:
+            carpetas.add(vista.rstrip("/"))
+        return any(ruta.startswith(carpeta + "/") and len(ruta) > len(carpeta) + 1 for carpeta in carpetas)
 
 
 def _extension(nombre: str) -> str:

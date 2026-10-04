@@ -43,7 +43,7 @@ from . import avisos
 from .ajustes import MAX_ID_SESION, Ajustes
 from .almacen import Almacen, Permiso
 from .envio import BAJA, ENVIADO, LIMITADO, PERMISO, REINTENTABLE, SIN_PERMISO, Mensajero
-from .fichero import Descarga, Ficheros, disposicion, parametros
+from .fichero import PATRON_SESION, Descarga, Ficheros, disposicion, parametros
 from .respaldo import PREFIJO as PREFIJO_RESPALDO
 from .respaldo import TOPE_CUERPO as TOPE_RESPALDO
 from .respaldo import Respaldos
@@ -115,7 +115,7 @@ class AppVigia:
 
     def __init__(self, almacen: Almacen, mensajero: Mensajero, *, secreto_tunel: str, caducidad_prueba: int = 300,
                  reloj=time.time, al_moverse=None, ficheros: Ficheros | None = None,
-                 respaldos: Respaldos | None = None):
+                 respaldos: Respaldos | None = None, exportaciones=None):
         if not secreto_tunel:
             raise ValueError("sin el secreto del túnel, la API del vigía quedaría abierta a cualquier proceso local")
         self.almacen = almacen
@@ -130,6 +130,8 @@ class AppVigia:
         self.ficheros = ficheros
         # La copia de Hermes en iCloud (`respaldo.py`). Sin el ayudante, esas rutas contestan 503.
         self.respaldos = respaldos
+        # Lo que la vigilancia de `exports/` ha visto llegar (`exportaciones.py`). Sin ella, la lista sale vacía.
+        self.exportaciones = exportaciones
 
     def viene_del_tunel(self, valor: str | None) -> bool:
         """Si la petición trae el secreto que pone nginx. Comparado en tiempo constante."""
@@ -225,6 +227,17 @@ class AppVigia:
             raise ErrorHTTP(503, "lector_no_disponible", "Este vigía no tiene el lector de ficheros")
         return self.ficheros.preparar(consulta.get("sesion"), consulta.get("ruta"))
 
+    def ficheros_dejados(self, sesion: object) -> dict:
+        """``GET /avisos/v1/ficheros?sesion=``: lo que Hermes ha dejado en ``exports/`` para esa conversación
+        (``exportaciones``), del más reciente al más antiguo. La app lo enseña como «Hermes ha dejado un fichero», aunque
+        Hermes aún no haya escrito su línea ``MEDIA:``. Solo nombres, tamaños y horas de lo que ya es del iPhone."""
+        if not (isinstance(sesion, str) and PATRON_SESION.fullmatch(sesion)):
+            raise ErrorHTTP(400, "parametro_invalido", "Falta la sesión, o no tiene forma de sesión")
+        if self.exportaciones is None:
+            return {"ficheros": []}
+        return {"ficheros": [{"ruta": f.ruta, "nombre": f.nombre, "tamano": f.tamano, "instante": f.instante}
+                             for f in self.exportaciones.de_la_sesion(sesion)]}
+
     def baja(self, token: str) -> None:
         if not self.almacen.borrar_dispositivo(token):
             raise ErrorHTTP(404, "dispositivo_desconocido", "Este dispositivo no estaba dado de alta")
@@ -282,6 +295,10 @@ class ManejadorVigia(ManejadorJSON):
             self._exigir(metodo, "GET")
             sesion, ruta_fichero = parametros(self.path.partition("?")[2])
             return self._enviar_descarga(app.fichero({"sesion": sesion, "ruta": ruta_fichero}))
+        elif ruta == "/avisos/v1/ficheros":
+            self._exigir(metodo, "GET")
+            sesion, _ = parametros(self.path.partition("?")[2])
+            return self.enviar_json(200, app.ficheros_dejados(sesion))
         else:
             encontrada = RUTA_DISPOSITIVO.fullmatch(ruta)
             if not encontrada:

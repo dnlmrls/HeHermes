@@ -150,6 +150,10 @@ class ErrorHTTP(Exception):
         self.extra = {}
 
 
+#: Lo que salta al escribir en una conexión que el otro lado ya ha cerrado.
+CORTES_DEL_OTRO_LADO = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+
+
 def cuerpo_de_error(codigo: str, mensaje: str, tipo: str = "invalid_request_error") -> dict:
     """El mismo envoltorio que usa el api_server de Hermes (contrato §8), para que la app los entienda igual."""
     return {"error": {"message": mensaje, "type": tipo, "param": None, "code": codigo}}
@@ -176,6 +180,16 @@ class ServidorHTTP(http.server.ThreadingHTTPServer):
         self.socket = heredado
         self.server_address = heredado.getsockname()
         self.server_name, self.server_port = str(self.server_address[0]), self.server_address[1]
+
+    def handle_error(self, request, client_address):
+        """La red de seguridad de `ManejadorJSON._cortado`: lo que se corta fuera de él (un error que decide
+        `http.server` antes de llegar a `atender`) tampoco deja la traza entera de `socketserver` en el registro, sino
+        una línea. Lo demás, como siempre."""
+        corte = sys.exc_info()[1]
+        if isinstance(corte, CORTES_DEL_OTRO_LADO):
+            logging.getLogger("http").info("el otro lado se fue antes de la respuesta (%s)", type(corte).__name__)
+            return
+        super().handle_error(request, client_address)
 
 
 class ManejadorJSON(http.server.BaseHTTPRequestHandler):
@@ -226,15 +240,33 @@ class ManejadorJSON(http.server.BaseHTTPRequestHandler):
 
     def _despachar(self) -> None:
         self._cuerpo_leido = False
+        que = None
         try:
-            self.atender()
-        except ErrorHTTP as error:
-            cuerpo = cuerpo_de_error(error.codigo, error.mensaje)
-            cuerpo["error"].update({k: v for k, v in getattr(error, "extra", {}).items() if k not in cuerpo["error"]})
-            self.enviar_json(error.estado, cuerpo, error.cabeceras)
+            try:
+                self.atender()
+            except ErrorHTTP as error:
+                que = f"{error.estado} {error.codigo}"
+                cuerpo = cuerpo_de_error(error.codigo, error.mensaje)
+                cuerpo["error"].update({k: v for k, v in getattr(error, "extra", {}).items()
+                                        if k not in cuerpo["error"]})
+                self.enviar_json(error.estado, cuerpo, error.cabeceras)
+        except CORTES_DEL_OTRO_LADO as corte:
+            self._cortado(corte, que)
         except Exception:  # noqa: BLE001 — la petición falla, el servicio no
             logging.getLogger(self.nombre_registro()).exception("fallo inesperado atendiendo una petición")
-            self.enviar_json(500, cuerpo_de_error("error_interno", "Error interno", "server_error"))
+            try:
+                self.enviar_json(500, cuerpo_de_error("error_interno", "Error interno", "server_error"))
+            except CORTES_DEL_OTRO_LADO as corte:
+                self._cortado(corte, "500 error_interno")
+
+    def _cortado(self, corte: BaseException, que: str | None) -> None:
+        """El otro lado se fue antes de llevarse la respuesta (el iPhone que se duerme a mitad, la pasarela que corta):
+        no es un fallo del servicio y no merece una traza, solo una línea. Sin la ruta, que lleva el token del iPhone.
+        Pasó el 2026-10-03 a las 13:10:52 con el 400 ``cuerpo_incompleto`` de un ``PUT …/ajustes`` cortado."""
+        self.close_connection = True
+        logging.getLogger(self.nombre_registro()).info(
+            "el otro lado se fue antes de la respuesta (%s%s%s)", self.command or "?", f", {que}" if que else "",
+            f", {type(corte).__name__}")
 
     do_GET = _despachar
     do_POST = _despachar

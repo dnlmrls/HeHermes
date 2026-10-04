@@ -166,12 +166,17 @@ marcó con una línea `MEDIA:<ruta>`. Hermes corre como root y deja sus ficheros
 leer, así que el reparto es este:
 
 - **El vigía decide si se puede pedir.** Lee las 50 últimas filas de la sesión (y las 500 solo si esas vuelven llenas
-  y sin la marca) y exige una fila `assistant` con una línea que, con las reglas de la app (`ExtraccionMedia.swift`),
-  dé esa ruta exacta. Si no la hay, 404, sin mirar el disco. Una marca vista se recuerda 2 minutos. Además limita: 30
+  y sin la marca; desde la 1.5.1, de la conversación entera con lo que Hermes compactó, `include_compacted`, y después
+  hacia atrás de 500 en 500 hasta 5000) y exige una fila `assistant` no oculta con una línea que, con las reglas de la
+  app (`ExtraccionMedia.swift`), dé esa ruta exacta. Si no la hay, 404, sin mirar el disco. Toda marca que ve se
+  recuerda 2 minutos, y una conversación recorrida hacia atrás no se vuelve a recorrer en ese rato. Además limita: 30
   por minuto, contando también las que no estaban marcadas, y 2 a la vez. Desde la 1.4.0, lo que el lector no deja
   leer es **el mismo 404** que lo que no está marcado, salvo, desde la 1.5.0, lo marcado **fuera de las carpetas
   permitidas** (el lector lo dice por el texto, `fuera`): un 409 `fichero_fuera_de_la_carpeta` con `"carpeta":
-  "exports"`, para que la app ofrezca pedirle a Hermes que lo copie ahí.
+  "exports"`, para que la app ofrezca pedirle a Hermes que lo copie ahí. Desde la 1.5.1, lo de **dentro de `exports/`**
+  (por el texto limpio de la ruta) se da **sin buscar su marca**: es la carpeta de Hermes para el iPhone, y un
+  subagente deja ahí sus ficheros horas antes de escribir su línea `MEDIA:`. Lo de cualquier otro sitio, las caches
+  incluidas, sigue necesitando la marca.
 - **El lector decide qué se puede leer.** Es `/usr/local/libexec/hehermes-leer-media` (`despliegue/`), Python sin
   dependencias:
   - desde la 1.4.0, **solo lee de una lista de permitidas**: `image_cache/`, `audio_cache/` y `exports/` de la carpeta
@@ -205,6 +210,14 @@ leer, así que el reparto es este:
 - el estado es uno de `invalida`, `no_existe`, `prohibida`, `no_es_fichero`, `demasiado_grande`, `carrera`, `error` o
   `no_autorizado`;
 - cada uno tiene su código de salida (`SALIDAS`, en el lector).
+
+Y desde la 1.5.1, **la vigilancia de `exports/`**: a la línea `?exports` el lector contesta `{"carpeta": …}` y, cada
+2 s durante 10 minutos, `{"ficheros": [{"nombre", "tamano", "mtime", "ctime"}, …]}` de los ficheros normales de esa
+carpeta (sin subcarpetas, ocultos ni temporales, con un solo enlace duro; ni un byte de dentro). El vigía la mantiene
+abierta (`vigia/exportaciones.py`) y, de cada fichero nuevo que lleva 5 s igual, busca su conversación (su nombre en las
+últimas filas de las de la bandeja y de sus subagentes) y avisa «Nuevo fichero listo: <nombre>» (`segundo-plano`). La
+app lo enseña en su conversación con `GET /avisos/v1/ficheros?sesion=` (contrato §11.1). Ocupa una de las 4 conexiones
+del socket (`MaxConnections`): quedan 3 para las 2 descargas a la vez. `[exportaciones] vigilar = no` lo apaga.
 
 **Para root, a mano:** `sudo /usr/local/libexec/hehermes-leer-media <ruta>`, con los bytes por la salida estándar. Lo
 que se aplica así es solo el código del lector, sin la jaula de systemd.

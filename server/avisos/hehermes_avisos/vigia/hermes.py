@@ -80,10 +80,27 @@ class ClienteHermes:
             raise ErrorHermes("la bandeja de Hermes no trae «data»")
         return [f for f in filas if isinstance(f, dict) and isinstance(f.get("id"), str) and f["id"]]
 
-    def mensajes(self, sesion: str, limite: int) -> list:
-        """Las ``limite`` filas más recientes de una sesión, en orden de id (el orden fiable, contrato §7)."""
-        datos = self._get(f"/api/sessions/{urllib.parse.quote(sesion, safe='')}/messages",
-                          {"order": "latest", "limit": limite})
+    def sesiones_con_hijas(self) -> list:
+        """La primera página de todas las sesiones, con las de los subagentes y su ``parent_session_id``:
+        ``GET /api/sessions?include_children=true&limit=200``. Para saber de qué conversación es lo que hace un subagente
+        (``exportaciones.atribuir``)."""
+        datos = self._get("/api/sessions", {"include_children": "true", "limit": LIMITE_BANDEJA})
+        filas = datos.get("data") if isinstance(datos, dict) else None
+        if not isinstance(filas, list):
+            raise ErrorHermes("la lista de sesiones de Hermes no trae «data»")
+        return [f for f in filas if isinstance(f, dict) and isinstance(f.get("id"), str) and f["id"]]
+
+    def mensajes(self, sesion: str, limite: int, desde: int = 0, compactadas: bool = False) -> list:
+        """Las ``limite`` filas más recientes de una sesión, en orden de id (el orden fiable, contrato §7), saltándose las
+        ``desde`` más recientes. Con ``compactadas``, de la conversación entera aunque Hermes la haya compactado
+        (``include_compacted=true``, contrato §7): sin ello, lo archivado no sale. Un Hermes que no lo conozca no lo
+        mira."""
+        consulta = {"order": "latest", "limit": limite}
+        if desde:
+            consulta["offset"] = desde
+        if compactadas:
+            consulta["include_compacted"] = "true"
+        datos = self._get(f"/api/sessions/{urllib.parse.quote(sesion, safe='')}/messages", consulta)
         filas = datos.get("data") if isinstance(datos, dict) else None
         if not isinstance(filas, list):
             raise ErrorHermes("los mensajes de Hermes no traen «data»")

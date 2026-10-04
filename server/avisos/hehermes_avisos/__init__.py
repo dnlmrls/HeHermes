@@ -30,4 +30,10 @@ máquina se lleva este paquete entero y arranca solo su mitad.
 #        pasa al ayudante `hehermes-respaldo` (despliegue/), que corre como el dueño de Hermes: instantáneas troceadas
 #        con las bases limpias de lo borrado, y restaurar con `hermes import`, la copia de antes y el deshacer. Cuerpos
 #        de hasta 4 MiB + 64 KiB en esas rutas; `comprobar` mira también el ayudante.
-VERSION = "1.5.0"
+# 1.5.1: la conversación que Hermes compacta en el sitio (contrato §7). Las marcas de un fichero se buscan en la
+#        conversación entera, con lo compactado (`include_compacted=true`) y hacia atrás de 500 en 500 hasta 5000 filas,
+#        recordando todo lo marcado que se ve; lo que nombra el resumen oculto no marca. Un iPhone que se va a mitad de una
+#        petición deja una línea en el registro y no una traza. Y los ficheros nuevos de exports/ (contrato §11.1): el
+#        vigía vigila la carpeta por el lector (`?exports`), avisa «Nuevo fichero listo» con su conversación y la app los
+#        pide en GET /avisos/v1/ficheros; lo de exports/ se descarga sin marca.
+VERSION = "1.5.1"

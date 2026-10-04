@@ -78,6 +78,16 @@ casa = /root
 por_minuto = 30
 simultaneos = 2
 
+[exportaciones]
+# Desde la 1.5.1: el vigía vigila la carpeta de Hermes para el iPhone (<HERMES_HOME>/exports) por el mismo lector de
+# [ficheros] y avisa de cada fichero nuevo («Nuevo fichero listo: <nombre>», de tipo segundo plano), aunque Hermes aún
+# no haya escrito su línea MEDIA:. Sin lector, no vigila. «no» lo apaga.
+vigilar = sí
+# Segundos que un fichero nuevo tiene que quedarse igual para avisar de él (no se avisa a medias). Como mínimo 2.
+estabilidad = 5
+# Lo que llegó a la carpeta hace más de esto (segundos; el vigía estuvo parado) se apunta sin avisar.
+antiguedad_maxima = 3600
+
 [respaldo]
 # La copia de Hermes en iCloud (/avisos/v1/respaldo/…, contrato §15). La hace el ayudante de root de
 # /usr/local/libexec/hehermes-respaldo, que systemd lanza por cada conexión a este socket (root:hh-vigia 0660).

@@ -27,6 +27,7 @@ from .almacen import Almacen
 from .api import AppVigia, ManejadorVigia
 from .configuracion import ConfigVigia
 from .envio import ClienteRele, Mensajero
+from .exportaciones import Exportaciones, VigiaDeExportaciones
 from .fichero import ClienteLector, Ficheros, Limites
 from .hermes import ClienteHermes, ErrorHermes
 from .respaldo import ClienteAyudante, Respaldos, limpiar_cada_hora
@@ -74,15 +75,20 @@ def servir(config: ConfigVigia) -> int:
     rele = (ClienteRele(config.rele_url, credencial, config.rele_plazo, huella=huellas_del_rele)
             if config.con_credencial else None)
     mensajero = Mensajero(almacen, rele, plazo=config.rele_plazo)
+    # Los ficheros nuevos de exports/, por el mismo lector que los sirve (`exportaciones.py`).
+    exportaciones = (Exportaciones(almacen, estabilidad=config.exportaciones_estabilidad,
+                                   antiguedad_maxima=config.exportaciones_antiguedad_maxima)
+                     if config.exportaciones_vigilar and config.ficheros_lector else None)
     vigilante = Vigilante(almacen, hermes, mensajero, intervalo=config.intervalo,
                           intervalo_en_calma=config.intervalo_en_calma, antiguedad_maxima=config.antiguedad_maxima,
                           filas_por_lectura=config.filas_por_lectura, caducidad_aprobacion=config.caducidad_aprobacion,
-                          reglas_entrega=config.reglas_de_entrega())
+                          reglas_entrega=config.reglas_de_entrega(), exportaciones=exportaciones)
     ficheros = Ficheros(hermes, ClienteLector(config.ficheros_lector),
-                        Limites(config.ficheros_por_minuto, config.ficheros_simultaneos), casa=config.ficheros_casa)
+                        Limites(config.ficheros_por_minuto, config.ficheros_simultaneos), casa=config.ficheros_casa,
+                        exportaciones=exportaciones)
     respaldos = Respaldos(ClienteAyudante(config.respaldo_ayudante)) if config.respaldo_ayudante else None
     app = AppVigia(almacen, mensajero, secreto_tunel=secreto_tunel, caducidad_prueba=config.caducidad_prueba,
-                   al_moverse=vigilante.despertar, ficheros=ficheros, respaldos=respaldos)
+                   al_moverse=vigilante.despertar, ficheros=ficheros, respaldos=respaldos, exportaciones=exportaciones)
     servidor = ServidorHTTP(config.escucha, ManejadorVigia, app, heredado=heredado)
     _avisar_si_no_coincide(heredado, config.escucha)
     threading.Thread(target=servidor.serve_forever, name="api", daemon=True).start()
@@ -91,6 +97,9 @@ def servir(config: ConfigVigia) -> int:
     signal.signal(signal.SIGINT, lambda *_: parar.set())
     if respaldos is not None:
         threading.Thread(target=limpiar_cada_hora, args=(respaldos, parar), name="respaldo", daemon=True).start()
+    if exportaciones is not None:
+        vigia = VigiaDeExportaciones(config.ficheros_lector, exportaciones, vigilante.despertar)
+        threading.Thread(target=vigia.correr, args=(parar,), name="exportaciones", daemon=True).start()
     registro.info("vigía %s escuchando en %s:%d%s; Hermes en %s%s; relé en %s", VERSION, *servidor.server_address[:2],
                   " (socket de systemd)" if heredado else "", config.hermes_base,
                   " (con clave)" if clave_hermes else "",

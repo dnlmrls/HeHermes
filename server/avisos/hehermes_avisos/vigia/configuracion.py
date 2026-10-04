@@ -93,6 +93,11 @@ class ConfigVigia:
     entregas_gracia: float = 60.0
     entregas_antiguedad_maxima: float = 10800.0
     entregas_cadena_maxima: int = 3
+    # Los ficheros nuevos de `exports/` (`exportaciones.py`, desde la 1.5.1): si se vigila la carpeta (por el lector),
+    # cuántos segundos tiene que quedarse igual un fichero para avisar de él, y desde qué edad ya no se avisa.
+    exportaciones_vigilar: bool = True
+    exportaciones_estabilidad: float = 5.0
+    exportaciones_antiguedad_maxima: float = 3600.0
 
     @classmethod
     def leer(cls, ruta: str) -> ConfigVigia:
@@ -107,6 +112,7 @@ class ConfigVigia:
 
         clave_hermes = (texto("hermes", "clave", base.hermes_clave) or "").strip() or None
         contestar = _si_o_no(texto("entregas", "contestar", "sí"), "[entregas] contestar")
+        vigilar_exportaciones = _si_o_no(texto("exportaciones", "vigilar", "sí"), "[exportaciones] vigilar")
         # Sin `url`, sin credencial: lo escribe así el instalador cuando no hay código de avisos. Con ella, las reglas de
         # siempre (https con huella, o en claro solo a 127.0.0.1).
         rele_url = (texto("rele", "url", "") or "").strip()
@@ -148,6 +154,11 @@ class ConfigVigia:
             entregas_gracia=max(30.0, numero("entregas", "gracia", base.entregas_gracia)),
             entregas_antiguedad_maxima=numero("entregas", "antiguedad_maxima", base.entregas_antiguedad_maxima),
             entregas_cadena_maxima=max(1, int(numero("entregas", "cadena_maxima", base.entregas_cadena_maxima))),
+            exportaciones_vigilar=vigilar_exportaciones,
+            # Menos de 2 s avisaría de lo que aún se está copiando entre dos miradas del lector (cada 2 s).
+            exportaciones_estabilidad=max(2.0, numero("exportaciones", "estabilidad", base.exportaciones_estabilidad)),
+            exportaciones_antiguedad_maxima=numero("exportaciones", "antiguedad_maxima",
+                                                   base.exportaciones_antiguedad_maxima),
         )
 
     @property

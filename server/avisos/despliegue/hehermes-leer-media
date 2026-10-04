@@ -52,17 +52,25 @@ sin root corre como él): ni a root, ni a ``hh-vigia``. Como root no vale (``--u
 lector de root solo atiende a root y a ``hh-vigia``, como siempre.
 
 En los dos, el código de salida dice qué pasó (``SALIDAS``). Nunca apunta el contenido ni la ruta.
+
+Y desde la 1.5.1, la **vigilancia de la carpeta de exportaciones**: con la línea ``?exports`` en lugar de una ruta, el
+lector cuenta cada dos segundos qué ficheros hay en ``exports/`` (``vigilar``: nombre, tamaño y horas de modificación y
+de cambio de los ficheros normales de la carpeta misma, sin ocultos ni temporales, con un solo enlace duro), durante diez
+minutos o hasta que el vigía se vaya. Es lo que deja al vigía avisar de un fichero nuevo en cuanto está (``vigia/exportaciones.py``)
+sin poder leer él la casa de Hermes. No lee nada de dentro de ningún fichero, ni mira fuera de esa carpeta.
 """
 
 from __future__ import annotations
 
 import errno
+import json
 import os
 import pwd
 import socket
 import stat
 import struct
 import sys
+import time
 
 TOPE = 50 * 1024 * 1024
 MAX_RUTA = 4096
@@ -83,6 +91,18 @@ SALIDAS = {
     # como fallo.
     "fuera": 10,
 }
+
+# La línea que pide vigilar la carpeta de exportaciones en lugar de leer un fichero (desde la 1.5.1 de los avisos). No es una
+# ruta: las rutas empiezan por «/».
+VIGILAR = "?exports"
+# Cada cuánto se mira la carpeta y cuánto dura una vigilancia: menos que el RuntimeMaxSec de la unidad, y el vigía vuelve a
+# llamar. Lo que se cuenta, como mucho: los más recientes.
+PAUSA_DE_VIGILANCIA = 2.0
+DURACION_DE_VIGILANCIA = 600.0
+MAX_VIGILADOS = 1000
+# Lo que se está escribiendo o no es para nadie: los ocultos, las copias de seguridad de los editores y los temporales de
+# quien descarga o copia.
+TEMPORALES = (".tmp", ".temp", ".part", ".partial", ".crdownload", ".download", ".swp", ".swx", ".lock", "~")
 
 # La casa de Hermes (HERMES_HOME) de serie. La de otro sitio se pasa con --hermes-home (la pone el instalador en la
 # unidad, si el entorno de hermes-gateway dice otra).
@@ -352,18 +372,80 @@ def _leer_linea(conexion, plazo: float) -> str:
         raise Rechazo("invalida") from None
 
 
+def carpeta_de_exportaciones(hermes: str = HERMES_HOME, exportaciones: str | None = None) -> str:
+    """La carpeta de exportaciones, la que se vigila: la dada aparte o la de dentro de la casa de Hermes."""
+    if exportaciones is not None:
+        return canonica(validar_casa(exportaciones))
+    return canonica(validar_casa(hermes)).rstrip("/") + "/" + EXPORTACIONES
+
+
+def listar(carpeta: str, *, prohibidas=es_prohibida) -> list:
+    """``[(nombre, tamaño, mtime, ctime)]`` (las horas en ns) de los ficheros de la carpeta, de los más recientes a los
+    más antiguos y como mucho ``MAX_VIGILADOS``: solo los ficheros normales de la carpeta misma (sin entrar en
+    subcarpetas), sin los ocultos, sin los temporales y con un solo enlace duro, como los que se dejan leer; nada de la
+    lista de prohibidas. Sin seguir ningún enlace. Sin la carpeta, nada: puede no existir todavía. El ``ctime`` es la
+    llegada de lo que se mueve a la carpeta, que conserva su ``mtime`` de antes."""
+    ficheros = []
+    try:
+        with os.scandir(carpeta) as entradas:
+            for entrada in entradas:
+                nombre = entrada.name
+                if nombre.startswith((".", "~")) or nombre.lower().endswith(TEMPORALES):
+                    continue
+                if prohibidas(carpeta.rstrip("/") + "/" + nombre):
+                    continue
+                try:
+                    visto = entrada.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(visto.st_mode) or visto.st_nlink != 1:
+                    continue
+                ficheros.append((nombre, visto.st_size, visto.st_mtime_ns, visto.st_ctime_ns))
+    except OSError:
+        return []
+    ficheros.sort(key=lambda fichero: max(fichero[2], fichero[3]), reverse=True)
+    return ficheros[:MAX_VIGILADOS]
+
+
+def vigilar(escribir, carpeta: str, *, prohibidas=es_prohibida, pausa: float = PAUSA_DE_VIGILANCIA,
+            duracion: float = DURACION_DE_VIGILANCIA, reloj=time.monotonic, dormir=time.sleep) -> int:
+    """Cuenta lo que hay en la carpeta de exportaciones, una línea JSON cada ``pausa`` segundos, hasta ``duracion`` o
+    hasta que el otro lado se vaya: primero ``{"carpeta": "<ruta>"}`` y después ``{"ficheros": [{"nombre", "tamano",
+    "mtime", "ctime"}, …]}``. Solo nombres, tamaños y horas de lo que Hermes deja para el iPhone, nunca nada de dentro. Es lo que
+    deja al vigía avisar de un fichero nuevo en cuanto está, sin poder leer él la casa de Hermes."""
+    fin = reloj() + duracion
+    try:
+        escribir((json.dumps({"carpeta": carpeta}) + "\n").encode("utf-8"))
+        while True:
+            lista = [{"nombre": nombre, "tamano": tamano, "mtime": mtime, "ctime": ctime}
+                     for nombre, tamano, mtime, ctime in listar(carpeta, prohibidas=prohibidas)]
+            escribir((json.dumps({"ficheros": lista}) + "\n").encode("utf-8"))
+            if reloj() >= fin:
+                return SALIDAS["ok"]
+            dormir(pausa)
+    except OSError:
+        # El vigía se ha ido (o se reinicia): no es un fallo.
+        return SALIDAS["ok"]
+
+
 def _decir(estado: str, tamano: int | None = None) -> None:
     sys.stderr.write("hehermes-leer-media: %s%s\n" % (estado, "" if tamano is None else " (%d bytes)" % tamano))
 
 
 def atender(conexion, *, prohibidas=es_prohibida, par_permitido=par_del_vigia, plazo: float = 10.0,
-            hermes: str = HERMES_HOME, exportaciones: str | None = None) -> int:
-    """Una conexión: una línea con la ruta, y la respuesta. Devuelve el código de salida."""
+            hermes: str = HERMES_HOME, exportaciones: str | None = None, vigilancia: dict | None = None) -> int:
+    """Una conexión: una línea con la ruta, y la respuesta; o ``VIGILAR``, y la vigilancia de la carpeta de
+    exportaciones (``vigilar``, con ``vigilancia`` para las pruebas). Devuelve el código de salida."""
     try:
         if not par_permitido(conexion):
             raise Rechazo("no_autorizado")
-        fd, tamano = abrir(_leer_linea(conexion, plazo), prohibidas=prohibidas, hermes=hermes,
-                           exportaciones=exportaciones)
+        linea = _leer_linea(conexion, plazo)
+        if linea == VIGILAR:
+            # Sin apuntarlo: es una por cada diez minutos, todo el día, y no dice nada.
+            conexion.settimeout(60)
+            return vigilar(conexion.sendall, carpeta_de_exportaciones(hermes, exportaciones), prohibidas=prohibidas,
+                           **(vigilancia or {}))
+        fd, tamano = abrir(linea, prohibidas=prohibidas, hermes=hermes, exportaciones=exportaciones)
     except Rechazo as rechazo:
         _decir(rechazo.estado)
         try:

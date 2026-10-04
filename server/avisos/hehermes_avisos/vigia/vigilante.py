@@ -35,7 +35,7 @@ from dataclasses import dataclass, replace
 
 from .. import texto
 from ..comun import cola
-from . import avisos, deteccion, entregas
+from . import avisos, deteccion, entregas, exportaciones
 from .almacen import Almacen, EstadoSesion
 from .envio import ENVIADO, LIMITADO, REINTENTABLE, Mensajero
 from .hermes import ClienteHermes, ErrorHermes
@@ -110,8 +110,10 @@ class Vigilante:
     def __init__(self, almacen: Almacen, hermes: ClienteHermes, mensajero: Mensajero, *, intervalo: float = 5.0,
                  intervalo_en_calma: float = INTERVALO_EN_CALMA, antiguedad_maxima: float = 900.0,
                  filas_por_lectura: int = 100, caducidad_aprobacion: int = 120, reloj=time.time,
-                 reglas_entrega: ReglasDeEntrega | None = None):
+                 reglas_entrega: ReglasDeEntrega | None = None, exportaciones=None):
         self.almacen = almacen
+        # Los ficheros nuevos de `exports/` que hay que avisar (`exportaciones`), si se vigila la carpeta.
+        self.exportaciones = exportaciones
         # Sin reglas, el vigía no contesta ninguna entrega: solo avisa de ella.
         self.reglas_entrega = reglas_entrega
         # (sesión, delegation_id) → lo hecho con su entrega. En memoria: tras un reinicio, la misma clave de
@@ -205,13 +207,60 @@ class Vigilante:
             # haber un iPhone se rehace la línea de base en vez de avisarle de lo de antes de darse de alta.
             self._rebasar = True
             self._pendiente_en_la_vuelta = False
+            # Salvo los ficheros nuevos de exports/: no se avisa de ellos, pero sí se busca su conversación, para
+            # que la app los enseñe en ella (`GET /avisos/v1/ficheros`) aunque no tenga los avisos puestos.
+            self._anunciar_ficheros(ahora, None)
             return
         bandeja = self.hermes.sesiones()
         self._titulos = {sesion["id"]: texto.titulo_de_sesion(sesion) for sesion in bandeja}
         self._revisar_turnos(ahora)
         self._revisar_bandeja(bandeja, ahora, rebasar=self._rebasar)
         self._rebasar = False
+        self._anunciar_ficheros(ahora, bandeja)
         self._podar(ahora)
+
+    # -- Los ficheros nuevos de exports/
+
+    def _anunciar_ficheros(self, ahora: float, bandeja: list | None) -> None:
+        """Avisa de los ficheros nuevos que ha visto la vigilancia de ``exports/`` (``exportaciones``): primero se busca
+        a qué conversación van, y el aviso sale como cualquier otro, con sus ajustes y sus reintentos. Lo que no sale
+        se intenta en la vuelta siguiente. Sin ``bandeja`` no hay a quién avisar (ningún iPhone dado de alta): solo se
+        busca su conversación, para la app, y se dan por avisados."""
+        if self.exportaciones is None:
+            return
+        pendientes = self.exportaciones.por_anunciar(ahora)
+        if not pendientes:
+            return
+        sin_atribuir = [fichero for fichero in pendientes if not fichero.atribuido]
+        if sin_atribuir:
+            try:
+                sesiones = exportaciones.atribuir(self.hermes, sin_atribuir, ahora, bandeja)
+            except ErrorHermes as error:
+                # Sin Hermes ahora, a la vuelta siguiente; si no caduca antes, se busca otra vez.
+                self._apuntar_fallo("exportaciones", "no se pudo buscar de qué conversación es un fichero nuevo: %s",
+                                    error)
+                self._pendiente_en_la_vuelta = True
+                return
+            pendientes = [self.exportaciones.atribuir(fichero, sesiones.get(fichero.nombre))
+                          if not fichero.atribuido else fichero for fichero in pendientes]
+        for fichero in pendientes:
+            if bandeja is None:
+                self.exportaciones.anunciado(fichero)
+                continue
+            try:
+                titulo = (self._titulos.get(fichero.sesion) if fichero.sesion else None) or "Hermes"
+                aviso = avisos.Aviso(tipo="segundo-plano", sesion=fichero.sesion, titulo=titulo,
+                                     texto=exportaciones.TEXTO.format(fichero.nombre), instante=fichero.instante,
+                                     clave=fichero.clave, colapsa_con=f"fichero:{fichero.nombre}")
+                if self._avisar(aviso, ahora):
+                    self.exportaciones.anunciado(fichero)
+                    registro.info("fichero nuevo de exports avisado%s",
+                                  " (con su conversación)" if fichero.sesion else " (sin conversación)")
+                else:
+                    self._pendiente_en_la_vuelta = True
+            except Exception:  # noqa: BLE001 — un fichero que rompe algo no puede dejar sin avisos al resto
+                self._apuntar_fallo("exportaciones", "fallo avisando de un fichero nuevo de exports", excepcion=True)
+                self.exportaciones.anunciado(fichero)
 
     # -- La bandeja
 
