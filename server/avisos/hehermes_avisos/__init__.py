@@ -36,4 +36,9 @@ máquina se lleva este paquete entero y arranca solo su mitad.
 #        petición deja una línea en el registro y no una traza. Y los ficheros nuevos de exports/ (contrato §11.1): el
 #        vigía vigila la carpeta por el lector (`?exports`), avisa «Nuevo fichero listo» con su conversación y la app los
 #        pide en GET /avisos/v1/ficheros; lo de exports/ se descarga sin marca.
-VERSION = "1.5.1"
+# 1.5.2: mandarle un fichero a Hermes (spec 2026-10-04, contrato §16). El vigía atiende /avisos/v1/entrada/… y se lo pasa
+#        al ayudante `hehermes-entrada` (despliegue/), que corre como el dueño de Hermes sin ninguna capacidad y solo ve
+#        <HERMES_HOME>/entrada: trozos de 4 MiB con su SHA-256, el fichero entero comprobado y colocado con `link` en la
+#        carpeta del día, con un nombre limpio, y la limpieza cada hora ([entrada] en vigia.ini). La copia en iCloud deja
+#        fuera esa carpeta.
+VERSION = "1.5.2"

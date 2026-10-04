@@ -24,7 +24,8 @@ secreto. Sin root, lo mismo en la casa del usuario de Hermes, con una unidad de 
 El lector de ficheros (`GET /avisos/v1/fichero`, `server/avisos/despliegue/hehermes-leer-media`): con root, como en el
 VPS de Daniel (el script en /usr/local/libexec, un socket de systemd `root:hh-vigia` 0660 y un lector de root enjaulado
 por conexión); sin root, una unidad de usuario del usuario de Hermes, con su socket en su /run/user, que solo atiende a
-su propio uid.
+su propio uid. Igual los ayudantes de la copia en iCloud (desde la 0.10.0) y de la entrada (desde la 0.10.6: lo que la
+app le manda a Hermes, en `<HERMES_HOME>/entrada`, que crea el instalador como `exports/`).
 """
 
 from __future__ import annotations
@@ -173,6 +174,7 @@ def planear(sis, det, man, op, origen, acciones, bloqueos, fichero, avisos=None)
     reemplazar = getattr(op, "reemplazar", frozenset())
     lector = planear_lector(sis, det, origen, acciones, bloqueos, avisos, fichero)
     respaldo = planear_respaldo(sis, det, origen, acciones, bloqueos, avisos, fichero)
+    entrada = planear_entrada(sis, det, origen, acciones, bloqueos, avisos, fichero)
     credencial = (vigia["credencial"] + "\n").encode() if vigia["credencial"] else None
     secreto = sis.leer(ambito.secreto_vigia)
     propias = [
@@ -180,7 +182,8 @@ def planear(sis, det, man, op, origen, acciones, bloqueos, fichero, avisos=None)
                                               det.hermes.casa_de_rutas,
                                               vigia["direccion"], vigia["puerto"], vigia["huella"],
                                               lector=ambito.socket_lector if lector else None,
-                                              respaldo=ambito.socket_respaldo if respaldo else None),
+                                              respaldo=ambito.socket_respaldo if respaldo else None,
+                                              entrada=ambito.socket_entrada if entrada else None),
                 0o640 if ambito.root else 0o600, detalle=detalle),
         _secreto(sis, man, acciones, ambito.secreto_vigia,
                  (secrets.token_urlsafe(32) + "\n").encode() if secreto is None else None, reemplazar,
@@ -268,6 +271,36 @@ def planear_respaldo(sis, det, origen, acciones, bloqueos, avisos, fichero) -> b
     return True
 
 
+def planear_entrada(sis, det, origen, acciones, bloqueos, avisos, fichero) -> bool:
+    """El ayudante de la entrada (desde la 0.10.6, contrato §16): el script (con root, en /usr/local/libexec; sin root,
+    el que ya va en su casa con el instalador), su socket y su plantilla. Devuelve si se pone: sin él, el vigía va igual
+    y /avisos/v1/entrada contesta 503. La carpeta `<HERMES_HOME>/entrada` se crea al aplicar (`crear_entrada`)."""
+    ambito = det.ambito
+    casa = det.hermes.home.rstrip("/")
+    if not p._RUTA_VALIDA.fullmatch(casa):
+        if avisos is not None:
+            avisos.append("La carpeta de Hermes (%r) no la sé poner en una unidad de systemd: no pongo la entrada de "
+                          "ficheros, y /avisos/v1/entrada contesta 503" % casa)
+        return False
+    from .plan import fuente_de_la_entrada
+    fuente = fuente_de_la_entrada(origen)
+    if fuente is None:
+        bloqueos.append(bloqueo("paquete", "el paquete no trae el ayudante de la entrada (hehermes-entrada)"))
+        return False
+    if ambito.root:
+        # Suelto, como el lector: cambiarlo no pide reiniciar nada, cada conexión lanza el que haya.
+        with open(fuente, "rb") as f:
+            fichero(ambito.entrada, f.read(), 0o755)
+    unidades = [fichero(ambito.unidad_entrada_socket, p.unidad_entrada_socket(ambito)),
+                fichero(ambito.unidad_entrada, p.unidad_entrada(ambito, casa,
+                                                                det.hermes.usuario if ambito.root else None))]
+    _unidad(sis, acciones, p.SOCKET_ENTRADA, unidades,
+            "lo que la app le manda a Hermes (/avisos/v1/entrada, en %s/%s), %s"
+            % (casa, p.CARPETA_ENTRADA, "uno por conexión, como el dueño de Hermes y sin capacidades" if ambito.root
+               else "como %s, uno por conexión" % ambito.usuario), "restart", ambito.systemctl)
+    return True
+
+
 def _secreto(sis, man, acciones, ruta, deseado, reemplazar, detalle):
     estado = _gestionado(sis, man, ruta, deseado, reemplazar)
     datos = deseado if deseado is not None else sis.leer(ruta)
@@ -279,7 +312,7 @@ def rutas(ambito) -> set:
     """Lo del vigía y del lector que `aplicar_tls` deja para su propio paso (y no con los ficheros sueltos)."""
     return {ambito.vigia_ini, ambito.secreto_vigia, ambito.credencial_rele, ambito.clave_hermes_vigia,
             ambito.unidad_vigia, ambito.socket_vigia, ambito.unidad_lector_socket, ambito.unidad_lector,
-            ambito.unidad_respaldo_socket, ambito.unidad_respaldo}
+            ambito.unidad_respaldo_socket, ambito.unidad_respaldo, ambito.unidad_entrada_socket, ambito.unidad_entrada}
 
 
 # MARK: Aplicar
@@ -335,8 +368,27 @@ def crear_exportaciones(sis, man, hermes, ambito, salida) -> None:
     salida("==> la carpeta de exportaciones de Hermes: %s (lo que deje ahí con MEDIA:, la app lo descarga)" % ruta)
 
 
+def crear_entrada(sis, man, hermes, ambito, salida) -> None:
+    """`<HERMES_HOME>/entrada`: donde el ayudante deja lo que la app le manda a Hermes, lo único de las casas que ve.
+    Del dueño de la casa de Hermes y solo suya, como `exports/`. Va al manifiesto aparte (`entrada`), con la pasarela:
+    desinstalarla quita lo que el ayudante dejó a medias (`.subidas`) y la carpeta solo si se queda vacía (lo entregado
+    ya es de Hermes)."""
+    ruta = hermes.home.rstrip("/") + "/" + p.CARPETA_ENTRADA
+    if sis.es_carpeta(ruta) or not sis.es_carpeta(hermes.home):
+        return
+    man.datos["entrada"] = ruta
+    man.guardar(sis)
+    sis.carpeta(ruta, 0o700)
+    if ambito.root and hermes.usuario and hermes.usuario != "root":
+        r = sis.ejecutar(["chown", "%s:" % hermes.usuario, ruta])
+        if not r.bien:
+            salida("    No he podido darle %s a %s: el ayudante de la entrada no podrá escribir en ella"
+                   % (ruta, hermes.usuario))
+    salida("==> la carpeta de entrada de Hermes: %s (lo que la app le manda, Hermes lo lee de ahí)" % ruta)
+
+
 def aplicar_unidades(sis, man, acciones, ambito, salida, hermes=None) -> None:
-    """El lector primero (el vigía lo quiere, `Wants=`), luego el puerto del vigía y el vigía."""
+    """El lector y los ayudantes primero (el vigía los quiere, `Wants=`), luego el puerto del vigía y el vigía."""
     from .aplicar import _con_unidad
     del_lector = [a for a in acciones if a.objeto in (ambito.unidad_lector_socket, ambito.unidad_lector,
                                                         p.SOCKET_LECTOR)]
@@ -348,6 +400,12 @@ def aplicar_unidades(sis, man, acciones, ambito, salida, hermes=None) -> None:
                                                           p.SOCKET_RESPALDO)]
     if del_respaldo:
         _con_unidad(sis, man, del_respaldo, p.SOCKET_RESPALDO, salida, systemctl=ambito.systemctl)
+    if hermes is not None and any(a.objeto == ambito.unidad_entrada for a in acciones):
+        crear_entrada(sis, man, hermes, ambito, salida)
+    de_la_entrada = [a for a in acciones if a.objeto in (ambito.unidad_entrada_socket, ambito.unidad_entrada,
+                                                           p.SOCKET_ENTRADA)]
+    if de_la_entrada:
+        _con_unidad(sis, man, de_la_entrada, p.SOCKET_ENTRADA, salida, systemctl=ambito.systemctl)
     if ambito.root:
         _con_unidad(sis, man, [a for a in acciones if a.objeto in (ambito.socket_vigia, p.SOCKET_VIGIA)],
                     p.SOCKET_VIGIA, salida)
@@ -383,6 +441,11 @@ def comprobar(sis, man, ambito, mira, hermes_pendiente=False, intentos=3, espera
         mira(respaldo, "copia en iCloud: el socket de su ayudante está en marcha (%s)" % ambito.socket_respaldo,
              "copia en iCloud: el socket de su ayudante está parado (%ssystemctl %sstart %s)"
              % ("sudo " if ambito.root else "", "" if ambito.root else "--user ", p.SOCKET_RESPALDO))
+    if ambito.unidad_entrada_socket in man.ficheros:
+        entrada = sis.ejecutar(ambito.systemctl + ["is-active", p.SOCKET_ENTRADA]).bien
+        mira(entrada, "entrada de ficheros: el socket de su ayudante está en marcha (%s)" % ambito.socket_entrada,
+             "entrada de ficheros: el socket de su ayudante está parado (%ssystemctl %sstart %s)"
+             % ("sudo " if ambito.root else "", "" if ambito.root else "--user ", p.SOCKET_ENTRADA))
     if hermes_pendiente:
         return
     orden = [ambito.python_venv, "-I", "-B", "-m", "hehermes_avisos.vigia", "--config", ambito.vigia_ini, "comprobar"]

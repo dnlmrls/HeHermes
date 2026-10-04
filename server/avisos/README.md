@@ -74,8 +74,9 @@ Con `server/` del repo copiado al VPS (a donde sea: el instalador busca el códi
 3. `sudo server/avisos/despliegue/instalar.sh`: usuarios, dependencias (solo ruedas, comprobadas por hash, y antes de
    cambiar el código), código, configuración, credencial del vigía ante el relé, secreto entre nginx y el vigía, la
    clave de Hermes del vigía (con `hehermes-dispositivo clave --solo-vigia`, que no toca nginx), el fragmento de nginx y
-   las unidades de systemd (dos sockets, que tienen los puertos, y dos servicios). Deja los dos en marcha: el relé, sin
-   su clave, contesta 503 a los avisos.
+   las unidades de systemd (dos sockets, que tienen los puertos, y dos servicios), además del lector y de los ayudantes
+   de la copia y de la entrada, con sus sockets. Deja los dos en marcha: el relé, sin su clave, contesta 503 a los
+   avisos.
 4. La clave de APNs (developer.apple.com › Certificates, IDs & Profiles › Keys, con «Apple Push Notifications service»):
    `sudo install -m 0600 -o hh-rele -g hh-rele AuthKey_XXXXXXXXXX.p8 /etc/hehermes-avisos/rele/AuthKey.p8`, y su Key ID
    en `/etc/hehermes-avisos/rele.ini` (`clave_id = …`). El Team ID (`8X7L8YHD9M`) y el tema ya están.
@@ -252,7 +253,41 @@ La app cifra y guarda en iCloud; aquí solo se hace la instantánea, se sirven s
 
 **Para root, a mano:** `sudo /usr/bin/python3 -I -S /usr/local/libexec/hehermes-respaldo estado` (lo que ve el
 ayudante, sin secretos) y `… limpiar`. Lo que pasa, en `journalctl -u 'hehermes-respaldo@*'`: ids, fases, tamaños y
-resultados; nunca una ruta ni un contenido.
+resultados; nunca una ruta ni un contenido. La copia deja fuera `entrada/` (abajo): son copias de lo que ya está en el
+iPhone, y se borran solas.
+
+## Lo que la app le manda a Hermes (desde la 1.5.2)
+
+Spec `docs/superpowers/specs/2026-10-04-ficheros-sin-limite-design.md`, contrato `server/API-CONTRACT.md` §16. Lo que no
+es texto que quepa en el mensaje, la app lo sube en trozos de 4 MiB, y Hermes recibe en el mismo mensaje la ruta donde
+ha quedado: `<HERMES_HOME>/entrada/<AAAA-MM-DD>/<nombre>`.
+
+- **El vigía** atiende `/avisos/v1/entrada/…` (`vigia/entrada.py`): comprueba la forma de lo que llega (ids, números,
+  el nombre, el SHA-256 de cada trozo en `X-HeHermes-SHA256`), deja cuatro trozos a la vez, le pasa al ayudante los
+  topes de `[entrada]` en `vigia.ini` y le pide la limpieza cada hora. Cuerpos de hasta 4 MiB + 64 KiB, como en la copia.
+- **El ayudante** es `/usr/local/libexec/hehermes-entrada` (`despliegue/`), Python sin dependencias, lanzado por
+  `hehermes-entrada.socket` (`/run/hehermes-entrada.sock`, `root:hh-vigia 0660`, `Accept=yes`) en un
+  `hehermes-entrada@.service` por conexión, **como el dueño de la casa de Hermes y sin ninguna capacidad**: la jaula del
+  lector, pero lo único de las casas que ve es `<HERMES_HOME>/entrada`, de lectura y escritura, y `LimitFSIZE=16G`.
+  **No acepta rutas**: el nombre del disco lo decide él (`nombre_seguro`: letras, cifras y `. - _ + , @`, nada al
+  principio que lo esconda o lo haga una opción, 180 bytes como mucho, `-2`, `-3`… si se repite ese día); los ids son
+  suyos. Baja con descriptores y sin seguir enlaces, comprueba cada trozo y el fichero entero, y coloca lo acabado con
+  `link` (no pisa nada), 0600.
+- **Sus topes, que el vigía no puede saltarse**: 16 GiB por fichero como mucho (el de `vigia.ini`, 2048 MiB, si es
+  menor), al menos 256 MiB libres después de guardarlo (1024 MiB de serie), contando lo que les falta a las demás
+  subidas a medias; ocho a medias y sesenta nuevas por hora.
+- **La limpieza**, cada hora: lo que lleva 24 horas sin un trozo nuevo, el registro de lo colocado hace más de 24 horas
+  (el fichero se queda) y, enteras, las carpetas de los días de hace más de `[entrada] dias` (30). `entrada/` es una
+  bandeja de entrada: lo que Hermes quiera conservar, que lo copie a otro sitio.
+- **La carpeta** la crea `instalar.sh` (0700, del dueño de Hermes), como `exports/`. Si Hermes no vive en `/root/.hermes`
+  o no es de root, deja un añadido (`hehermes-entrada@.service.d/hermes.conf`) con `--hermes-home=`, la carpeta que ve y
+  su usuario. Sin la carpeta, la ruta contesta 503 (`entrada_no_disponible`).
+- **Quitarlo:** `sudo …/instalar.sh --desinstalar-entrada` (no mientras termina una subida). La carpeta se queda: lo de
+  dentro es de Hermes.
+
+**Para root, a mano:** `sudo /usr/bin/python3 -I -S /usr/local/libexec/hehermes-entrada estado` (el disco libre, las
+subidas a medias y la carpeta) y `… --dias=30 limpiar`. Lo que pasa, en `journalctl -u 'hehermes-entrada@*'`: el
+principio del id, los tamaños, los números de trozo y el resultado; nunca el nombre, la ruta ni nada de dentro.
 
 ## Probar de punta a punta
 

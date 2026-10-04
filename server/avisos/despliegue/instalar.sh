@@ -27,9 +27,18 @@
 #                                                   ayudante de root, enjaulado, por cada conexión; su carpeta de trabajo,
 #                                                   /var/lib/hehermes-respaldo (0700, la crea systemd)
 #
+#   /usr/local/libexec/hehermes-entrada             el ayudante que recibe lo que la app le manda a Hermes (root 0755,
+#                                                   desde la 1.5.2)
+#   /etc/systemd/system/hehermes-entrada.socket y hehermes-entrada@.service   su socket (root:hh-vigia 0660) y un
+#                                                   ayudante por conexión, como el dueño de la casa de Hermes, sin
+#                                                   capacidades y que solo ve <casa de Hermes>/entrada
+#   <casa de Hermes>/entrada                        donde queda lo que la app le manda (0700, del dueño de Hermes)
+#
 #   sudo …/instalar.sh --desinstalar-lector         quita solo el lector (y con él, GET /avisos/v1/fichero da 503)
 #   sudo …/instalar.sh --desinstalar-respaldo       quita solo el ayudante de la copia (/avisos/v1/respaldo da 503); su
 #                                                   carpeta de trabajo, con la copia de antes de restaurar, se queda
+#   sudo …/instalar.sh --desinstalar-entrada        quita solo el ayudante de la entrada (/avisos/v1/entrada da 503); la
+#                                                   carpeta de entrada, con lo que ya recibió Hermes, se queda
 #
 # La entrada pública del relé (spec 2026-09-28, «El relé para los probadores»): por donde llegan los avisos de los
 # vigías de otros servidores. Se pone una vez, y desde entonces cada pasada la mantiene:
@@ -288,6 +297,102 @@ desinstalar_respaldo() {
 }
 # --- fin del ayudante de la copia -------------------------------------------------------------------------------------
 
+# --- El ayudante de la entrada (funciones) -----------------------------------------------------------------------------
+# Lo usan la instalación y --desinstalar-entrada. Como el lector: un ayudante por conexión a su socket, como el dueño de
+# la casa de Hermes y sin capacidades; lo único de las casas que ve es <casa>/entrada, donde escribe.
+ENTRADA=/usr/local/libexec/hehermes-entrada
+UNIDADES_ENTRADA="hehermes-entrada.socket hehermes-entrada@.service"
+ANADIDO_ENTRADA="$SYSTEMD/hehermes-entrada@.service.d/hermes.conf"
+ENTRADA_CAMBIADO=0
+
+instalar_entrada() {
+  install -d -m 0755 -o root -g root "$(dirname "$ENTRADA")"
+  if ! cmp -s "$AQUI/hehermes-entrada" "$ENTRADA"; then
+    install -m 0755 -o root -g root "$AQUI/hehermes-entrada" "$ENTRADA.nuevo"
+    mv -f "$ENTRADA.nuevo" "$ENTRADA"
+    echo "    ayudante de la entrada puesto en $ENTRADA"
+  fi
+  local unidad
+  for unidad in $UNIDADES_ENTRADA; do
+    if ! cmp -s "$AQUI/$unidad" "$SYSTEMD/$unidad"; then
+      install -m 0644 -o root -g root "$AQUI/$unidad" "$SYSTEMD/$unidad"
+      ENTRADA_CAMBIADO=1
+    fi
+  done
+  # Si Hermes no vive en /root/.hermes o no es de root, un añadido le dice al ayudante dónde, qué carpeta ver y de quién
+  # es: escribe como el dueño de la casa, y sin capacidades no podría escribir en la de otro.
+  local casa dueno texto usuario=""
+  casa="$(hermes_del_gateway)"
+  crear_entrada "$casa"
+  dueno="$(stat -c %U "$casa" 2>/dev/null || echo root)"
+  [[ "$dueno" =~ ^[a-z_][a-z0-9_-]*$ ]] || dueno=root
+  if [[ "$casa" == "$HERMES_DE_SERIE" && "$dueno" == root ]]; then
+    if [[ -e "$ANADIDO_ENTRADA" ]]; then
+      rm -f "$ANADIDO_ENTRADA"
+      rmdir "$(dirname "$ANADIDO_ENTRADA")" 2>/dev/null || true
+      ENTRADA_CAMBIADO=1
+    fi
+    return 0
+  fi
+  [[ "$dueno" != root ]] && usuario="
+User=$dueno"
+  texto="# Lo escribe instalar.sh: el HERMES_HOME de hermes-gateway es $casa, de $dueno.
+[Service]
+ExecStart=
+ExecStart=/usr/bin/python3 -I -S -B $ENTRADA --hermes-home=$casa --conexion
+BindPaths=
+BindPaths=-$casa/entrada$usuario"
+  if [[ ! -f "$ANADIDO_ENTRADA" || "$(cat "$ANADIDO_ENTRADA")" != "$texto" ]]; then
+    install -d -m 0755 -o root -g root "$(dirname "$ANADIDO_ENTRADA")"
+    printf '%s\n' "$texto" > "$ANADIDO_ENTRADA.nuevo"
+    chmod 0644 "$ANADIDO_ENTRADA.nuevo"
+    mv -f "$ANADIDO_ENTRADA.nuevo" "$ANADIDO_ENTRADA"
+    ENTRADA_CAMBIADO=1
+  fi
+  echo "    el ayudante de la entrada escribe en $casa/entrada, como $dueno"
+}
+
+crear_entrada() {
+  # Donde queda lo que la app le manda a Hermes, del dueño de su casa y solo suya, como exports/. Si la casa aún no existe
+  # (Hermes sin instalar), no se inventa: el ayudante contesta 503 hasta que se vuelva a lanzar esto.
+  local casa="$1" dueno grupo
+  [[ -d "$casa" ]] || return 0
+  [[ -d "$casa/entrada" ]] && return 0
+  dueno="$(stat -c %U "$casa" 2>/dev/null || echo root)"
+  grupo="$(stat -c %G "$casa" 2>/dev/null || echo root)"
+  install -d -m 0700 -o "$dueno" -g "$grupo" "$casa/entrada"
+  echo "    carpeta de entrada de Hermes: $casa/entrada (lo que la app le manda, Hermes lo lee de ahí)"
+}
+
+arrancar_entrada() {
+  # Como el lector: solo el socket. Reiniciarlo no corta una subida (cada trozo es su propio proceso).
+  systemctl enable --quiet hehermes-entrada.socket
+  if [[ $ENTRADA_CAMBIADO -eq 1 ]]; then
+    systemctl restart hehermes-entrada.socket
+  else
+    systemctl start hehermes-entrada.socket
+  fi
+}
+
+desinstalar_entrada() {
+  paso "quitando el ayudante de la entrada"
+  systemctl disable --now --quiet hehermes-entrada.socket 2>/dev/null || true
+  # Un fichero a medio colocar no se corta: si hay un ayudante en marcha, se espera a que acabe.
+  if systemctl list-units --no-legend --state=active 'hehermes-entrada@*.service' 2>/dev/null | grep -q .; then
+    fallar "hay una subida terminándose (journalctl -u 'hehermes-entrada@*'): espera a que acabe"
+  fi
+  local unidad
+  for unidad in $UNIDADES_ENTRADA; do
+    rm -f "$SYSTEMD/$unidad"
+  done
+  rm -f "$ANADIDO_ENTRADA" "$ANADIDO_ENTRADA.nuevo"
+  rmdir "$(dirname "$ANADIDO_ENTRADA")" 2>/dev/null || true
+  rm -f "$ENTRADA" "$ENTRADA.nuevo"
+  systemctl daemon-reload
+  echo "    quitado: /avisos/v1/entrada contesta 503. La carpeta de entrada de Hermes se queda (lo de dentro es suyo)"
+}
+# --- fin del ayudante de la entrada ------------------------------------------------------------------------------------
+
 # --- La entrada pública del relé (funciones) ---------------------------------------------------------------------------
 PUBLICO_INI="$CONF/rele-publico.ini"
 PUBLICO_CARPETA="$CONF/rele-publico"
@@ -342,13 +447,14 @@ quitar_rele_publico() {
 
 RELE_PUBLICO=0
 if [[ $# -gt 0 ]]; then
-  [[ $# -eq 1 ]] || fallar "uso: instalar.sh [--desinstalar-lector | --desinstalar-respaldo | --rele-publico | --quitar-rele-publico]"
+  [[ $# -eq 1 ]] || fallar "uso: instalar.sh [--desinstalar-lector | --desinstalar-respaldo | --desinstalar-entrada | --rele-publico | --quitar-rele-publico]"
   case "$1" in
     --desinstalar-lector) desinstalar_lector; exit 0 ;;
     --desinstalar-respaldo) desinstalar_respaldo; exit 0 ;;
+    --desinstalar-entrada) desinstalar_entrada; exit 0 ;;
     --quitar-rele-publico) quitar_rele_publico; exit 0 ;;
     --rele-publico) RELE_PUBLICO=1 ;;
-    *) fallar "uso: instalar.sh [--desinstalar-lector | --desinstalar-respaldo | --rele-publico | --quitar-rele-publico]" ;;
+    *) fallar "uso: instalar.sh [--desinstalar-lector | --desinstalar-respaldo | --desinstalar-entrada | --rele-publico | --quitar-rele-publico]" ;;
   esac
 fi
 # Una vez puesta, cada pasada la mantiene (con el código nuevo): se sabe por su unidad.
@@ -370,9 +476,10 @@ paso "Python"
 command -v "$PY" >/dev/null || fallar "no hay $PY"
 "$PY" -I -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
   || fallar "hace falta Python 3.10 o más nuevo ($("$PY" -I --version 2>&1))"
-# El lector de ficheros y el ayudante de la copia corren con el Python del sistema, sin venv (no tienen dependencias).
+# El lector de ficheros y los ayudantes de la copia y de la entrada corren con el Python del sistema, sin venv (no tienen
+# dependencias).
 /usr/bin/python3 -I -S -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' \
-  || fallar "el lector de ficheros y el ayudante de la copia necesitan /usr/bin/python3, 3.9 o más nuevo"
+  || fallar "el lector de ficheros y los ayudantes de la copia y de la entrada necesitan /usr/bin/python3, 3.9 o más nuevo"
 if ! "$PY" -I -c 'import ensurepip, venv' 2>/dev/null; then
   # En Debian y Ubuntu, venv sin ensurepip viene aparte.
   paso "instalando python3-venv"
@@ -599,10 +706,11 @@ for unidad in hehermes-vigia hehermes-rele; do
 done
 instalar_lector
 instalar_respaldo
+instalar_entrada
 systemctl daemon-reload
 systemd-analyze verify /etc/systemd/system/hehermes-vigia.socket /etc/systemd/system/hehermes-vigia.service \
   /etc/systemd/system/hehermes-rele.socket /etc/systemd/system/hehermes-rele.service \
-  "$SYSTEMD/hehermes-leer-media.socket" "$SYSTEMD/hehermes-respaldo.socket" \
+  "$SYSTEMD/hehermes-leer-media.socket" "$SYSTEMD/hehermes-respaldo.socket" "$SYSTEMD/hehermes-entrada.socket" \
   || echo "    (systemd-analyze avisa de algo en las unidades: míralo arriba)"
 for unidad in hehermes-vigia hehermes-rele; do
   systemctl enable --quiet "$unidad.socket" "$unidad.service"
@@ -617,6 +725,7 @@ done
 # fichero por haber arrancado primero.
 arrancar_lector
 arrancar_respaldo
+arrancar_entrada
 # Con los dos puertos ya de systemd, los servicios: con el código nuevo, y el relé con la clave si Daniel ya la ha
 # puesto (sin ella, arranca igual y contesta 503).
 for unidad in hehermes-vigia hehermes-rele; do

@@ -88,6 +88,14 @@ class ConfigVigia:
     ficheros_simultaneos: int = 2
     # La copia de Hermes en iCloud: el socket del ayudante (`hehermes-respaldo.socket`). Vacío: sin copia (503).
     respaldo_ayudante: str = "/run/hehermes-respaldo.sock"
+    # Lo que la app le manda a Hermes (`/avisos/v1/entrada/…`, desde la 1.5.2): el socket del ayudante
+    # (`hehermes-entrada.socket`; vacío, 503), lo más grande que se acepta, lo que tiene que quedar libre en el disco
+    # después de guardarlo (los dos en MiB: el ayudante los recorta a 16 GiB y a 256 MiB) y los días que se guarda cada
+    # carpeta del día de `<HERMES_HOME>/entrada`. Sin la sección (un `vigia.ini` de antes), estos.
+    entrada_ayudante: str = "/run/hehermes-entrada.sock"
+    entrada_tope_mb: int = 2048
+    entrada_margen_mb: int = 1024
+    entrada_dias: int = 30
     # Las entregas de los subagentes que el vigía contesta con el turno de continuación de la app (`entregas`).
     entregas_contestar: bool = True
     entregas_gracia: float = 60.0
@@ -149,6 +157,10 @@ class ConfigVigia:
             ficheros_por_minuto=max(1, int(numero("ficheros", "por_minuto", base.ficheros_por_minuto))),
             ficheros_simultaneos=max(1, int(numero("ficheros", "simultaneos", base.ficheros_simultaneos))),
             respaldo_ayudante=texto("respaldo", "ayudante", base.respaldo_ayudante).strip(),
+            entrada_ayudante=texto("entrada", "ayudante", base.entrada_ayudante).strip(),
+            entrada_tope_mb=max(1, int(numero("entrada", "tope_mb", base.entrada_tope_mb))),
+            entrada_margen_mb=max(0, int(numero("entrada", "margen_mb", base.entrada_margen_mb))),
+            entrada_dias=max(1, min(3650, int(numero("entrada", "dias", base.entrada_dias)))),
             entregas_contestar=contestar,
             # Menos de 30 s no deja a la app, si está delante, lanzar la suya con las instrucciones de la conversación.
             entregas_gracia=max(30.0, numero("entregas", "gracia", base.entregas_gracia)),
@@ -160,6 +172,14 @@ class ConfigVigia:
             exportaciones_antiguedad_maxima=numero("exportaciones", "antiguedad_maxima",
                                                    base.exportaciones_antiguedad_maxima),
         )
+
+    @property
+    def entrada_tope(self) -> int:
+        return self.entrada_tope_mb * 1024 * 1024
+
+    @property
+    def entrada_margen(self) -> int:
+        return self.entrada_margen_mb * 1024 * 1024
 
     @property
     def con_credencial(self) -> bool:

@@ -1,0 +1,21 @@
+# /etc/systemd/system/hehermes-entrada.socket
+# La puerta del ayudante que recibe lo que la app le manda a Hermes (despliegue/hehermes-entrada, contrato §16). Solo
+# root y el grupo hh-vigia pueden conectarse (0660), y el ayudante lo vuelve a mirar con SO_PEERCRED. Con Accept=yes,
+# systemd lanza un ayudante nuevo por cada conexión, como el dueño de la casa de Hermes, sin capacidades y con su jaula
+# (hehermes-entrada@.service): el vigía no tiene nada de root ni escribe en la casa de Hermes.
+[Unit]
+Description=HeHermes: el socket del ayudante de la entrada de Hermes
+
+[Socket]
+ListenStream=/run/hehermes-entrada.sock
+SocketUser=root
+SocketGroup=hh-vigia
+SocketMode=0660
+Accept=yes
+# Cuatro trozos a la vez (el vigía no deja más), crear o terminar una subida y el estado: esto es el tope por si algo va
+# mal, no el límite de la app.
+MaxConnections=8
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

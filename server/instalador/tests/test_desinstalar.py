@@ -132,6 +132,26 @@ class Desinstalar(Base):
         self.assertEqual(paradas[0], "hehermes-leer-media.socket")
         self.assertIn(["systemctl", "stop", "hehermes-leer-media@*.service"], self.sis.ordenes)
 
+    def test_con_los_avisos_quita_tambien_el_ayudante_de_la_entrada(self):
+        """Los avisos a mano de instalar.sh, con el ayudante de la entrada (desde la 1.5.2): fuera también, y su carpeta
+        de la casa de Hermes, no (no es suya)."""
+        self.montar(vpn_antigua.servidor())
+        self.vpn(avisos=True)
+        rutas = ["/usr/local/libexec/hehermes-entrada", "/etc/systemd/system/hehermes-entrada.socket",
+                 "/etc/systemd/system/hehermes-entrada@.service",
+                 "/etc/systemd/system/hehermes-entrada@.service.d/hermes.conf"]
+        for ruta in rutas:
+            self.sis.poner(ruta, "x\n")
+        self.sis.poner("/root/.hermes/entrada/2026-10-04/informe.docx", "de Hermes\n")
+        texto = resumen(self.sis, Manifiesto.leer(self.sis))
+        self.assertIn("hehermes-entrada.socket", texto)
+        self.assertIn("/usr/local/libexec/hehermes-entrada", texto)
+        self.desinstalar()
+        self.assertEqual([r for r in rutas + ["/etc/systemd/system/hehermes-entrada@.service.d"] if self.sis.existe(r)],
+                         [])
+        self.assertIn(["systemctl", "disable", "--now", "hehermes-entrada.socket"], self.sis.ordenes)
+        self.assertTrue(self.sis.existe("/root/.hermes/entrada/2026-10-04/informe.docx"))
+
     def test_el_resumen_dice_lo_que_quita(self):
         self.montar(vpn_antigua.servidor())
         self.vpn()

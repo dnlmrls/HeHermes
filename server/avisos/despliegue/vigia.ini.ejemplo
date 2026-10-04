@@ -93,3 +93,18 @@ antiguedad_maxima = 3600
 # /usr/local/libexec/hehermes-respaldo, que systemd lanza por cada conexión a este socket (root:hh-vigia 0660).
 # Vacío: sin copia, y esas rutas contestan 503.
 ayudante = /run/hehermes-respaldo.sock
+
+[entrada]
+# Desde la 1.5.2: lo que la app le manda a Hermes (/avisos/v1/entrada/…, contrato §16) queda en
+# <HERMES_HOME>/entrada/<AAAA-MM-DD>/. Lo recibe el ayudante de /usr/local/libexec/hehermes-entrada, que systemd lanza por
+# cada conexión a este socket (root:hh-vigia 0660) como el dueño de la casa de Hermes, sin ninguna capacidad, y que de
+# las casas solo ve esa carpeta. Vacío: sin entrada, y esas rutas contestan 503.
+ayudante = /run/hehermes-entrada.sock
+# Lo más grande que se acepta, en MiB (2048 son los 2 GB de la app). El ayudante no deja pasar de 16 GiB.
+tope_mb = 2048
+# Lo que tiene que quedar libre en el disco después de guardar un fichero, en MiB, contando lo que les falta a las
+# demás subidas a medias. El ayudante no baja de 256.
+margen_mb = 1024
+# Los días que se guarda cada carpeta del día: cada hora se borran enteras las que pasan de esto (es una bandeja de
+# entrada; lo que Hermes quiera conservar, que lo copie a otro sitio). De 1 a 3650.
+dias = 30

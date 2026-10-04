@@ -675,9 +675,10 @@ class ElCodigoNuevo(Base):
         self.assertFalse([o for o in self.reinicios("hehermes-pasarela.service") if o in self.ordenes_de(desde)])
 
     def test_lo_que_arranca_uno_por_conexion_no_reinicia_nada(self):
-        # El lector, el ayudante de la copia y hehermes-dispositivo se lanzan de nuevo cada vez: cogen el código solos.
+        # El lector, los ayudantes de la copia y de la entrada y hehermes-dispositivo se lanzan de nuevo cada vez: cogen
+        # el código solos.
         self.instalado()
-        for relativa in ("hehermes-leer-media", "hehermes-respaldo", "hehermes-dispositivo"):
+        for relativa in ("hehermes-leer-media", "hehermes-respaldo", "hehermes-entrada", "hehermes-dispositivo"):
             if self.sis.existe(self.prefijo() + "/" + relativa):
                 self.de_antes(relativa)
         desde = len(self.sis.ordenes)

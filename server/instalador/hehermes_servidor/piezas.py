@@ -449,14 +449,15 @@ def _ip_del_rele(direccion: str) -> str | None:
 
 def vigia_ini(ambito, puerto_hermes: int, env: str, casa_hermes: str, direccion: str | None = None,
               puerto: int | None = None, huella: str | None = None, lector: str | None = None,
-              respaldo: str | None = None) -> str:
+              respaldo: str | None = None, entrada: str | None = None) -> str:
     """Lo que lee el vigía (`hehermes_avisos.vigia.configuracion`). Sin secretos: dice dónde están.
 
     Con un código de avisos (`direccion`, `puerto`, `huella`), el relé es el de otra máquina (el de Daniel), por HTTPS
     y con la huella de su certificado anclada, y la credencial va en su fichero. Sin código (`direccion` None), sin
     credencial ni relé fijo: `[rele] url` vacía, y cada aviso va con el permiso que la app le da en el alta de cada
     iPhone, con la dirección y la huella del relé que trae con él. `lector`: el socket del lector de ficheros;
-    `respaldo`, el del ayudante de la copia en iCloud."""
+    `respaldo`, el del ayudante de la copia en iCloud; `entrada`, el del ayudante que recibe lo que la app le manda a
+    Hermes (sus topes, los de serie del vigía)."""
     if not isinstance(puerto_hermes, int) or not 0 < puerto_hermes < 65536:
         raise ValueError("puerto de Hermes no válido: %r" % (puerto_hermes,))
     if direccion is None:
@@ -475,6 +476,9 @@ def vigia_ini(ambito, puerto_hermes: int, env: str, casa_hermes: str, direccion:
     copia = ("# El ayudante de la copia en iCloud (/avisos/v1/respaldo/…): sin él, esas rutas contestan 503.\n"
              "ayudante = %s\n" % _ruta_segura(respaldo) if respaldo else
              "# Sin el ayudante de la copia en iCloud (/avisos/v1/respaldo/…): esas rutas contestan 503.\nayudante =\n")
+    recibir = ("# El ayudante de la entrada (/avisos/v1/entrada/…): lo que la app le manda a Hermes.\n"
+               "ayudante = %s\n" % _ruta_segura(entrada) if entrada else
+               "# Sin el ayudante de la entrada (/avisos/v1/entrada/…): esas rutas contestan 503.\nayudante =\n")
     return (
         CABECERA
         + "# El vigía de avisos de HeHermes (server/avisos/README.md): lee a Hermes, cifra cada aviso para cada iPhone y\n"
@@ -497,9 +501,12 @@ def vigia_ini(ambito, puerto_hermes: int, env: str, casa_hermes: str, direccion:
         "\n"
         "[respaldo]\n"
         "%s"
+        "\n"
+        "[entrada]\n"
+        "%s"
     ) % (VIGIA, _ruta_segura(ambito.base_vigia), _ruta_segura(ambito.secreto_vigia), puerto_hermes,
          _ruta_segura(ambito.clave_hermes_vigia if ambito.root else env), rele, ficheros, _ruta_segura(casa_hermes),
-         copia)
+         copia, recibir)
 
 
 def unidad_vigia_socket() -> str:
@@ -533,7 +540,8 @@ def unidad_vigia(ambito, direccion_rele: str | None) -> str:
     es una IP. Sin código de avisos (`direccion_rele` None), hacia esta máquina y hacia internet, pero no hacia las
     redes de dentro (`REDES_DE_DENTRO`). Sin root, una unidad de usuario que abre su propio puerto. Sin
     `MemoryDenyWriteExecute`: cffi (de cryptography) puede necesitar memoria ejecutable, y un vigía que no arranca no
-    avisa de nada. Los dos quieren el socket del lector de ficheros, si está (`Wants=`: sin él, el vigía va igual)."""
+    avisa de nada. Los dos quieren los sockets del lector de ficheros y de los ayudantes de la copia y de la entrada, si
+    están (`Wants=`: sin ellos, el vigía va igual y esas rutas dan 503)."""
     orden = "%s -I -B -m hehermes_avisos.vigia --config %s servir" % (_ruta_segura(ambito.python_venv),
                                                                       _ruta_segura(ambito.vigia_ini))
     comun = (
@@ -558,8 +566,8 @@ def unidad_vigia(ambito, direccion_rele: str | None) -> str:
             + "# El vigía de avisos de HeHermes, como el usuario de Hermes: lee su .env.\n"
             "[Unit]\n"
             "Description=HeHermes: vigía de avisos\n"
-            "Wants=%s %s\n"
-            "After=%s %s\n"
+            "Wants=%s %s %s\n"
+            "After=%s %s %s\n"
             "\n"
             "[Service]\n"
             "Type=simple\n"
@@ -571,7 +579,8 @@ def unidad_vigia(ambito, direccion_rele: str | None) -> str:
             "\n"
             "[Install]\n"
             "WantedBy=default.target\n"
-        ) % (SOCKET_LECTOR, SOCKET_RESPALDO, SOCKET_LECTOR, SOCKET_RESPALDO, orden, red, comun)
+        ) % (SOCKET_LECTOR, SOCKET_RESPALDO, SOCKET_ENTRADA, SOCKET_LECTOR, SOCKET_RESPALDO, SOCKET_ENTRADA, orden, red,
+             comun)
     if direccion_rele is None:
         red = ("# Sin credencial: el relé de cada permiso lo dice la app, y no se sabe al instalar. Esta máquina (Hermes,\n"
                "# la pasarela) e internet, sí; las redes de dentro, no. La huella anclada cierra el paso a cualquier otro.\n"
@@ -585,9 +594,9 @@ def unidad_vigia(ambito, direccion_rele: str | None) -> str:
         + "# El vigía de avisos de HeHermes: lee a Hermes (sin tocarlo) y pide los avisos al relé.\n"
         "[Unit]\n"
         "Description=HeHermes: vigía de avisos\n"
-        "Wants=network-online.target %s %s\n"
+        "Wants=network-online.target %s %s %s\n"
         "Requires=%s\n"
-        "After=network-online.target %s %s %s\n"
+        "After=network-online.target %s %s %s %s\n"
         "\n"
         "[Service]\n"
         "Type=simple\n"
@@ -619,8 +628,8 @@ def unidad_vigia(ambito, direccion_rele: str | None) -> str:
         "[Install]\n"
         "WantedBy=multi-user.target\n"
         "Also=%s\n"
-    ) % (SOCKET_LECTOR, SOCKET_RESPALDO, SOCKET_VIGIA, SOCKET_VIGIA, SOCKET_LECTOR, SOCKET_RESPALDO, USUARIO_VIGIA,
-         USUARIO_VIGIA, orden, red,
+    ) % (SOCKET_LECTOR, SOCKET_RESPALDO, SOCKET_ENTRADA, SOCKET_VIGIA, SOCKET_VIGIA, SOCKET_LECTOR, SOCKET_RESPALDO,
+         SOCKET_ENTRADA, USUARIO_VIGIA, USUARIO_VIGIA, orden, red,
          ambito.carpeta_pasarela, ambito.carpeta_config, comun, SOCKET_VIGIA)
 
 
@@ -925,3 +934,119 @@ def unidad_respaldo(ambito, hermes_home: str, usuario_hermes: str | None = None,
         "InaccessiblePaths=-/etc/nginx -/etc/swanctl -/etc/strongswan -/etc/ipsec.secrets -/etc/ipsec.d -/etc/wireguard\n"
     ) % (_ruta_segura(ambito.respaldo), casa, _ruta_segura(ambito.carpeta_respaldo), unidad_hermes, usuario, comun,
          _JAULA_RESPALDO)
+
+
+# MARK: El ayudante de la entrada (spec 2026-10-04, desde la 0.10.6)
+
+SOCKET_ENTRADA = "hehermes-entrada.socket"
+#: Donde el ayudante deja lo que la app le manda a Hermes, dentro de su casa (contrato §16): lo único de las casas que
+#: ve. Lo crea el instalador, como `exports/`.
+CARPETA_ENTRADA = "entrada"
+
+
+def unidad_entrada_socket(ambito) -> str:
+    """Como el del lector: con root, `/run/hehermes-entrada.sock`, de root y del grupo `hh-vigia` (0660), como en el VPS
+    de Daniel (`server/avisos/despliegue/hehermes-entrada.socket`); sin root, en el `/run/user` del usuario de Hermes
+    (`%t`), 0600."""
+    if ambito.root:
+        dueno = ("ListenStream=/run/hehermes-entrada.sock\nSocketUser=root\nSocketGroup=%s\nSocketMode=0660\n"
+                 % USUARIO_VIGIA)
+        que = ("# Solo root y el grupo hh-vigia pueden conectarse (0660), y el ayudante lo vuelve a mirar con SO_PEERCRED.\n"
+               "# Por cada conexión, systemd lanza un ayudante como el dueño de la casa de Hermes, sin capacidades\n"
+               "# (hehermes-entrada@.service).\n")
+    else:
+        dueno = "ListenStream=%t/hehermes-entrada.sock\nSocketMode=0600\n"
+        que = ("# En el /run/user del usuario de Hermes, 0600, y el ayudante solo atiende a su propio uid (--usuario).\n"
+               "# Por cada conexión, systemd lanza un ayudante como este usuario (hehermes-entrada@.service).\n")
+    return (
+        CABECERA
+        + "# La puerta del ayudante que recibe lo que la app le manda a Hermes (/avisos/v1/entrada/… del vigía).\n"
+        + que
+        + "[Unit]\n"
+        "Description=HeHermes: el socket del ayudante de la entrada de Hermes\n"
+        "\n"
+        "[Socket]\n"
+        + dueno
+        + "Accept=yes\n"
+        "# Cuatro trozos a la vez (el vigía no deja más), crear o terminar y el estado: esto es el tope.\n"
+        "MaxConnections=8\n"
+        "RemoveOnStop=yes\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=sockets.target\n"
+    )
+
+
+#: La jaula del ayudante de la entrada, la del lector de root (una prueba la compara con la de
+#: `server/avisos/despliegue/hehermes-entrada@.service`): lo que cambia es lo que ve, `<casa>/entrada` de lectura y
+#: escritura, y los límites de lo que escribe.
+_JAULA_ENTRADA = _JAULA_LECTOR
+_JAULA_ENTRADA_USUARIO = _JAULA_LECTOR_USUARIO
+
+
+def unidad_entrada(ambito, hermes_home: str, usuario_hermes: str | None = None) -> str:
+    """Un ayudante por conexión (`Accept=yes`): recibe una orden (y los bytes de un trozo) y contesta por el mismo
+    socket. Con root, con la jaula del VPS de Daniel: como el dueño de la casa de Hermes (root si Hermes es root; si no,
+    su usuario) y **sin ninguna capacidad**, con las casas tapadas (`ProtectHome=tmpfs`) salvo `<casa>/entrada`
+    (`BindPaths`, la única que puede escribir), y lo de los secretos del sistema y del instalador, tapado. Sin root,
+    como el usuario de Hermes, con `--usuario` (solo atiende a su propio uid) y con lo que una unidad de usuario se puede
+    poner: ahí, dónde escribe lo decide solo el ayudante."""
+    casa = _ruta_segura(hermes_home.rstrip("/"))
+    comun = (
+        "StandardInput=socket\n"
+        "StandardOutput=socket\n"
+        "StandardError=journal\n"
+        "RuntimeMaxSec=900\n"
+        "UMask=0077\n"
+        "LimitCORE=0\n"
+        "LimitFSIZE=16G\n"
+    )
+    if not ambito.root:
+        return (
+            CABECERA
+            + "# Un ayudante de la entrada por conexión a %%t/hehermes-entrada.sock, como el usuario de Hermes:\n"
+            "# escribe en su <casa>/entrada lo que la app le manda.\n"
+            "# Lo que una unidad de usuario NO puede ponerse (ProtectSystem, ProtectHome, BindPaths,\n"
+            "# InaccessiblePaths, PrivateNetwork, CapabilityBoundingSet): aquí dónde se escribe lo decide solo el\n"
+            "# ayudante.\n"
+            "[Unit]\n"
+            "Description=HeHermes: ayudante de la entrada de Hermes\n"
+            "CollectMode=inactive-or-failed\n"
+            "\n"
+            "[Service]\n"
+            "Type=simple\n"
+            "ExecStart=/usr/bin/python3 -I -S -B %s --usuario --hermes-home=%s --conexion\n"
+            "%s"
+            "%s"
+        ) % (_ruta_segura(ambito.entrada), casa, comun, _JAULA_ENTRADA_USUARIO)
+    usuario = ""
+    if usuario_hermes and usuario_hermes != "root":
+        if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", usuario_hermes):
+            raise ValueError("usuario de Hermes no válido para una unidad: %r" % usuario_hermes)
+        usuario = "User=%s\n" % usuario_hermes
+    return (
+        CABECERA
+        + "# Un ayudante de la entrada por conexión a /run/hehermes-entrada.sock (hehermes-entrada.socket,\n"
+        "# Accept=yes). Corre como el dueño de la casa de Hermes, sin ninguna capacidad: de las casas solo ve\n"
+        "# <casa>/entrada.\n"
+        "[Unit]\n"
+        "Description=HeHermes: ayudante de la entrada de Hermes\n"
+        "CollectMode=inactive-or-failed\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "ExecStart=/usr/bin/python3 -I -S -B %s --hermes-home=%s --conexion\n"
+        "%s"
+        "%s"
+        "%s"
+        "# Las casas vacías, y dentro solo la carpeta de entrada, de lectura y escritura (si aún no existe, se\n"
+        "# salta).\n"
+        "ProtectHome=tmpfs\n"
+        "BindPaths=-%s/%s\n"
+        "# Y fuera de las casas, los secretos del sistema y del instalador, tapados.\n"
+        "InaccessiblePaths=-/etc/shadow -/etc/shadow- -/etc/gshadow -/etc/gshadow- -/etc/sudoers -/etc/sudoers.d\n"
+        "InaccessiblePaths=-/etc/ssh -/etc/ssl/private -/etc/letsencrypt\n"
+        "InaccessiblePaths=-/etc/hehermes -/etc/hehermes-avisos -/etc/hehermes-pasarela -/var/lib/hehermes-vigia "
+        "-/var/lib/hehermes-pasarela -/var/lib/hehermes-rele-publico -/var/lib/hehermes-respaldo\n"
+        "InaccessiblePaths=-/etc/nginx -/etc/swanctl -/etc/strongswan -/etc/ipsec.secrets -/etc/ipsec.d -/etc/wireguard\n"
+    ) % (_ruta_segura(ambito.entrada), casa, comun, usuario, _JAULA_ENTRADA, casa, CARPETA_ENTRADA)

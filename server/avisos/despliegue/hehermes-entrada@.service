@@ -1,0 +1,69 @@
+# /etc/systemd/system/hehermes-entrada@.service
+# Un ayudante por conexión a /run/hehermes-entrada.sock (hehermes-entrada.socket, Accept=yes): lee una orden (y los bytes
+# de un trozo) y contesta por el mismo socket. Corre como el dueño de la casa de Hermes (aquí root, porque Hermes es
+# root) y SIN NINGUNA capacidad: de las casas solo ve <HERMES_HOME>/entrada, que es lo único donde puede escribir, y lo
+# que escribe es de Hermes (0600), que lo lee sin más.
+[Unit]
+Description=HeHermes: ayudante de la entrada de Hermes
+Documentation=file:///opt/hehermes-avisos/src/README.md
+# Cada rechazo es una respuesta, no un fallo: que no se acumulen en `systemctl --failed`. Lo que pasó queda en el
+# registro (journalctl -u 'hehermes-entrada@*'): el principio del id, tamaños y números de trozo, nunca un nombre.
+CollectMode=inactive-or-failed
+
+[Service]
+Type=simple
+# Python del sistema, sin nada del entorno ni del directorio (-I), sin site (-S: no hace falta ningún paquete) y sin
+# escribir bytecode (-B). Si el entorno de hermes-gateway dice otra casa, o Hermes no es de root, instalar.sh deja un
+# añadido (hehermes-entrada@.service.d/hermes.conf) que cambia esta línea, la de BindPaths y el usuario.
+ExecStart=/usr/bin/python3 -I -S -B /usr/local/libexec/hehermes-entrada --hermes-home=/root/.hermes --conexion
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+# Un trozo es un momento; terminar 16 GiB (su SHA-256) cabe de sobra.
+RuntimeMaxSec=900
+UMask=0077
+LimitCORE=0
+# Lo más grande que deja el ayudante (TOPE_MAXIMO): el núcleo tampoco le deja escribir un fichero mayor.
+LimitFSIZE=16G
+
+# La jaula del lector de ficheros (hehermes-leer-media@.service): ninguna capacidad, sin red ni dispositivos, y todo el
+# sistema de ficheros de solo lectura salvo la carpeta de entrada.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateNetwork=yes
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+PrivateDevices=yes
+PrivateIPC=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+KeyringMode=private
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Lo que el código decide, otra vez, pero ahora lo hace cumplir el núcleo: /root y /home, vacíos (un tmpfs), y dentro
+# solo <HERMES_HOME>/entrada, de lectura y escritura. Si aún no existe se salta (el «-»): el ayudante contesta 503
+# (entrada_no_disponible) hasta que el instalador la cree.
+ProtectHome=tmpfs
+BindPaths=-/root/.hermes/entrada
+# Y fuera de las casas, los secretos del sistema y de HeHermes, tapados (también la copia de antes de restaurar, que
+# lleva las claves de Hermes: un ayudante de root sin capacidades podría leer lo que es de root).
+InaccessiblePaths=-/etc/shadow -/etc/shadow- -/etc/gshadow -/etc/gshadow- -/etc/sudoers -/etc/sudoers.d
+InaccessiblePaths=-/etc/ssh -/etc/ssl/private -/etc/letsencrypt
+InaccessiblePaths=-/etc/hehermes -/etc/hehermes-avisos -/etc/hehermes-pasarela -/var/lib/hehermes-vigia -/var/lib/hehermes-pasarela -/var/lib/hehermes-rele-publico -/var/lib/hehermes-respaldo
+InaccessiblePaths=-/etc/nginx -/etc/swanctl -/etc/strongswan -/etc/ipsec.secrets -/etc/ipsec.d -/etc/wireguard

@@ -74,7 +74,7 @@ class Paquete(unittest.TestCase):
                              ("hehermes_servidor/modos.py", 0o644),
                              ("hehermes_servidor/plan.py", 0o644), ("clave-publica.pem", 0o644),
                              ("hehermes-dispositivo", 0o755), ("README.md", 0o644), ("hehermes-leer-media", 0o755),
-                             ("hehermes-respaldo", 0o755),
+                             ("hehermes-respaldo", 0o755), ("hehermes-entrada", 0o755),
                              ("requirements-canje.txt", 0o644), ("hehermes_servidor/canje.py", 0o644),
                              ("hehermes_servidor/porchat.py", 0o644)):
             with self.subTest(fichero=nombre):
@@ -90,14 +90,18 @@ class Paquete(unittest.TestCase):
         self.assertIn("hehermes_avisos/vigia/__main__.py", avisos)
         self.assertEqual(ficheros, sorted(["README.md", "clave-publica.pem", "hehermes-dispositivo", "hehermes-pasarela",
                                            "hehermes-servidor", "requirements-canje.txt", "hehermes-leer-media",
-                                           "hehermes-respaldo"]
+                                           "hehermes-respaldo", "hehermes-entrada"]
                                           + modulos + avisos))
-        # El dispositivo es el de server/vpn, y el lector (desde la 0.8.0), el de server/avisos/despliegue, byte a byte.
+        # El dispositivo es el de server/vpn, y el lector (desde la 0.8.0) y los ayudantes, los de
+        # server/avisos/despliegue, byte a byte.
         with tarfile.open(ruta) as tar:
             dentro = tar.extractfile(prefijo + "hehermes-dispositivo").read()
             lector = tar.extractfile(prefijo + "hehermes-leer-media").read()
+            de_la_entrada = tar.extractfile(prefijo + "hehermes-entrada").read()
         self.assertEqual(dentro, (apoyo.REPO / "server" / "vpn" / "hehermes-dispositivo").read_bytes())
         self.assertEqual(lector, (apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-leer-media").read_bytes())
+        self.assertEqual(de_la_entrada,
+                         (apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-entrada").read_bytes())
 
     def test_desempaquetado_se_encuentra_todo_sin_el_repositorio(self):
         ruta, _ = self.construir()
@@ -117,6 +121,9 @@ class Paquete(unittest.TestCase):
         lector = next(a for a in plan.acciones if a.objeto == "/usr/local/libexec/hehermes-leer-media")
         with open(os.path.join(origen, "hehermes-leer-media"), "rb") as f:
             self.assertEqual(lector.datos, f.read())
+        de_la_entrada = next(a for a in plan.acciones if a.objeto == "/usr/local/libexec/hehermes-entrada")
+        with open(os.path.join(origen, "hehermes-entrada"), "rb") as f:
+            self.assertEqual(de_la_entrada.datos, f.read())
 
     def test_el_comando_de_la_app(self):
         comando = self.e.comando("https://ejemplo.org/hehermes", "0.1.0", "ab" * 32, "mi-iphone")

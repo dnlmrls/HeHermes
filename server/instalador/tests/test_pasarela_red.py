@@ -277,6 +277,16 @@ class LoQueSePasaAHermes(ConPasarela):
                      % (TOKEN, pa.MAX_CUERPO_AVISOS + 1)).encode())
         self.assertEqual(self.leer_respuesta(tls)[0], 413)
 
+    def test_en_la_entrada_el_tope_es_de_un_trozo(self):
+        tls = self.conectar()
+        tls.sendall(("PUT /avisos/v1/entrada/subidas/%s/trozos/0 HTTP/1.1\r\nAuthorization: Bearer %s\r\n"
+                     "Content-Length: %d\r\n\r\n" % ("a" * 32, TOKEN, pa.MAX_CUERPO_ENTRADA + 1)).encode())
+        self.assertEqual(self.leer_respuesta(tls)[0], 413)
+        tls = self.conectar()
+        tls.sendall(("POST /avisos/v1/entradax HTTP/1.1\r\nAuthorization: Bearer %s\r\nContent-Length: %d\r\n\r\n"
+                     % (TOKEN, pa.MAX_CUERPO_AVISOS + 1)).encode())
+        self.assertEqual(self.leer_respuesta(tls)[0], 413)
+
     def test_transfer_encoding_es_un_400(self):
         tls = self.peticion("POST", "/v1/runs", extra="Transfer-Encoding: chunked\r\n")
         estado, _, cuerpo, _ = self.leer_respuesta(tls)
@@ -446,6 +456,16 @@ class LoQueSePasaAlVigia(ConPasarela):
     def test_un_trozo_de_la_copia_en_icloud_llega_entero_al_vigia(self):
         trozo = bytes(range(256)) * (4 * 1024 * 4)  # 4 MiB
         ruta = "/avisos/v1/respaldo/restauraciones/%s/trozos/3" % ("a" * 32)
+        tls = self.peticion("PUT", ruta, cuerpo=trozo)
+        estado, _, _, _ = self.leer_respuesta(tls)
+        self.assertEqual(estado, 200)
+        vista = self.vigia.peticiones[-1]
+        self.assertEqual((vista["ruta"], vista["cuerpo"]), (ruta, trozo))
+        self.assertEqual(self.hermes.peticiones, [])
+
+    def test_un_trozo_de_la_entrada_llega_entero_al_vigia(self):
+        trozo = bytes(range(256)) * (4 * 1024 * 4)  # 4 MiB
+        ruta = "/avisos/v1/entrada/subidas/%s/trozos/2" % ("b" * 32)
         tls = self.peticion("PUT", ruta, cuerpo=trozo)
         estado, _, _, _ = self.leer_respuesta(tls)
         self.assertEqual(estado, 200)

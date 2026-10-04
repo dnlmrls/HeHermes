@@ -38,25 +38,32 @@ RUTA = re.compile(r"/avisos/v1/respaldo/(estado|deshacer|instantaneas|restauraci
 
 
 class ClienteAyudante:
-    """Habla con ``/run/hehermes-respaldo.sock``: una línea JSON (y los bytes que diga), y otra de vuelta."""
+    """Habla con el socket de un ayudante de systemd (``/run/hehermes-respaldo.sock``; y desde la 1.5.2 también el de la
+    entrada, ``vigia/entrada.py``): una línea JSON (y los bytes que diga), y otra de vuelta. ``no_disponible`` es el
+    código con el que se contesta si el ayudante no está o no contesta, y ``de_quien``, cómo se le nombra."""
 
-    def __init__(self, ruta_socket: str, plazo: float = 120.0):
+    def __init__(self, ruta_socket: str, plazo: float = 120.0, no_disponible: str = "respaldo_no_disponible",
+                 de_quien: str = "de la copia"):
         self.ruta_socket = ruta_socket
         self.plazo = plazo
+        self.no_disponible = no_disponible
+        self.de_quien = de_quien
 
-    def pedir(self, peticion: dict, cuerpo: bytes | None = None) -> tuple:
-        """``(respuesta, bytes o None)``. ``ErrorHTTP`` si el ayudante no está o no contesta."""
+    def pedir(self, peticion: dict, cuerpo: bytes | None = None, plazo: float | None = None) -> tuple:
+        """``(respuesta, bytes o None)``. ``ErrorHTTP`` si el ayudante no está o no contesta. ``plazo``, para una orden
+        que tarda más que las demás (terminar una subida grande)."""
         if cuerpo is not None:
             peticion = dict(peticion, bytes=len(cuerpo))
         linea = json.dumps(peticion, separators=(",", ":")).encode("utf-8") + b"\n"
+        no_disponible, de_quien = self.no_disponible, self.de_quien
         conexion = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        conexion.settimeout(self.plazo)
+        conexion.settimeout(self.plazo if plazo is None else plazo)
         try:
             try:
                 conexion.connect(self.ruta_socket)
             except OSError:
-                raise ErrorHTTP(503, "respaldo_no_disponible", "El ayudante de la copia no está instalado o no "
-                                                               "contesta", {"Retry-After": "30"}) from None
+                raise ErrorHTTP(503, no_disponible, "El ayudante %s no está instalado o no contesta" % de_quien,
+                                {"Retry-After": "30"}) from None
             conexion.sendall(linea + (cuerpo or b""))
             recibido = bytearray()
             while b"\n" not in recibido:
@@ -68,13 +75,13 @@ class ClienteAyudante:
                     break
             cabecera, salto, resto = bytes(recibido).partition(b"\n")
             if not salto:
-                raise ErrorHTTP(503, "respaldo_no_disponible", "El ayudante de la copia no ha contestado")
+                raise ErrorHTTP(503, no_disponible, "El ayudante %s no ha contestado" % de_quien)
             try:
                 respuesta = json.loads(cabecera.decode("utf-8"))
             except (UnicodeDecodeError, ValueError):
-                raise ErrorHTTP(502, "respaldo_no_disponible", "El ayudante contesta algo que no entiendo") from None
+                raise ErrorHTTP(502, no_disponible, "El ayudante contesta algo que no entiendo") from None
             if not isinstance(respuesta, dict):
-                raise ErrorHTTP(502, "respaldo_no_disponible", "El ayudante contesta algo que no entiendo")
+                raise ErrorHTTP(502, no_disponible, "El ayudante contesta algo que no entiendo")
             datos = None
             largo = respuesta.get("bytes")
             if respuesta.get("ok") and isinstance(largo, int) and not isinstance(largo, bool) and 0 <= largo <= \
@@ -83,25 +90,25 @@ class ClienteAyudante:
                 while quedan > 0:
                     trozo = conexion.recv(min(quedan, 1024 * 1024))
                     if not trozo:
-                        raise ErrorHTTP(502, "respaldo_no_disponible", "El trozo llegó cortado del ayudante")
+                        raise ErrorHTTP(502, no_disponible, "El trozo llegó cortado del ayudante")
                     partes.append(trozo)
                     quedan -= len(trozo)
                 datos = b"".join(partes)
                 if len(datos) != largo:
-                    raise ErrorHTTP(502, "respaldo_no_disponible", "El trozo llegó cortado del ayudante")
+                    raise ErrorHTTP(502, no_disponible, "El trozo llegó cortado del ayudante")
             return respuesta, datos
         except OSError:
-            raise ErrorHTTP(503, "respaldo_no_disponible", "El ayudante de la copia no ha contestado") from None
+            raise ErrorHTTP(503, no_disponible, "El ayudante %s no ha contestado" % de_quien) from None
         finally:
             conexion.close()
 
 
-def _error_de(respuesta: dict) -> ErrorHTTP:
+def _error_de(respuesta: dict, no_disponible: str = "respaldo_no_disponible") -> ErrorHTTP:
     """El rechazo del ayudante, como la respuesta HTTP que dice el contrato. Lo que no tenga forma, 502."""
     estado, codigo, mensaje = respuesta.get("http"), respuesta.get("codigo"), respuesta.get("mensaje")
     if not (isinstance(estado, int) and 400 <= estado <= 599 and isinstance(codigo, str)
             and re.fullmatch(r"[a-z_]{1,64}", codigo)):
-        return ErrorHTTP(502, "respaldo_no_disponible", "El ayudante contesta algo que no entiendo")
+        return ErrorHTTP(502, no_disponible, "El ayudante contesta algo que no entiendo")
     cabeceras = {}
     for nombre, valor in (respuesta.get("cabeceras") or {}).items():
         if nombre == "Retry-After" and str(valor).isdigit():
@@ -266,9 +273,10 @@ def _json(datos: bytes) -> dict:
     return objeto
 
 
-def limpiar_cada_hora(respaldos: Respaldos, parar: threading.Event, cada: float = 3600.0) -> None:
-    """El hilo de la limpieza: una al arrancar (tras un minuto) y luego cada hora, hasta que el vigía se pare."""
-    if parar.wait(60.0):
+def limpiar_cada_hora(respaldos, parar: threading.Event, cada: float = 3600.0, primera: float = 60.0) -> None:
+    """El hilo de la limpieza: una al arrancar (tras un minuto) y luego cada hora, hasta que el vigía se pare. Vale
+    para cualquiera con su ``limpiar()``: la copia (``Respaldos``) y, desde la 1.5.2, la entrada (``Entradas``)."""
+    if parar.wait(primera):
         return
     while True:
         respaldos.limpiar()

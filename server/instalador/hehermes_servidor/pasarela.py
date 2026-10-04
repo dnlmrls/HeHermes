@@ -73,6 +73,11 @@ MAX_CUERPO_AVISOS = 64 * 1024
 #: si no comprime, o el manifiesto de una restauración. Lo mismo que el vigía (`hehermes_avisos.vigia.respaldo`).
 MAX_CUERPO_RESPALDO = 4 * 1024 * 1024 + 64 * 1024
 PREFIJO_RESPALDO = "/avisos/v1/respaldo/"
+#: Mandarle un fichero a Hermes (contrato §16, desde la 0.10.6): un trozo de 4 MiB sin comprimir, con el mismo margen.
+#: Lo mismo que el vigía (`hehermes_avisos.vigia.entrada`). Una pasarela de antes lo corta con 413, y la app lo entiende
+#: como un servidor que todavía no sabe recibir ficheros.
+MAX_CUERPO_ENTRADA = 4 * 1024 * 1024 + 64 * 1024
+PREFIJO_ENTRADA = "/avisos/v1/entrada/"
 #: Cada cuánto se mira si ha cambiado tokens.json (y se cortan las conexiones de un token dado de baja).
 REVISION_TOKENS = 1.0
 
@@ -1074,6 +1079,8 @@ class Pasarela:
         """El cuerpo más grande que se deja pasar a esa ruta."""
         if peticion.ruta.startswith(PREFIJO_RESPALDO):
             return MAX_CUERPO_RESPALDO
+        if peticion.ruta.startswith(PREFIJO_ENTRADA):
+            return MAX_CUERPO_ENTRADA
         return MAX_CUERPO_AVISOS if peticion.ruta.startswith("/avisos/") else MAX_CUERPO
 
     def destino(self, peticion, ip):

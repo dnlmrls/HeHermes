@@ -29,6 +29,7 @@ RELE = "198.51.100.7"
 LLAVE = base64.urlsafe_b64encode(bytes(range(40, 72))).rstrip(b"=").decode()
 LECTOR = apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-leer-media"
 RESPALDO = apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-respaldo"
+ENTRADA = apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-entrada"
 
 
 def codigo(credencial=CREDENCIAL, direccion=RELE, puerto=61999, huella=HUELLA):
@@ -94,6 +95,24 @@ class LaConfiguracionDelVigia(unittest.TestCase):
                 self.assertEqual((config.rele_url, config.rele_huella, config.ficheros_lector),
                                  ("", None, "/run/hehermes-leer-media.sock" if a.root
                                   else "/run/user/1000/hehermes-leer-media.sock"))
+
+    def test_la_entrada_la_lee_el_vigia_de_verdad(self):
+        """El socket del ayudante de la entrada que escribe el instalador, y sin él, vacío (el vigía contesta 503)."""
+        import os
+        import tempfile
+        sys.path.insert(0, str(apoyo.REPO / "server" / "avisos"))
+        self.addCleanup(sys.path.remove, str(apoyo.REPO / "server" / "avisos"))
+        from hehermes_avisos.vigia.configuracion import ConfigVigia
+        from hehermes_servidor import ambito
+        for a in (ambito.de_root(), ambito.de_usuario("hermes", "/home/hermes", 1000)):
+            with self.subTest(root=a.root), tempfile.TemporaryDirectory() as carpeta:
+                ruta = os.path.join(carpeta, "vigia.ini")
+                for entrada, esperado in ((a.socket_entrada, a.socket_entrada), (None, "")):
+                    with open(ruta, "w") as f:
+                        f.write(p.vigia_ini(a, 8642, "/home/hermes/.hermes/.env", "/home/hermes", entrada=entrada))
+                    config = ConfigVigia.leer(ruta)
+                    self.assertEqual(config.entrada_ayudante, esperado)
+                    self.assertEqual((config.entrada_tope, config.entrada_dias), (2 * 1024 ** 3, 30), "los de serie")
 
     def test_la_jaula_del_lector_es_la_del_vps_de_daniel(self):
         """La unidad del lector de root que escribe el instalador lleva la misma jaula que la de instalar.sh."""
@@ -339,7 +358,8 @@ class SinCodigo(Base):
         self.assertIn("IPAddressAllow=localhost\nIPAddressDeny=10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 "
                       "100.64.0.0/10 fc00::/7 fe80::/10\n", unidad)
         self.assertNotIn("IPAddressDeny=any", unidad)
-        self.assertIn("Wants=network-online.target hehermes-leer-media.socket hehermes-respaldo.socket\n", unidad)
+        self.assertIn("Wants=network-online.target hehermes-leer-media.socket hehermes-respaldo.socket "
+                      "hehermes-entrada.socket\n", unidad)
         for linea in ("User=hh-vigia", "ProtectSystem=strict", "ProtectHome=yes", "NoNewPrivileges=yes",
                       "CapabilityBoundingSet=", "PrivateTmp=yes"):
             self.assertIn(linea + "\n", unidad, "la jaula de siempre")
@@ -523,7 +543,7 @@ class SinRoot(Base):
         self.assertNotIn("CapabilityBoundingSet=CAP", servicio)
         self.assertNotIn("InaccessiblePaths=", servicio)
         vigia = self.sis.leer_texto(a.unidad_vigia)
-        self.assertIn("Wants=hehermes-leer-media.socket hehermes-respaldo.socket\n", vigia)
+        self.assertIn("Wants=hehermes-leer-media.socket hehermes-respaldo.socket hehermes-entrada.socket\n", vigia)
         self.assertNotIn("IPAddress", vigia.replace("IPAddressDeny necesita", ""))
         self.assertTrue({"hehermes-leer-media.socket", "hehermes-vigia"} <= self.falso.activos_usuario)
         self.assertFalse({"hehermes-leer-media.socket", "hehermes-vigia"} & self.falso.activos)
@@ -631,6 +651,136 @@ class CopiaEnICloudSinRoot(Base):
         self.assertEqual(self.orden("desinstalar", "--si"), 0, self.salida)
         for ruta in (a.respaldo, a.unidad_respaldo_socket, a.unidad_respaldo):
             self.assertFalse(self.sis.existe(ruta), ruta)
+
+
+class EntradaDeFicheros(Base):
+    """El ayudante de la entrada (desde la 0.10.6), con root: como en el VPS de Daniel."""
+
+    CASA = "/root/.hermes"
+
+    def test_con_root_el_ayudante_su_socket_su_jaula_y_su_carpeta(self):
+        self.assertEqual(self.orden("instalar", "--si", "--iphone", "mi-iphone"), 0, self.salida)
+        a = self.ambito()
+        self.assertEqual(self.sis.leer(a.entrada), ENTRADA.read_bytes())
+        self.assertEqual(self.sis.modo(a.entrada), 0o755)
+        ini = self.sis.leer_texto(a.vigia_ini)
+        self.assertIn("\n[entrada]\n", ini)
+        self.assertIn("ayudante = /run/hehermes-entrada.sock\n", ini)
+        # El socket y la jaula son los de server/avisos/despliegue, línea a línea (menos los comentarios).
+        for nuestra, suya in ((a.unidad_entrada_socket, "hehermes-entrada.socket"),
+                              (a.unidad_entrada, "hehermes-entrada@.service")):
+            unidad = activas(self.sis.leer_texto(nuestra))
+            despliegue = activas((ENTRADA.parent / suya).read_text())
+            for clave in set(despliegue) | set(unidad):
+                if clave != "Documentation":
+                    self.assertEqual(unidad.get(clave), despliegue.get(clave), (suya, clave))
+        servicio = activas(self.sis.leer_texto(a.unidad_entrada))
+        self.assertEqual(servicio["ExecStart"], ["/usr/bin/python3 -I -S -B /usr/local/libexec/hehermes-entrada "
+                                                 "--hermes-home=/root/.hermes --conexion"])
+        self.assertEqual((servicio["CapabilityBoundingSet"], servicio["BindPaths"], servicio["LimitFSIZE"]),
+                         ([""], ["-/root/.hermes/entrada"], ["16G"]))
+        self.assertNotIn("User", servicio)
+        # La carpeta, creada y apuntada (desinstalar la quita solo si está vacía).
+        self.assertTrue(self.sis.es_carpeta("/root/.hermes/entrada"))
+        self.assertEqual(self.sis.modo("/root/.hermes/entrada"), 0o700)
+        self.assertEqual(self.manifiesto()["entrada"], "/root/.hermes/entrada")
+        self.assertIn("==> la carpeta de entrada de Hermes: /root/.hermes/entrada", self.salida)
+        self.assertIn("hehermes-entrada.socket", self.falso.activos)
+        self.assertIn("hehermes-entrada.socket", self.manifiesto()["unidades"])
+        self.assertIn("bien entrada de ficheros: el socket de su ayudante está en marcha (/run/hehermes-entrada.sock)",
+                      self.salida)
+        self.assertEqual(self.orden("instalar", "--plan"), 0, self.salida)
+        self.assertIn("Todo al día: 0 cambios.", self.salida)
+        # Desinstalar: fuera el ayudante, sus unidades y lo que quedó a medias; la carpeta, vacía, también.
+        self.sis.poner("/root/.hermes/entrada/.subidas/%s/datos" % ("a" * 32), b"a medias", modo=0o600)
+        self.sis.poner("/root/.hermes/entrada/.subidas/.cerrojo", b"", modo=0o600)
+        self.assertEqual(self.orden("desinstalar", "--si"), 0, self.salida)
+        for ruta in (a.entrada, a.unidad_entrada_socket, a.unidad_entrada, "/root/.hermes/entrada"):
+            self.assertFalse(self.sis.existe(ruta), ruta)
+        self.assertNotIn("hehermes-entrada.socket", self.falso.activos)
+
+    def test_desinstalar_deja_lo_que_ya_es_de_hermes(self):
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+        self.sis.poner("/root/.hermes/entrada/2026-10-04/informe.docx", b"de Hermes", modo=0o600)
+        self.sis.poner("/root/.hermes/entrada/.subidas/%s/datos" % ("b" * 32), b"a medias", modo=0o600)
+        self.assertEqual(self.orden("desinstalar", "--si"), 0, self.salida)
+        self.assertIn("/root/.hermes/entrada/.subidas (lo que la app dejó a medias) y /root/.hermes/entrada, si se "
+                      "queda vacía", self.salida, "el resumen lo dice antes")
+        self.assertTrue(self.sis.existe("/root/.hermes/entrada/2026-10-04/informe.docx"))
+        self.assertFalse(self.sis.existe("/root/.hermes/entrada/.subidas"), "lo de a medias es del ayudante")
+        self.assertIn("/root/.hermes/entrada: la carpeta de entrada de Hermes no está vacía", self.salida)
+
+    def test_una_entrada_cambiada_por_un_enlace_no_lleva_el_borrado_a_otro_sitio(self):
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+        self.sis.poner("/srv/otra/.subidas/de-otro.txt", b"no se borra", modo=0o600)
+        self.sis.borrar("/root/.hermes/entrada")
+        self.sis.enlazar("/root/.hermes/entrada", self.sis.ruta("/srv/otra"))
+        self.assertEqual(self.orden("desinstalar", "--si"), 0, self.salida)
+        self.assertEqual(self.sis.leer("/srv/otra/.subidas/de-otro.txt"), b"no se borra")
+
+    def test_una_carpeta_de_entrada_que_ya_estaba_no_es_mia(self):
+        self.sis.carpeta("/root/.hermes/entrada", 0o750)
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+        self.assertNotIn("entrada", self.manifiesto())
+        self.assertEqual(self.sis.modo("/root/.hermes/entrada"), 0o750)
+        self.assertEqual(self.orden("desinstalar", "--si"), 0, self.salida)
+        self.assertTrue(self.sis.es_carpeta("/root/.hermes/entrada"))
+
+    def test_mientras_coloca_un_fichero_no_se_corta(self):
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+        self.sis.poner("/root/.hermes/entrada/.subidas/%s/datos" % ("c" * 32), b"terminandose", modo=0o600)
+        self.falso.activos.add("hehermes-entrada@*")
+        self.assertEqual(self.orden("desinstalar", "--si"), 0, self.salida)
+        self.assertIn("la entrada de ficheros: su ayudante está colocando un fichero", self.salida)
+        self.assertNotIn(["systemctl", "stop", "hehermes-entrada@*.service"], self.sis.ordenes)
+        self.assertTrue(self.sis.existe("/root/.hermes/entrada/.subidas/%s/datos" % ("c" * 32)))
+
+    def test_con_hermes_de_otro_usuario_escribe_como_el(self):
+        unidad = p.unidad_entrada(self.ambito(), "/srv/hermes", "hermes")
+        self.assertIn("--hermes-home=/srv/hermes --conexion\n", unidad)
+        self.assertIn("User=hermes\n", unidad)
+        self.assertIn("BindPaths=-/srv/hermes/entrada\n", unidad)
+        self.assertNotIn("User=", p.unidad_entrada(self.ambito(), "/srv/hermes", "root"))
+        for malo in ("root;x", "Hermes", "a b"):
+            with self.assertRaises(ValueError):
+                p.unidad_entrada(self.ambito(), "/srv/hermes", malo)
+        with self.assertRaises(ValueError):
+            p.unidad_entrada(self.ambito(), "/srv/her mes")
+
+
+class EntradaDeFicherosSinRoot(Base):
+    euid = 1000
+    cuenta = ("hermes", "/home/hermes", 1000)
+
+    def servidor(self):
+        sis, falso = sf.servidor(usuario="hermes")
+        sis.carpeta("/run/user/1000", 0o700)
+        return sis, falso
+
+    def test_como_el_usuario_de_hermes_en_su_casa(self):
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+        a = self.ambito()
+        self.assertEqual(a.entrada, "/home/hermes/.local/share/hehermes-servidor/hehermes-entrada")
+        self.assertEqual(self.sis.leer(a.entrada), ENTRADA.read_bytes())
+        self.assertIn("[entrada]\n# El ayudante de la entrada (/avisos/v1/entrada/…): lo que la app le manda a "
+                      "Hermes.\nayudante = /run/user/1000/hehermes-entrada.sock\n", self.sis.leer_texto(a.vigia_ini))
+        self.assertIn("ListenStream=%t/hehermes-entrada.sock\nSocketMode=0600\n",
+                      self.sis.leer_texto(a.unidad_entrada_socket))
+        servicio = self.sis.leer_texto(a.unidad_entrada)
+        self.assertIn("ExecStart=/usr/bin/python3 -I -S -B %s --usuario --hermes-home=/home/hermes/.hermes --conexion\n"
+                      % a.entrada, servicio)
+        self.assertIn("NO puede ponerse", servicio, "dice lo que una unidad de usuario no puede, no lo finge")
+        for nunca in ("CapabilityBoundingSet=", "BindPaths=", "ProtectHome=", "User="):
+            self.assertNotIn(nunca, servicio)
+        self.assertIn("LimitFSIZE=16G\n", servicio)
+        self.assertTrue(self.sis.es_carpeta("/home/hermes/.hermes/entrada"))
+        self.assertEqual(self.sis.modo("/home/hermes/.hermes/entrada"), 0o700)
+        self.assertIn("hehermes-entrada.socket", self.falso.activos_usuario)
+        self.assertNotIn("hehermes-entrada.socket", self.falso.activos)
+        self.assertEqual(self.orden("desinstalar", "--si"), 0, self.salida)
+        for ruta in (a.entrada, a.unidad_entrada_socket, a.unidad_entrada, "/home/hermes/.hermes/entrada"):
+            self.assertFalse(self.sis.existe(ruta), ruta)
+        self.assertIn(["systemctl", "--user", "disable", "--now", "hehermes-entrada.socket"], self.sis.ordenes)
 
 
 class ElPaquete(unittest.TestCase):

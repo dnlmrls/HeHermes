@@ -86,6 +86,17 @@ class Ambito:
             self.carpeta_respaldo = casa + "/.local/state/hehermes-respaldo"
         self.unidad_respaldo_socket = self.unidades + "/hehermes-respaldo.socket"
         self.unidad_respaldo = self.unidades + "/hehermes-respaldo@.service"
+        # El ayudante de la entrada (desde la 0.10.6): lo que la app le manda a Hermes, en `<HERMES_HOME>/entrada`. Como
+        # el lector: con root, en /usr/local/libexec; sin root, la copia del paquete que va en su casa, y su socket en su
+        # /run/user. La carpeta no va aquí: es de la casa de Hermes (`avisos.crear_entrada`).
+        if root:
+            self.entrada = "/usr/local/libexec/hehermes-entrada"
+            self.socket_entrada = "/run/hehermes-entrada.sock"
+        else:
+            self.entrada = self.prefijo + "/hehermes-entrada"
+            self.socket_entrada = "/run/user/%d/hehermes-entrada.sock" % uid
+        self.unidad_entrada_socket = self.unidades + "/hehermes-entrada.socket"
+        self.unidad_entrada = self.unidades + "/hehermes-entrada@.service"
         self.manifiesto = self.carpeta_config + "/instalacion.json"
         self.pasarela_ini = self.carpeta_pasarela + "/pasarela.ini"
         self.cert = self.carpeta_pasarela + "/cert.pem"

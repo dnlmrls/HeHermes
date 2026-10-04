@@ -21,7 +21,7 @@ UNIDADES_VPN = frozenset(("hehermes-xfrm.service", "hehermes-clave.path", "stron
 #: El vigía de los avisos y el lector de ficheros van con la pasarela (les llega por ella): `desinstalar --modo tls` se
 #: los lleva también.
 UNIDADES_TLS = frozenset((p.UNIDAD_PASARELA, "hehermes-pasarela-clave.path", p.UNIDAD_VIGIA, p.SOCKET_VIGIA,
-                          p.SOCKET_LECTOR, p.SOCKET_RESPALDO, "hehermes-borrado.timer"))
+                          p.SOCKET_LECTOR, p.SOCKET_RESPALDO, p.SOCKET_ENTRADA, "hehermes-borrado.timer"))
 USUARIOS_TLS = frozenset((p.USUARIO_PASARELA, p.USUARIO_VIGIA))
 #: El único paquete que pueden pedir los dos (el venv de `cryptography`); los demás son de strongSwan y nginx.
 PAQUETES_COMUNES = frozenset(("python3-venv",))
@@ -36,10 +36,11 @@ def de_fichero(ruta: str, ambito) -> str | None:
         return TLS
     if (ruta.startswith((ambito.carpeta_avisos + "/", ambito.prefijo + "/hehermes_avisos/"))
             or ruta in (ambito.unidad_vigia, ambito.socket_vigia, ambito.unidad_lector_socket, ambito.unidad_lector,
-                        ambito.unidad_respaldo_socket, ambito.unidad_respaldo)):
+                        ambito.unidad_respaldo_socket, ambito.unidad_respaldo, ambito.unidad_entrada_socket,
+                        ambito.unidad_entrada)):
         return TLS
     # El lector con root (/usr/local/libexec); sin root es la copia que va con el instalador, que es de los dos.
-    if ambito.root and ruta in (ambito.lector, ambito.respaldo):
+    if ambito.root and ruta in (ambito.lector, ambito.respaldo, ambito.entrada):
         return TLS
     return None
 

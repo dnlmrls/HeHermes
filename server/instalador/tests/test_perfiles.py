@@ -260,6 +260,12 @@ class ElDelProbador(Base):
         respaldo = self.sis.leer_texto("/etc/systemd/system/hehermes-respaldo@.service")
         self.assertIn("--hermes-home=%s " % TRABAJO, respaldo)
         self.assertIn("--unidad-hermes=hermes-gateway-trabajo.service ", respaldo)
+        # Lo que la app le manda (desde la 0.10.6), en la entrada de su perfil.
+        entrada = self.sis.leer_texto("/etc/systemd/system/hehermes-entrada@.service")
+        self.assertIn("--hermes-home=%s " % TRABAJO, entrada)
+        self.assertIn("BindPaths=-%s/entrada\n" % TRABAJO, entrada)
+        self.assertEqual(man["entrada"], TRABAJO + "/entrada")
+        self.assertTrue(self.sis.es_carpeta(TRABAJO + "/entrada"))
 
     def test_de_noche_para_y_arranca_su_unidad(self):
         self.assertEqual(self.por_chat(), 0, self.salida)

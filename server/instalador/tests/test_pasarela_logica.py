@@ -202,7 +202,23 @@ class LosLimites(unittest.TestCase):
         self.assertEqual((pa.PLAZO_CABECERAS, pa.PLAZO_PARADA, pa.RETRASO_404), (10, 75, 1.0))
         self.assertEqual((pa.MAX_CUERPO, pa.MAX_CUERPO_AVISOS), (25 * 1024 * 1024, 64 * 1024))
         self.assertEqual(pa.MAX_CUERPO_RESPALDO, 4 * 1024 * 1024 + 64 * 1024)
+        self.assertEqual(pa.MAX_CUERPO_ENTRADA, 4 * 1024 * 1024 + 64 * 1024)
         self.assertEqual((pa.MAX_CABECERAS, pa.MAX_LINEAS_CABECERA), (16 * 1024, 100))
+
+    def test_el_tope_de_cada_ruta(self):
+        def tope(ruta):
+            return pa.Pasarela.tope(None, pa.Peticion("PUT", ruta, "HTTP/1.1", []))
+
+        self.assertEqual(tope("/v1/runs"), pa.MAX_CUERPO)
+        self.assertEqual(tope("/avisos/v1/dispositivos"), pa.MAX_CUERPO_AVISOS)
+        self.assertEqual(tope("/avisos/v1/respaldo/restauraciones/%s/trozos/0" % ("a" * 32)), pa.MAX_CUERPO_RESPALDO)
+        # Desde la 0.10.6, un trozo de lo que la app le manda a Hermes (contrato §16).
+        self.assertEqual(tope("/avisos/v1/entrada/subidas/%s/trozos/0" % ("a" * 32)), pa.MAX_CUERPO_ENTRADA)
+        self.assertEqual(tope("/avisos/v1/entrada/subidas"), pa.MAX_CUERPO_ENTRADA)
+        for fuera in ("/avisos/v1/entrada", "/avisos/v1/entradax/subidas", "/avisos/v1/salud", "/avisos/entrada/"):
+            with self.subTest(ruta=fuera):
+                self.assertEqual(tope(fuera), pa.MAX_CUERPO_AVISOS)
+        self.assertEqual(pa.PREFIJO_ENTRADA, "/avisos/v1/entrada/")
 
     def test_dieciseis_conexiones_por_ip(self):
         for _ in range(pa.CONEXIONES_POR_IP):

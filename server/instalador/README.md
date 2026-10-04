@@ -40,6 +40,11 @@ reiniciaba para encender su API; la app no se quedó con la conexión, y la mism
 Ahora el mismo iPhone (el mismo `--iphone`) puede volver a pedirla en la media hora siguiente a instalar: otro enlace,
 otro token, y el de antes deja de valer. El canje dura 12 minutos y el reinicio de Hermes no lo toca: [abajo](#el-alta-por-chat---por-chat).
 
+**La 0.10.6 deja que la app le mande a Hermes cualquier fichero** ([abajo](#lo-que-la-app-le-manda-a-hermes-desde-la-0106)):
+lleva los avisos 1.5.2 y el ayudante `hehermes-entrada`, con su socket, como el de la copia; crea `<HERMES_HOME>/entrada`
+(como `exports/`), y la pasarela deja pasar trozos de 4 MiB en `/avisos/v1/entrada/`. Una pasarela de antes los corta
+con un 413, y la app dice que hay que actualizar el servidor.
+
 **La 0.10.5 lleva el vigía 1.5.1.** Lo que cambia está en los avisos (`server/avisos`): las marcas de un fichero se buscan en la conversación entera (también lo compactado), un fichero nuevo en `exports/` se avisa en cuanto deja de crecer y se puede descargar sin esperar a su `MEDIA:`, y un cliente que se corta a media petición deja una línea en el registro, no una traza. El instalador en sí no cambia.
 
 **La 0.10.4 mira el Hermes del probador antes de dar nada, y deja el chat abierto hasta que se use.** Tres cosas:
@@ -203,6 +208,22 @@ deshacer de 7 días). Sin él, `/avisos/v1/respaldo/…` contesta 503.
 | El vigía | `[respaldo] ayudante = /run/hehermes-respaldo.sock` y su unidad lo quiere (`Wants=`) | `ayudante = /run/user/<uid>/hehermes-respaldo.sock` |
 | Desinstalar | Quita el ayudante y sus unidades; de su carpeta, las instantáneas. **La copia de antes de una restauración se queda** (lo dice): es lo que había en Hermes | Lo mismo |
 
+### Lo que la app le manda a Hermes (desde la 0.10.6)
+
+Spec `docs/superpowers/specs/2026-10-04-ficheros-sin-limite-design.md`, contrato `server/API-CONTRACT.md` §16. Lo que
+no es texto que quepa en el mensaje (un Word, un zip, un audio, un PDF escaneado…) la app lo sube en trozos de 4 MiB, y
+Hermes recibe en el mismo mensaje la ruta donde ha quedado: `<HERMES_HOME>/entrada/<AAAA-MM-DD>/<nombre>`. Lo recibe el
+ayudante `hehermes-entrada` (de `server/avisos/despliegue`); sin él, `/avisos/v1/entrada/…` contesta 503.
+
+| | Con root | Sin root |
+|---|---|---|
+| El ayudante | `/usr/local/libexec/hehermes-entrada` (root 0755), el mismo que pone `instalar.sh` en el VPS de Daniel | La copia que va con el instalador (`~/.local/share/hehermes-servidor/hehermes-entrada`) |
+| Su socket | `hehermes-entrada.socket`: `/run/hehermes-entrada.sock`, `root:hh-vigia` 0660, `Accept=yes` | `%t/hehermes-entrada.sock`, 0600, unidad de usuario |
+| Cada orden | `hehermes-entrada@.service`: **como el dueño de la casa de Hermes y sin ninguna capacidad**, con la jaula del lector, pero lo único de las casas que ve es `<HERMES_HOME>/entrada`, de lectura y escritura (`BindPaths`); `LimitFSIZE=16G` | Como el usuario de Hermes, con `--usuario` (solo atiende a su uid); dónde escribe lo decide solo el ayudante |
+| Su carpeta | `<HERMES_HOME>/entrada`, que crea el instalador (0700, del dueño de Hermes), como `exports/`: una carpeta por día y `.subidas/`, lo que está a medias | Lo mismo, en `~/.hermes/entrada` |
+| El vigía | `[entrada] ayudante = /run/hehermes-entrada.sock` y su unidad lo quiere (`Wants=`); los topes, los de serie (2 GB por fichero, 1 GB libre después, 30 días) | `ayudante = /run/user/<uid>/hehermes-entrada.sock` |
+| Desinstalar | Quita el ayudante y sus unidades, lo que quedó a medias (`.subidas`) y la carpeta **solo si se queda vacía**: lo entregado es de Hermes | Lo mismo |
+
 Lo del código de avisos (la 0.7.0), que sigue valiendo: el código lo da Daniel (`sudo hehermes-rele credencial alta
 <nombre>`, en su VPS):
 
@@ -315,7 +336,7 @@ Hay que saber:
   - /usr/local/sbin/hehermes-dispositivo no es mío: no lo toco. Para los iPhone de la pasarela usa el mío: sudo /opt/hehermes-servidor/hehermes-dispositivo alta <nombre>
   - Aquí ya hay unos avisos puestos a mano (/opt/hehermes-avisos, los de server/avisos/despliegue/instalar.sh): ni el vigía ni el lector de ficheros los pongo yo, y lo suyo no lo toco
 
-54 cambios.
+55 cambios.
 ```
 <!-- /pasarela-de-daniel -->
 
@@ -350,8 +371,9 @@ server/instalador/empaquetar --firmar hehermes-firma.pem       # y el .sig (hace
 - **Lleva:** `hehermes-servidor`, `hehermes-pasarela` y `hehermes_servidor/`, `hehermes-dispositivo` (de `server/vpn`),
   `clave-publica.pem`, `requirements-canje.txt`, este README, desde la 0.7.0 el código de los avisos
   (`hehermes_avisos/`, sus `.py`: el vigía) y, desde la 0.8.0, el lector de ficheros (`hehermes-leer-media`, de
-  `server/avisos/despliegue`) y, desde la 0.10.0, el ayudante de la copia en iCloud (`hehermes-respaldo`, de ahí
-  también). Ni pruebas ni `__pycache__`, ni el resto del despliegue a mano del relé.
+  `server/avisos/despliegue`), desde la 0.10.0, el ayudante de la copia en iCloud (`hehermes-respaldo`, de ahí
+  también) y, desde la 0.10.6, el de la entrada (`hehermes-entrada`). Ni pruebas ni `__pycache__`, ni el resto del
+  despliegue a mano del relé.
 
 ### La firma de las actualizaciones
 

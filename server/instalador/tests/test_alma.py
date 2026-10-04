@@ -125,8 +125,10 @@ class ElParrafo(Base):
                 self.assertIn("dile que los deje en /root/.hermes/exports y que los mande con una línea MEDIA:<ruta>",
                               aviso)
                 self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+                # Lo único nuevo, las carpetas que crea el instalador: exports/ y (desde la 0.10.6) entrada/.
                 despues = {r: v for r, v in self.sis.foto().items()
-                           if r.startswith("/root/.hermes") and not r.startswith("/root/.hermes/exports")}
+                           if r.startswith("/root/.hermes") and not r.startswith(("/root/.hermes/exports",
+                                                                                  "/root/.hermes/entrada"))}
                 self.assertEqual(despues, antes, "su casa, como estaba")
 
     def test_con_un_perfil_es_el_de_su_perfil(self):

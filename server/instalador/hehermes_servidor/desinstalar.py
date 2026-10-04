@@ -8,7 +8,9 @@ de una versión anterior dejando la pasarela, sin dejar restos.
 
 from __future__ import annotations
 
+import os
 import shlex
+import shutil
 
 from . import manifiesto as m
 from . import modos as md
@@ -16,8 +18,8 @@ from . import piezas as p
 from .plan import registro_de_dispositivos
 
 # El lector de ficheros primero: su socket es de root y es lo único de los avisos que lee como root.
-UNIDADES_AVISOS = ("hehermes-leer-media.socket", "hehermes-respaldo.socket", "hehermes-vigia.socket", "hehermes-vigia.service",
-                   "hehermes-rele.socket", "hehermes-rele.service")
+UNIDADES_AVISOS = ("hehermes-leer-media.socket", "hehermes-respaldo.socket", "hehermes-entrada.socket",
+                   "hehermes-vigia.socket", "hehermes-vigia.service", "hehermes-rele.socket", "hehermes-rele.service")
 CARPETAS_AVISOS = ("/opt/hehermes-avisos", "/etc/hehermes-avisos", "/etc/nginx/hehermes-avisos", "/var/lib/hehermes-vigia")
 # La plantilla del lector (se para con sus instancias, no se deshabilita: no tiene [Install]), su añadido si Hermes
 # vive fuera de /root/.hermes (el fichero y luego su carpeta, que solo se borra vacía) y el propio lector.
@@ -26,7 +28,10 @@ FICHEROS_AVISOS = ("/etc/systemd/system/hehermes-leer-media@.service",
                    "/etc/systemd/system/hehermes-leer-media@.service.d", "/usr/local/libexec/hehermes-leer-media",
                    "/etc/systemd/system/hehermes-respaldo@.service",
                    "/etc/systemd/system/hehermes-respaldo@.service.d/hermes.conf",
-                   "/etc/systemd/system/hehermes-respaldo@.service.d", "/usr/local/libexec/hehermes-respaldo")
+                   "/etc/systemd/system/hehermes-respaldo@.service.d", "/usr/local/libexec/hehermes-respaldo",
+                   "/etc/systemd/system/hehermes-entrada@.service",
+                   "/etc/systemd/system/hehermes-entrada@.service.d/hermes.conf",
+                   "/etc/systemd/system/hehermes-entrada@.service.d", "/usr/local/libexec/hehermes-entrada")
 NGINX = (p.SITIO_ENLACE, p.SITIO, p.SITIO_CONF_D, p.BEARER, p.DROP_IN_NGINX)
 
 
@@ -38,6 +43,25 @@ _AVISOS_SE_QUEDAN = ("los avisos (el vigía y el relé): los instalé con la VPN
                      "que no los quito. Si cambias la clave de Hermes, pónsela al día al vigía con: sudo "
                      "hehermes-dispositivo clave --solo-vigia. «sudo hehermes-servidor desinstalar», sin --modo, los "
                      "quita con todo lo demás")
+
+
+#: Lo que el ayudante de la entrada tiene a medias, dentro de `<HERMES_HOME>/entrada` (`hehermes-entrada`).
+SUBIDAS = ".subidas"
+
+
+def _borrar_subidas(sis, carpeta: str) -> None:
+    """`.subidas` entera, dentro de la carpeta de entrada: es del ayudante (lo que la app subió a medias y sus
+    cerrojos), no de Hermes. Solo si la carpeta de entrada es una carpeta de verdad: un enlace en su sitio llevaría el
+    borrado, de root, a otro sitio. Si `.subidas` fuera un enlace, se quita el enlace; `shutil.rmtree`, con descriptores
+    en Linux, no sigue los de dentro."""
+    entrada = sis.ruta(carpeta)
+    if os.path.islink(entrada) or not os.path.isdir(entrada):
+        return
+    real = os.path.join(entrada, SUBIDAS)
+    if os.path.islink(real):
+        os.unlink(real)
+    elif os.path.isdir(real):
+        shutil.rmtree(real, ignore_errors=True)
 
 
 def _iphones(sis, man=None):
@@ -89,6 +113,9 @@ def resumen(sis, man, ambito=None, modo=None) -> str:
         lineas.append("  " + ambito.carpeta_venv)
     if man.datos.get("vigia") and que.tls:
         lineas.append("  " + ambito.carpeta_estado_vigia + " (la base de datos del vigía, con las claves de los iPhone)")
+    if man.datos.get("entrada") and que.tls:
+        lineas.append("  %s/%s (lo que la app dejó a medias) y %s, si se queda vacía (lo entregado es de Hermes)"
+                      % (man.datos["entrada"], SUBIDAS, man.datos["entrada"]))
     if que.tls:
         from . import alma
         lineas += alma.resumen(man)
@@ -168,7 +195,7 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
     if que.tls:
         salida("==> la pasarela")
         for unidad in (p.UNIDAD_PASARELA, "hehermes-pasarela-clave.path", p.UNIDAD_VIGIA, p.SOCKET_VIGIA,
-                       p.SOCKET_LECTOR, p.SOCKET_RESPALDO):
+                       p.SOCKET_LECTOR, p.SOCKET_RESPALDO, p.SOCKET_ENTRADA):
             if unidad in man.unidades:
                 sis.ejecutar(ambito.systemctl + ["disable", "--now", unidad])
         if p.SOCKET_LECTOR in man.unidades:
@@ -179,6 +206,13 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
             # Una restauración a medias no se corta: la pasarela ya no deja pedir nada nuevo, y se dice.
             quedan.append("la copia en iCloud: su ayudante tiene una operación en marcha (journalctl %s-u "
                           "'hehermes-respaldo@*'): la dejo acabar" % ("" if ambito.root else "--user "))
+    # Un fichero a medio colocar no se corta (el socket ya no deja pedir nada nuevo): se deja acabar, y lo que tenga a
+    # medias se queda.
+    entrada_en_marcha = p.SOCKET_ENTRADA in man.unidades and que.tls and sis.ejecutar(
+        ambito.systemctl + ["is-active", "hehermes-entrada@*.service"]).bien
+    if entrada_en_marcha:
+        quedan.append("la entrada de ficheros: su ayudante está colocando un fichero (journalctl %s-u "
+                      "'hehermes-entrada@*'): lo dejo acabar" % ("" if ambito.root else "--user "))
     # 1. Los iPhone: sin esto, las sesiones vivas siguen aunque se borre su conexión.
     if sis.existe(p.DISPOSITIVO) and que.vpn:
         for nombre in de_la_vpn:
@@ -286,7 +320,7 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
         if not que.de(md.de_unidad(unidad)):
             continue
         sis.ejecutar((ambito.systemctl if unidad in (p.UNIDAD_PASARELA, p.UNIDAD_VIGIA, p.SOCKET_LECTOR,
-                                                     p.SOCKET_RESPALDO)
+                                                     p.SOCKET_RESPALDO, p.SOCKET_ENTRADA)
                       else ["systemctl"]) + ["disable", "--now", unidad])
         if not que.todo:
             man.unidades.remove(unidad)
@@ -338,6 +372,18 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
                           % man.datos["exportaciones"])
         if not que.todo:
             del man.datos["exportaciones"]
+    #    La carpeta de entrada de Hermes que creó el instalador: lo que el ayudante dejó a medias (`.subidas`, suyo) se
+    #    va, y la carpeta solo si se queda vacía: lo que ya se entregó es de Hermes.
+    if man.datos.get("entrada") and que.tls:
+        carpeta = man.datos["entrada"]
+        if not entrada_en_marcha:
+            _borrar_subidas(sis, carpeta)
+        sis.borrar(carpeta)
+        if sis.existe(carpeta):
+            quedan.append("%s: la carpeta de entrada de Hermes no está vacía; lo de dentro es suyo, no lo toco"
+                          % carpeta)
+        if not que.todo:
+            del man.datos["entrada"]
     for usuario in list(man.datos.get("usuarios", [])):
         if not que.de(md.de_usuario(usuario)):
             continue

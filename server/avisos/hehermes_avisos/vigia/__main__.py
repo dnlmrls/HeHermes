@@ -26,6 +26,8 @@ from ..comun import ErrorDeSecreto, ErrorHTTP, ServidorHTTP, cola, configurar_re
 from .almacen import Almacen
 from .api import AppVigia, ManejadorVigia
 from .configuracion import ConfigVigia
+from .entrada import Entradas
+from .entrada import ayudante as ayudante_de_la_entrada
 from .envio import ClienteRele, Mensajero
 from .exportaciones import Exportaciones, VigiaDeExportaciones
 from .fichero import ClienteLector, Ficheros, Limites
@@ -87,8 +89,12 @@ def servir(config: ConfigVigia) -> int:
                         Limites(config.ficheros_por_minuto, config.ficheros_simultaneos), casa=config.ficheros_casa,
                         exportaciones=exportaciones)
     respaldos = Respaldos(ClienteAyudante(config.respaldo_ayudante)) if config.respaldo_ayudante else None
+    entradas = (Entradas(ayudante_de_la_entrada(config.entrada_ayudante), tope=config.entrada_tope,
+                         margen=config.entrada_margen, dias=config.entrada_dias)
+                if config.entrada_ayudante else None)
     app = AppVigia(almacen, mensajero, secreto_tunel=secreto_tunel, caducidad_prueba=config.caducidad_prueba,
-                   al_moverse=vigilante.despertar, ficheros=ficheros, respaldos=respaldos, exportaciones=exportaciones)
+                   al_moverse=vigilante.despertar, ficheros=ficheros, respaldos=respaldos, exportaciones=exportaciones,
+                   entradas=entradas)
     servidor = ServidorHTTP(config.escucha, ManejadorVigia, app, heredado=heredado)
     _avisar_si_no_coincide(heredado, config.escucha)
     threading.Thread(target=servidor.serve_forever, name="api", daemon=True).start()
@@ -97,6 +103,9 @@ def servir(config: ConfigVigia) -> int:
     signal.signal(signal.SIGINT, lambda *_: parar.set())
     if respaldos is not None:
         threading.Thread(target=limpiar_cada_hora, args=(respaldos, parar), name="respaldo", daemon=True).start()
+    if entradas is not None:
+        # Lo que se quedó a medias (24 horas) y las carpetas de los días que pasan de [entrada] dias.
+        threading.Thread(target=limpiar_cada_hora, args=(entradas, parar), name="entrada", daemon=True).start()
     if exportaciones is not None:
         vigia = VigiaDeExportaciones(config.ficheros_lector, exportaciones, vigilante.despertar)
         threading.Thread(target=vigia.correr, args=(parar,), name="exportaciones", daemon=True).start()
@@ -191,6 +200,10 @@ def comprobar(config: ConfigVigia) -> int:
         decir(*_comprobar_ayudante(config.respaldo_ayudante))
     else:
         decir(True, "sin el ayudante de la copia en iCloud ([respaldo] ayudante vacío): /avisos/v1/respaldo contesta 503")
+    if config.entrada_ayudante:
+        decir(*_comprobar_entrada(config))
+    else:
+        decir(True, "sin el ayudante de la entrada ([entrada] ayudante vacío): /avisos/v1/entrada contesta 503")
     if not config.con_credencial:
         return 1 if fallos else 0
     base_rele = config.rele_url.rsplit("/v1/", 1)[0]
@@ -249,6 +262,24 @@ def _comprobar_ayudante(ruta_socket: str) -> tuple:
     if respuesta.get("ok"):
         return True, f"el ayudante de la copia en iCloud contesta en {ruta_socket}"
     return False, f"el ayudante de la copia en {ruta_socket} contesta «{str(respuesta.get('codigo'))[:40]}»"
+
+
+def _comprobar_entrada(config: ConfigVigia) -> tuple:
+    """El ayudante de la entrada, con la orden que no cambia nada (``estado``): contesta, y encuentra la carpeta
+    ``<HERMES_HOME>/entrada`` (sin ella, ``entrada_no_disponible``). Dice cuánto hay libre y el tope que deja."""
+    try:
+        respuesta, _ = ayudante_de_la_entrada(config.entrada_ayudante, plazo=30).pedir(
+            {"orden": "estado", "tope": config.entrada_tope, "margen": config.entrada_margen})
+    except ErrorHTTP as error:
+        return False, f"el ayudante de la entrada en {config.entrada_ayudante}: {error.estado} {error.codigo} (¿está " \
+                      f"en marcha hehermes-entrada.socket?)"
+    if not respuesta.get("ok"):
+        return False, f"el ayudante de la entrada en {config.entrada_ayudante} contesta " \
+                      f"«{str(respuesta.get('codigo'))[:40]}» (¿existe <HERMES_HOME>/entrada?)"
+    gib = 1024 ** 3
+    return True, (f"el ayudante de la entrada contesta en {config.entrada_ayudante}: "
+                  f"{str(respuesta.get('carpeta'))[:200]}, {int(respuesta.get('libre') or 0) / gib:.1f} GiB libres, "
+                  f"hasta {int(respuesta.get('tope') or 0) / gib:.1f} GiB por fichero")
 
 
 def _sin_clave(error: urllib.error.HTTPError) -> bool:

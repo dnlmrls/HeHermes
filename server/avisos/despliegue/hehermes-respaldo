@@ -94,6 +94,11 @@ RAIZ_FUERA = frozenset({
     # nuestras: registros, servidores de lenguaje, entornos del navegador y binarios descargados
     "logs", "lsp", "environments", "bin", ".curator_backups",
 })
+#: La bandeja de entrada (``hehermes-entrada``, desde la 1.5.2), en la raíz de cada perfil: copias de lo que ya está en
+#: el iPhone, que se borran solas a los 30 días, y lo que se quedó a medias de subir. Sin esto, como carpeta desconocida
+#: de menos de 200 MB, entraría entera en la configuración. Se salta al hacer la copia y no en ``clase_de``: una copia de
+#: antes con una carpeta ``entrada`` suya se sigue pudiendo restaurar.
+BANDEJA_DE_ENTRADA = "entrada"
 #: A cualquier profundidad (``_EXCLUDED_DIRS`` de Hermes).
 CARPETAS_FUERA = frozenset({
     "__pycache__", ".git", "node_modules", "backups", "state-snapshots", "checkpoints", "browser-profiles",
@@ -228,7 +233,7 @@ def recorrer(casa: str, clases, desconocida_maxima: int | None = None) -> tuple:
                     continue
             except OSError:
                 continue
-            if not carpeta_fuera(partes + (sub,)):
+            if not carpeta_fuera(partes + (sub,)) and _dentro_del_perfil(partes + (sub,)) != (BANDEJA_DE_ENTRADA,):
                 guardar.append(sub)
         subcarpetas[:] = guardar
         for nombre in sorted(nombres):

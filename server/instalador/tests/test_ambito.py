@@ -43,6 +43,28 @@ class LasRutas(unittest.TestCase):
         for ruta in (a.prefijo, a.orden, a.dispositivo, a.manifiesto, a.pasarela_ini, a.unidad, a.venv):
             self.assertTrue(ruta.startswith("/home/hermes/"), ruta)
 
+    def test_el_ayudante_de_la_entrada(self):
+        """Desde la 0.10.6, como el lector: con root, en /usr/local/libexec y su socket en /run; sin root, la copia del
+        paquete en su casa y su socket en su /run/user. Y es de la pasarela: `desinstalar --modo tls` se lo lleva."""
+        from hehermes_servidor import modos
+        a = ambito.de_root()
+        self.assertEqual((a.entrada, a.socket_entrada, a.unidad_entrada_socket, a.unidad_entrada),
+                         ("/usr/local/libexec/hehermes-entrada", "/run/hehermes-entrada.sock",
+                          "/etc/systemd/system/hehermes-entrada.socket",
+                          "/etc/systemd/system/hehermes-entrada@.service"))
+        u = ambito.de_usuario("hermes", "/home/hermes", 1000)
+        self.assertEqual((u.entrada, u.socket_entrada, u.unidad_entrada_socket, u.unidad_entrada),
+                         ("/home/hermes/.local/share/hehermes-servidor/hehermes-entrada",
+                          "/run/user/1000/hehermes-entrada.sock",
+                          "/home/hermes/.config/systemd/user/hehermes-entrada.socket",
+                          "/home/hermes/.config/systemd/user/hehermes-entrada@.service"))
+        for x in (a, u):
+            for ruta in (x.unidad_entrada_socket, x.unidad_entrada):
+                self.assertEqual(modos.de_fichero(ruta, x), modos.TLS, ruta)
+        self.assertEqual(modos.de_fichero(a.entrada, a), modos.TLS)
+        self.assertIsNone(modos.de_fichero(u.entrada, u), "sin root, la copia que va con el instalador es de los dos")
+        self.assertEqual(modos.de_unidad(p.SOCKET_ENTRADA), modos.TLS)
+
     def test_una_casa_que_no_se_puede_poner_en_una_unidad(self):
         for casa in ("home/hermes", "/home/her mes", "/home/hermes\n", "/"):
             with self.subTest(casa=casa):

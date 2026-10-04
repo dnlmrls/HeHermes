@@ -1,0 +1,1107 @@
+#!/usr/bin/python3 -IS
+"""Lo que la app le manda a Hermes, trozo a trozo. Va en /usr/local/libexec/hehermes-entrada.
+
+Spec ``docs/superpowers/specs/2026-10-04-ficheros-sin-limite-design.md`` (§3 y §4) y contrato ``server/API-CONTRACT.md``
+§16. Un fichero que no cabe como texto en el mensaje sube en trozos de 4 MiB por ``/avisos/v1/entrada/…`` del vigía, y
+el vigía se los pasa a este ayudante, que systemd lanza por cada conexión a ``/run/hehermes-entrada.sock``
+(``Accept=yes``) como **el dueño de la casa de Hermes, sin ninguna capacidad**, con una jaula que de las casas solo le
+deja ver ``<HERMES_HOME>/entrada``. Al terminar, el fichero queda en ``<HERMES_HOME>/entrada/<AAAA-MM-DD>/<nombre>``,
+0600 y de Hermes, y la app le dice a Hermes dónde está. El vigía (``hh-vigia``) no puede escribir en la casa de
+Hermes, y no se le da nada para hacerlo: lo hace esto por él, y no sabe hacer otra cosa.
+
+Lo que hace que no sirva para nada más, aunque el vigía estuviera comprometido y le pidiera cualquier cosa:
+
+- **No acepta rutas.** El nombre que manda la app es solo lo que se ve: el del disco lo decide ``nombre_seguro``
+  (sin ``/``, sin ``..``, sin nada que un shell interprete) en la carpeta del día, y no pisa nunca otro (``-2``,
+  ``-3``…). Los ids son suyos (32 hexadecimales al azar) y los números de trozo, enteros: ninguno llega nunca al disco
+  sin su forma.
+- **Bajando con descriptores** (``dir_fd``, ``O_NOFOLLOW``): ``entrada``, ``.subidas``, la carpeta de una subida y la
+  del día tienen que ser carpetas de verdad, y un enlace por el camino hace fallar la orden en vez de llevarla a otro
+  sitio.
+  Lo acabado se coloca con ``link``, que no pisa nada, y no con ``rename``; y se comprueba que lo colocado es lo mismo
+  que se comprobó.
+- **Con topes que el vigía no puede saltarse.** Pasa los de ``vigia.ini`` (``[entrada]``) en cada orden, y aquí se
+  recortan a los propios: 16 GiB por fichero como mucho (``TOPE_MAXIMO``; y ``LimitFSIZE=16G`` en la unidad), al menos
+  256 MiB libres (``MARGEN_MINIMO``), ocho subidas a medias y sesenta nuevas por hora.
+- **Comprueba lo que recibe**: el largo y el SHA-256 de cada trozo, y el SHA-256 del fichero entero antes de colocarlo.
+  Nunca lee lo que lleva dentro ni adivina su tipo, y nada queda con permiso de ejecución.
+- **Solo atiende al vigía** (root o ``hh-vigia``, por ``SO_PEERCRED``), o con ``--usuario`` solo a su propio uid.
+- **Nunca apunta un nombre, una ruta ni un contenido**: el principio del id, tamaños, números de trozo y el resultado.
+
+Lo que está a medias vive en ``entrada/.subidas/<id>/``: su registro (``subida.json``), el fichero de datos, escrito
+trozo a trozo en su sitio (``pwrite``), y una marca por trozo recibido. Cada conexión es su propio proceso, y varias
+escriben a la vez trozos de la misma subida: por eso cada trozo deja su propia marca (nadie reescribe una lista que otro
+esté escribiendo), una subida tiene su cerrojo (los trozos lo comparten; terminarla o borrarla lo quiere para ella sola)
+y lo que cambia ``entrada/`` entera (crear, colocar, limpiar, los límites) va con el cerrojo de ``.subidas``.
+
+El protocolo, el de ``hehermes-respaldo``: una línea JSON (``{"orden": …}``) y, si dice ``"bytes": n``, n bytes detrás;
+la respuesta, otra línea (``{"ok": true, …}`` o ``{"ok": false, "http": …, "codigo": …, "mensaje": …}``).
+
+Sin dependencias, y nada del entorno: ``-IS`` en la primera línea. Corre con el Python del sistema (3.9 o más).
+"""
+
+from __future__ import annotations
+
+import contextlib
+import datetime
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import pwd
+import re
+import secrets
+import socket
+import stat
+import struct
+import sys
+import time
+import unicodedata
+
+MIB = 1024 * 1024
+GIB = 1024 * MIB
+#: El tamaño de cada trozo (el último, lo que quede). Fijo: es el de la app, y cada trozo se comprueba contra él.
+TROZO = 4 * MIB
+#: Lo que pasa el vigía en cada orden sale de ``vigia.ini``; estos son los de serie y los que no se dejan pasar.
+TOPE_DE_SERIE = 2 * GIB
+TOPE_MAXIMO = 16 * GIB
+MARGEN_DE_SERIE = GIB
+MARGEN_MINIMO = 256 * MIB
+DIAS_DE_SERIE, DIAS_MINIMO, DIAS_MAXIMO = 30, 1, 3650
+MAX_ABIERTAS = 8
+MAX_POR_HORA = 60
+HORA = 3600
+#: Lo que vive una subida a medias sin un trozo nuevo, y el registro de una ya colocada.
+VIDA = 24 * HORA
+#: Con ocho a medias no se crea otra: que la app vuelva a probar dentro de un rato (alguna acabará o caducará).
+ESPERA_CON_ABIERTAS = 60
+#: Los números de los trozos que faltan que se dicen como mucho (la app sube los que falten y vuelve a terminar).
+MAX_FALTAN = 64
+MAX_NOMBRE = 255
+MAX_SEGURO = 180
+MAX_EXTENSION = 16
+#: Con ese día ya lleno de nombres iguales se para: con sesenta nuevas por hora no se llega nunca.
+MAX_COPIAS = 9999
+#: Lo que se baja como mucho al borrar una carpeta de un día (lo que deja Hermes dentro puede tener subcarpetas).
+MAX_PROFUNDIDAD = 128
+#: Una orden (sin trozo), y el cuerpo de un trozo con el mismo margen que en el vigía y la pasarela.
+MAX_LINEA = 64 * 1024
+MAX_CUERPO = TROZO + 64 * 1024
+#: Leer el fichero entero para su SHA-256, de tanto en tanto.
+LECTURA = MIB
+USUARIO_VIGIA = "hh-vigia"
+HERMES_HOME = "/root/.hermes"
+ENTRADA = "entrada"
+SUBIDAS = ".subidas"
+CERROJO = ".cerrojo"
+CREADAS = "creadas.json"
+REGISTRO = "subida.json"
+DATOS = "datos"
+MARCAS = "trozos"
+TOCADA = "tocada"
+CERROJO_DE_LA_SUBIDA = "cerrojo"
+#: El de Linux, que es donde corre; en el Mac de las pruebas no existe y se prueba con dobles.
+SO_PEERCRED = getattr(socket, "SO_PEERCRED", 17)
+
+PATRON_ID = re.compile(r"[0-9a-f]{32}")
+PATRON_SHA = re.compile(r"[0-9a-f]{64}")
+PATRON_DIA = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})")
+PATRON_MARCA = re.compile(r"0|[1-9][0-9]{0,8}")
+#: Lo que queda de un nombre, además de letras y cifras: nada que un shell o una ruta interpreten.
+PERMITIDOS = frozenset(".-_+,@")
+
+_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_CARPETA = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | _CLOEXEC
+_FICHERO_NUEVO = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | _CLOEXEC
+
+ORDENES = ("estado", "crear", "subida", "trozo", "terminar", "borrar", "limpiar")
+
+
+class Rechazo(Exception):
+    def __init__(self, http_: int, codigo: str, mensaje: str, extra: dict | None = None, cabeceras=None):
+        super().__init__(mensaje)
+        self.http, self.codigo, self.mensaje = http_, codigo, mensaje
+        self.extra, self.cabeceras = extra or {}, cabeceras or {}
+
+    def respuesta(self) -> dict:
+        r = {"ok": False, "http": self.http, "codigo": self.codigo, "mensaje": self.mensaje}
+        if self.extra:
+            r["extra"] = self.extra
+        if self.cabeceras:
+            r["cabeceras"] = self.cabeceras
+        return r
+
+
+def _decir(texto: str) -> None:
+    """El registro: el principio del id, tamaños, números de trozo y el resultado. Nunca un nombre, una ruta ni un
+    contenido."""
+    sys.stderr.write("hehermes-entrada: %s\n" % texto)
+    sys.stderr.flush()
+
+
+# MARK: El nombre en el disco (contrato §16)
+
+
+def _partir(nombre: str) -> tuple:
+    """``(base, ".extension")`` si acaba en una extensión de 1 a 16 caracteres con algo delante; si no, ``(nombre,
+    "")``. Es lo que se conserva al recortar y donde va el ``-2`` de un nombre repetido."""
+    base, punto, extension = nombre.rpartition(".")
+    if punto and base and 1 <= len(extension) <= MAX_EXTENSION:
+        return base, "." + extension
+    return nombre, ""
+
+
+def _recortar(texto: str, maximo: int) -> str:
+    """Lo que cabe en ``maximo`` bytes de UTF-8, sin partir un carácter."""
+    return texto.encode("utf-8")[:maximo].decode("utf-8", "ignore")
+
+
+def nombre_seguro(nombre: str) -> str:
+    """El nombre del fichero en el disco, del que manda la app: en NFC (un «ñ» es un carácter, venga como venga);
+    letras, cifras y ``. - _ + , @`` y nada más (espacios, barras, controles, los de dirección como U+202E y los de
+    ancho cero pasan a ``_``, y una racha de ``_`` queda en uno); sin ``.``, ``-`` ni ``_`` al principio (ni oculto,
+    ni ``..``, ni una opción para quien lo pase a una orden) ni ``.`` o ``_`` al final; como mucho 180 bytes,
+    conservando la extensión; y «fichero» si no queda nada. Así ningún nombre que llegue puede salirse de su carpeta ni
+    engañar a quien lo lea."""
+    texto = unicodedata.normalize("NFC", nombre)
+    limpio = "".join(c if c.isalnum() or c in PERMITIDOS else "_" for c in texto)
+    limpio = re.sub(r"_+", "_", limpio).lstrip(".-_").rstrip("._")
+    if len(limpio.encode("utf-8")) > MAX_SEGURO:
+        base, extension = _partir(limpio)
+        base = _recortar(base, MAX_SEGURO - len(extension.encode("utf-8"))).rstrip("._")
+        limpio = base + extension if base else _recortar(limpio, MAX_SEGURO).rstrip("._")
+    return limpio or "fichero"
+
+
+def con_sufijo(nombre: str, numero: int) -> str:
+    """El nombre de la copia ``numero`` de ese día: ``informe-2.docx``, delante de la extensión (sin paréntesis, que un
+    shell interpreta)."""
+    if numero <= 1:
+        return nombre
+    base, extension = _partir(nombre)
+    return "%s-%d%s" % (base, numero, extension)
+
+
+def validar_nombre(nombre) -> str:
+    """El nombre tal como lo ve el usuario: 1 a 255 bytes de UTF-8, sin ``/``, sin NUL y sin caracteres de control.
+    Otra forma es un error de la app (``nombre_invalido``), no algo que se arregla callando."""
+    malo = Rechazo(400, "nombre_invalido",
+                   "El nombre tiene que tener de 1 a 255 bytes, sin «/» ni caracteres de control")
+    if not isinstance(nombre, str) or not nombre:
+        raise malo
+    try:
+        largo = len(nombre.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise malo from None
+    if largo > MAX_NOMBRE or "/" in nombre or any(unicodedata.category(c) == "Cc" for c in nombre):
+        raise malo
+    return nombre
+
+
+# MARK: Las formas y los topes
+
+
+def _entero(valor) -> bool:
+    return isinstance(valor, int) and not isinstance(valor, bool)
+
+
+def _validar_id(valor) -> str:
+    if not isinstance(valor, str) or not PATRON_ID.fullmatch(valor):
+        raise Rechazo(400, "parametro_invalido", "El id tiene que ser de 32 hexadecimales")
+    return valor
+
+
+def _validar_numero(valor) -> int:
+    if not _entero(valor) or valor < 0:
+        raise Rechazo(400, "parametro_invalido", "El número de trozo no tiene su forma")
+    return valor
+
+
+def topes(tope=None, margen=None) -> tuple:
+    """``(tope, margen)`` en bytes: los de ``vigia.ini`` que pasa el vigía, recortados a los de aquí. El vigía puede
+    pedir menos tope y más margen, nunca al revés."""
+    if tope is None:
+        tope = TOPE_DE_SERIE
+    if margen is None:
+        margen = MARGEN_DE_SERIE
+    if not _entero(tope) or tope < 1 or not _entero(margen) or margen < 0:
+        raise Rechazo(400, "parametro_invalido", "El tope y el margen son bytes")
+    return min(tope, TOPE_MAXIMO), max(margen, MARGEN_MINIMO)
+
+
+def dias_validos(dias=None) -> int:
+    if dias is None:
+        return DIAS_DE_SERIE
+    if not _entero(dias):
+        raise Rechazo(400, "parametro_invalido", "Los días son un número")
+    return min(max(dias, DIAS_MINIMO), DIAS_MAXIMO)
+
+
+def cuantos_trozos(tamano: int) -> int:
+    return (tamano + TROZO - 1) // TROZO
+
+
+def largo_del_trozo(tamano: int, n: int) -> int:
+    return min(TROZO, tamano - n * TROZO)
+
+
+def dia_de(instante: float) -> str:
+    """La carpeta del día: la fecha del servidor, la misma que ve Hermes."""
+    return time.strftime("%Y-%m-%d", time.localtime(instante))
+
+
+def validar_casa(casa) -> str:
+    """La casa de Hermes que pone la unidad: absoluta, limpia y que no sea «/» (una opción mal puesta tiene que decirse,
+    no adivinarse)."""
+    if (not isinstance(casa, str) or not casa.startswith("/")
+            or any(ord(c) < 0x20 or ord(c) == 0x7F for c in casa)):
+        raise ValueError("casa")
+    partes = [parte for parte in casa.split("/") if parte]
+    if not partes or any(parte in (".", "..") for parte in partes):
+        raise ValueError("casa")
+    return "/" + "/".join(partes)
+
+
+# MARK: Descriptores, sin seguir enlaces
+
+
+def _abrir_carpeta(nombre: str, dentro: int) -> int:
+    """Una carpeta de verdad dentro de otra ya abierta. Un enlace da ELOOP en Linux y ENOTDIR en el Mac: los dos son
+    que no es una carpeta."""
+    return os.open(nombre, _CARPETA, dir_fd=dentro)
+
+
+def _abrir_o_crear_carpeta(nombre: str, dentro: int) -> int:
+    try:
+        return _abrir_carpeta(nombre, dentro)
+    except FileNotFoundError:
+        pass
+    try:
+        os.mkdir(nombre, 0o700, dir_fd=dentro)
+    except FileExistsError:
+        pass
+    return _abrir_carpeta(nombre, dentro)
+
+
+def _cerrar(*fds) -> None:
+    for fd in fds:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _escribir_todo(fd: int, datos, desde: int | None = None) -> None:
+    vista = memoryview(datos)
+    hecho = 0
+    while hecho < len(vista):
+        if desde is None:
+            hecho += os.write(fd, vista[hecho:])
+        else:
+            hecho += os.pwrite(fd, vista[hecho:], desde + hecho)
+
+
+def _leer_json(carpeta: int, nombre: str, tope: int = 1024 * 1024):
+    """Un JSON pequeño de una carpeta abierta, o None. Sin seguir enlaces ni quedarse esperando a una tubería."""
+    try:
+        fd = os.open(nombre, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | _CLOEXEC, dir_fd=carpeta)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        partes, total = [], 0
+        while total <= tope:
+            trozo = os.read(fd, 64 * 1024)
+            if not trozo:
+                break
+            partes.append(trozo)
+            total += len(trozo)
+        if total > tope:
+            return None
+        return json.loads(b"".join(partes).decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    finally:
+        os.close(fd)
+
+
+def _escribir_json(carpeta: int, nombre: str, datos) -> None:
+    """Al lado y con un rename: quien lo lea a la vez ve el de antes o el nuevo, nunca medio. El temporal, con un nombre
+    al azar: varias conexiones pueden escribir el mismo a la vez (``tocada``)."""
+    temporal = "%s.%s.nuevo" % (nombre, secrets.token_hex(6))
+    fd = os.open(temporal, _FICHERO_NUEVO, 0o600, dir_fd=carpeta)
+    try:
+        _escribir_todo(fd, json.dumps(datos, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.replace(temporal, nombre, src_dir_fd=carpeta, dst_dir_fd=carpeta)
+
+
+def _borrar_dentro(padre: int, nombre: str, profundidad: int = 0) -> None:
+    """Borra ``nombre`` de la carpeta ``padre`` con todo lo de dentro, bajando con descriptores y sin seguir ningún
+    enlace: un enlace se borra él, nunca lo que señala. Es ``shutil.rmtree`` con descriptores, pero desde ``padre``: la
+    ruta de arriba no se vuelve a resolver nunca (el de Python 3.9 no sabe empezar por un descriptor)."""
+    visto = os.stat(nombre, dir_fd=padre, follow_symlinks=False)
+    if not stat.S_ISDIR(visto.st_mode):
+        os.unlink(nombre, dir_fd=padre)
+        return
+    if profundidad >= MAX_PROFUNDIDAD:
+        raise OSError(errno.ELOOP, "demasiadas carpetas una dentro de otra")
+    fd = _abrir_carpeta(nombre, padre)
+    try:
+        abierta = os.fstat(fd)
+        if (abierta.st_dev, abierta.st_ino) != (visto.st_dev, visto.st_ino):
+            raise OSError(errno.ESTALE, "la carpeta ha cambiado mientras se borraba")
+        for hijo in os.listdir(fd):
+            _borrar_dentro(fd, hijo, profundidad + 1)
+    finally:
+        os.close(fd)
+    os.rmdir(nombre, dir_fd=padre)
+
+
+def _tomar(carpeta: int, nombre: str, compartido: bool = False, esperar: bool = True) -> int | None:
+    """Un cerrojo (``flock``) en el fichero ``nombre`` de una carpeta abierta: su descriptor, que lo suelta al cerrarse;
+    o None si no se espera y lo tiene otro. Sin la carpeta (se ha borrado), ``FileNotFoundError``."""
+    fd = os.open(nombre, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | _CLOEXEC, 0o600, dir_fd=carpeta)
+    modo = fcntl.LOCK_SH if compartido else fcntl.LOCK_EX
+    try:
+        fcntl.flock(fd, modo if esperar else modo | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+@contextlib.contextmanager
+def _con_cerrojo(carpeta: int, nombre: str, compartido: bool = False):
+    fd = _tomar(carpeta, nombre, compartido)
+    try:
+        yield
+    finally:
+        os.close(fd)
+
+
+def _sha256_de(fd: int) -> str:
+    os.lseek(fd, 0, os.SEEK_SET)
+    resumen = hashlib.sha256()
+    while True:
+        trozo = os.read(fd, LECTURA)
+        if not trozo:
+            return resumen.hexdigest()
+        resumen.update(trozo)
+
+
+# MARK: La carpeta de entrada
+
+
+class Entrada:
+    """``<HERMES_HOME>/entrada`` y todas las órdenes, sin sockets (``atender`` solo traduce). ``reloj`` y ``libre`` son
+    para las pruebas: la hora y los bytes libres del disco, que en el servidor son los de verdad (``statvfs``)."""
+
+    def __init__(self, casa: str = HERMES_HOME, reloj=time.time, libre=None):
+        self.casa = validar_casa(casa)
+        self.carpeta = self.casa.rstrip("/") + "/" + ENTRADA
+        self.reloj = reloj
+        self._libre = libre
+
+    # -- Lo común
+
+    def disco_libre(self, entrada: int) -> int:
+        """Lo que puede escribir quien no es root en el disco de ``entrada`` (``f_bavail``: lo reservado para root no
+        cuenta, aunque Hermes sea root)."""
+        if self._libre is not None:
+            return int(self._libre())
+        datos = os.fstatvfs(entrada)
+        return datos.f_bavail * datos.f_frsize
+
+    @contextlib.contextmanager
+    def _carpetas(self):
+        """``(entrada, .subidas)``, abiertas. ``entrada`` la crea el instalador (del dueño de Hermes, 0700): sin ella, o
+        si no es una carpeta de verdad, nada. La casa sí puede ser un enlace (la da la unidad), lo de dentro no. Y tiene
+        que ser de quien corre esto: root a mano sobre la de un Hermes que no es root dejaría dentro cosas de root que
+        el ayudante de verdad, que corre como ese usuario, ya no podría usar."""
+        no_disponible = Rechazo(503, "entrada_no_disponible", "No está la carpeta de entrada de Hermes")
+        try:
+            casa = os.open(self.casa, os.O_RDONLY | os.O_DIRECTORY | _CLOEXEC)
+        except OSError:
+            raise no_disponible from None
+        entrada = subidas = None
+        try:
+            try:
+                entrada = _abrir_carpeta(ENTRADA, casa)
+                if os.fstat(entrada).st_uid != os.geteuid():
+                    raise OSError(errno.EPERM, "la carpeta de entrada es de otro usuario")
+                subidas = _abrir_o_crear_carpeta(SUBIDAS, entrada)
+            except OSError as error:
+                _decir("la carpeta de entrada no se puede usar (%s)" % errno.errorcode.get(error.errno, "?"))
+                raise no_disponible from None
+            yield entrada, subidas
+        finally:
+            _cerrar(subidas, entrada, casa)
+
+    def _subida(self, subidas: int, id_: str) -> int:
+        """La carpeta de una subida, abierta: tiene que ser una carpeta de verdad con su nombre."""
+        _validar_id(id_)
+        try:
+            return _abrir_carpeta(id_, subidas)
+        except OSError as error:
+            if error.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+                raise Rechazo(404, "subida_desconocida", "Esa subida no existe, caducó o se borró") from None
+            raise
+
+    @staticmethod
+    def _registro_de(carpeta: int, id_: str) -> dict | None:
+        """El registro de una subida si tiene su forma (la de ``crear`` o la de ``terminar``); si no, None."""
+        datos = _leer_json(carpeta, REGISTRO)
+        if not isinstance(datos, dict) or datos.get("id") != id_:
+            return None
+        tamano, sha = datos.get("tamano"), datos.get("sha256")
+        if (not isinstance(datos.get("nombre"), str) or not _entero(tamano) or not 1 <= tamano <= TOPE_MAXIMO
+                or not isinstance(sha, str) or not PATRON_SHA.fullmatch(sha)
+                or datos.get("trozos") != cuantos_trozos(tamano)
+                or not isinstance(datos.get("creada"), (int, float))):
+            return None
+        if datos.get("estado") == "recibiendo":
+            return datos
+        if (datos.get("estado") == "lista" and isinstance(datos.get("terminada"), (int, float))
+                and isinstance(datos.get("dia"), str) and PATRON_DIA.fullmatch(datos["dia"])
+                and isinstance(datos.get("final"), str) and isinstance(datos.get("ruta"), str)):
+            return datos
+        return None
+
+    @staticmethod
+    def _tocada(carpeta: int, registro: dict) -> float:
+        """Cuándo llegó su último trozo (o cuándo se creó): de ahí cuentan sus 24 horas."""
+        datos = _leer_json(carpeta, TOCADA)
+        cuando = datos.get("cuando") if isinstance(datos, dict) else None
+        return max(registro["creada"], cuando) if isinstance(cuando, (int, float)) else registro["creada"]
+
+    def _caduca(self, carpeta: int, registro: dict) -> float:
+        if registro["estado"] == "lista":
+            return registro["terminada"] + VIDA
+        return self._tocada(carpeta, registro) + VIDA
+
+    @staticmethod
+    def _recibidos(carpeta: int, registro: dict) -> list:
+        """Los números de los trozos que tienen su marca."""
+        if registro["estado"] == "lista":
+            return list(range(registro["trozos"]))
+        try:
+            marcas = _abrir_carpeta(MARCAS, carpeta)
+        except OSError:
+            return []
+        try:
+            nombres = os.listdir(marcas)
+        finally:
+            os.close(marcas)
+        return sorted(int(n) for n in nombres if PATRON_MARCA.fullmatch(n) and int(n) < registro["trozos"])
+
+    def _vista(self, carpeta: int, registro: dict) -> dict:
+        """Lo que se contesta de una subida (``GET …/subidas/{id}``, contrato §16)."""
+        lista = registro["estado"] == "lista"
+        return {"id": registro["id"], "estado": registro["estado"], "tamano": registro["tamano"],
+                "tamano_trozo": TROZO, "trozos": registro["trozos"],
+                "recibidos": self._recibidos(carpeta, registro), "caduca": int(self._caduca(carpeta, registro)),
+                "ruta": registro["ruta"] if lista else None, "nombre": registro["final"] if lista else None}
+
+    @staticmethod
+    def _cada_una(subidas: int):
+        """``(id, carpeta abierta, registro o None)`` de cada subida, de una en una: la carpeta se cierra al pasar a la
+        siguiente. Nunca todas abiertas a la vez: los registros de lo colocado se guardan 24 horas, y a sesenta por hora
+        pasarían del tope de descriptores del proceso."""
+        for nombre in sorted(os.listdir(subidas)):
+            if not PATRON_ID.fullmatch(nombre):
+                continue
+            try:
+                carpeta = _abrir_carpeta(nombre, subidas)
+            except OSError:
+                continue
+            try:
+                yield nombre, carpeta, Entrada._registro_de(carpeta, nombre)
+            finally:
+                os.close(carpeta)
+
+    def _caducar(self, subidas: int, ahora: float) -> tuple:
+        """``(subidas a medias, registros)`` borrados: lo que lleva 24 horas sin un trozo nuevo, y el registro de lo
+        colocado hace más de 24 horas (solo el registro: el fichero ya es de Hermes). Lo que tiene su cerrojo cogido se
+        está usando ahora mismo y se deja. Con el cerrojo de ``.subidas`` cogido."""
+        a_medias = registros = 0
+        with contextlib.closing(self._cada_una(subidas)) as todas:
+            for id_, carpeta, registro in todas:
+                try:
+                    cerrojo = _tomar(carpeta, CERROJO_DE_LA_SUBIDA, esperar=False)
+                except OSError:
+                    cerrojo = None
+                if cerrojo is None:
+                    continue
+                try:
+                    if registro is None:
+                        # A medio crear o roto: si ya es viejo, fuera.
+                        viejo = ahora - os.fstat(carpeta).st_mtime > VIDA
+                    elif registro["estado"] == "recibiendo":
+                        viejo = ahora >= self._caduca(carpeta, registro)
+                    else:
+                        viejo = ahora >= registro["terminada"] + VIDA
+                    if viejo:
+                        _borrar_dentro(subidas, id_)
+                        if registro is not None and registro["estado"] == "lista":
+                            registros += 1
+                        else:
+                            a_medias += 1
+                except OSError as error:
+                    _decir("subida %s: no se ha podido borrar (%s)" % (id_[:8],
+                                                                         errno.errorcode.get(error.errno, "?")))
+                finally:
+                    os.close(cerrojo)
+        return a_medias, registros
+
+    def _pendientes(self, carpeta: int, registro: dict) -> int:
+        """Lo que le falta por llegar a una subida a medias: lo que aún va a ocupar el disco."""
+        return registro["tamano"] - sum(largo_del_trozo(registro["tamano"], n)
+                                        for n in self._recibidos(carpeta, registro))
+
+    def _creadas(self, subidas: int, ahora: float) -> list:
+        """Cuándo se crearon las de la última hora. Va aparte de las subidas: crear y borrar no se salta el límite."""
+        datos = _leer_json(subidas, CREADAS)
+        lista = datos.get("creadas") if isinstance(datos, dict) else None
+        return [t for t in (lista if isinstance(lista, list) else []) if isinstance(t, (int, float))
+                and 0 <= ahora - t < HORA]
+
+    # -- Las órdenes
+
+    def estado(self, tope=None, margen=None) -> dict:
+        tope, margen = topes(tope, margen)
+        with self._carpetas() as (entrada, subidas), contextlib.closing(self._cada_una(subidas)) as todas:
+            ahora = self.reloj()
+            abiertas = sum(1 for _, carpeta, registro in todas if registro is not None
+                           and registro["estado"] == "recibiendo" and ahora < self._caduca(carpeta, registro))
+            return {"ok": True, "tope": tope, "margen": margen, "libre": self.disco_libre(entrada),
+                    "abiertas": abiertas, "carpeta": self.carpeta}
+
+    def crear(self, nombre, tamano, sha256, tope=None, margen=None) -> dict:
+        """La subida de un fichero, o la que ya había (reanudar es volver a crearla): ``http`` 201 si es nueva y 200 si
+        ya estaba, a medias (con lo que tiene) o lista hace menos de 24 horas y con su fichero en su sitio."""
+        nombre = validar_nombre(nombre)
+        tope, margen = topes(tope, margen)
+        if not _entero(tamano) or tamano < 1:
+            raise Rechazo(400, "parametro_invalido", "El tamaño son bytes, al menos uno")
+        if tamano > tope:
+            raise Rechazo(413, "fichero_demasiado_grande", "El fichero pasa del tope del servidor", {"tope": tope})
+        if not isinstance(sha256, str) or not PATRON_SHA.fullmatch(sha256):
+            raise Rechazo(400, "parametro_invalido", "El SHA-256 son 64 hexadecimales en minúsculas")
+        with self._carpetas() as (entrada, subidas), _con_cerrojo(subidas, CERROJO):
+            ahora = self.reloj()
+            self._caducar(subidas, ahora)
+            # Una pasada: la que coincide (reanudar o ya lista) se contesta tal cual; de las demás a medias, cuántas
+            # son y lo que les falta.
+            abiertas = pendientes = 0
+            with contextlib.closing(self._cada_una(subidas)) as todas:
+                for id_, carpeta, registro in todas:
+                    if registro is None:
+                        continue
+                    igual = (registro["nombre"], registro["tamano"], registro["sha256"]) == (nombre, tamano, sha256)
+                    if registro["estado"] == "recibiendo":
+                        if igual and ahora < self._caduca(carpeta, registro):
+                            vista = self._vista(carpeta, registro)
+                            _decir("subida %s: retomada (%d de %d trozos)" % (id_[:8], len(vista["recibidos"]),
+                                                                               registro["trozos"]))
+                            return dict(vista, ok=True, http=200)
+                        abiertas += 1
+                        # Lo que les falta a las demás también va a ocupar el disco: el margen cuenta con ello.
+                        pendientes += self._pendientes(carpeta, registro)
+                    elif (igual and ahora < registro["terminada"] + VIDA
+                          and self._sigue_en_su_sitio(entrada, registro)):
+                        _decir("subida %s: ya estaba lista" % id_[:8])
+                        return dict(self._vista(carpeta, registro), ok=True, http=200)
+            if abiertas >= MAX_ABIERTAS:
+                raise Rechazo(429, "demasiadas_subidas", "Ya hay %d subidas sin terminar" % MAX_ABIERTAS,
+                              cabeceras={"Retry-After": str(ESPERA_CON_ABIERTAS)})
+            creadas = self._creadas(subidas, ahora)
+            if len(creadas) >= MAX_POR_HORA:
+                espera = int(HORA - (ahora - min(creadas))) + 1
+                raise Rechazo(429, "demasiadas_subidas", "Ya van %d subidas en la última hora" % MAX_POR_HORA,
+                              cabeceras={"Retry-After": str(espera)})
+            libre = self.disco_libre(entrada)
+            necesita = tamano + pendientes + margen
+            if libre < necesita:
+                raise Rechazo(507, "sin_espacio", "No hay sitio en el disco del servidor", {"faltan": necesita - libre})
+            id_ = secrets.token_hex(16)
+            os.mkdir(id_, 0o700, dir_fd=subidas)
+            carpeta = _abrir_carpeta(id_, subidas)
+            try:
+                os.mkdir(MARCAS, 0o700, dir_fd=carpeta)
+                os.close(os.open(DATOS, _FICHERO_NUEVO, 0o600, dir_fd=carpeta))
+                os.close(os.open(CERROJO_DE_LA_SUBIDA, _FICHERO_NUEVO, 0o600, dir_fd=carpeta))
+                registro = {"id": id_, "nombre": nombre, "tamano": tamano, "sha256": sha256,
+                            "trozos": cuantos_trozos(tamano), "creada": ahora, "estado": "recibiendo",
+                            "terminada": None, "dia": None, "final": None, "ruta": None}
+                # El registro, lo último: una carpeta sin él es una creación que no acabó, y la limpieza la quita.
+                _escribir_json(carpeta, REGISTRO, registro)
+                _escribir_json(subidas, CREADAS, {"creadas": creadas + [ahora]})
+                _decir("subida %s: nueva (%d bytes, %d trozos)" % (id_[:8], tamano, registro["trozos"]))
+                return dict(self._vista(carpeta, registro), ok=True, http=201)
+            finally:
+                os.close(carpeta)
+
+    def _sigue_en_su_sitio(self, entrada: int, registro: dict) -> bool:
+        """Si el fichero de una subida lista sigue en su carpeta del día, con su tamaño: si Hermes lo ha movido o
+        borrado, otra subida igual se vuelve a subir."""
+        try:
+            dia = _abrir_carpeta(registro["dia"], entrada)
+        except OSError:
+            return False
+        try:
+            visto = os.stat(registro["final"], dir_fd=dia, follow_symlinks=False)
+        except OSError:
+            return False
+        finally:
+            os.close(dia)
+        return stat.S_ISREG(visto.st_mode) and visto.st_size == registro["tamano"]
+
+    def subida(self, id_) -> dict:
+        _validar_id(id_)
+        with self._carpetas() as (_entrada, subidas):
+            carpeta = self._subida(subidas, id_)
+            try:
+                with self._de_la_subida(carpeta, compartido=True):
+                    registro = self._vigente(carpeta, id_)
+                    return dict(self._vista(carpeta, registro), ok=True)
+            finally:
+                os.close(carpeta)
+
+    @contextlib.contextmanager
+    def _de_la_subida(self, carpeta: int, compartido: bool):
+        """El cerrojo de una subida: los trozos lo comparten; terminarla o borrarla lo quiere para ella sola. Si la
+        subida se ha borrado mientras se esperaba, ya no está."""
+        try:
+            fd = _tomar(carpeta, CERROJO_DE_LA_SUBIDA, compartido)
+        except FileNotFoundError:
+            raise Rechazo(404, "subida_desconocida", "Esa subida no existe, caducó o se borró") from None
+        try:
+            yield
+        finally:
+            os.close(fd)
+
+    def _vigente(self, carpeta: int, id_: str) -> dict:
+        """El registro de una subida que no ha caducado; si no, ``404 subida_desconocida`` (lo caducado y lo que no
+        tiene registro es lo mismo para la app: la crea otra vez)."""
+        registro = self._registro_de(carpeta, id_)
+        if registro is None or self.reloj() >= self._caduca(carpeta, registro):
+            raise Rechazo(404, "subida_desconocida", "Esa subida no existe, caducó o se borró")
+        return registro
+
+    def trozo(self, id_, n, sha256, datos: bytes, margen=None) -> dict:
+        """Un trozo, en su sitio del fichero de datos y con su marca. Repetido, se vuelve a escribir; en cualquier
+        orden."""
+        _validar_id(id_)
+        n = _validar_numero(n)
+        if not isinstance(sha256, str) or not PATRON_SHA.fullmatch(sha256):
+            raise Rechazo(400, "trozo_invalido", "X-HeHermes-SHA256 no tiene su forma")
+        _, margen = topes(None, margen)
+        with self._carpetas() as (entrada, subidas):
+            carpeta = self._subida(subidas, id_)
+            try:
+                with self._de_la_subida(carpeta, compartido=True):
+                    registro = self._vigente(carpeta, id_)
+                    if registro["estado"] == "lista":
+                        raise Rechazo(409, "ya_terminada", "Esa subida ya está lista: pide terminar")
+                    if n >= registro["trozos"]:
+                        raise Rechazo(404, "trozo_desconocido", "Esa subida no tiene ese trozo")
+                    if len(datos) != largo_del_trozo(registro["tamano"], n):
+                        raise Rechazo(400, "trozo_invalido", "El trozo no tiene el largo que le toca")
+                    if hashlib.sha256(datos).hexdigest() != sha256:
+                        raise Rechazo(400, "trozo_invalido", "El SHA-256 del trozo no da")
+                    marcas = _abrir_carpeta(MARCAS, carpeta)
+                    try:
+                        ya_estaba = self._tiene_marca(marcas, n)
+                        if not ya_estaba:
+                            libre = self.disco_libre(entrada)
+                            if libre - len(datos) < margen:
+                                raise Rechazo(507, "sin_espacio", "No hay sitio en el disco del servidor",
+                                              {"faltan": margen + len(datos) - libre})
+                        self._escribir_trozo(carpeta, n, datos)
+                        if not ya_estaba:
+                            try:
+                                os.close(os.open(str(n), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+                                                 | _CLOEXEC, 0o600, dir_fd=marcas))
+                            except OSError:
+                                raise Rechazo(500, "error", "La marca del trozo no se puede escribir") from None
+                    finally:
+                        os.close(marcas)
+                    _escribir_json(carpeta, TOCADA, {"cuando": self.reloj()})
+                    return {"ok": True, "http": 204}
+            finally:
+                os.close(carpeta)
+
+    @staticmethod
+    def _tiene_marca(marcas: int, n: int) -> bool:
+        try:
+            return stat.S_ISREG(os.stat(str(n), dir_fd=marcas, follow_symlinks=False).st_mode)
+        except FileNotFoundError:
+            return False
+
+    @staticmethod
+    def _escribir_trozo(carpeta: int, n: int, datos: bytes) -> None:
+        try:
+            # Sin esperar a nadie: si ahí hubiera una tubería, abrirla para escribir esperaría a quien la leyera.
+            fd = os.open(DATOS, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | _CLOEXEC, 0o600,
+                         dir_fd=carpeta)
+        except OSError:
+            raise Rechazo(500, "error", "El fichero de la subida no se puede escribir") from None
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise Rechazo(500, "error", "El fichero de la subida no es un fichero")
+            _escribir_todo(fd, datos, n * TROZO)
+        except OSError as error:
+            if error.errno in (errno.ENOSPC, errno.EDQUOT, errno.EFBIG):
+                raise Rechazo(507, "sin_espacio", "No hay sitio en el disco del servidor",
+                              {"faltan": len(datos)}) from None
+            raise
+        finally:
+            os.close(fd)
+
+    def terminar(self, id_) -> dict:
+        """Con todos los trozos, el SHA-256 del fichero entero y, si da el de crear, a su carpeta del día con su nombre
+        limpio (``link``: no pisa nada) y 0600. Si no da, la subida se tira (``422``): la app la empieza de cero. Una ya
+        lista contesta lo mismo."""
+        _validar_id(id_)
+        with self._carpetas() as (entrada, subidas):
+            carpeta = self._subida(subidas, id_)
+            try:
+                with self._de_la_subida(carpeta, compartido=False):
+                    registro = self._vigente(carpeta, id_)
+                    if registro["estado"] == "lista":
+                        return {"ok": True, "http": 200, "ruta": registro["ruta"], "nombre": registro["final"],
+                                "tamano": registro["tamano"]}
+                    recibidos = set(self._recibidos(carpeta, registro))
+                    faltan = [n for n in range(registro["trozos"]) if n not in recibidos]
+                    if faltan:
+                        raise Rechazo(409, "faltan_trozos", "Faltan trozos", {"faltan": faltan[:MAX_FALTAN]})
+                    return self._colocar(entrada, subidas, carpeta, registro)
+            finally:
+                os.close(carpeta)
+
+    def _colocar(self, entrada: int, subidas: int, carpeta: int, registro: dict) -> dict:
+        id_ = registro["id"]
+        try:
+            datos = os.open(DATOS, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | _CLOEXEC, dir_fd=carpeta)
+        except OSError:
+            datos = None
+        try:
+            visto = os.fstat(datos) if datos is not None else None
+            bien = (visto is not None and stat.S_ISREG(visto.st_mode) and visto.st_size == registro["tamano"]
+                    and _sha256_de(datos) == registro["sha256"])
+            if not bien:
+                with _con_cerrojo(subidas, CERROJO):
+                    _borrar_dentro(subidas, id_)
+                _decir("subida %s: lo recibido no da su SHA-256 (%d bytes): se tira" % (id_[:8], registro["tamano"]))
+                raise Rechazo(422, "fichero_distinto", "Lo recibido no da el SHA-256 del fichero: se ha tirado")
+            os.fchmod(datos, 0o600)
+            # Lo que se escribió por trozos, en el disco antes de darlo por colocado.
+            os.fsync(datos)
+            with _con_cerrojo(subidas, CERROJO):
+                ahora = self.reloj()
+                dia = dia_de(ahora)
+                try:
+                    carpeta_del_dia = _abrir_o_crear_carpeta(dia, entrada)
+                except OSError:
+                    raise Rechazo(500, "error", "La carpeta del día no es una carpeta") from None
+                try:
+                    final = self._enlazar(carpeta, carpeta_del_dia, nombre_seguro(registro["nombre"]), visto)
+                    try:
+                        os.fsync(carpeta_del_dia)
+                    except OSError:
+                        pass
+                finally:
+                    os.close(carpeta_del_dia)
+                ruta = "%s/%s/%s" % (self.carpeta, dia, final)
+                registro = dict(registro, estado="lista", terminada=ahora, dia=dia, final=final, ruta=ruta)
+                _escribir_json(carpeta, REGISTRO, registro)
+                # Lo de recibir ya no hace falta: el fichero es el mismo inodo, ahora con su nombre de verdad.
+                for sobra in (DATOS, TOCADA):
+                    try:
+                        os.unlink(sobra, dir_fd=carpeta)
+                    except FileNotFoundError:
+                        pass
+                try:
+                    _borrar_dentro(carpeta, MARCAS)
+                except FileNotFoundError:
+                    pass
+            _decir("subida %s: lista (%d bytes)" % (id_[:8], registro["tamano"]))
+            return {"ok": True, "http": 200, "ruta": ruta, "nombre": final, "tamano": registro["tamano"]}
+        finally:
+            _cerrar(datos)
+
+    @staticmethod
+    def _enlazar(carpeta: int, carpeta_del_dia: int, nombre: str, visto) -> str:
+        """Un nombre nuevo en la carpeta del día para el fichero de datos: el limpio, o con ``-2``, ``-3``… si ese día
+        ya hay uno. ``link`` falla si el nombre existe, así que nunca se pisa nada; y lo enlazado tiene que ser el mismo
+        inodo que se comprobó (si no, alguien ha cambiado el fichero por el camino y no se entrega). Un nombre que ya es
+        ese mismo inodo es el de un terminar que se cortó justo después de enlazar: se aprovecha, sin otro nombre."""
+        for numero in range(1, MAX_COPIAS + 1):
+            candidato = con_sufijo(nombre, numero)
+            try:
+                os.link(DATOS, candidato, src_dir_fd=carpeta, dst_dir_fd=carpeta_del_dia, follow_symlinks=False)
+            except FileExistsError:
+                try:
+                    ya = os.stat(candidato, dir_fd=carpeta_del_dia, follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISREG(ya.st_mode) and (ya.st_dev, ya.st_ino) == (visto.st_dev, visto.st_ino):
+                    return candidato
+                continue
+            enlazado = os.stat(candidato, dir_fd=carpeta_del_dia, follow_symlinks=False)
+            if (enlazado.st_dev, enlazado.st_ino) != (visto.st_dev, visto.st_ino):
+                try:
+                    os.unlink(candidato, dir_fd=carpeta_del_dia)
+                except OSError:
+                    pass
+                raise Rechazo(500, "error", "El fichero de la subida ha cambiado mientras se colocaba")
+            return candidato
+        raise Rechazo(500, "error", "Ese día ya no queda ningún nombre libre para este fichero")
+
+    def borrar(self, id_) -> dict:
+        """Una a medias, con lo recibido; una lista, solo su registro (el fichero ya es de Hermes)."""
+        _validar_id(id_)
+        with self._carpetas() as (_entrada, subidas):
+            carpeta = self._subida(subidas, id_)
+            try:
+                with self._de_la_subida(carpeta, compartido=False):
+                    if self._registro_de(carpeta, id_) is None:
+                        raise Rechazo(404, "subida_desconocida", "Esa subida no existe, caducó o se borró")
+                    with _con_cerrojo(subidas, CERROJO):
+                        _borrar_dentro(subidas, id_)
+            finally:
+                os.close(carpeta)
+        _decir("subida %s: borrada" % id_[:8])
+        return {"ok": True, "http": 204}
+
+    def limpiar(self, dias=None) -> dict:
+        """Lo que se lanza cada hora: las subidas a medias de hace más de 24 horas, los registros de las colocadas hace
+        más de 24 horas y, enteras, las carpetas ``AAAA-MM-DD`` de hace más de ``dias`` días (``entrada/`` es una
+        bandeja de entrada: lo que Hermes quiera conservar lo copia a otro sitio). Solo carpetas de verdad con nombre de
+        fecha: lo demás que haya en ``entrada/`` no se toca."""
+        dias = dias_validos(dias)
+        with self._carpetas() as (entrada, subidas), _con_cerrojo(subidas, CERROJO):
+            ahora = self.reloj()
+            a_medias, registros = self._caducar(subidas, ahora)
+            hoy = datetime.date.fromtimestamp(ahora)
+            carpetas = 0
+            for nombre in sorted(os.listdir(entrada)):
+                fecha = PATRON_DIA.fullmatch(nombre)
+                if not fecha:
+                    continue
+                try:
+                    cuando = datetime.date(*(int(parte) for parte in fecha.groups()))
+                    if (hoy - cuando).days <= dias:
+                        continue
+                    if not stat.S_ISDIR(os.stat(nombre, dir_fd=entrada, follow_symlinks=False).st_mode):
+                        continue
+                    _borrar_dentro(entrada, nombre)
+                    carpetas += 1
+                except ValueError:
+                    continue
+                except OSError as error:
+                    _decir("la carpeta de un día no se ha podido borrar (%s)" % errno.errorcode.get(error.errno, "?"))
+        if a_medias or registros or carpetas:
+            _decir("limpieza: %d subidas a medias, %d registros y %d carpetas de días"
+                   % (a_medias, registros, carpetas))
+        return {"ok": True, "subidas": a_medias, "registros": registros, "carpetas": carpetas}
+
+    def orden(self, peticion: dict, cuerpo: bytes | None = None) -> dict:
+        """La respuesta a una orden, o ``Rechazo``. Solo un trozo lleva bytes."""
+        orden = peticion.get("orden")
+        if cuerpo is not None and orden != "trozo":
+            raise Rechazo(400, "peticion_invalida", "Solo un trozo lleva bytes")
+        if orden == "estado":
+            return self.estado(peticion.get("tope"), peticion.get("margen"))
+        if orden == "crear":
+            return self.crear(peticion.get("nombre"), peticion.get("tamano"), peticion.get("sha256"),
+                              peticion.get("tope"), peticion.get("margen"))
+        if orden == "subida":
+            return self.subida(peticion.get("id"))
+        if orden == "trozo":
+            if cuerpo is None:
+                raise Rechazo(400, "trozo_invalido", "Falta el trozo")
+            return self.trozo(peticion.get("id"), peticion.get("n"), peticion.get("sha256"), cuerpo,
+                              peticion.get("margen"))
+        if orden == "terminar":
+            return self.terminar(peticion.get("id"))
+        if orden == "borrar":
+            return self.borrar(peticion.get("id"))
+        if orden == "limpiar":
+            return self.limpiar(peticion.get("dias"))
+        raise Rechazo(400, "orden_desconocida", "Orden desconocida")
+
+
+# MARK: El socket
+
+
+def par_del_vigia(conexion, uid_vigia: int | None = None) -> bool:
+    """Si al otro lado del socket está root o el vigía, según el núcleo (``SO_PEERCRED``). Sin eso, nadie."""
+    try:
+        if uid_vigia is None:
+            uid_vigia = pwd.getpwnam(USUARIO_VIGIA).pw_uid
+        credenciales = conexion.getsockopt(socket.SOL_SOCKET, SO_PEERCRED, struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", credenciales)
+    except (OSError, KeyError, AttributeError, struct.error):
+        return False
+    return uid in (0, uid_vigia)
+
+
+def par_del_mismo_usuario(conexion, uid_propio: int | None = None) -> bool:
+    """Con ``--usuario``: solo este mismo usuario (el vigía sin root corre como él). Ni root ni nadie más."""
+    try:
+        if uid_propio is None:
+            uid_propio = os.geteuid()
+        credenciales = conexion.getsockopt(socket.SOL_SOCKET, SO_PEERCRED, struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", credenciales)
+    except (OSError, AttributeError, struct.error):
+        return False
+    return uid_propio != 0 and uid == uid_propio
+
+
+def _leer_exacto(conexion, n: int) -> bytes:
+    partes, quedan = [], n
+    while quedan:
+        trozo = conexion.recv(min(quedan, MIB))
+        if not trozo:
+            raise Rechazo(400, "peticion_invalida", "La petición llegó cortada")
+        partes.append(trozo)
+        quedan -= len(trozo)
+    return b"".join(partes)
+
+
+def leer_peticion(conexion, plazo: float = 30.0) -> tuple:
+    conexion.settimeout(plazo)
+    recibido = bytearray()
+    while b"\n" not in recibido:
+        if len(recibido) > MAX_LINEA:
+            raise Rechazo(400, "peticion_invalida", "La petición es demasiado grande")
+        trozo = conexion.recv(256 * 1024)
+        if not trozo:
+            raise Rechazo(400, "peticion_invalida", "La petición llegó cortada")
+        recibido += trozo
+    linea, _, resto = bytes(recibido).partition(b"\n")
+    if len(linea) > MAX_LINEA:
+        raise Rechazo(400, "peticion_invalida", "La petición es demasiado grande")
+    try:
+        peticion = json.loads(linea.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise Rechazo(400, "peticion_invalida", "La petición no es JSON") from None
+    if not isinstance(peticion, dict) or peticion.get("orden") not in ORDENES:
+        raise Rechazo(400, "orden_desconocida", "Orden desconocida")
+    cuerpo = None
+    largo = peticion.get("bytes")
+    if largo is not None:
+        if not _entero(largo) or not 0 <= largo <= MAX_CUERPO:
+            raise Rechazo(400, "peticion_invalida", "El cuerpo no tiene un tamaño válido")
+        if len(resto) > largo:
+            raise Rechazo(400, "peticion_invalida", "Sobran bytes")
+        cuerpo = resto + _leer_exacto(conexion, largo - len(resto))
+    elif resto:
+        raise Rechazo(400, "peticion_invalida", "Sobran bytes")
+    return peticion, cuerpo
+
+
+def _de_que(peticion) -> str:
+    """De qué orden se habla en el registro: la orden, el principio del id y el número de trozo. Nada más."""
+    if not isinstance(peticion, dict):
+        return "petición"
+    orden = peticion.get("orden") if peticion.get("orden") in ORDENES else "?"
+    id_ = peticion.get("id")
+    texto = orden
+    if isinstance(id_, str) and PATRON_ID.fullmatch(id_):
+        texto += " %s" % id_[:8]
+    if _entero(peticion.get("n")):
+        texto += " trozo %d" % peticion["n"]
+    return texto
+
+
+def atender(conexion, entrada_de, par_permitido=par_del_vigia) -> None:
+    """Una conexión: la orden y la respuesta. ``entrada_de()`` crea la ``Entrada`` solo si el par es de fiar."""
+    peticion = None
+    try:
+        if not par_permitido(conexion):
+            raise Rechazo(403, "no_autorizado", "Este ayudante solo atiende al vigía")
+        peticion, cuerpo = leer_peticion(conexion)
+        respuesta = entrada_de().orden(peticion, cuerpo)
+    except Rechazo as rechazo:
+        respuesta = rechazo.respuesta()
+        _decir("%s: %d %s" % (_de_que(peticion), rechazo.http, rechazo.codigo))
+    except Exception as error:  # noqa: BLE001 — la orden falla, el ayudante contesta
+        _decir("%s: error inesperado (%s)" % (_de_que(peticion), type(error).__name__))
+        respuesta = Rechazo(500, "error", "Error interno del ayudante").respuesta()
+    try:
+        conexion.settimeout(120)
+        conexion.sendall(json.dumps(respuesta, separators=(",", ":"), sort_keys=True).encode("utf-8") + b"\n")
+    except OSError:
+        pass
+
+
+USO = ("uso: hehermes-entrada [--hermes-home=<carpeta>] [--usuario] --conexion | estado | limpiar [--dias=<n>]\n")
+
+
+def main(argv: list) -> int:
+    opciones, resto = {}, []
+    for argumento in argv:
+        if argumento.startswith("--") and "=" in argumento:
+            clave, _, valor = argumento[2:].partition("=")
+            opciones[clave] = valor
+        else:
+            resto.append(argumento)
+    if set(opciones) - {"hermes-home", "dias"}:
+        sys.stderr.write(USO)
+        return 2
+    usuario = "--usuario" in resto
+    if usuario and os.geteuid() == 0:
+        sys.stderr.write("hehermes-entrada: --usuario es para el ayudante sin root; como root atiende a root y a %s\n"
+                         % USUARIO_VIGIA)
+        return 2
+    try:
+        casa = validar_casa(opciones.get("hermes-home", HERMES_HOME))
+    except ValueError:
+        sys.stderr.write("hehermes-entrada: --hermes-home tiene que ser una carpeta absoluta\n")
+        return 2
+    os.umask(0o077)
+    resto = [r for r in resto if r != "--usuario"]
+    if resto == ["--conexion"] and "dias" not in opciones:
+        conexion = socket.socket(fileno=0)
+        try:
+            atender(conexion, lambda: Entrada(casa), par_del_mismo_usuario if usuario else par_del_vigia)
+            try:
+                conexion.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        finally:
+            conexion.detach()
+        return 0
+    if resto in (["estado"], ["limpiar"]):
+        try:
+            dias = int(opciones["dias"]) if "dias" in opciones else None
+            if resto == ["estado"]:
+                if dias is not None:
+                    raise ValueError("dias")
+                respuesta = Entrada(casa).estado()
+            else:
+                respuesta = Entrada(casa).limpiar(dias)
+        except ValueError:
+            sys.stderr.write(USO)
+            return 2
+        except Rechazo as rechazo:
+            sys.stderr.write("hehermes-entrada: %d %s: %s\n" % (rechazo.http, rechazo.codigo, rechazo.mensaje))
+            return 1
+        print(json.dumps(respuesta, indent=2, sort_keys=True))
+        return 0
+    sys.stderr.write(USO)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
