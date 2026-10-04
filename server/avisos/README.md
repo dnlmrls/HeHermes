@@ -327,7 +327,9 @@ Leyendo el historial como la app (el SSE de un run es de un solo uso: si el vig�
   la ampliación de abajo.
 
 No se avisa de nada con la app delante (ni de lo que llegó mientras lo estaba, aunque el vigía lo lea después), ni de
-lo escrito hace más de 15 minutos, ni de nada anterior a la primera vuelta del vigía.
+lo escrito hace más de 15 minutos, ni de nada anterior a la primera vuelta del vigía. Desde la 1.5.3, tampoco de las
+copias que deja una compactación: Hermes vuelve a escribir la cola de la conversación con ids nuevos y sus horas de
+siempre, y el vigía recuerda la hora de la última respuesta que vio en cada una (contrato §7).
 
 ### Las entregas de los subagentes: el vigía lanza el turno que falta
 

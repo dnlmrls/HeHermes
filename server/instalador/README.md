@@ -47,6 +47,11 @@ con un 413, y la app dice que hay que actualizar el servidor.
 
 **La 0.10.7 solo quita del paquete nombres de personas que se habían colado en un comentario y en el README de los avisos.** No cambia nada de lo que hace.
 
+**La 0.10.8 lleva el vigía 1.5.3.** Cuando Hermes compacta una conversación vuelve a escribir sus últimos mensajes con
+otros ids, y el vigía avisaba otra vez de la última respuesta si era de hace menos de 15 minutos. Ahora recuerda la hora
+de la última respuesta que vio en cada conversación (su base de datos pasa a la versión 4 al arrancar, sola). El
+instalador en sí no cambia.
+
 **La 0.10.5 lleva el vigía 1.5.1.** Lo que cambia está en los avisos (`server/avisos`): las marcas de un fichero se buscan en la conversación entera (también lo compactado), un fichero nuevo en `exports/` se avisa en cuanto deja de crecer y se puede descargar sin esperar a su `MEDIA:`, y un cliente que se corta a media petición deja una línea en el registro, no una traza. El instalador en sí no cambia.
 
 **La 0.10.4 mira el Hermes del probador antes de dar nada, y deja el chat abierto hasta que se use.** Tres cosas:

@@ -41,4 +41,8 @@ máquina se lleva este paquete entero y arranca solo su mitad.
 #        <HERMES_HOME>/entrada: trozos de 4 MiB con su SHA-256, el fichero entero comprobado y colocado con `link` en la
 #        carpeta del día, con un nombre limpio, y la limpieza cada hora ([entrada] en vigia.ini). La copia en iCloud deja
 #        fuera esa carpeta.
-VERSION = "1.5.2"
+# 1.5.3: una compactación ya no repite el aviso de la última respuesta (contrato §7). Hermes vuelve a escribir la cola
+#        con ids nuevos y sus horas de siempre, y el vigía la tomaba por nueva si era de hace menos de 15 minutos. Ahora
+#        recuerda la hora de la última respuesta vista de cada conversación (base de datos 4) y no avisa de una que no
+#        sea posterior.
+VERSION = "1.5.3"

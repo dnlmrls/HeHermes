@@ -20,6 +20,12 @@ Las aprobaciones pendientes y los errores **no dejan rastro fiable en el histori
 
 **De una sesión se avisa como mucho una respuesta por vuelta**: la última. Si en cinco segundos Hermes ha contestado
 dos veces (un desvío, un reintento), el iPhone quiere leer lo último, no recibir dos banners seguidos.
+
+**Una compactación no es una respuesta nueva.** Hermes compacta en el sitio (contrato §7): la cola de la conversación
+vuelve a escribirse con ``id`` nuevos y sus horas de siempre. Por el ``id`` parecerían nuevas, y la última respuesta se
+avisaba otra vez si era de hace menos de ``antiguedad_maxima``. Por eso el vigía recuerda también la hora de la última
+respuesta que ha visto (``ultima_respuesta``): una respuesta que no es posterior a ella es una copia. Solo cuentan las
+respuestas, no los pasos intermedios, que pueden llevar la misma hora que la respuesta de su turno.
 """
 
 from __future__ import annotations
@@ -103,11 +109,13 @@ class _Entrega:
 
 
 def sucesos(filas: list, *, ultimo_id: int | None, referencia: float, ahora: float, antiguedad_maxima: float,
-            pagina_llena: bool, entregas_del_vigia: int | None = None) -> list:
+            pagina_llena: bool, entregas_del_vigia: int | None = None, ultima_respuesta: float | None = None) -> list:
     """Lo que hay que avisar de una sesión, a partir de sus últimas filas.
 
     - ``ultimo_id``: la última fila ya vista. ``None`` si el vigía aún no ha leído esta sesión nunca: entonces es nuevo
       lo escrito después de ``referencia`` (el instante de la línea de base).
+    - ``ultima_respuesta``: la hora de la última respuesta ya vista (``ultima_respuesta()``). Una respuesta que no es
+      posterior es la copia que deja una compactación, aunque traiga un ``id`` nuevo.
     - ``antiguedad_maxima``: lo escrito hace más de esto no se avisa aunque sea nuevo para el vigía. Tras un reinicio
       largo, un aviso de hace una hora es ruido, no un aviso.
     - ``pagina_llena``: la lectura trajo tantas filas como se pidieron, así que puede faltar el principio del turno.
@@ -145,10 +153,8 @@ def sucesos(filas: list, *, ultimo_id: int | None, referencia: float, ahora: flo
             elif es_entrega(fila):
                 entregas.append(_Entrega(fila, nueva(fila)))
         elif rol == "assistant":
-            contenido = _texto(fila).strip()
-            if not contenido or fila.get("finish_reason") == "tool_calls" or fila.get("display_kind") is not None:
-                continue
-            if es_interrupcion(contenido) or not nueva(fila):
+            contenido = _respuesta(fila)
+            if not contenido or es_interrupcion(contenido) or not nueva(fila) or _copia(fila, ultima_respuesta):
                 continue
             respuestas.append((fila, turno, desvio_en_el_turno))
 
@@ -187,3 +193,29 @@ def _tipo_de_respuesta(turno: dict | None, hubo_desvio: bool, pagina_llena: bool
 def _instante(fila: dict, ahora: float) -> float:
     instante = fila.get("timestamp")
     return float(instante) if isinstance(instante, (int, float)) else ahora
+
+
+def _respuesta(fila: dict) -> str:
+    """El texto de una fila ``assistant`` que es una respuesta: ni un paso intermedio, ni oculta, ni vacía. Si no lo
+    es, ``""``."""
+    if fila.get("role") != "assistant" or fila.get("finish_reason") == "tool_calls" \
+            or fila.get("display_kind") is not None:
+        return ""
+    return _texto(fila).strip()
+
+
+def _copia(fila: dict, ultima_respuesta: float | None) -> bool:
+    instante = fila.get("timestamp")
+    return (ultima_respuesta is not None and isinstance(instante, (int, float))
+            and float(instante) <= ultima_respuesta)
+
+
+def ultima_respuesta(filas: list, anterior: float | None, hasta: int | None = None) -> float | None:
+    """La hora de la respuesta más reciente de ``filas`` (solo las de ``id`` menor que ``hasta``, si se da: lo que queda
+    pendiente de avisar no cuenta como visto), o ``anterior`` si es más reciente."""
+    instantes = [float(f["timestamp"]) for f in filas
+                 if isinstance(f, dict) and isinstance(f.get("id"), int) and (hasta is None or f["id"] < hasta)
+                 and isinstance(f.get("timestamp"), (int, float)) and _respuesta(f)]
+    if anterior is not None:
+        instantes.append(anterior)
+    return max(instantes) if instantes else None

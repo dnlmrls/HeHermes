@@ -25,8 +25,9 @@ registro = logging.getLogger("vigia.almacen")
 
 # La versión de la base de datos (`PRAGMA user_version`). Cada cambio sube uno, con su paso en `_migrar`, y una base de
 # una versión anterior se pone al día al abrirla. La 2 añadió el latido del primer plano (`delante_latido`,
-# `delante_caduca`); la 3, el permiso de cada iPhone para el relé (`permiso*`).
-ESQUEMA = 3
+# `delante_caduca`); la 3, el permiso de cada iPhone para el relé (`permiso*`); la 4, la hora de la última respuesta vista
+# de cada conversación (`sesiones.ultima_respuesta`), para no avisar otra vez de las copias que deja una compactación.
+ESQUEMA = 4
 
 # Lo que se da por visto antes de que la app dijera «estoy delante»: el aviso de «delante» llega un momento después de
 # que la app ya esté en pantalla. Por arriba no hace falta margen: el «ya no estoy delante» se apunta al llegar, que es
@@ -119,6 +120,9 @@ class EstadoSesion:
     ultima_actividad: float | None
     mensajes: int | None
     visto: float
+    # La hora de la última fila `assistant` vista (`deteccion.ultima_respuesta`): tras una compactación, Hermes vuelve a
+    # escribir la cola con ids nuevos y sus horas de siempre, y lo que no es posterior a esta hora es una copia.
+    ultima_respuesta: float | None = None
 
 
 @dataclass(frozen=True)
@@ -159,7 +163,8 @@ _CREAR = f"""
         referencia REAL NOT NULL,
         ultima_actividad REAL,
         mensajes INTEGER,
-        visto REAL NOT NULL
+        visto REAL NOT NULL,
+        ultima_respuesta REAL
     );
     CREATE TABLE IF NOT EXISTS turnos (
         run_id TEXT PRIMARY KEY,
@@ -229,6 +234,15 @@ class Almacen:
                     ALTER TABLE dispositivos ADD COLUMN permiso_huella TEXT;
                     ALTER TABLE dispositivos ADD COLUMN permiso_rechazado REAL;
                     PRAGMA user_version = 3;
+                    COMMIT;
+                """)
+            if version < 4:
+                registro.info("base de datos de la versión %d: se pone al día (la última respuesta vista de cada "
+                              "conversación)", max(version, 3))
+                self._con.executescript("""
+                    BEGIN;
+                    ALTER TABLE sesiones ADD COLUMN ultima_respuesta REAL;
+                    PRAGMA user_version = 4;
                     COMMIT;
                 """)
 
@@ -354,7 +368,8 @@ class Almacen:
     def sesiones(self) -> dict:
         with self._cerrojo:
             filas = self._con.execute(
-                "SELECT id, ultimo_id, referencia, ultima_actividad, mensajes, visto FROM sesiones").fetchall()
+                "SELECT id, ultimo_id, referencia, ultima_actividad, mensajes, visto, ultima_respuesta "
+                "FROM sesiones").fetchall()
         return {fila[0]: EstadoSesion(*fila) for fila in filas}
 
     def guardar_sesion(self, estado: EstadoSesion) -> None:
@@ -362,12 +377,12 @@ class Almacen:
         consta."""
         with self._cerrojo:
             self._con.execute(
-                "INSERT INTO sesiones (id, ultimo_id, referencia, ultima_actividad, mensajes, visto) "
-                "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET ultimo_id = excluded.ultimo_id, "
+                "INSERT INTO sesiones (id, ultimo_id, referencia, ultima_actividad, mensajes, visto, ultima_respuesta) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET ultimo_id = excluded.ultimo_id, "
                 "referencia = excluded.referencia, ultima_actividad = excluded.ultima_actividad, "
-                "mensajes = excluded.mensajes, visto = excluded.visto",
+                "mensajes = excluded.mensajes, visto = excluded.visto, ultima_respuesta = excluded.ultima_respuesta",
                 (estado.id, estado.ultimo_id, estado.referencia, estado.ultima_actividad, estado.mensajes,
-                 estado.visto))
+                 estado.visto, estado.ultima_respuesta))
 
     def podar_sesiones(self, antes_de: float) -> int:
         """Olvida las sesiones que hace mucho que no salen en la bandeja (archivadas, borradas, o muy atrás)."""

@@ -325,7 +325,8 @@ class Vigilante:
         try:
             sucesos = deteccion.sucesos(filas, ultimo_id=estado.ultimo_id, referencia=estado.referencia, ahora=ahora,
                                         antiguedad_maxima=self.antiguedad_maxima, pagina_llena=len(filas) >= limite,
-                                        entregas_del_vigia=entregas_del_vigia)
+                                        entregas_del_vigia=entregas_del_vigia,
+                                        ultima_respuesta=estado.ultima_respuesta)
             for suceso in sucesos:
                 aviso = avisos.Aviso(tipo=suceso.tipo, sesion=sid, titulo=self._titulos.get(sid, "Hermes"),
                                      texto=suceso.texto, instante=suceso.instante, clave=suceso.clave)
@@ -337,14 +338,17 @@ class Vigilante:
             pendiente = None
         if pendiente is None:
             self.almacen.guardar_sesion(EstadoSesion(sid, max(ids) if ids else None, estado.referencia, actividad,
-                                                     mensajes, ahora))
+                                                     mensajes, ahora,
+                                                     deteccion.ultima_respuesta(filas, estado.ultima_respuesta)))
             return
         # Queda algo por mandar: leída solo hasta justo antes, para que la vuelta siguiente lo vuelva a encontrar, y con
         # la actividad de antes, para que la bandeja la dé por cambiada y se vuelva a leer.
         self._pendiente_en_la_vuelta = True
         antes = [i for i in ids if i < pendiente]
         self.almacen.guardar_sesion(EstadoSesion(sid, max(antes) if antes else estado.ultimo_id, estado.referencia,
-                                                 estado.ultima_actividad, estado.mensajes, ahora))
+                                                 estado.ultima_actividad, estado.mensajes, ahora,
+                                                 deteccion.ultima_respuesta(filas, estado.ultima_respuesta,
+                                                                            hasta=pendiente)))
 
     # -- Las entregas de los subagentes
 
