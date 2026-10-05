@@ -45,4 +45,15 @@ máquina se lleva este paquete entero y arranca solo su mitad.
 #        con ids nuevos y sus horas de siempre, y el vigía la tomaba por nueva si era de hace menos de 15 minutos. Ahora
 #        recuerda la hora de la última respuesta vista de cada conversación (base de datos 4) y no avisa de una que no
 #        sea posterior.
-VERSION = "1.5.3"
+# 1.5.4: aprobar y denegar desde el aviso (spec 2026-10-04). El aviso de una aprobación con `request_id` lleva dentro del
+#        sobre lo que la app necesita para contestarla sin abrirse (`aprobacion`: el run, la petición y las opciones de
+#        Hermes) y la petición entera, con sus líneas, para leerla al mantener pulsado el aviso. Solo con la vista previa
+#        en «Siempre» y si cabe entera en el push (`avisos.TOPE_CLARO`); si no, el aviso de siempre.
+# 1.5.5: actualizar el servidor con un toque, y su estado en Ajustes (spec 2026-10-04, contrato §17). El vigía atiende
+#        /avisos/v1/servidor (las versiones, si Hermes contesta, el espacio libre, los servicios, la última copia y la
+#        actualización en curso, sin secretos) y /avisos/v1/servidor/actualizar, que se lo pasa al ayudante
+#        `hehermes-actualizar` (despliegue/): de root por conexión, sin capacidades ni red, que lanza la actualización en
+#        su propia unidad tras mirar la forma, el cerrojo y el tope; la descarga sale solo de la URL del paquete
+#        instalado y se comprueban la suma de la app y la firma de Daniel. El ayudante del respaldo dice cuándo hizo la
+#        última instantánea (`ultima`). [servidor] en vigia.ini.
+VERSION = "1.5.5"

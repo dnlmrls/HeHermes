@@ -1,0 +1,62 @@
+# /etc/systemd/system/hehermes-actualizar@.service
+# Un ayudante por conexión a /run/hehermes-actualizar.sock (hehermes-actualizar.socket, Accept=yes): lee una orden y
+# contesta. No descarga ni instala nada: comprueba lo que pide la app, lo apunta y lanza la actualización en su propia
+# unidad con systemd-run (hehermes-actualizacion), sin jaula, porque instalar es tocarlo todo. Esa unidad no muere con
+# esta conexión, ni con el vigía ni con la pasarela, que la versión nueva reinicia.
+#
+# Corre como root porque systemd-run solo le deja lanzar unidades del sistema a root. Y nada más: ninguna capacidad, sin
+# red, el sistema de ficheros de solo lectura salvo su carpeta (/var/lib/hehermes-actualizar: el estado, los intentos,
+# el cerrojo y el registro del instalador) y los secretos del sistema y de HeHermes, tapados.
+[Unit]
+Description=HeHermes: ayudante que actualiza el servidor
+Documentation=file:///opt/hehermes-avisos/src/README.md
+# Cada rechazo es una respuesta, no un fallo: que no se acumulen en `systemctl --failed`. Lo que pasó queda en el
+# registro (journalctl -u 'hehermes-actualizar@*' y -u hehermes-actualizacion): la versión, la fase y el resultado.
+CollectMode=inactive-or-failed
+
+[Service]
+Type=simple
+# Python del sistema, sin nada del entorno ni del directorio (-I), sin site (-S: no hace falta ningún paquete) y sin
+# escribir bytecode (-B).
+ExecStart=/usr/bin/python3 -I -S -B /usr/local/libexec/hehermes-actualizar --conexion
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+StateDirectory=hehermes-actualizar
+StateDirectoryMode=0700
+RuntimeMaxSec=120
+UMask=0077
+LimitCORE=0
+
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+# systemd-run le habla a systemd por su socket de /run (un socket Unix con ruta, que no depende de la red).
+PrivateNetwork=yes
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+PrivateDevices=yes
+PrivateIPC=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+KeyringMode=private
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+InaccessiblePaths=-/etc/shadow -/etc/shadow- -/etc/gshadow -/etc/gshadow- -/etc/sudoers -/etc/sudoers.d
+InaccessiblePaths=-/etc/ssh -/etc/ssl/private -/etc/letsencrypt
+InaccessiblePaths=-/etc/hehermes -/etc/hehermes-avisos -/etc/hehermes-pasarela -/var/lib/hehermes-vigia -/var/lib/hehermes-pasarela -/var/lib/hehermes-rele-publico -/var/lib/hehermes-respaldo
+InaccessiblePaths=-/etc/nginx -/etc/swanctl -/etc/strongswan -/etc/ipsec.secrets -/etc/ipsec.d -/etc/wireguard

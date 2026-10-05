@@ -455,7 +455,7 @@ class Vigilante:
             aviso = avisos.Aviso(tipo="aprobacion", sesion=turno.sesion, titulo=titulo,
                                  texto=_texto_de_aprobacion(aprobacion), instante=instante,
                                  clave=f"aprobacion:{pedida}", caduca=self.caducidad_aprobacion,
-                                 colapsa_con="aprobacion")
+                                 colapsa_con="aprobacion", aprobacion=_peticion_de_permiso(turno.run_id, aprobacion))
             if self._avisar(aviso, ahora):
                 self.almacen.marcar_aprobacion(turno.run_id, pedida)
         elif situacion in ("failed", "interrupted"):
@@ -549,12 +549,27 @@ def _numero_de_texto(valor: str | None) -> float | None:
         return None
 
 
-def _texto_de_aprobacion(aprobacion: dict) -> str:
+def _texto_de_aprobacion(aprobacion: dict, entero: bool = False) -> str:
+    """Lo que se lee de una petición de permiso: el comando, o sin comando la descripción. En una línea y recortado, o
+    entero, con sus líneas, para leerlo al mantener pulsado el aviso (`_peticion_de_permiso`)."""
+    limpiar = texto.entero if entero else texto.corto
     comando = aprobacion.get("command")
     if isinstance(comando, str) and comando.strip():
-        return texto.corto(f"Pide permiso para ejecutar: {comando}")
+        return limpiar(f"Pide permiso para ejecutar: {comando}")
     descripcion = aprobacion.get("description")
-    return texto.corto(descripcion) if isinstance(descripcion, str) else ""
+    return limpiar(descripcion) if isinstance(descripcion, str) else ""
+
+
+def _peticion_de_permiso(run_id: str, aprobacion: dict) -> avisos.PeticionDePermiso | None:
+    """Lo que hace falta para contestar la aprobación desde el aviso (spec 2026-10-04), o `None` si Hermes no da su
+    ``request_id``: sin él no se sabría a qué petición se contesta."""
+    peticion = aprobacion.get("request_id")
+    if not (isinstance(peticion, str) and peticion):
+        return None
+    choices = aprobacion.get("choices")
+    opciones = tuple(opcion for opcion in choices if isinstance(opcion, str)) if isinstance(choices, list) else ()
+    return avisos.PeticionDePermiso(run=run_id, peticion=peticion, opciones=opciones,
+                                    texto=_texto_de_aprobacion(aprobacion, entero=True))
 
 
 def _texto_de_error(estado: dict) -> str:

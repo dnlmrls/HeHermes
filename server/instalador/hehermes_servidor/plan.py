@@ -17,8 +17,9 @@ from .deteccion import NORMAL, PREFIJO_DETALLE, PREFIJO_ERROR, ROJO, Bloqueo, bl
 
 NOMBRE_VALIDO = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 # Lo que va en /opt/hehermes-servidor: con eso, `comprobar`, `actualizar` y `desinstalar` siguen ahí después de que se
-# borre la carpeta temporal del comando.
-PROPIOS = ("hehermes-servidor", "hehermes-pasarela", "clave-publica.pem", "requirements-canje.txt")
+# borre la carpeta temporal del comando. Las dos claves públicas de las firmas (`firma.CLAVES`), desde la 0.10.10.
+PROPIOS = ("hehermes-servidor", "hehermes-pasarela", "clave-publica.pem", "clave-rescate.pem",
+           "requirements-canje.txt")
 EJECUTABLES_PROPIOS = ("hehermes-servidor", "hehermes-pasarela")
 
 
@@ -116,9 +117,11 @@ def ficheros_propios(origen: str, prefijo: str = p.PREFIJO) -> list:
     if fuente is not None:
         with open(fuente, "rb") as f:
             salida.append((prefijo + "/hehermes-leer-media", f.read(), 0o755))
-    # Y el ayudante de la copia en iCloud (desde la 0.10.0) y el de la entrada (desde la 0.10.6), igual.
+    # Y el ayudante de la copia en iCloud (desde la 0.10.0), el de la entrada (desde la 0.10.6) y el que actualiza
+    # (desde la 0.10.10), igual.
     for nombre, fuente in (("hehermes-respaldo", fuente_del_respaldo(origen)),
-                           ("hehermes-entrada", fuente_de_la_entrada(origen))):
+                           ("hehermes-entrada", fuente_de_la_entrada(origen)),
+                           ("hehermes-actualizar", fuente_del_actualizar(origen))):
         if fuente is not None:
             with open(fuente, "rb") as f:
                 salida.append((prefijo + "/" + nombre, f.read(), 0o755))
@@ -143,6 +146,11 @@ def fuente_del_respaldo(origen: str) -> str | None:
 def fuente_de_la_entrada(origen: str) -> str | None:
     """`hehermes-entrada`: en el paquete, junto al instalador; en el repositorio, en `server/avisos/despliegue`."""
     return buscar_en_origen(origen, "hehermes-entrada", "../avisos/despliegue/hehermes-entrada")
+
+
+def fuente_del_actualizar(origen: str) -> str | None:
+    """`hehermes-actualizar`: en el paquete, junto al instalador; en el repositorio, en `server/avisos/despliegue`."""
+    return buscar_en_origen(origen, "hehermes-actualizar", "../avisos/despliegue/hehermes-actualizar")
 
 
 def buscar_en_origen(origen: str, *candidatas: str) -> str | None:

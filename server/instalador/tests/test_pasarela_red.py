@@ -473,6 +473,25 @@ class LoQueSePasaAlVigia(ConPasarela):
         self.assertEqual((vista["ruta"], vista["cuerpo"]), (ruta, trozo))
         self.assertEqual(self.hermes.peticiones, [])
 
+    def test_tu_servidor_va_al_vigia_solo_con_un_token_de_verdad(self):
+        """Ajustes › Tu servidor y actualizarlo (contrato §17): como todo /avisos/, solo con el token de un iPhone dado
+        de alta y con el secreto del vigía. Sin token, el 404 de siempre, y al vigía no le llega nada."""
+        cuerpo = b'{"version": "0.10.11", "sha256": "' + b"a" * 64 + b'"}'
+        for metodo, ruta, con in (("GET", "/avisos/v1/servidor", b""), ("GET", "/avisos/v1/servidor/actualizar", b""),
+                                  ("POST", "/avisos/v1/servidor/actualizar", cuerpo)):
+            with self.subTest(metodo=metodo, ruta=ruta):
+                self.assertEqual(self.todo(self.peticion(metodo, ruta, cuerpo=con, token=None)), NO_404)
+                self.assertEqual(self.vigia.peticiones, [])
+        for metodo, ruta, con in (("GET", "/avisos/v1/servidor", b""), ("POST", "/avisos/v1/servidor/actualizar", cuerpo)):
+            with self.subTest(metodo=metodo, ruta=ruta, token=True):
+                estado, _, _, _ = self.leer_respuesta(self.peticion(metodo, ruta, cuerpo=con))
+                self.assertEqual(estado, 200)
+                vista = self.vigia.peticiones[-1]
+                self.assertEqual((vista["ruta"], vista["cuerpo"]), (ruta, con))
+                self.assertEqual([v for k, v in vista["lista"] if k.lower() == "x-hehermes-vigia"], [SECRETO_VIGIA])
+                self.assertFalse([k for k, _ in vista["lista"] if k.lower() == "authorization"])
+        self.assertEqual(self.hermes.peticiones, [])
+
     def test_avisos_sin_la_barra_de_detras_va_a_hermes(self):
         self.leer_respuesta(self.peticion(ruta="/avisosx"))
         self.assertEqual(self.vigia.peticiones, [])

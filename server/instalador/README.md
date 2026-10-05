@@ -52,6 +52,18 @@ otros ids, y el vigía avisaba otra vez de la última respuesta si era de hace m
 de la última respuesta que vio en cada conversación (su base de datos pasa a la versión 4 al arrancar, sola). El
 instalador en sí no cambia.
 
+**La 0.10.9 lleva el vigía 1.5.4: aprobar y denegar desde el aviso.** El aviso de una aprobación lleva, dentro del
+sobre cifrado, lo que la app necesita para contestarla sin abrirse (el run, la petición y las opciones de Hermes) y
+la petición entera, para leerla al mantener pulsado el aviso: solo con la vista previa en «Siempre» y si cabe en el
+push (`server/avisos/README.md`, «Aprobar y denegar desde el aviso»). El instalador en sí no cambia.
+
+**La 0.10.10 se actualiza desde la app, con un toque** ([abajo](#actualizar-desde-la-app-desde-la-01010)), y lleva
+los avisos 1.5.5. Con root pone el ayudante `hehermes-actualizar`, con su socket, como los otros: la app manda la versión
+y la suma que lleva, y el servidor descarga solo de la URL de su paquete, comprueba la suma y la firma de Daniel, no
+vuelve atrás y se instala en su propia unidad. Las firmas valen con dos claves, la principal y la de rescate
+([abajo](#la-firma-de-las-actualizaciones)), y `actualizar` ya no toma el cerrojo que necesita el `instalar` de la
+versión nueva. El vigía enseña además el estado del servidor (Ajustes › Tu servidor).
+
 **La 0.10.5 lleva el vigía 1.5.1.** Lo que cambia está en los avisos (`server/avisos`): las marcas de un fichero se buscan en la conversación entera (también lo compactado), un fichero nuevo en `exports/` se avisa en cuanto deja de crecer y se puede descargar sin esperar a su `MEDIA:`, y un cliente que se corta a media petición deja una línea en el registro, no una traza. El instalador en sí no cambia.
 
 **La 0.10.4 mira el Hermes del probador antes de dar nada, y deja el chat abierto hasta que se use.** Tres cosas:
@@ -114,7 +126,7 @@ rutas y los errores.
 | Pieza | Qué deja |
 |---|---|
 | El usuario | `hh-pasarela`, de sistema, sin casa ni shell |
-| Código | `/opt/hehermes-servidor/` (con `hehermes-pasarela` y la clave pública de las firmas), `/usr/local/sbin/hehermes-servidor` y `/usr/local/sbin/hehermes-dispositivo` (si no hay ya uno ajeno) |
+| Código | `/opt/hehermes-servidor/` (con `hehermes-pasarela` y las dos claves públicas de las firmas), `/usr/local/sbin/hehermes-servidor` y `/usr/local/sbin/hehermes-dispositivo` (si no hay ya uno ajeno) |
 | La pasarela | `/etc/hehermes-pasarela/` (0750, `root:hh-pasarela`): `pasarela.ini` y `tokens.json` (0640, del grupo), `cert.pem` (0644), `clave.pem` (0600, de root), `clave-hermes` (0600, de `hh-pasarela`, que la lee sola), `siguiente/` (el certificado que viene después: su `cert.pem` 0644 y su `clave.pem` 0600 de root, sin usar hasta rotar) y, tras rotar, `anterior/`. **No** escribe `/etc/hehermes/servidor.ini`, que era de la VPN |
 | La unidad | `hehermes-pasarela.service`: `User=hh-pasarela`, sin capacidades, `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `ProtectKernel*`, `ProtectProc=invisible`, `RestrictNamespaces`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, `MemoryDenyWriteExecute`, `SystemCallFilter=@system-service` sin `@privileged` ni `@resources` y `UMask=0077`. La clave del certificado y (si están los avisos) el secreto del vigía le llegan con `LoadCredential`. Solo escribe en su `StateDirectory` (`/var/lib/hehermes-pasarela`: el borrado pendiente, su actividad y, desde la 0.10.4, `usos.json`: el primer 2xx de cada token, con su hash, su nombre y cuándo, sin nada de la petición). Un error de configuración sale con 78, que no se reinicia en bucle (`RestartPreventExitStatus=78`, `StartLimitBurst=5`) |
 | La clave de Hermes | `hehermes-pasarela-clave.path` vigila el `.env` y, si cambia, `hehermes-servidor pasarela-clave` pone al día `clave-hermes`; desde la 0.9.0 la pasarela la vuelve a leer sola, **sin reiniciarse** (los SSE abiertos siguen) |
@@ -231,6 +243,29 @@ ayudante `hehermes-entrada` (de `server/avisos/despliegue`); sin él, `/avisos/v
 | El vigía | `[entrada] ayudante = /run/hehermes-entrada.sock` y su unidad lo quiere (`Wants=`); los topes, los de serie (2 GB por fichero, 1 GB libre después, 30 días) | `ayudante = /run/user/<uid>/hehermes-entrada.sock` |
 | Desinstalar | Quita el ayudante y sus unidades, lo que quedó a medias (`.subidas`) y la carpeta **solo si se queda vacía**: lo entregado es de Hermes | Lo mismo |
 
+### Actualizar desde la app (desde la 0.10.10)
+
+Spec `docs/superpowers/specs/2026-10-04-actualizar-el-servidor-design.md`, contrato `server/API-CONTRACT.md` §17. La app
+lleva la versión y la suma del instalador que conoce; si la del servidor es menor, Ajustes › Tu servidor ofrece
+«Actualizar» y, con un toque, le manda las dos al vigía, que se las pasa al ayudante `hehermes-actualizar` (de
+`server/avisos/despliegue`). Sin él, `/avisos/v1/servidor/actualizar` contesta 503 y la app enseña los dos caminos de
+siempre: el comando de la app o la frase para Hermes.
+
+| | Con root | Sin root |
+|---|---|---|
+| El ayudante | `/usr/local/libexec/hehermes-actualizar` (root 0755), el mismo que pone `instalar.sh` en el VPS de Daniel, y su copia en `/opt/hehermes-servidor` | No hay: actualizar es instalar, y eso pide root. La app enseña cómo hacerlo a mano |
+| Su socket | `hehermes-actualizar.socket`: `/run/hehermes-actualizar.sock`, `root:hh-vigia` 0660, `Accept=yes` | — |
+| Cada orden | `hehermes-actualizar@.service`, **de root y sin nada más**: ninguna capacidad, sin red, de solo lectura salvo su carpeta. Solo mira (la forma, que no vuelva atrás, una a la vez y tres por hora) y lanza | — |
+| La actualización | En su propia unidad, `systemd-run --unit hehermes-actualizacion`: descarga solo de `<URL base>/v<versión>/…` (la de este paquete), comprueba la suma de la app, la firma (la principal o la de rescate de lo instalado) y la versión de dentro, y lanza `actualizar --paquete … --firma …`. No muere al reiniciarse el vigía ni la pasarela | — |
+| Su carpeta | `/var/lib/hehermes-actualizar` (0700, `StateDirectory`): el estado, los intentos, el cerrojo y lo que dijo el instalador (`registro.txt`) | — |
+| El vigía | `[servidor]` en `vigia.ini`: la carpeta del instalador (su versión), `ayudante = /run/hehermes-actualizar.sock`, las unidades que se enseñan y la de Hermes si la puede mirar; su unidad lo quiere (`Wants=`) | `[servidor]`, con las unidades de usuario y `ayudante =` vacío |
+| Desinstalar | Quita el ayudante, sus unidades y su carpeta | — |
+
+**Una vez a mano.** Un servidor de antes de la 0.10.10 no tiene el ayudante, y uno con las claves de marcador no tiene
+con qué comprobar una firma: los dos se actualizan una vez con el comando de la app (o la frase para Hermes), y desde
+ahí, con un toque. **En el VPS de Daniel**, con los avisos de `instalar.sh`, el ayudante lo pone ese script; actualizar
+desde la app pone lo del instalador (la pasarela) y los avisos siguen con su script.
+
 Lo del código de avisos (la 0.7.0), que sigue valiendo: el código lo da Daniel (`sudo hehermes-rele credencial alta
 <nombre>`, en su VPS):
 
@@ -343,7 +378,7 @@ Hay que saber:
   - /usr/local/sbin/hehermes-dispositivo no es mío: no lo toco. Para los iPhone de la pasarela usa el mío: sudo /opt/hehermes-servidor/hehermes-dispositivo alta <nombre>
   - Aquí ya hay unos avisos puestos a mano (/opt/hehermes-avisos, los de server/avisos/despliegue/instalar.sh): ni el vigía ni el lector de ficheros los pongo yo, y lo suyo no lo toco
 
-55 cambios.
+57 cambios.
 ```
 <!-- /pasarela-de-daniel -->
 
@@ -376,30 +411,62 @@ server/instalador/empaquetar --firmar hehermes-firma.pem       # y el .sig (hace
 - **Es reproducible:** la misma versión da siempre el mismo fichero y la misma suma (orden fijo, dueño root, hora fija
   y gzip sin nombre ni hora). Si se cambia algo, hay que subir la versión.
 - **Lleva:** `hehermes-servidor`, `hehermes-pasarela` y `hehermes_servidor/`, `hehermes-dispositivo` (de `server/vpn`),
-  `clave-publica.pem`, `requirements-canje.txt`, este README, desde la 0.7.0 el código de los avisos
-  (`hehermes_avisos/`, sus `.py`: el vigía) y, desde la 0.8.0, el lector de ficheros (`hehermes-leer-media`, de
-  `server/avisos/despliegue`), desde la 0.10.0, el ayudante de la copia en iCloud (`hehermes-respaldo`, de ahí
-  también) y, desde la 0.10.6, el de la entrada (`hehermes-entrada`). Ni pruebas ni `__pycache__`, ni el resto del
-  despliegue a mano del relé.
+  `clave-publica.pem` y, desde la 0.10.10, `clave-rescate.pem`, `requirements-canje.txt`, este README, desde la 0.7.0 el
+  código de los avisos (`hehermes_avisos/`, sus `.py`: el vigía) y, desde la 0.8.0, el lector de ficheros
+  (`hehermes-leer-media`, de `server/avisos/despliegue`), desde la 0.10.0, el ayudante de la copia en iCloud
+  (`hehermes-respaldo`, de ahí también), desde la 0.10.6, el de la entrada (`hehermes-entrada`) y, desde la 0.10.10, el
+  que actualiza (`hehermes-actualizar`). Ni pruebas ni `__pycache__`, ni el resto del despliegue a mano del relé.
 
 ### La firma de las actualizaciones
 
-`sudo hehermes-servidor actualizar --paquete <tar.gz> --firma <tar.gz.sig>` no pasa por la app, así que no hay suma
-que la ancle: se fía de una firma Ed25519 de Daniel, comprobada con
-`openssl pkeyutl -verify -pubin -inkey /opt/hehermes-servidor/clave-publica.pem -rawin -in <tar.gz> -sigfile <sig>`.
-Solo si la firma es buena desempaqueta (y solo ficheros y carpetas dentro de `hehermes-servidor-X.Y.Z/`) y lanza
-`instalar --si` de la versión nueva, que repara hasta dejarlo todo al día. Solo actualiza una pasarela: sin ella (en un
-servidor que solo tenga la VPN de antes), no instala nada ([arriba](#la-vpn-de-antes)).
+`sudo hehermes-servidor actualizar --paquete <tar.gz> --firma <tar.gz.sig>` (lo que lanza el ayudante que actualiza, o
+una persona) no pasa por la app, así que no hay suma que la ancle: se fía de una firma Ed25519 de Daniel, comprobada
+con `openssl pkeyutl -verify -pubin -inkey <clave> -rawin -in <tar.gz> -sigfile <sig>`. Vale la de cualquiera de las
+**dos claves** del instalador instalado (`firma.CLAVES`): la principal (`/opt/hehermes-servidor/clave-publica.pem`) y la
+de rescate (`clave-rescate.pem`). Solo si la firma es buena desempaqueta (y solo ficheros y carpetas dentro de
+`hehermes-servidor-X.Y.Z/`) y lanza `instalar --si` de la versión nueva, que repara hasta dejarlo todo al día. Solo
+actualiza una pasarela: sin ella (en un servidor que solo tenga la VPN de antes), no instala nada
+([arriba](#la-vpn-de-antes)).
 
 - **Todo sobre una copia.** Antes de nada copia el paquete y su firma a una carpeta 0700 de root, y comprueba y abre
   la copia: quien pueda escribir donde está el original no puede cambiarlo entre la firma y el `tar`.
 - **Sin vuelta atrás.** Una versión más vieja que la instalada no se instala aunque esté firmada: una vieja puede tener
   un fallo ya arreglado. La primera instalación sigue anclada a la suma SHA-256 que lleva la app.
+- **Sin el cerrojo** (desde la 0.10.10): no cambia nada él; lo cambia el `instalar --si` de la versión nueva, que toma
+  el cerrojo de siempre. Hasta la 0.10.9 lo tomaba antes, y el `instalar` de dentro se habría parado en «ya hay otro
+  hehermes-servidor en marcha» (nunca pasó: con el marcador, se negaba antes).
+- **Mientras las dos sean el marcador** (`PENDIENTE-DE-DANIEL`), `actualizar` se niega. Una privada puesta por error en
+  el sitio de una pública tampoco cuenta.
+- Las pruebas generan claves de usar y tirar (`tests/apoyo.py`, `ed25519`) o usan
+  `tests/datos/clave-de-prueba-NO-ES-DE-DANIEL.pem`, marcada en el nombre y en el fichero.
 
-- **No hay ninguna clave real.** `clave-publica.pem` es un marcador (`PENDIENTE-DE-DANIEL`) y, mientras lo sea,
-  `actualizar` se niega. La privada irá en el llavero del Mac de Daniel, nunca en un servidor ni en el repositorio;
-  cómo crearla está dentro del propio `clave-publica.pem`. Hace falta OpenSSL 3: el LibreSSL de macOS no sabe Ed25519.
-- Las pruebas usan `tests/datos/clave-de-prueba-NO-ES-DE-DANIEL.pem`, marcada en el nombre y en el fichero.
+**Las claves de Daniel** (spec 2026-10-04, «Las claves»), con `scripts/firma/crear-claves.sh`, que lanza él en su
+terminal, una vez (hace falta OpenSSL 3, `brew install openssl@3`: el LibreSSL de macOS no sabe Ed25519):
+
+- **La principal** va a su llavero de inicio de sesión (servicio «HeHermes · firma del instalador»), sin ninguna app de
+  confianza: macOS pide permiso cada vez que alguien la lee. Si ya hay una, el script se niega, salvo con `--rotar`.
+- **La de rescate** la enseña una sola vez en el terminal, como PEM, para guardarla en Contraseñas como nota segura; no
+  la deja en ningún sitio.
+- **Las dos públicas** van a `clave-publica.pem` y `clave-rescate.pem`, que sí se versionan. El paquete cambia con
+  ellas, y con él su suma: va otra vez en la app (`Bienvenida.sha256DelPaquete` y su fixture).
+- Las privadas solo pasan por ficheros 0600 de una carpeta 0700 que se borra al salir, también si algo falla, y nunca
+  van en los argumentos de un proceso.
+
+**Publicar firma.** `scripts/publicar-instalador.sh` no publica sin la principal en el llavero (como sin la lista de
+prohibidos): firma el paquete con ella (`scripts/firma/firmar.sh`, que comprueba antes que es la de
+`clave-publica.pem` y después que la firma se comprueba con ella) y deja el `.sig` junto al paquete, para la Release.
+
+**Si la clave principal se pierde o se compromete.** No se automatiza; a mano y en este orden:
+
+1. `scripts/firma/crear-claves.sh --rotar`: otra principal en el llavero y en `clave-publica.pem`; la de rescate no
+   cambia.
+2. Sube la versión del instalador, ancla su suma en la app y publícala como siempre, pero su firma no vale todavía: los
+   servidores aún tienen la principal de antes. Fírmala con la **de rescate**: pégala desde Contraseñas en un fichero de
+   una carpeta temporal 0700 y `openssl pkeyutl -sign -inkey <rescate.pem> -rawin -in <paquete> -out <paquete>.sig`
+   (con el OpenSSL 3 de Homebrew); borra la carpeta. Sube ese `.sig`.
+3. Desde esa versión, los servidores tienen la principal nueva, y lo siguiente se firma como siempre. Si fue la de
+   rescate la que se comprometió, lo mismo al revés: una versión firmada con la principal que trae otra de rescate
+   (crear la de rescate nueva es, por ahora, a mano).
 
 ## El alta por chat (`--por-chat`)
 

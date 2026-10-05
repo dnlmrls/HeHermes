@@ -12,6 +12,14 @@ from dataclasses import dataclass
 
 from ..comun import direccion, leer_ini
 from .entregas import ReglasDeEntrega
+from .servidor import unidad_valida
+
+#: Las unidades de HeHermes cuyo estado enseña Ajustes › Tu servidor si `vigia.ini` no dice otras: las de un servidor
+#: con los avisos de `despliegue/instalar.sh` (el VPS de Daniel, con su relé), cuyo `vigia.ini` puede ser de antes de la
+#: 1.5.5. El instalador escribe las suyas.
+SERVICIOS_DE_SERIE = ("hehermes-pasarela.service", "hehermes-vigia.service", "hehermes-rele.service",
+                      "hehermes-leer-media.socket", "hehermes-respaldo.socket", "hehermes-entrada.socket",
+                      "hehermes-actualizar.socket")
 
 
 def _si_o_no(valor: str, nombre: str) -> bool:
@@ -96,6 +104,13 @@ class ConfigVigia:
     entrada_tope_mb: int = 2048
     entrada_margen_mb: int = 1024
     entrada_dias: int = 30
+    # Ajustes › Tu servidor (`/avisos/v1/servidor`, desde la 1.5.5): la carpeta del instalador (su versión), el socket
+    # del ayudante que actualiza (`hehermes-actualizar.socket`; vacío, 503), las unidades de HeHermes cuyo estado se
+    # enseña (con «usuario:» delante, una de `systemctl --user`) y la de Hermes (vacía, si no tiene: tmux, contenedor…).
+    servidor_instalador: str = "/opt/hehermes-servidor"
+    servidor_ayudante: str = "/run/hehermes-actualizar.sock"
+    servidor_servicios: tuple = SERVICIOS_DE_SERIE
+    servidor_hermes: str | None = "hermes-gateway.service"
     # Las entregas de los subagentes que el vigía contesta con el turno de continuación de la app (`entregas`).
     entregas_contestar: bool = True
     entregas_gracia: float = 60.0
@@ -132,6 +147,14 @@ class ConfigVigia:
                 raise ValueError("[rele] huella_siguiente tiene que ser una huella (43 caracteres), o no estar")
         else:
             rele_huella = rele_huella_siguiente = None
+        servicios = texto("servidor", "servicios", None)
+        servicios = base.servidor_servicios if servicios is None else tuple(servicios.split())
+        servidor_hermes = (texto("servidor", "hermes", base.servidor_hermes) or "").strip() or None
+        for unidad in servicios + ((servidor_hermes,) if servidor_hermes else ()):
+            unidad_valida(unidad)
+        instalador = (texto("servidor", "instalador", base.servidor_instalador) or "").strip()
+        if not instalador.startswith("/"):
+            raise ValueError("[servidor] instalador tiene que ser una carpeta absoluta")
         return cls(
             escucha=direccion(texto("vigia", "escucha", "%s:%d" % base.escucha)),
             base_de_datos=texto("vigia", "base_de_datos", base.base_de_datos),
@@ -161,6 +184,10 @@ class ConfigVigia:
             entrada_tope_mb=max(1, int(numero("entrada", "tope_mb", base.entrada_tope_mb))),
             entrada_margen_mb=max(0, int(numero("entrada", "margen_mb", base.entrada_margen_mb))),
             entrada_dias=max(1, min(3650, int(numero("entrada", "dias", base.entrada_dias)))),
+            servidor_instalador=instalador,
+            servidor_ayudante=texto("servidor", "ayudante", base.servidor_ayudante).strip(),
+            servidor_servicios=servicios,
+            servidor_hermes=servidor_hermes,
             entregas_contestar=contestar,
             # Menos de 30 s no deja a la app, si está delante, lanzar la suya con las instrucciones de la conversación.
             entregas_gracia=max(30.0, numero("entregas", "gracia", base.entregas_gracia)),

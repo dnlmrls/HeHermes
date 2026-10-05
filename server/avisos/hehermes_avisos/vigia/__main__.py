@@ -33,6 +33,8 @@ from .exportaciones import Exportaciones, VigiaDeExportaciones
 from .fichero import ClienteLector, Ficheros, Limites
 from .hermes import ClienteHermes, ErrorHermes
 from .respaldo import ClienteAyudante, Respaldos, limpiar_cada_hora
+from .servidor import NO_DISPONIBLE as ACTUALIZAR_NO_DISPONIBLE
+from .servidor import Servidor
 from .vigilante import Vigilante
 
 registro = logging.getLogger("vigia")
@@ -92,9 +94,17 @@ def servir(config: ConfigVigia) -> int:
     entradas = (Entradas(ayudante_de_la_entrada(config.entrada_ayudante), tope=config.entrada_tope,
                          margen=config.entrada_margen, dias=config.entrada_dias)
                 if config.entrada_ayudante else None)
+    # Ajustes › Tu servidor (desde la 1.5.5): lo que el vigía no puede mirar se lo pregunta a los ayudantes.
+    servidor = Servidor(hermes=hermes, instalador=config.servidor_instalador,
+                        actualizador=_actualizador(config.servidor_ayudante) if config.servidor_ayudante else None,
+                        entrada=ayudante_de_la_entrada(config.entrada_ayudante, plazo=10) if config.entrada_ayudante
+                        else None,
+                        respaldo=ClienteAyudante(config.respaldo_ayudante, plazo=10) if config.respaldo_ayudante
+                        else None,
+                        servicios=config.servidor_servicios, hermes_unidad=config.servidor_hermes)
     app = AppVigia(almacen, mensajero, secreto_tunel=secreto_tunel, caducidad_prueba=config.caducidad_prueba,
                    al_moverse=vigilante.despertar, ficheros=ficheros, respaldos=respaldos, exportaciones=exportaciones,
-                   entradas=entradas)
+                   entradas=entradas, servidor=servidor)
     servidor = ServidorHTTP(config.escucha, ManejadorVigia, app, heredado=heredado)
     _avisar_si_no_coincide(heredado, config.escucha)
     threading.Thread(target=servidor.serve_forever, name="api", daemon=True).start()
@@ -121,6 +131,11 @@ def servir(config: ConfigVigia) -> int:
         almacen.cerrar()
         registro.info("vigía parado")
     return 0
+
+
+def _actualizador(ruta_socket: str, plazo: float = 30.0) -> ClienteAyudante:
+    """El cliente del socket del ayudante que actualiza: el de la copia, con su código de «no disponible»."""
+    return ClienteAyudante(ruta_socket, plazo, no_disponible=ACTUALIZAR_NO_DISPONIBLE, de_quien="que actualiza")
 
 
 def _avisar_si_no_coincide(heredado, escucha: tuple) -> None:
@@ -204,6 +219,10 @@ def comprobar(config: ConfigVigia) -> int:
         decir(*_comprobar_entrada(config))
     else:
         decir(True, "sin el ayudante de la entrada ([entrada] ayudante vacío): /avisos/v1/entrada contesta 503")
+    if config.servidor_ayudante:
+        decir(*_comprobar_actualizar(config.servidor_ayudante))
+    else:
+        decir(True, "sin el ayudante que actualiza ([servidor] ayudante vacío): la app no puede actualizar este servidor")
     if not config.con_credencial:
         return 1 if fallos else 0
     base_rele = config.rele_url.rsplit("/v1/", 1)[0]
@@ -280,6 +299,22 @@ def _comprobar_entrada(config: ConfigVigia) -> tuple:
     return True, (f"el ayudante de la entrada contesta en {config.entrada_ayudante}: "
                   f"{str(respuesta.get('carpeta'))[:200]}, {int(respuesta.get('libre') or 0) / gib:.1f} GiB libres, "
                   f"hasta {int(respuesta.get('tope') or 0) / gib:.1f} GiB por fichero")
+
+
+def _comprobar_actualizar(ruta_socket: str) -> tuple:
+    """El ayudante que actualiza, con la orden que no cambia nada (``estado``): en qué está y si el instalador tiene con
+    qué comprobar una actualización (con las claves de marcador, la app no puede: hay que hacerlo una vez a mano)."""
+    try:
+        respuesta, _ = _actualizador(ruta_socket, plazo=30).pedir({"orden": "estado"})
+    except ErrorHTTP as error:
+        return False, f"el ayudante que actualiza en {ruta_socket}: {error.estado} {error.codigo} (¿está en marcha " \
+                      f"hehermes-actualizar.socket?)"
+    if not respuesta.get("ok"):
+        return False, f"el ayudante que actualiza en {ruta_socket} contesta «{str(respuesta.get('codigo'))[:40]}»"
+    firmas = ("con las claves con las que comprobar las actualizaciones" if respuesta.get("firmas") is True else
+              "sin claves de verdad todavía: la app no puede actualizar, hay que hacerlo una vez a mano")
+    return True, (f"el ayudante que actualiza contesta en {ruta_socket}: {str(respuesta.get('estado'))[:20]}; "
+                  f"{firmas}")
 
 
 def _sin_clave(error: urllib.error.HTTPError) -> bool:

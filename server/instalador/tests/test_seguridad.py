@@ -57,6 +57,7 @@ class Base(unittest.TestCase):
 class TrasInstalar(Base):
     def test_todo_cerrado_es_todo_bien(self):
         self.instalar()
+        apoyo.claves_de_marcador(self.sis, p.PREFIJO)
         resultado = self.revisar()
         self.assertEqual([t for e, t in resultado if e == "mal"], [])
         textos = "\n".join(t for _, t in resultado)
@@ -67,10 +68,21 @@ class TrasInstalar(Base):
 
     def test_comprobar_la_pinta_y_sale_con_cero(self):
         self.instalar()
+        apoyo.claves_de_marcador(self.sis, p.PREFIJO)
         self.assertEqual(self.orden("comprobar"), 0, self.salida)
         self.assertIn("\nSeguridad\n", self.salida)
         self.assertRegex(self.salida, r"\n  bien  la API de Hermes solo escucha")
         self.assertRegex(self.salida, r"\n  aviso actualizar:")
+
+    def test_con_cualquiera_de_las_dos_claves_actualizar_se_puede(self):
+        """La principal o la de rescate (`firma.CLAVES`): con una de verdad ya hay firma que comprobar."""
+        self.instalar()
+        apoyo.claves_de_marcador(self.sis, p.PREFIJO)
+        self.assertEqual([e for e, _ in self.estados("actualizar:")], ["aviso"], "con las dos de marcador")
+        _, publica = apoyo.ed25519()
+        self.sis.poner(p.PREFIJO + "/clave-rescate.pem", publica)
+        self.assertEqual(self.estados("actualizar:"), [("bien", "actualizar: solo con un paquete firmado con una clave "
+                                                                "de Daniel (la principal o la de rescate)")])
 
     def test_un_mal_hace_salir_con_uno(self):
         self.instalar()

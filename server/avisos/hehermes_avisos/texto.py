@@ -274,3 +274,19 @@ def titulo_de_sesion(sesion: dict) -> str:
 def corto(texto: str, tope: int = TOPE_TEXTO) -> str:
     """Un texto cualquiera (un error, un comando que pide permiso) en una línea y recortado."""
     return recortar(una_linea(_preparar(texto)), tope)
+
+
+# Lo que se lee de un texto que se enseña entero antes de limpiarlo. Es la misma defensa que `TOPE_ENTRADA`, y no recorta
+# nada que se pueda enseñar: lo que se enseña entero tiene que caber en el sobre de un aviso (`vigia.avisos.TOPE_CLARO`,
+# 2800 bytes), y un texto de más caracteres que esto tiene más bytes que eso, así que quien mira si cabe lo descarta igual.
+TOPE_ENTERO = 16384
+
+
+def entero(texto: str) -> str:
+    """Un texto que se lee entero: la petición de una aprobación, al mantener pulsado su aviso (spec 2026-10-04, «Aprobar
+    y denegar desde el aviso»). Sin caracteres de control salvo saltos de línea y tabuladores, con los saltos de Windows
+    pasados a ``\\n`` y sin espacios en los bordes, pero con sus líneas: es un comando, y se aprueba lo que se ve.
+
+    No se recorta: quien lo usa mira si cabe y, si no, enseña el corto (`corto`)."""
+    recortado = texto[:TOPE_ENTERO].replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(c for c in recortado if c in "\n\t" or unicodedata.category(c) != "Cc").strip()

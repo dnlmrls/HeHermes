@@ -151,7 +151,7 @@ class ConLasDos(Ayudas):
         for de_la_vpn in ("strongSwan:", "hh-ipsec:", "túnel:", "nginx: en marcha"):
             self.assertNotIn(de_la_vpn, self.salida)
         for una_vez in ("Hermes: contesta con su clave", "cortafuegos: ufw, en marcha", "canje: ninguno abierto",
-                        "la API de Hermes solo escucha", "actualizar: la clave de las firmas"):
+                        "la API de Hermes solo escucha", "actualizar:"):
             self.assertEqual(self.salida.count(una_vez), 1, una_vez)
 
     def test_comprobar_ve_lo_que_falla_en_la_pasarela(self):

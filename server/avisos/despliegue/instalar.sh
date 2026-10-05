@@ -33,12 +33,21 @@
 #                                                   ayudante por conexión, como el dueño de la casa de Hermes, sin
 #                                                   capacidades y que solo ve <casa de Hermes>/entrada
 #   <casa de Hermes>/entrada                        donde queda lo que la app le manda (0700, del dueño de Hermes)
+#   /usr/local/libexec/hehermes-actualizar          el ayudante que actualiza el servidor desde la app (root 0755, desde
+#                                                   la 1.5.5): actualiza lo del instalador (/opt/hehermes-servidor); los
+#                                                   avisos de este servidor siguen con este script
+#   /etc/systemd/system/hehermes-actualizar.socket y hehermes-actualizar@.service   su socket (root:hh-vigia 0660) y un
+#                                                   ayudante de root por conexión, sin capacidades ni red, que solo mira
+#                                                   y lanza: la actualización va en su propia unidad
+#                                                   (hehermes-actualizacion); su carpeta, /var/lib/hehermes-actualizar
 #
 #   sudo …/instalar.sh --desinstalar-lector         quita solo el lector (y con él, GET /avisos/v1/fichero da 503)
 #   sudo …/instalar.sh --desinstalar-respaldo       quita solo el ayudante de la copia (/avisos/v1/respaldo da 503); su
 #                                                   carpeta de trabajo, con la copia de antes de restaurar, se queda
 #   sudo …/instalar.sh --desinstalar-entrada        quita solo el ayudante de la entrada (/avisos/v1/entrada da 503); la
 #                                                   carpeta de entrada, con lo que ya recibió Hermes, se queda
+#   sudo …/instalar.sh --desinstalar-actualizar     quita solo el ayudante que actualiza (la app ya no puede actualizar
+#                                                   este servidor: POST /avisos/v1/servidor/actualizar da 503)
 #
 # La entrada pública del relé (spec 2026-09-28, «El relé para los probadores»): por donde llegan los avisos de los
 # vigías de otros servidores. Se pone una vez, y desde entonces cada pasada la mantiene:
@@ -393,6 +402,57 @@ desinstalar_entrada() {
 }
 # --- fin del ayudante de la entrada ------------------------------------------------------------------------------------
 
+# --- El ayudante que actualiza el servidor (funciones) -----------------------------------------------------------------
+# Lo usan la instalación y --desinstalar-actualizar. Como los demás: un ayudante de root por conexión a su socket, que
+# solo mira y lanza; la actualización corre en su propia unidad (hehermes-actualizacion, con systemd-run).
+ACTUALIZAR=/usr/local/libexec/hehermes-actualizar
+UNIDADES_ACTUALIZAR="hehermes-actualizar.socket hehermes-actualizar@.service"
+ACTUALIZAR_CAMBIADO=0
+
+instalar_actualizar() {
+  install -d -m 0755 -o root -g root "$(dirname "$ACTUALIZAR")"
+  if ! cmp -s "$AQUI/hehermes-actualizar" "$ACTUALIZAR"; then
+    install -m 0755 -o root -g root "$AQUI/hehermes-actualizar" "$ACTUALIZAR.nuevo"
+    mv -f "$ACTUALIZAR.nuevo" "$ACTUALIZAR"
+    echo "    ayudante que actualiza puesto en $ACTUALIZAR"
+  fi
+  local unidad
+  for unidad in $UNIDADES_ACTUALIZAR; do
+    if ! cmp -s "$AQUI/$unidad" "$SYSTEMD/$unidad"; then
+      install -m 0644 -o root -g root "$AQUI/$unidad" "$SYSTEMD/$unidad"
+      ACTUALIZAR_CAMBIADO=1
+    fi
+  done
+}
+
+arrancar_actualizar() {
+  # Como el lector: solo el socket. Reiniciarlo no corta una actualización en marcha (va en su propia unidad).
+  systemctl enable --quiet hehermes-actualizar.socket
+  if [[ $ACTUALIZAR_CAMBIADO -eq 1 ]]; then
+    systemctl restart hehermes-actualizar.socket
+  else
+    systemctl start hehermes-actualizar.socket
+  fi
+}
+
+desinstalar_actualizar() {
+  paso "quitando el ayudante que actualiza el servidor"
+  systemctl disable --now --quiet hehermes-actualizar.socket 2>/dev/null || true
+  # Una actualización en marcha no se corta: se espera a que acabe.
+  if systemctl list-units --no-legend --state=active hehermes-actualizacion.service 2>/dev/null | grep -q .; then
+    fallar "hay una actualización en marcha (journalctl -u hehermes-actualizacion): espera a que acabe"
+  fi
+  local unidad
+  for unidad in $UNIDADES_ACTUALIZAR; do
+    rm -f "$SYSTEMD/$unidad"
+  done
+  rm -f "$ACTUALIZAR" "$ACTUALIZAR.nuevo"
+  systemctl daemon-reload
+  echo "    quitado: la app ya no puede actualizar este servidor. /var/lib/hehermes-actualizar se queda (el estado de la"
+  echo "    última y lo que dijo el instalador); bórrala tú si quieres"
+}
+# --- fin del ayudante que actualiza ------------------------------------------------------------------------------------
+
 # --- La entrada pública del relé (funciones) ---------------------------------------------------------------------------
 PUBLICO_INI="$CONF/rele-publico.ini"
 PUBLICO_CARPETA="$CONF/rele-publico"
@@ -447,14 +507,16 @@ quitar_rele_publico() {
 
 RELE_PUBLICO=0
 if [[ $# -gt 0 ]]; then
-  [[ $# -eq 1 ]] || fallar "uso: instalar.sh [--desinstalar-lector | --desinstalar-respaldo | --desinstalar-entrada | --rele-publico | --quitar-rele-publico]"
+  USO="uso: instalar.sh [--desinstalar-lector | --desinstalar-respaldo | --desinstalar-entrada | --desinstalar-actualizar | --rele-publico | --quitar-rele-publico]"
+  [[ $# -eq 1 ]] || fallar "$USO"
   case "$1" in
     --desinstalar-lector) desinstalar_lector; exit 0 ;;
     --desinstalar-respaldo) desinstalar_respaldo; exit 0 ;;
     --desinstalar-entrada) desinstalar_entrada; exit 0 ;;
+    --desinstalar-actualizar) desinstalar_actualizar; exit 0 ;;
     --quitar-rele-publico) quitar_rele_publico; exit 0 ;;
     --rele-publico) RELE_PUBLICO=1 ;;
-    *) fallar "uso: instalar.sh [--desinstalar-lector | --desinstalar-respaldo | --desinstalar-entrada | --rele-publico | --quitar-rele-publico]" ;;
+    *) fallar "$USO" ;;
   esac
 fi
 # Una vez puesta, cada pasada la mantiene (con el código nuevo): se sabe por su unidad.
@@ -479,7 +541,7 @@ command -v "$PY" >/dev/null || fallar "no hay $PY"
 # El lector de ficheros y los ayudantes de la copia y de la entrada corren con el Python del sistema, sin venv (no tienen
 # dependencias).
 /usr/bin/python3 -I -S -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' \
-  || fallar "el lector de ficheros y los ayudantes de la copia y de la entrada necesitan /usr/bin/python3, 3.9 o más nuevo"
+  || fallar "el lector de ficheros y los ayudantes (la copia, la entrada y el que actualiza) necesitan /usr/bin/python3, 3.9 o más nuevo"
 if ! "$PY" -I -c 'import ensurepip, venv' 2>/dev/null; then
   # En Debian y Ubuntu, venv sin ensurepip viene aparte.
   paso "instalando python3-venv"
@@ -707,10 +769,12 @@ done
 instalar_lector
 instalar_respaldo
 instalar_entrada
+instalar_actualizar
 systemctl daemon-reload
 systemd-analyze verify /etc/systemd/system/hehermes-vigia.socket /etc/systemd/system/hehermes-vigia.service \
   /etc/systemd/system/hehermes-rele.socket /etc/systemd/system/hehermes-rele.service \
   "$SYSTEMD/hehermes-leer-media.socket" "$SYSTEMD/hehermes-respaldo.socket" "$SYSTEMD/hehermes-entrada.socket" \
+  "$SYSTEMD/hehermes-actualizar.socket" \
   || echo "    (systemd-analyze avisa de algo en las unidades: míralo arriba)"
 for unidad in hehermes-vigia hehermes-rele; do
   systemctl enable --quiet "$unidad.socket" "$unidad.service"
@@ -726,6 +790,7 @@ done
 arrancar_lector
 arrancar_respaldo
 arrancar_entrada
+arrancar_actualizar
 # Con los dos puertos ya de systemd, los servicios: con el código nuevo, y el relé con la clave si Daniel ya la ha
 # puesto (sin ella, arranca igual y contesta 503).
 for unidad in hehermes-vigia hehermes-rele; do

@@ -19,7 +19,8 @@ from .plan import registro_de_dispositivos
 
 # El lector de ficheros primero: su socket es de root y es lo único de los avisos que lee como root.
 UNIDADES_AVISOS = ("hehermes-leer-media.socket", "hehermes-respaldo.socket", "hehermes-entrada.socket",
-                   "hehermes-vigia.socket", "hehermes-vigia.service", "hehermes-rele.socket", "hehermes-rele.service")
+                   "hehermes-actualizar.socket", "hehermes-vigia.socket", "hehermes-vigia.service",
+                   "hehermes-rele.socket", "hehermes-rele.service")
 CARPETAS_AVISOS = ("/opt/hehermes-avisos", "/etc/hehermes-avisos", "/etc/nginx/hehermes-avisos", "/var/lib/hehermes-vigia")
 # La plantilla del lector (se para con sus instancias, no se deshabilita: no tiene [Install]), su añadido si Hermes
 # vive fuera de /root/.hermes (el fichero y luego su carpeta, que solo se borra vacía) y el propio lector.
@@ -31,7 +32,8 @@ FICHEROS_AVISOS = ("/etc/systemd/system/hehermes-leer-media@.service",
                    "/etc/systemd/system/hehermes-respaldo@.service.d", "/usr/local/libexec/hehermes-respaldo",
                    "/etc/systemd/system/hehermes-entrada@.service",
                    "/etc/systemd/system/hehermes-entrada@.service.d/hermes.conf",
-                   "/etc/systemd/system/hehermes-entrada@.service.d", "/usr/local/libexec/hehermes-entrada")
+                   "/etc/systemd/system/hehermes-entrada@.service.d", "/usr/local/libexec/hehermes-entrada",
+                   "/etc/systemd/system/hehermes-actualizar@.service", "/usr/local/libexec/hehermes-actualizar")
 NGINX = (p.SITIO_ENLACE, p.SITIO, p.SITIO_CONF_D, p.BEARER, p.DROP_IN_NGINX)
 
 
@@ -195,7 +197,7 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
     if que.tls:
         salida("==> la pasarela")
         for unidad in (p.UNIDAD_PASARELA, "hehermes-pasarela-clave.path", p.UNIDAD_VIGIA, p.SOCKET_VIGIA,
-                       p.SOCKET_LECTOR, p.SOCKET_RESPALDO, p.SOCKET_ENTRADA):
+                       p.SOCKET_LECTOR, p.SOCKET_RESPALDO, p.SOCKET_ENTRADA, p.SOCKET_ACTUALIZAR):
             if unidad in man.unidades:
                 sis.ejecutar(ambito.systemctl + ["disable", "--now", unidad])
         if p.SOCKET_LECTOR in man.unidades:
@@ -320,7 +322,7 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
         if not que.de(md.de_unidad(unidad)):
             continue
         sis.ejecutar((ambito.systemctl if unidad in (p.UNIDAD_PASARELA, p.UNIDAD_VIGIA, p.SOCKET_LECTOR,
-                                                     p.SOCKET_RESPALDO, p.SOCKET_ENTRADA)
+                                                     p.SOCKET_RESPALDO, p.SOCKET_ENTRADA, p.SOCKET_ACTUALIZAR)
                       else ["systemctl"]) + ["disable", "--now", unidad])
         if not que.todo:
             man.unidades.remove(unidad)
@@ -359,6 +361,9 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
                           "No la borro: si no la quieres, bórrala tú" % antes)
         else:
             sis.borrar_arbol(ambito.carpeta_respaldo)
+    #    La del ayudante que actualiza (el estado de la última, sus intentos y lo que dijo el instalador): de HeHermes.
+    if que.tls and ambito.carpeta_actualizar and sis.es_carpeta(ambito.carpeta_actualizar):
+        sis.borrar_arbol(ambito.carpeta_actualizar)
     #    La carpeta de estado de la pasarela (el borrado pendiente, su actividad): nada que no sea de HeHermes.
     if que.tls and sis.existe(ambito.carpeta_estado_pasarela):
         sis.borrar_arbol(ambito.carpeta_estado_pasarela)

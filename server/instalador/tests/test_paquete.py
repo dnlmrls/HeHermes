@@ -73,8 +73,10 @@ class Paquete(unittest.TestCase):
                              ("hehermes_servidor/cli.py", 0o644), ("hehermes_servidor/desinstalar.py", 0o644),
                              ("hehermes_servidor/modos.py", 0o644),
                              ("hehermes_servidor/plan.py", 0o644), ("clave-publica.pem", 0o644),
+                             ("clave-rescate.pem", 0o644),
                              ("hehermes-dispositivo", 0o755), ("README.md", 0o644), ("hehermes-leer-media", 0o755),
                              ("hehermes-respaldo", 0o755), ("hehermes-entrada", 0o755),
+                             ("hehermes-actualizar", 0o755),
                              ("requirements-canje.txt", 0o644), ("hehermes_servidor/canje.py", 0o644),
                              ("hehermes_servidor/porchat.py", 0o644)):
             with self.subTest(fichero=nombre):
@@ -88,9 +90,10 @@ class Paquete(unittest.TestCase):
         avisos = sorted("hehermes_avisos/" + str(p.relative_to(de_avisos)) for p in de_avisos.rglob("*.py")
                         if "__pycache__" not in p.parts)
         self.assertIn("hehermes_avisos/vigia/__main__.py", avisos)
-        self.assertEqual(ficheros, sorted(["README.md", "clave-publica.pem", "hehermes-dispositivo", "hehermes-pasarela",
+        self.assertEqual(ficheros, sorted(["README.md", "clave-publica.pem", "clave-rescate.pem", "hehermes-dispositivo",
+                                           "hehermes-pasarela",
                                            "hehermes-servidor", "requirements-canje.txt", "hehermes-leer-media",
-                                           "hehermes-respaldo", "hehermes-entrada"]
+                                           "hehermes-respaldo", "hehermes-entrada", "hehermes-actualizar"]
                                           + modulos + avisos))
         # El dispositivo es el de server/vpn, y el lector (desde la 0.8.0) y los ayudantes, los de
         # server/avisos/despliegue, byte a byte.
@@ -98,10 +101,13 @@ class Paquete(unittest.TestCase):
             dentro = tar.extractfile(prefijo + "hehermes-dispositivo").read()
             lector = tar.extractfile(prefijo + "hehermes-leer-media").read()
             de_la_entrada = tar.extractfile(prefijo + "hehermes-entrada").read()
+            el_que_actualiza = tar.extractfile(prefijo + "hehermes-actualizar").read()
         self.assertEqual(dentro, (apoyo.REPO / "server" / "vpn" / "hehermes-dispositivo").read_bytes())
         self.assertEqual(lector, (apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-leer-media").read_bytes())
         self.assertEqual(de_la_entrada,
                          (apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-entrada").read_bytes())
+        self.assertEqual(el_que_actualiza,
+                         (apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-actualizar").read_bytes())
 
     def test_desempaquetado_se_encuentra_todo_sin_el_repositorio(self):
         ruta, _ = self.construir()
@@ -220,12 +226,72 @@ class LaApp(unittest.TestCase):
 
 
 class Firma(unittest.TestCase):
-    def test_la_clave_publica_del_paquete_es_un_marcador(self):
-        texto = (apoyo.RAIZ / "clave-publica.pem").read_text()
-        self.assertTrue(firma.pendiente(texto))
-        self.assertIn(firma.MARCADOR, texto)
-        self.assertNotIn("BEGIN PUBLIC KEY", texto, "la de Daniel no está en el repositorio")
+    def test_las_claves_del_paquete_son_el_marcador_o_publicas_y_nunca_una_privada(self):
+        """La principal y la de rescate: el marcador hasta que Daniel lance `scripts/firma/crear-claves.sh`, y desde
+        entonces su parte pública, que es lo único de ellas que puede estar en el repositorio."""
+        for nombre in firma.CLAVES:
+            with self.subTest(clave=nombre):
+                texto = (apoyo.RAIZ / nombre).read_text()
+                self.assertNotIn("PRIVATE", texto, "una privada no puede estar en el repositorio")
+                if firma.pendiente(texto):
+                    self.assertIn(firma.MARCADOR, texto)
+                    self.assertNotIn("-----BEGIN", texto)
+                else:
+                    self.assertEqual(texto.count("-----BEGIN PUBLIC KEY-----"), 1)
+                    try:
+                        from cryptography.hazmat.primitives import serialization
+                        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+                    except ImportError:
+                        continue
+                    self.assertIsInstance(serialization.load_pem_public_key(texto.encode()), Ed25519PublicKey)
+        self.assertEqual(firma.CLAVES, ("clave-publica.pem", "clave-rescate.pem"))
         self.assertFalse(firma.pendiente(PUBLICA.read_text()))
+
+    def test_el_marcador_y_una_privada_no_son_claves(self):
+        sis = apoyo.SistemaFalso()
+        self.addCleanup(sis.limpiar)
+        _, publica = apoyo.ed25519()
+        self.assertEqual(firma.claves(sis, "/opt/hh"), [], "sin ninguna, ninguna")
+        sis.poner("/opt/hh/clave-publica.pem", (apoyo.RAIZ / "clave-publica.pem").read_bytes())
+        sis.poner("/opt/hh/clave-rescate.pem", (apoyo.RAIZ / "clave-rescate.pem").read_bytes())
+        if firma.pendiente((apoyo.RAIZ / "clave-publica.pem").read_text()):
+            self.assertEqual(firma.claves(sis, "/opt/hh"), [], "los marcadores no son claves")
+        sis.poner("/opt/hh/clave-publica.pem", PRIVADA.read_bytes())
+        sis.poner("/opt/hh/clave-rescate.pem", publica)
+        self.assertEqual(firma.claves(sis, "/opt/hh"), [sis.ruta("/opt/hh/clave-rescate.pem")],
+                         "una privada en el sitio de la pública no cuenta")
+        sis.poner("/opt/hh/clave-publica.pem", publica)
+        self.assertEqual(firma.claves(sis, "/opt/hh"), [sis.ruta("/opt/hh/clave-publica.pem"),
+                                                         sis.ruta("/opt/hh/clave-rescate.pem")])
+
+    def test_vale_la_firma_de_cualquiera_de_las_dos_y_de_ninguna_otra(self):
+        principal, publica_principal = apoyo.ed25519()
+        rescate, publica_rescate = apoyo.ed25519()
+        otra, _ = apoyo.ed25519()
+        sis = apoyo.SistemaFalso()
+        self.addCleanup(sis.limpiar)
+        sis.responder["openssl"] = apoyo.openssl_que_verifica
+        sis.poner("/opt/hh/clave-publica.pem", publica_principal)
+        sis.poner("/opt/hh/clave-rescate.pem", publica_rescate)
+        claves = firma.claves(sis, "/opt/hh")
+        with tempfile.TemporaryDirectory() as carpeta:
+            paquete = os.path.join(carpeta, "hehermes-servidor-9.0.0.tar.gz")
+            with open(paquete, "wb") as f:
+                f.write(b"un paquete")
+            for quien, privada, vale in (("la principal", principal, True), ("la de rescate", rescate, True),
+                                         ("otra", otra, False)):
+                with self.subTest(firma=quien):
+                    sello = apoyo.firmar(privada, paquete)
+                    self.assertEqual(firma.verificar_con_alguna(sis, paquete, sello, claves), vale)
+            # Con solo la principal instalada (la de rescate aún es el marcador), la de rescate no vale.
+            apoyo.firmar(rescate, paquete)
+            self.assertFalse(firma.verificar_con_alguna(sis, paquete, paquete + ".sig", claves[:1]))
+            self.assertFalse(firma.verificar_con_alguna(sis, paquete, paquete + ".sig", []), "sin claves, nada")
+            # Un byte cambiado en el paquete, y la firma buena ya no vale.
+            apoyo.firmar(principal, paquete)
+            with open(paquete, "ab") as f:
+                f.write(b"!")
+            self.assertFalse(firma.verificar_con_alguna(sis, paquete, paquete + ".sig", claves))
 
     def test_la_de_prueba_esta_marcada(self):
         for ruta in (PRIVADA, PUBLICA):

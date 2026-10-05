@@ -25,7 +25,9 @@ El lector de ficheros (`GET /avisos/v1/fichero`, `server/avisos/despliegue/heher
 VPS de Daniel (el script en /usr/local/libexec, un socket de systemd `root:hh-vigia` 0660 y un lector de root enjaulado
 por conexión); sin root, una unidad de usuario del usuario de Hermes, con su socket en su /run/user, que solo atiende a
 su propio uid. Igual los ayudantes de la copia en iCloud (desde la 0.10.0) y de la entrada (desde la 0.10.6: lo que la
-app le manda a Hermes, en `<HERMES_HOME>/entrada`, que crea el instalador como `exports/`).
+app le manda a Hermes, en `<HERMES_HOME>/entrada`, que crea el instalador como `exports/`). Y desde la 0.10.10, solo con
+root, el que actualiza el servidor desde la app (`hehermes-actualizar`), con lo que enseña Ajustes › Tu servidor en la
+sección `[servidor]` de `vigia.ini`.
 """
 
 from __future__ import annotations
@@ -175,6 +177,7 @@ def planear(sis, det, man, op, origen, acciones, bloqueos, fichero, avisos=None)
     lector = planear_lector(sis, det, origen, acciones, bloqueos, avisos, fichero)
     respaldo = planear_respaldo(sis, det, origen, acciones, bloqueos, avisos, fichero)
     entrada = planear_entrada(sis, det, origen, acciones, bloqueos, avisos, fichero)
+    actualizar = planear_actualizar(sis, det, origen, acciones, bloqueos, fichero)
     credencial = (vigia["credencial"] + "\n").encode() if vigia["credencial"] else None
     secreto = sis.leer(ambito.secreto_vigia)
     propias = [
@@ -183,7 +186,11 @@ def planear(sis, det, man, op, origen, acciones, bloqueos, fichero, avisos=None)
                                               vigia["direccion"], vigia["puerto"], vigia["huella"],
                                               lector=ambito.socket_lector if lector else None,
                                               respaldo=ambito.socket_respaldo if respaldo else None,
-                                              entrada=ambito.socket_entrada if entrada else None),
+                                              entrada=ambito.socket_entrada if entrada else None,
+                                              actualizar=ambito.socket_actualizar if actualizar else None,
+                                              servicios=servicios_del_vigia(ambito, lector, respaldo, entrada,
+                                                                            actualizar),
+                                              hermes_unidad=unidad_de_hermes_para_el_vigia(det.hermes, ambito)),
                 0o640 if ambito.root else 0o600, detalle=detalle),
         _secreto(sis, man, acciones, ambito.secreto_vigia,
                  (secrets.token_urlsafe(32) + "\n").encode() if secreto is None else None, reemplazar,
@@ -301,6 +308,53 @@ def planear_entrada(sis, det, origen, acciones, bloqueos, avisos, fichero) -> bo
     return True
 
 
+def planear_actualizar(sis, det, origen, acciones, bloqueos, fichero) -> bool:
+    """El ayudante que actualiza el servidor desde la app (desde la 0.10.10): con root, el script en /usr/local/libexec,
+    su socket y su plantilla. Sin root, nada: actualizar es instalar, y la app enseña cómo hacerlo a mano. Devuelve si se
+    pone: sin él, el vigía va igual y /avisos/v1/servidor/actualizar contesta 503."""
+    ambito = det.ambito
+    if not ambito.root:
+        return False
+    from .plan import fuente_del_actualizar
+    fuente = fuente_del_actualizar(origen)
+    if fuente is None:
+        bloqueos.append(bloqueo("paquete", "el paquete no trae el ayudante que actualiza (hehermes-actualizar)"))
+        return False
+    # Suelto, como el lector: cambiarlo no pide reiniciar nada, cada conexión lanza el que haya.
+    with open(fuente, "rb") as f:
+        fichero(ambito.actualizar, f.read(), 0o755)
+    unidades = [fichero(ambito.unidad_actualizar_socket, p.unidad_actualizar_socket()),
+                fichero(ambito.unidad_actualizar, p.unidad_actualizar(ambito))]
+    _unidad(sis, acciones, p.SOCKET_ACTUALIZAR, unidades, "actualizar desde la app (/avisos/v1/servidor/actualizar), "
+            "un ayudante de root por conexión, sin capacidades ni red, que lanza la actualización en su propia unidad",
+            "restart", ambito.systemctl)
+    return True
+
+
+def servicios_del_vigia(ambito, lector, respaldo, entrada, actualizar) -> list:
+    """Las unidades de HeHermes cuyo estado enseña Ajustes › Tu servidor: las que se ponen aquí, de usuario sin root."""
+    unidades = [p.UNIDAD_PASARELA, p.UNIDAD_VIGIA] + [u for u, si in ((p.SOCKET_LECTOR, lector),
+                                                                     (p.SOCKET_RESPALDO, respaldo),
+                                                                     (p.SOCKET_ENTRADA, entrada),
+                                                                     (p.SOCKET_ACTUALIZAR, actualizar)) if si]
+    return unidades if ambito.root else ["usuario:" + u for u in unidades]
+
+
+def unidad_de_hermes_para_el_vigia(hermes, ambito) -> str | None:
+    """La unidad de Hermes cuyo estado enseña Ajustes › Tu servidor, si el vigía la puede mirar: con root (el vigía es
+    `hh-vigia`), una del sistema; sin root, una del sistema o una de usuario suya («usuario:»). Una de usuario de otro, un
+    contenedor o un Hermes suelto (tmux), ninguna: la pantalla dice solo si contesta. Y solo con un nombre que el vigía
+    sepa poner en `systemctl` (sin los escapes `\\x2d` de un cgroup)."""
+    gestor = hermes.gestor
+    if gestor is None or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9:_.@-]{0,199}\.service", gestor.nombre):
+        return None
+    if gestor.tipo == "sistema":
+        return gestor.nombre
+    if gestor.tipo == "usuario" and not ambito.root and gestor.usuario == ambito.usuario:
+        return "usuario:" + gestor.nombre
+    return None
+
+
 def _secreto(sis, man, acciones, ruta, deseado, reemplazar, detalle):
     estado = _gestionado(sis, man, ruta, deseado, reemplazar)
     datos = deseado if deseado is not None else sis.leer(ruta)
@@ -312,7 +366,8 @@ def rutas(ambito) -> set:
     """Lo del vigía y del lector que `aplicar_tls` deja para su propio paso (y no con los ficheros sueltos)."""
     return {ambito.vigia_ini, ambito.secreto_vigia, ambito.credencial_rele, ambito.clave_hermes_vigia,
             ambito.unidad_vigia, ambito.socket_vigia, ambito.unidad_lector_socket, ambito.unidad_lector,
-            ambito.unidad_respaldo_socket, ambito.unidad_respaldo, ambito.unidad_entrada_socket, ambito.unidad_entrada}
+            ambito.unidad_respaldo_socket, ambito.unidad_respaldo, ambito.unidad_entrada_socket, ambito.unidad_entrada,
+            ambito.unidad_actualizar_socket, ambito.unidad_actualizar}
 
 
 # MARK: Aplicar
@@ -406,6 +461,10 @@ def aplicar_unidades(sis, man, acciones, ambito, salida, hermes=None) -> None:
                                                            p.SOCKET_ENTRADA)]
     if de_la_entrada:
         _con_unidad(sis, man, de_la_entrada, p.SOCKET_ENTRADA, salida, systemctl=ambito.systemctl)
+    del_actualizar = [a for a in acciones if a.objeto in (ambito.unidad_actualizar_socket, ambito.unidad_actualizar,
+                                                            p.SOCKET_ACTUALIZAR)]
+    if del_actualizar:
+        _con_unidad(sis, man, del_actualizar, p.SOCKET_ACTUALIZAR, salida, systemctl=ambito.systemctl)
     if ambito.root:
         _con_unidad(sis, man, [a for a in acciones if a.objeto in (ambito.socket_vigia, p.SOCKET_VIGIA)],
                     p.SOCKET_VIGIA, salida)
@@ -446,6 +505,12 @@ def comprobar(sis, man, ambito, mira, hermes_pendiente=False, intentos=3, espera
         mira(entrada, "entrada de ficheros: el socket de su ayudante está en marcha (%s)" % ambito.socket_entrada,
              "entrada de ficheros: el socket de su ayudante está parado (%ssystemctl %sstart %s)"
              % ("sudo " if ambito.root else "", "" if ambito.root else "--user ", p.SOCKET_ENTRADA))
+    if ambito.unidad_actualizar_socket in man.ficheros:
+        actualizar = sis.ejecutar(ambito.systemctl + ["is-active", p.SOCKET_ACTUALIZAR]).bien
+        mira(actualizar, "actualizar desde la app: el socket de su ayudante está en marcha (%s)"
+             % ambito.socket_actualizar,
+             "actualizar desde la app: el socket de su ayudante está parado (sudo systemctl start %s)"
+             % p.SOCKET_ACTUALIZAR)
     if hermes_pendiente:
         return
     orden = [ambito.python_venv, "-I", "-B", "-m", "hehermes_avisos.vigia", "--config", ambito.vigia_ini, "comprobar"]

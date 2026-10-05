@@ -192,6 +192,7 @@ class LasDemas(Base):
 
     def test_actualizar_se_niega_con_la_clave_de_marcador(self):
         self.orden("instalar", "--si", terminal=False)
+        apoyo.claves_de_marcador(self.sis, p.PREFIJO)
         self.assertEqual(self.orden("actualizar", "--paquete", "/tmp/x.tar.gz", "--firma", "/tmp/x.sig"), 1)
         self.assertIn("PENDIENTE-DE-DANIEL", self.salida)
 
@@ -239,8 +240,83 @@ class LasDemas(Base):
         self.assertFalse(os.path.exists(os.path.dirname(os.path.dirname(nueva[0][2]))), "la carpeta temporal, fuera")
         self.assertNotIn("VPN", self.salida)
 
+    def firmado_de_verdad(self, quien, claves):
+        """Las dos claves del paquete instalado (`claves`: lo que va en clave-publica.pem y clave-rescate.pem), un
+        paquete 9.0.0 firmado por `quien` y openssl comprobando de verdad (con `cryptography`)."""
+        self.orden("instalar", "--si", terminal=False)
+        for nombre, texto in zip(("clave-publica.pem", "clave-rescate.pem"), claves):
+            self.sis.poner(p.PREFIJO + "/" + nombre, texto)
+        paquete = self.empaquetar("9.0.0")
+        if quien is not None:
+            apoyo.firmar(quien, paquete)
+        self.sis.responder["openssl"] = apoyo.openssl_que_verifica
+        self.sis.responder["python3 -I"] = apoyo.bien("Todo al día: 0 cambios.\n")
+        desde = len(self.sis.ordenes)
+        codigo = self.orden("actualizar", "--paquete", paquete, "--firma", paquete + ".sig")
+        return codigo, [o for o in self.sis.ordenes[desde:] if o[:2] == ["python3", "-I"]]
+
+    def test_vale_la_principal_y_la_de_rescate(self):
+        principal, publica_principal = apoyo.ed25519()
+        rescate, publica_rescate = apoyo.ed25519()
+        for quien in (principal, rescate):
+            with self.subTest(principal=quien is principal):
+                codigo, nueva = self.firmado_de_verdad(quien, (publica_principal, publica_rescate))
+                self.assertEqual(codigo, 0, self.salida)
+                self.assertEqual(len(nueva), 1)
+
+    def test_una_clave_que_no_es_ninguna_de_las_dos_no_vale(self):
+        _, publica_principal = apoyo.ed25519()
+        _, publica_rescate = apoyo.ed25519()
+        otra, _ = apoyo.ed25519()
+        codigo, nueva = self.firmado_de_verdad(otra, (publica_principal, publica_rescate))
+        self.assertEqual(codigo, 1)
+        self.assertIn("la firma de", self.salida)
+        self.assertEqual(nueva, [], "ni desempaqueta ni lanza nada")
+
+    def test_con_la_principal_de_marcador_vale_la_de_rescate_y_no_otra(self):
+        rescate, publica_rescate = apoyo.ed25519()
+        otra, _ = apoyo.ed25519()
+        marcador = (apoyo.RAIZ / "clave-publica.pem").read_bytes()
+        if not marcador.startswith(b"# PENDIENTE-DE-DANIEL"):
+            marcador = b"# PENDIENTE-DE-DANIEL\n"
+        codigo, nueva = self.firmado_de_verdad(rescate, (marcador, publica_rescate))
+        self.assertEqual((codigo, len(nueva)), (0, 1), self.salida)
+        codigo, nueva = self.firmado_de_verdad(otra, (marcador, publica_rescate))
+        self.assertEqual((codigo, nueva), (1, []))
+
+    def test_con_las_dos_de_marcador_se_niega_sin_mirar_la_firma(self):
+        principal, _ = apoyo.ed25519()
+        codigo, nueva = self.firmado_de_verdad(principal, (b"# PENDIENTE-DE-DANIEL\n", b"# PENDIENTE-DE-DANIEL\n"))
+        self.assertEqual((codigo, nueva), (1, []))
+        self.assertIn("PENDIENTE-DE-DANIEL", self.salida)
+        self.assertFalse([o for o in self.sis.ordenes if o[:1] == ["openssl"] and "-verify" in o])
+
+    def test_la_version_nueva_puede_tomar_el_cerrojo(self):
+        """`instalar --si` de la versión nueva toma el cerrojo de siempre (`/run/hehermes-servidor.lock`): si
+        `actualizar` lo tuviera mientras, se pararía en «ya hay otro hehermes-servidor en marcha» y no actualizaría
+        nunca."""
+        import fcntl
+        self.orden("instalar", "--si", terminal=False)
+        self.sis.poner(p.PREFIJO + "/clave-publica.pem", PUBLICA.read_bytes())
+        self.sis.responder["openssl"] = apoyo.bien("Signature Verified Successfully\n")
+        paquete = self.empaquetar("9.0.0")
+
+        def instalar_de_la_nueva(args, entrada):
+            ruta = self.sis.ruta(cli._cerrojo.RUTA)
+            os.makedirs(os.path.dirname(ruta), exist_ok=True)
+            with open(ruta, "w") as f:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return Resultado(1, "error: ya hay otro hehermes-servidor en marcha\n")
+            return Resultado(0, "Todo al día: 0 cambios.\n")
+
+        self.sis.responder["python3 -I"] = instalar_de_la_nueva
+        self.assertEqual(self.orden("actualizar", "--paquete", paquete, "--firma", paquete + ".sig"), 0, self.salida)
+
     def test_actualizar_con_firma_mala_no_toca_nada(self):
         self.orden("instalar", "--si", terminal=False)
+        apoyo.claves_de_marcador(self.sis, p.PREFIJO)
         self.sis.poner(p.PREFIJO + "/clave-publica.pem", PUBLICA.read_bytes())
         self.sis.responder["openssl"] = apoyo.mal(salida="Signature Verification Failure\n")
         paquete = self.empaquetar("9.0.0")

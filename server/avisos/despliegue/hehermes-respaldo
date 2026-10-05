@@ -976,6 +976,8 @@ class Instantaneas:
             return
         _escribir_json(os.path.join(carpeta, "manifiesto.json"), manifiesto)
         self._estado(id_, estado="lista", progreso=None)
+        # Para Ajustes › Tu servidor (`ultima`): la instantánea se borra al bajarla, y esto se queda.
+        _escribir_json(self.trabajo.ruta("ultima.json"), {"hecha": int(self.sistema.ahora())})
         total = sum(f["tamano"] for f in manifiesto["ficheros"])
         _decir("instantánea %s: lista, %d ficheros en %d trozos, %d bytes, %.1f s" % (
             id_, len(manifiesto["ficheros"]), len(manifiesto["trozos"]), total, time.monotonic() - inicio))
@@ -1874,6 +1876,14 @@ class Ayudante:
                                                 "estado": antes.get("estado")},
         }
 
+    def ultima(self) -> dict:
+        """Cuándo acabó la última instantánea buena (``ultima.json``), para Ajustes › Tu servidor (contrato §17): barata,
+        sin recorrer la casa ni preguntarle nada a Hermes, que es lo que hace ``estado``."""
+        datos = _leer_json(self.trabajo.ruta("ultima.json"))
+        hecha = datos.get("hecha") if isinstance(datos, dict) else None
+        return {"ok": True, "ultima": hecha if isinstance(hecha, int) and not isinstance(hecha, bool) and hecha > 0
+                else None}
+
     def version_reciente(self) -> dict:
         """La versión de Hermes, recordada 10 minutos: ``hermes --version`` tarda, y la pantalla la pide a menudo."""
         ruta = self.trabajo.ruta("version.json")
@@ -1913,6 +1923,8 @@ class Ayudante:
             self.restauraciones
         if orden == "estado":
             return self.estado(), None, None
+        if orden == "ultima":
+            return self.ultima(), None, None
         if orden == "limpiar":
             return dict(self.trabajo.limpiar(), ok=True), None, None
         if orden == "instantanea":
@@ -1947,8 +1959,8 @@ class Ayudante:
         raise Rechazo(400, "orden_desconocida", "Orden desconocida")
 
 
-ORDENES = ("estado", "limpiar", "instantanea", "instantanea-estado", "trozo", "instantanea-borrar", "restauracion",
-           "restauracion-estado", "restauracion-trozo", "aplicar", "restauracion-borrar", "deshacer")
+ORDENES = ("estado", "ultima", "limpiar", "instantanea", "instantanea-estado", "trozo", "instantanea-borrar",
+           "restauracion", "restauracion-estado", "restauracion-trozo", "aplicar", "restauracion-borrar", "deshacer")
 
 
 # MARK: El socket

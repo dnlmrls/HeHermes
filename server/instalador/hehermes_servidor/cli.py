@@ -156,10 +156,12 @@ def _con_ambito(op, sis, ambito, aqui, entrada, salida, terminal) -> int:
              "actualizar": _actualizar,
              "desinstalar": _desinstalar, "canje-limpiar": _canje_limpiar, "cortafuegos": _cortafuegos,
              "pasarela-clave": _pasarela_clave, "borrado-seguro": _borrado_seguro}[op.orden]
-    if op.orden in ("comprobar", "canje-limpiar", "cortafuegos", "pasarela-clave", "borrado-seguro") or \
+    if op.orden in ("comprobar", "canje-limpiar", "cortafuegos", "pasarela-clave", "borrado-seguro", "actualizar") or \
             getattr(op, "plan", False):
         # canje-limpiar tampoco: corre dentro del `systemctl stop` de un instalar que ya tiene el cerrojo.
         # Lo que solo lee no toma el cerrojo: --plan no deja ni un fichero en /run.
+        # Ni actualizar: no cambia nada él, y quien cambia es el `instalar --si` de la versión nueva, que lo toma; con
+        # el de fuera tomado, se pararía en «ya hay otro hehermes-servidor en marcha».
         return orden(op, sis, man, aqui, entrada, salida, terminal, ambito)
     with _cerrojo(sis, ambito.cerrojo):
         return orden(op, sis, man, aqui, entrada, salida, terminal, ambito)
@@ -513,10 +515,10 @@ def _actualizar(op, sis, man, aqui, entrada, salida, terminal, ambito):
                    ": lo que hay es la VPN IKEv2 de una versión anterior, que desde la 0.6.0 ya no se instala ni se "
                    "actualiza (se quita con: sudo hehermes-servidor desinstalar --modo vpn)"))
         return 1
-    ruta_clave = sis.ruta(p.PREFIJO + "/clave-publica.pem")
-    clave = sis.leer_texto(p.PREFIJO + "/clave-publica.pem") or ""
-    if firma.pendiente(clave):
-        salida("error: la clave pública de este paquete es el marcador (%s): no hay firma que comprobar, así que no "
+    # Las de la versión instalada, no las del paquete nuevo: la principal y la de rescate (`firma.CLAVES`).
+    claves = firma.claves(sis, p.PREFIJO)
+    if not claves:
+        salida("error: las claves públicas de este paquete son el marcador (%s): no hay firma que comprobar, así que no "
                "actualizo. Mientras tanto, vuelve a lanzar el comando de la app." % firma.MARCADOR)
         return 1
     # Todo sobre una copia en una carpeta 0700 de root: si se comprobara y se abriera el fichero que se da, quien
@@ -530,7 +532,7 @@ def _actualizar(op, sis, man, aqui, entrada, salida, terminal, ambito):
         except OSError as error:
             salida("error: no puedo leer el paquete o su firma (%s)" % error)
             return 1
-        if not firma.verificar(sis, paquete, sello, ruta_clave):
+        if not firma.verificar_con_alguna(sis, paquete, sello, claves):
             salida("error: la firma de %s no es buena: no lo instalo" % op.paquete)
             return 1
         version = _version_del_paquete(paquete)

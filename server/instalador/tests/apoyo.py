@@ -106,6 +106,67 @@ class SistemaFalso(Sistema):
         return foto
 
 
+#: Lo que lleva en sus claves un paquete sin firmar (`firma.MARCADOR`).
+MARCADOR_DE_CLAVE = b"# PENDIENTE-DE-DANIEL\n"
+
+
+def claves_de_marcador(sis, prefijo):
+    """Las dos claves de lo instalado, de vuelta al marcador. Desde que Daniel creó las suyas (2026-10-05), el paquete
+    lleva claves de verdad: las pruebas de un servidor sin firmas que comprobar las ponen ellas, y no dependen de lo que
+    tenga el repositorio."""
+    for nombre in ("clave-publica.pem", "clave-rescate.pem"):
+        sis.poner(prefijo + "/" + nombre, MARCADOR_DE_CLAVE)
+
+
+def ed25519():
+    """Una clave Ed25519 de usar y tirar, generada ahora: ``(privada, pública en PEM)``. Nunca una de Daniel. Sin
+    `cryptography` (va en el venv de server/avisos) la prueba que la pida se salta."""
+    import unittest
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    except ImportError:
+        raise unittest.SkipTest("sin cryptography (va en el venv de server/avisos)")
+    privada = Ed25519PrivateKey.generate()
+    publica = privada.public_key().public_bytes(serialization.Encoding.PEM,
+                                                serialization.PublicFormat.SubjectPublicKeyInfo)
+    return privada, publica
+
+
+def firmar(privada, ruta: str) -> str:
+    """Lo que hace `openssl pkeyutl -sign -rawin`: los 64 bytes de Ed25519 sobre el fichero entero, en `<ruta>.sig`."""
+    with open(ruta, "rb") as f:
+        sello = privada.sign(f.read())
+    with open(ruta + ".sig", "wb") as f:
+        f.write(sello)
+    return ruta + ".sig"
+
+
+def openssl_que_verifica(args, entrada=None):
+    """`openssl pkeyutl -verify -pubin -inkey <pem> -rawin -in <fichero> -sigfile <firma>` como el OpenSSL 3 del
+    servidor, con `cryptography`: el LibreSSL del Mac no sabe Ed25519. Contesta lo mismo que él, en lo bueno y en lo
+    malo, y a lo que no es esa orden, como un openssl que no la entiende."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import serialization
+    forma = ["openssl", "pkeyutl", "-verify", "-pubin", "-inkey", None, "-rawin", "-in", None, "-sigfile", None]
+    if len(args) != len(forma) or any(f is not None and a != f for a, f in zip(args, forma)):
+        return Resultado(1, "", "pkeyutl: Unknown option\n")
+    try:
+        with open(args[5], "rb") as f:
+            publica = serialization.load_pem_public_key(f.read())
+        with open(args[8], "rb") as f:
+            datos = f.read()
+        with open(args[10], "rb") as f:
+            sello = f.read()
+    except (OSError, ValueError):
+        return Resultado(1, "", "Could not read\n")
+    try:
+        publica.verify(sello, datos)
+    except (InvalidSignature, AttributeError, TypeError):
+        return Resultado(1, "Signature Verification Failure\n", "")
+    return Resultado(0, "Signature Verified Successfully\n", "")
+
+
 def bien(salida: str = "") -> "callable":
     return lambda args, entrada: Resultado(0, salida, "")
 

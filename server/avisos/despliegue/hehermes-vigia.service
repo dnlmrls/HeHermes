@@ -11,8 +11,10 @@ Wants=hehermes-leer-media.socket
 Wants=hehermes-respaldo.socket
 # Lo que la app le manda a Hermes (/avisos/v1/entrada, desde la 1.5.2). Sin él, esas rutas dan 503.
 Wants=hehermes-entrada.socket
+# Actualizar el servidor desde la app (/avisos/v1/servidor/actualizar, desde la 1.5.5). Sin él, esas rutas dan 503.
+Wants=hehermes-actualizar.socket
 After=network-online.target nginx.service hehermes-vigia.socket hehermes-rele.socket hehermes-leer-media.socket
-After=hehermes-respaldo.socket hehermes-entrada.socket
+After=hehermes-respaldo.socket hehermes-entrada.socket hehermes-actualizar.socket
 
 [Service]
 Type=simple

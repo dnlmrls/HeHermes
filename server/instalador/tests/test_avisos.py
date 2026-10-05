@@ -30,6 +30,7 @@ LLAVE = base64.urlsafe_b64encode(bytes(range(40, 72))).rstrip(b"=").decode()
 LECTOR = apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-leer-media"
 RESPALDO = apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-respaldo"
 ENTRADA = apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-entrada"
+ACTUALIZAR = apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-actualizar"
 
 
 def codigo(credencial=CREDENCIAL, direccion=RELE, puerto=61999, huella=HUELLA):
@@ -359,7 +360,7 @@ class SinCodigo(Base):
                       "100.64.0.0/10 fc00::/7 fe80::/10\n", unidad)
         self.assertNotIn("IPAddressDeny=any", unidad)
         self.assertIn("Wants=network-online.target hehermes-leer-media.socket hehermes-respaldo.socket "
-                      "hehermes-entrada.socket\n", unidad)
+                      "hehermes-entrada.socket hehermes-actualizar.socket\n", unidad)
         for linea in ("User=hh-vigia", "ProtectSystem=strict", "ProtectHome=yes", "NoNewPrivileges=yes",
                       "CapabilityBoundingSet=", "PrivateTmp=yes"):
             self.assertIn(linea + "\n", unidad, "la jaula de siempre")
@@ -781,6 +782,118 @@ class EntradaDeFicherosSinRoot(Base):
         for ruta in (a.entrada, a.unidad_entrada_socket, a.unidad_entrada, "/home/hermes/.hermes/entrada"):
             self.assertFalse(self.sis.existe(ruta), ruta)
         self.assertIn(["systemctl", "--user", "disable", "--now", "hehermes-entrada.socket"], self.sis.ordenes)
+
+
+class ActualizarDesdeLaApp(Base):
+    """El ayudante que actualiza el servidor (desde la 0.10.10), con root: como en el VPS de Daniel."""
+
+    def test_con_root_el_ayudante_su_socket_su_jaula_y_lo_que_lee_el_vigia(self):
+        self.assertEqual(self.orden("instalar", "--si", "--iphone", "mi-iphone"), 0, self.salida)
+        a = self.ambito()
+        self.assertEqual(self.sis.leer(a.actualizar), ACTUALIZAR.read_bytes())
+        self.assertEqual(self.sis.modo(a.actualizar), 0o755)
+        self.assertEqual(self.sis.leer("/opt/hehermes-servidor/hehermes-actualizar"), ACTUALIZAR.read_bytes(),
+                         "y su copia con el instalador, para repararlo desde lo instalado")
+        ini = self.sis.leer_texto(a.vigia_ini)
+        self.assertIn("\n[servidor]\n", ini)
+        self.assertIn("instalador = /opt/hehermes-servidor\n", ini)
+        self.assertIn("ayudante = /run/hehermes-actualizar.sock\n", ini)
+        self.assertIn("servicios = hehermes-pasarela.service hehermes-vigia.service hehermes-leer-media.socket "
+                      "hehermes-respaldo.socket hehermes-entrada.socket hehermes-actualizar.socket\n", ini)
+        self.assertIn("hermes = hermes-gateway.service\n", ini)
+        # El socket y la jaula son los de server/avisos/despliegue, línea a línea (menos los comentarios).
+        for nuestra, suya in ((a.unidad_actualizar_socket, "hehermes-actualizar.socket"),
+                              (a.unidad_actualizar, "hehermes-actualizar@.service")):
+            unidad = activas(self.sis.leer_texto(nuestra))
+            despliegue = activas((ACTUALIZAR.parent / suya).read_text())
+            for clave in set(despliegue) | set(unidad):
+                if clave != "Documentation":
+                    self.assertEqual(unidad.get(clave), despliegue.get(clave), (suya, clave))
+        vigia = activas(self.sis.leer_texto(a.unidad_vigia))
+        self.assertIn("hehermes-actualizar.socket", " ".join(vigia["Wants"]).split())
+        self.assertNotIn("hehermes-actualizar.socket", " ".join(vigia.get("Requires", [])))
+        self.assertIn("hehermes-actualizar.socket", self.falso.activos)
+        self.assertIn("hehermes-actualizar.socket", self.manifiesto()["unidades"])
+        self.assertIn("bien actualizar desde la app: el socket de su ayudante está en marcha "
+                      "(/run/hehermes-actualizar.sock)", self.salida)
+        self.assertEqual(self.orden("instalar", "--plan"), 0, self.salida)
+        self.assertIn("Todo al día: 0 cambios.", self.salida)
+        # Desinstalar se lo lleva, y su carpeta (el estado de la última y lo que dijo el instalador).
+        self.sis.poner("/var/lib/hehermes-actualizar/estado.json", b'{"estado": "hecho"}', modo=0o600)
+        self.assertEqual(self.orden("desinstalar", "--si"), 0, self.salida)
+        for ruta in (a.actualizar, a.unidad_actualizar_socket, a.unidad_actualizar, "/var/lib/hehermes-actualizar"):
+            self.assertFalse(self.sis.existe(ruta), ruta)
+        self.assertNotIn("hehermes-actualizar.socket", self.falso.activos)
+
+    def test_lo_lee_el_vigia_de_verdad(self):
+        import os
+        import tempfile
+        sys.path.insert(0, str(apoyo.REPO / "server" / "avisos"))
+        self.addCleanup(sys.path.remove, str(apoyo.REPO / "server" / "avisos"))
+        from hehermes_avisos.vigia.configuracion import ConfigVigia
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+        with tempfile.TemporaryDirectory() as carpeta:
+            ruta = os.path.join(carpeta, "vigia.ini")
+            with open(ruta, "w") as f:
+                f.write(self.sis.leer_texto(self.ambito().vigia_ini))
+            config = ConfigVigia.leer(ruta)
+        self.assertEqual((config.servidor_instalador, config.servidor_ayudante, config.servidor_hermes),
+                         ("/opt/hehermes-servidor", "/run/hehermes-actualizar.sock", "hermes-gateway.service"))
+        self.assertEqual(config.servidor_servicios[:2], ("hehermes-pasarela.service", "hehermes-vigia.service"))
+
+    def test_con_los_avisos_a_mano_no_lo_pone_el_instalador(self):
+        """En el VPS de Daniel lo pone `instalar.sh` con los avisos; el instalador solo deja su copia en /opt."""
+        self.sis.carpeta(avisos.A_MANO, 0o755)
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+        a = self.ambito()
+        for ruta in (a.actualizar, a.unidad_actualizar_socket, a.unidad_actualizar):
+            self.assertFalse(self.sis.existe(ruta), ruta)
+        self.assertTrue(self.sis.existe("/opt/hehermes-servidor/hehermes-actualizar"))
+
+    def test_la_unidad_de_hermes_solo_si_el_vigia_la_puede_mirar(self):
+        from hehermes_servidor import ambito as amb
+        from hehermes_servidor.gestor import Gestor
+
+        class Hermes:
+            def __init__(self, gestor):
+                self.gestor = gestor
+
+        root, usuario = amb.de_root(), amb.de_usuario("hermes", "/home/hermes", 1000)
+        casos = ((root, Gestor("sistema", "hermes-gateway-perfil.service"), "hermes-gateway-perfil.service"),
+                 (root, Gestor("usuario", "hermes-gateway.service", "hermes", 1000), None),
+                 (root, Gestor("docker", "a" * 64), None),
+                 (root, None, None),
+                 (root, Gestor("sistema", "hermes\\x2dgateway.service"), None),
+                 (usuario, Gestor("usuario", "hermes-gateway.service", "hermes", 1000), "usuario:hermes-gateway.service"),
+                 (usuario, Gestor("usuario", "hermes-gateway.service", "otro", 1001), None),
+                 (usuario, Gestor("sistema", "hermes-gateway.service"), "hermes-gateway.service"))
+        for a, gestor, esperada in casos:
+            with self.subTest(root=a.root, gestor=gestor):
+                self.assertEqual(avisos.unidad_de_hermes_para_el_vigia(Hermes(gestor), a), esperada)
+
+
+class ActualizarDesdeLaAppSinRoot(Base):
+    euid = 1000
+    cuenta = ("hermes", "/home/hermes", 1000)
+
+    def servidor(self):
+        sis, falso = sf.servidor(usuario="hermes")
+        sis.carpeta("/run/user/1000", 0o700)
+        return sis, falso
+
+    def test_sin_root_no_hay_ayudante_y_el_vigia_lo_sabe(self):
+        """Instalar es cosa de root: sin root, la app enseña cómo hacerlo a mano (el comando o la frase)."""
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+        a = self.ambito()
+        self.assertIsNone(a.actualizar)
+        self.assertFalse(self.sis.existe(a.unidad_actualizar_socket))
+        ini = self.sis.leer_texto(a.vigia_ini)
+        self.assertIn("instalador = /home/hermes/.local/share/hehermes-servidor\n", ini)
+        self.assertIn("\nayudante =\n", ini.split("[servidor]")[1])
+        self.assertIn("servicios = usuario:hehermes-pasarela.service usuario:hehermes-vigia.service "
+                      "usuario:hehermes-leer-media.socket usuario:hehermes-respaldo.socket "
+                      "usuario:hehermes-entrada.socket\n", ini)
+        self.assertNotIn("hehermes-actualizar", self.sis.leer_texto(a.unidad_vigia))
 
 
 class ElPaquete(unittest.TestCase):

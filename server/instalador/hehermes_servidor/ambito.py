@@ -97,6 +97,13 @@ class Ambito:
             self.socket_entrada = "/run/user/%d/hehermes-entrada.sock" % uid
         self.unidad_entrada_socket = self.unidades + "/hehermes-entrada.socket"
         self.unidad_entrada = self.unidades + "/hehermes-entrada@.service"
+        # El ayudante que actualiza el servidor desde la app (desde la 0.10.10): solo con root, porque actualizar es
+        # instalar (sin root, la app enseña cómo hacerlo a mano). Como los demás, en /usr/local/libexec, con su socket.
+        self.actualizar = "/usr/local/libexec/hehermes-actualizar" if root else None
+        self.socket_actualizar = "/run/hehermes-actualizar.sock" if root else None
+        self.carpeta_actualizar = "/var/lib/hehermes-actualizar" if root else None
+        self.unidad_actualizar_socket = self.unidades + "/hehermes-actualizar.socket"
+        self.unidad_actualizar = self.unidades + "/hehermes-actualizar@.service"
         self.manifiesto = self.carpeta_config + "/instalacion.json"
         self.pasarela_ini = self.carpeta_pasarela + "/pasarela.ini"
         self.cert = self.carpeta_pasarela + "/cert.pem"

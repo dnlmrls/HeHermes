@@ -12,6 +12,8 @@
   el estado, las instantáneas y sus trozos, y restaurar; los trozos van en binario, y los cuerpos, hasta 4 MiB + 64 KiB
 - ``/avisos/v1/entrada/…``                                mandarle un fichero a Hermes (``entrada.py``, contrato §16,
   desde la 1.5.2): las subidas y sus trozos, en binario, con cuerpos de hasta 4 MiB + 64 KiB
+- ``/avisos/v1/servidor``, ``…/servidor/actualizar``       Ajustes › Tu servidor (``servidor.py``, contrato §17, desde
+  la 1.5.5): el estado del servidor, sin secretos, y actualizarlo con el ayudante que actualiza
 
 Todo contesta 204 si va bien, y los errores con el envoltorio del api_server de Hermes, que es el que entiende la app.
 Menos dos (spec 2026-09-28, «Avisos sin comandos», Contrato C): el alta contesta ``200 {"envio": …}``, con qué va a
@@ -52,6 +54,8 @@ from .fichero import PATRON_SESION, Descarga, Ficheros, disposicion, parametros
 from .respaldo import PREFIJO as PREFIJO_RESPALDO
 from .respaldo import TOPE_CUERPO as TOPE_RESPALDO
 from .respaldo import Respaldos
+from .servidor import PREFIJO as PREFIJO_SERVIDOR
+from .servidor import Servidor
 
 registro = logging.getLogger("vigia.api")
 
@@ -120,7 +124,8 @@ class AppVigia:
 
     def __init__(self, almacen: Almacen, mensajero: Mensajero, *, secreto_tunel: str, caducidad_prueba: int = 300,
                  reloj=time.time, al_moverse=None, ficheros: Ficheros | None = None,
-                 respaldos: Respaldos | None = None, exportaciones=None, entradas: Entradas | None = None):
+                 respaldos: Respaldos | None = None, exportaciones=None, entradas: Entradas | None = None,
+                 servidor: Servidor | None = None):
         if not secreto_tunel:
             raise ValueError("sin el secreto del túnel, la API del vigía quedaría abierta a cualquier proceso local")
         self.almacen = almacen
@@ -139,6 +144,8 @@ class AppVigia:
         self.exportaciones = exportaciones
         # Lo que la app le manda a Hermes (`entrada.py`). Sin el ayudante, esas rutas contestan 503.
         self.entradas = entradas
+        # Ajustes › Tu servidor (`servidor.py`). Sin él, como un vigía de antes: 404 `ruta_desconocida`.
+        self.servidor = servidor
 
     def viene_del_tunel(self, valor: str | None) -> bool:
         """Si la petición trae el secreto que pone nginx. Comparado en tiempo constante."""
@@ -300,6 +307,8 @@ class ManejadorVigia(ManejadorJSON):
             return self._respaldo(app)
         elif ruta.startswith(PREFIJO_ENTRADA):
             return self._entrada(app)
+        elif ruta == PREFIJO_SERVIDOR or ruta.startswith(PREFIJO_SERVIDOR + "/"):
+            return self._servidor(app)
         elif ruta == "/avisos/v1/fichero":
             self._exigir(metodo, "GET")
             sesion, ruta_fichero = parametros(self.path.partition("?")[2])
@@ -355,6 +364,13 @@ class ManejadorVigia(ManejadorJSON):
             raise ErrorHTTP(503, "entrada_no_disponible", "Este vigía no tiene el ayudante de la entrada")
         self.tope_cuerpo = TOPE_ENTRADA
         estado, objeto, cabeceras = app.entradas.atender(self.command, self.ruta, self.leer_cuerpo, self.headers)
+        return self.enviar_json(estado, objeto, cabeceras)
+
+    def _servidor(self, app: AppVigia) -> None:
+        """Ajustes › Tu servidor: el estado (sin secretos) y la actualización."""
+        if app.servidor is None:
+            raise ErrorHTTP(404, "ruta_desconocida", "Ruta desconocida")
+        estado, objeto, cabeceras = app.servidor.atender(self.command, self.ruta, self.leer_cuerpo)
         return self.enviar_json(estado, objeto, cabeceras)
 
     def _enviar_descarga(self, descarga: Descarga) -> None:

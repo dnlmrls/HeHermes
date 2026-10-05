@@ -32,7 +32,7 @@ URL_BASE = "https://github.com/dnlmrls/HeHermes/releases/download"
 # Un instante fijo para todo lo del paquete: con la hora de verdad, cada vez saldría otra suma.
 INSTANTE = 1_788_220_800  # 2026-09-01T00:00:00Z
 EJECUTABLES = {"hehermes-servidor", "hehermes-pasarela", "hehermes-dispositivo", "hehermes-leer-media",
-               "hehermes-respaldo", "hehermes-entrada"}
+               "hehermes-respaldo", "hehermes-entrada", "hehermes-actualizar"}
 
 
 def ficheros():
@@ -40,16 +40,19 @@ def ficheros():
     el código de los avisos (`server/avisos/hehermes_avisos`, solo los .py): `avisos` pone el vigía, que habla con el
     relé de Daniel (spec 2026-09-28). Ni sus pruebas ni su despliegue a mano; de él, desde la 0.8.0, solo el lector de
     ficheros (`hehermes-leer-media`), que `instalar` pone siempre, desde la 0.10.0 el ayudante de la copia en iCloud
-    (`hehermes-respaldo`) y desde la 0.10.6 el de la entrada (`hehermes-entrada`)."""
+    (`hehermes-respaldo`), desde la 0.10.6 el de la entrada (`hehermes-entrada`) y desde la 0.10.10 el que actualiza
+    (`hehermes-actualizar`) y la clave de rescate de las firmas (`clave-rescate.pem`)."""
     lista = [("hehermes-servidor", os.path.join(AQUI, "hehermes-servidor")),
              ("hehermes-pasarela", os.path.join(AQUI, "hehermes-pasarela")),
              ("clave-publica.pem", os.path.join(AQUI, "clave-publica.pem")),
+             ("clave-rescate.pem", os.path.join(AQUI, "clave-rescate.pem")),
              ("requirements-canje.txt", os.path.join(AQUI, "requirements-canje.txt")),
              ("README.md", os.path.join(AQUI, "README.md")),
              ("hehermes-dispositivo", os.path.join(SERVER, "vpn", "hehermes-dispositivo")),
              ("hehermes-leer-media", os.path.join(SERVER, "avisos", "despliegue", "hehermes-leer-media")),
              ("hehermes-respaldo", os.path.join(SERVER, "avisos", "despliegue", "hehermes-respaldo")),
-             ("hehermes-entrada", os.path.join(SERVER, "avisos", "despliegue", "hehermes-entrada"))]
+             ("hehermes-entrada", os.path.join(SERVER, "avisos", "despliegue", "hehermes-entrada")),
+             ("hehermes-actualizar", os.path.join(SERVER, "avisos", "despliegue", "hehermes-actualizar"))]
     for nombre in sorted(os.listdir(os.path.join(AQUI, "hehermes_servidor"))):
         if nombre.endswith(".py"):
             lista.append(("hehermes_servidor/" + nombre, os.path.join(AQUI, "hehermes_servidor", nombre)))

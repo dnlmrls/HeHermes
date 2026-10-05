@@ -289,6 +289,46 @@ ha quedado: `<HERMES_HOME>/entrada/<AAAA-MM-DD>/<nombre>`.
 subidas a medias y la carpeta) y `… --dias=30 limpiar`. Lo que pasa, en `journalctl -u 'hehermes-entrada@*'`: el
 principio del id, los tamaños, los números de trozo y el resultado; nunca el nombre, la ruta ni nada de dentro.
 
+## Tu servidor, y actualizarlo desde la app (desde la 1.5.5)
+
+Spec `docs/superpowers/specs/2026-10-04-actualizar-el-servidor-design.md`, contrato `server/API-CONTRACT.md` §17. La app
+enseña en Ajustes › Tu servidor cómo está el servidor y, si su instalador es más viejo que el que ella conoce, ofrece
+«Actualizar», con un toque y sin pegar ningún comando.
+
+- **El vigía** atiende `GET /avisos/v1/servidor` (`vigia/servidor.py`): las versiones del instalador (de su carpeta,
+  `[servidor] instalador`), de los avisos y de Hermes (su `/health`), si Hermes contesta, lo libre en el disco de su casa
+  (se lo pregunta al ayudante de la entrada, que la ve), el estado de las unidades de `[servidor] servicios` y
+  `[servidor] hermes` (`systemctl is-active`, sin root), la última instantánea del ayudante de la copia (su orden
+  `ultima`) y la actualización en curso. Todo a la vez y como mucho 5 s cada parte; lo que no se sabe, `null`. **Sin
+  secretos**: lo que dicen los ayudantes se vuelve a filtrar. Y `/avisos/v1/servidor/actualizar` (`POST` con la versión
+  y la suma que lleva la app, y `GET` para ver cómo va), que se lo pasa al ayudante que actualiza.
+- **El ayudante** es `/usr/local/libexec/hehermes-actualizar` (`despliegue/`), Python sin dependencias, lanzado por
+  `hehermes-actualizar.socket` (`/run/hehermes-actualizar.sock`, `root:hh-vigia 0660`, `Accept=yes`) en un
+  `hehermes-actualizar@.service` por conexión, **de root** (`systemd-run` solo se lo deja a root) **y sin nada más**:
+  ninguna capacidad, sin red, de solo lectura salvo su carpeta (`/var/lib/hehermes-actualizar`). Solo mira y lanza:
+  - la forma de la versión (tres números) y de la suma, y nada más en la petición: **la URL es fija**, la del paquete
+    instalado (`URL_BASE`, la de `empaquetar`);
+  - **nunca hacia atrás** (ni la instalada ni una anterior), **una a la vez** (`actualizar.lock`) y **tres por hora**
+    (`intentos.json`);
+  - y lanza el trabajo en **su propia unidad**, `systemd-run --unit hehermes-actualizacion --collect`, sin jaula
+    (instalar es tocarlo todo): la versión nueva reinicia el vigía, la pasarela y este socket, y el trabajo no muere con
+    ninguno.
+- **El trabajo** descarga el paquete y su `.sig` (solo por HTTPS, y redirecciones solo a HTTPS), comprueba **la suma
+  que manda la app** y **la firma** con la clave principal o la de rescate del instalador instalado
+  (`/opt/hehermes-servidor/clave-publica.pem` y `clave-rescate.pem`), y que por dentro es esa versión, y lanza
+  `hehermes-servidor actualizar --paquete … --firma …`, que la vuelve a comprobar. Su estado, con su hora, en
+  `estado.json`: `descargando`, `comprobando`, `instalando`, `hecho` o `fallo` con su motivo. Con las dos claves de
+  marcador (un instalador de antes de que Daniel tuviera las suyas), se niega sin descargar nada (`sin_firmas`): ese
+  servidor se actualiza una vez a mano.
+- **En el VPS de Daniel** lo pone `instalar.sh`, con los demás ayudantes. Ahí actualiza lo del instalador (la pasarela,
+  `/opt/hehermes-servidor`); los avisos siguen con `instalar.sh`.
+- **Quitarlo:** `sudo …/instalar.sh --desinstalar-actualizar` (no con una actualización en marcha). Su carpeta se queda.
+
+**Para root, a mano:** `sudo /usr/bin/python3 -I -S /usr/local/libexec/hehermes-actualizar estado`. Lo que pasa, en
+`journalctl -u 'hehermes-actualizar@*' -u hehermes-actualizacion`: la versión, la fase y el resultado. Lo que dijo el
+instalador (que puede llevar rutas y nombres de los iPhone), en `/var/lib/hehermes-actualizar/registro.txt`, de root, y
+no en el journal.
+
 ## Probar de punta a punta
 
 1. Con la VPN puesta, en Safari del iPhone: `http://10.77.0.1/avisos/v1/salud` → `{"estado": "ok", "servicio": "vigia", …}`.
@@ -323,13 +363,34 @@ Leyendo el historial como la app (el SSE de un run es de un solo uso: si el vig�
   o de una conversación sin ninguna petición; y la entrega de un subagente (`display_kind: async_delegation_complete`)
   solo cuando nadie la va a contestar (el vigía con `[entregas] contestar = no`, o tras una cadena de delegaciones).
 - **Aprobación pendiente y error**: no dejan rastro fiable en el historial. Salen del estado del run
-  (`GET /v1/runs/{id}`), y para eso el vigía necesita el `run_id`, que solo tiene la app. **Hoy no llegan**: hace falta
-  la ampliación de abajo.
+  (`GET /v1/runs/{id}`), y para eso el vigía necesita el `run_id`, que solo tiene la app: se lo da en el primer plano
+  (la ampliación de abajo). Una aprobación se puede contestar desde el propio aviso desde la 1.5.4 (abajo).
 
 No se avisa de nada con la app delante (ni de lo que llegó mientras lo estaba, aunque el vigía lo lea después), ni de
 lo escrito hace más de 15 minutos, ni de nada anterior a la primera vuelta del vigía. Desde la 1.5.3, tampoco de las
 copias que deja una compactación: Hermes vuelve a escribir la cola de la conversación con ids nuevos y sus horas de
 siempre, y el vigía recuerda la hora de la última respuesta que vio en cada una (contrato §7).
+
+### Aprobar y denegar desde el aviso (desde la 1.5.4)
+
+Spec `docs/superpowers/specs/2026-10-04-aprobar-desde-el-aviso-design.md`. El aviso de una aprobación sale con
+«Aprobar» y «Denegar», y la app la contesta sin abrirse (`POST /v1/runs/{id}/approval`, contrato §5). Para eso, dentro
+del sobre y nunca en claro, el contenido lleva además `aprobacion`, y su `texto` es la petición entera, con sus líneas:
+
+```json
+{"tipo": "aprobacion", "sesion": "api_…", "titulo": "Limpieza",
+ "texto": "Pide permiso para ejecutar: rm -rf /tmp/x \\\n  --one-file-system",
+ "aprobacion": {"run": "run_…", "peticion": "<request_id>", "opciones": ["once", "session", "always", "deny"]}}
+```
+
+- Solo si Hermes da el `request_id` de la petición: sin él, `POST …/approval` resuelve «la más antigua», que puede no
+  ser la del aviso.
+- Solo con la vista previa en «Siempre»: con las otras, el aviso no dice qué se pide, y no se aprueba lo que no se ve.
+- Solo si cabe entera en el push: el claro del sobre no pasa de `TOPE_CLARO` (2800 bytes), y así el push no pasa de los
+  4096 que acepta el relé. Si no cabe, el aviso de siempre (una línea de 200 caracteres) y sin `aprobacion`.
+- `opciones` son las `choices` de Hermes tal cual, o vacías si no las da (la app entiende entonces `once` y `deny`).
+
+Una app de antes no lee `aprobacion` y enseña el texto; uno largo, recortado.
 
 ### Las entregas de los subagentes: el vigía lanza el turno que falta
 

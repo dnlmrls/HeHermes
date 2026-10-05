@@ -1,0 +1,20 @@
+# /etc/systemd/system/hehermes-actualizar.socket
+# La puerta del ayudante que actualiza el servidor desde la app (despliegue/hehermes-actualizar, contrato §17). Solo root
+# y el grupo hh-vigia pueden conectarse (0660), y el ayudante lo vuelve a mirar con SO_PEERCRED. Con Accept=yes, systemd
+# lanza un ayudante de root por cada conexión, con su jaula (hehermes-actualizar@.service): solo mira y lanza, y la
+# actualización corre en su propia unidad (hehermes-actualizacion).
+[Unit]
+Description=HeHermes: el socket del ayudante que actualiza el servidor
+
+[Socket]
+ListenStream=/run/hehermes-actualizar.sock
+SocketUser=root
+SocketGroup=hh-vigia
+SocketMode=0660
+Accept=yes
+# El estado y, de vez en cuando, una petición de actualizar: esto es el tope por si algo va mal.
+MaxConnections=4
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

@@ -14,6 +14,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -51,13 +52,13 @@ class ClienteHermes:
         self.plazo = plazo
         self._abridor = abridor or comun.abridor()
 
-    def _get(self, ruta: str, consulta: dict | None = None) -> object:
+    def _get(self, ruta: str, consulta: dict | None = None, plazo: float | None = None) -> object:
         url = self.base + ruta + ("?" + urllib.parse.urlencode(consulta) if consulta else "")
         peticion = urllib.request.Request(url, method="GET", headers={"Accept": "application/json"})
         if self._clave:
             peticion.add_header("Authorization", f"Bearer {self._clave}")
         try:
-            with self._abridor.open(peticion, timeout=self.plazo) as respuesta:
+            with self._abridor.open(peticion, timeout=self.plazo if plazo is None else plazo) as respuesta:
                 return json.loads(respuesta.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
             error.close()
@@ -71,6 +72,15 @@ class ClienteHermes:
             raise ErrorHermes(f"no se puede hablar con Hermes: {razon}") from None
         except ValueError:
             raise ErrorHermes("Hermes contestó algo que no es JSON") from None
+
+    def salud(self, plazo: float = 3.0) -> str | None:
+        """``GET /health`` (sin clave, la única ruta que no la pide; se manda igual): si contesta, con su versión
+        (``{"status": "ok", "platform": "hermes-agent", "version": "0.21.3"}``), o ``None`` si no la dice con su forma.
+        Si no contesta, ``ErrorHermes``. Para Ajustes › Tu servidor (``servidor.py``)."""
+        datos = self._get("/health", plazo=plazo)
+        version = datos.get("version") if isinstance(datos, dict) else None
+        return version if isinstance(version, str) and re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,39}", version) \
+            else None
 
     def sesiones(self) -> list:
         """La bandeja, la misma que pide la app: ``GET /api/sessions?source=api_server&limit=200``."""

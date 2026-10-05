@@ -416,7 +416,7 @@ def _avisos(sis, man):
 
 
 def _firma(sis):
-    if firma.pendiente(sis.leer_texto(p.PREFIJO + "/clave-publica.pem") or ""):
+    if not firma.claves(sis, p.PREFIJO):
         return (AVISO, "actualizar: la clave de las firmas todavía es el marcador, así que actualizar se niega (lo "
                        "nuevo, con el comando de la app)")
-    return (BIEN, "actualizar: solo con un paquete firmado con la clave de Daniel")
+    return (BIEN, "actualizar: solo con un paquete firmado con una clave de Daniel (la principal o la de rescate)")

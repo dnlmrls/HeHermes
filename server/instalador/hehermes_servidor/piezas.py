@@ -429,6 +429,8 @@ def pasarela_ini(ambito, puerto: int, puerto_hermes: int, env: str, direccion: s
 USUARIO_VIGIA = "hh-vigia"
 UNIDAD_VIGIA = "hehermes-vigia.service"
 SOCKET_VIGIA = "hehermes-vigia.socket"
+#: Una unidad que el vigía sabe mirar con `systemctl is-active` (`hehermes_avisos.vigia.servidor.unidad_valida`).
+_UNIDAD_DEL_VIGIA = re.compile(r"^(usuario:)?[A-Za-z0-9][A-Za-z0-9:_.@-]{0,199}\.(service|socket|timer)$")
 
 
 def url_del_rele(direccion: str, puerto: int) -> str:
@@ -449,7 +451,8 @@ def _ip_del_rele(direccion: str) -> str | None:
 
 def vigia_ini(ambito, puerto_hermes: int, env: str, casa_hermes: str, direccion: str | None = None,
               puerto: int | None = None, huella: str | None = None, lector: str | None = None,
-              respaldo: str | None = None, entrada: str | None = None) -> str:
+              respaldo: str | None = None, entrada: str | None = None, actualizar: str | None = None,
+              servicios=(), hermes_unidad: str | None = None) -> str:
     """Lo que lee el vigía (`hehermes_avisos.vigia.configuracion`). Sin secretos: dice dónde están.
 
     Con un código de avisos (`direccion`, `puerto`, `huella`), el relé es el de otra máquina (el de Daniel), por HTTPS
@@ -457,7 +460,9 @@ def vigia_ini(ambito, puerto_hermes: int, env: str, casa_hermes: str, direccion:
     credencial ni relé fijo: `[rele] url` vacía, y cada aviso va con el permiso que la app le da en el alta de cada
     iPhone, con la dirección y la huella del relé que trae con él. `lector`: el socket del lector de ficheros;
     `respaldo`, el del ayudante de la copia en iCloud; `entrada`, el del ayudante que recibe lo que la app le manda a
-    Hermes (sus topes, los de serie del vigía)."""
+    Hermes (sus topes, los de serie del vigía). Y desde la 0.10.10, lo de Ajustes › Tu servidor: `actualizar`, el socket
+    del ayudante que actualiza (solo con root), y las unidades cuyo estado se enseña (`servicios`, con «usuario:»
+    delante las de usuario, y la de Hermes, `hermes_unidad`, si el vigía la puede mirar)."""
     if not isinstance(puerto_hermes, int) or not 0 < puerto_hermes < 65536:
         raise ValueError("puerto de Hermes no válido: %r" % (puerto_hermes,))
     if direccion is None:
@@ -479,6 +484,20 @@ def vigia_ini(ambito, puerto_hermes: int, env: str, casa_hermes: str, direccion:
     recibir = ("# El ayudante de la entrada (/avisos/v1/entrada/…): lo que la app le manda a Hermes.\n"
                "ayudante = %s\n" % _ruta_segura(entrada) if entrada else
                "# Sin el ayudante de la entrada (/avisos/v1/entrada/…): esas rutas contestan 503.\nayudante =\n")
+    for unidad in tuple(servicios) + ((hermes_unidad,) if hermes_unidad else ()):
+        if not _UNIDAD_DEL_VIGIA.fullmatch(unidad):
+            raise ValueError("unidad que el vigía no sabría mirar: %r" % unidad)
+    servidor = (
+        "# Lo que enseña Ajustes › Tu servidor (GET /avisos/v1/servidor): la versión del instalador, de aquí.\n"
+        "instalador = %s\n" % _ruta_segura(ambito.prefijo)
+        + ("# El ayudante que actualiza el servidor desde la app (/avisos/v1/servidor/actualizar).\n"
+           "ayudante = %s\n" % _ruta_segura(actualizar) if actualizar else
+           "# Sin el ayudante que actualiza (sin root no hay: actualizar es instalar): la app enseña cómo hacerlo a\n"
+           "# mano.\nayudante =\n")
+        + "# El estado de estas unidades, con systemctl is-active (con «usuario:» delante, --user).\n"
+        "servicios = %s\n" % " ".join(servicios)
+        + "# La de Hermes (vacía si el vigía no la puede mirar: en tmux, en un contenedor, de otro usuario).\n"
+        "hermes = %s\n" % (hermes_unidad or ""))
     return (
         CABECERA
         + "# El vigía de avisos de HeHermes (server/avisos/README.md): lee a Hermes, cifra cada aviso para cada iPhone y\n"
@@ -504,9 +523,12 @@ def vigia_ini(ambito, puerto_hermes: int, env: str, casa_hermes: str, direccion:
         "\n"
         "[entrada]\n"
         "%s"
+        "\n"
+        "[servidor]\n"
+        "%s"
     ) % (VIGIA, _ruta_segura(ambito.base_vigia), _ruta_segura(ambito.secreto_vigia), puerto_hermes,
          _ruta_segura(ambito.clave_hermes_vigia if ambito.root else env), rele, ficheros, _ruta_segura(casa_hermes),
-         copia, recibir)
+         copia, recibir, servidor)
 
 
 def unidad_vigia_socket() -> str:
@@ -594,9 +616,9 @@ def unidad_vigia(ambito, direccion_rele: str | None) -> str:
         + "# El vigía de avisos de HeHermes: lee a Hermes (sin tocarlo) y pide los avisos al relé.\n"
         "[Unit]\n"
         "Description=HeHermes: vigía de avisos\n"
-        "Wants=network-online.target %s %s %s\n"
+        "Wants=network-online.target %s %s %s %s\n"
         "Requires=%s\n"
-        "After=network-online.target %s %s %s %s\n"
+        "After=network-online.target %s %s %s %s %s\n"
         "\n"
         "[Service]\n"
         "Type=simple\n"
@@ -628,8 +650,8 @@ def unidad_vigia(ambito, direccion_rele: str | None) -> str:
         "[Install]\n"
         "WantedBy=multi-user.target\n"
         "Also=%s\n"
-    ) % (SOCKET_LECTOR, SOCKET_RESPALDO, SOCKET_ENTRADA, SOCKET_VIGIA, SOCKET_VIGIA, SOCKET_LECTOR, SOCKET_RESPALDO,
-         SOCKET_ENTRADA, USUARIO_VIGIA, USUARIO_VIGIA, orden, red,
+    ) % (SOCKET_LECTOR, SOCKET_RESPALDO, SOCKET_ENTRADA, SOCKET_ACTUALIZAR, SOCKET_VIGIA, SOCKET_VIGIA, SOCKET_LECTOR,
+         SOCKET_RESPALDO, SOCKET_ENTRADA, SOCKET_ACTUALIZAR, USUARIO_VIGIA, USUARIO_VIGIA, orden, red,
          ambito.carpeta_pasarela, ambito.carpeta_config, comun, SOCKET_VIGIA)
 
 
@@ -1050,3 +1072,101 @@ def unidad_entrada(ambito, hermes_home: str, usuario_hermes: str | None = None) 
         "-/var/lib/hehermes-pasarela -/var/lib/hehermes-rele-publico -/var/lib/hehermes-respaldo\n"
         "InaccessiblePaths=-/etc/nginx -/etc/swanctl -/etc/strongswan -/etc/ipsec.secrets -/etc/ipsec.d -/etc/wireguard\n"
     ) % (_ruta_segura(ambito.entrada), casa, comun, usuario, _JAULA_ENTRADA, casa, CARPETA_ENTRADA)
+
+
+# MARK: El ayudante que actualiza el servidor (spec 2026-10-04, desde la 0.10.10)
+
+SOCKET_ACTUALIZAR = "hehermes-actualizar.socket"
+
+
+def unidad_actualizar_socket() -> str:
+    """Solo con root (actualizar es instalar): `/run/hehermes-actualizar.sock`, de root y del grupo `hh-vigia` (0660),
+    como en el VPS de Daniel (`server/avisos/despliegue/hehermes-actualizar.socket`)."""
+    return (
+        CABECERA
+        + "# La puerta del ayudante que actualiza el servidor desde la app (/avisos/v1/servidor/actualizar del vigía).\n"
+        "# Solo root y el grupo hh-vigia pueden conectarse (0660), y el ayudante lo vuelve a mirar con SO_PEERCRED.\n"
+        "# Por cada conexión, systemd lanza un ayudante de root con su jaula (hehermes-actualizar@.service).\n"
+        "[Unit]\n"
+        "Description=HeHermes: el socket del ayudante que actualiza el servidor\n"
+        "\n"
+        "[Socket]\n"
+        "ListenStream=/run/hehermes-actualizar.sock\n"
+        "SocketUser=root\n"
+        "SocketGroup=%s\n"
+        "SocketMode=0660\n"
+        "Accept=yes\n"
+        "# El estado y, de vez en cuando, una petición de actualizar: esto es el tope.\n"
+        "MaxConnections=4\n"
+        "RemoveOnStop=yes\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=sockets.target\n"
+    ) % USUARIO_VIGIA
+
+
+#: La jaula del ayudante que actualiza, la de `server/avisos/despliegue/hehermes-actualizar@.service` (una prueba las
+#: compara): solo mira y lanza, así que ninguna capacidad, sin red y de solo lectura salvo su carpeta. La actualización
+#: va en su propia unidad, sin jaula (`systemd-run`).
+_JAULA_ACTUALIZAR = (
+    "CapabilityBoundingSet=\n"
+    "AmbientCapabilities=\n"
+    "NoNewPrivileges=yes\n"
+    "ProtectSystem=strict\n"
+    "ProtectHome=yes\n"
+    "PrivateNetwork=yes\n"
+    "IPAddressDeny=any\n"
+    "RestrictAddressFamilies=AF_UNIX\n"
+    "PrivateDevices=yes\n"
+    "PrivateIPC=yes\n"
+    "PrivateTmp=yes\n"
+    "ProtectKernelTunables=yes\n"
+    "ProtectKernelModules=yes\n"
+    "ProtectKernelLogs=yes\n"
+    "ProtectControlGroups=yes\n"
+    "ProtectClock=yes\n"
+    "ProtectHostname=yes\n"
+    "ProtectProc=invisible\n"
+    "KeyringMode=private\n"
+    "RestrictNamespaces=yes\n"
+    "RestrictRealtime=yes\n"
+    "RestrictSUIDSGID=yes\n"
+    "LockPersonality=yes\n"
+    "MemoryDenyWriteExecute=yes\n"
+    "SystemCallArchitectures=native\n"
+    "SystemCallFilter=@system-service\n"
+    "SystemCallErrorNumber=EPERM\n"
+)
+
+
+def unidad_actualizar(ambito) -> str:
+    """Un ayudante de root por conexión (`Accept=yes`), con root porque `systemd-run` solo se lo deja a root. No
+    descarga ni instala: comprueba lo que pide la app, lo apunta y lanza la actualización en su propia unidad
+    (`hehermes-actualizacion`), que no muere con el vigía ni con la pasarela."""
+    return (
+        CABECERA
+        + "# Un ayudante por conexión a /run/hehermes-actualizar.sock (hehermes-actualizar.socket, Accept=yes): mira lo\n"
+        "# que pide la app y lanza la actualización en su propia unidad (systemd-run, hehermes-actualizacion).\n"
+        "[Unit]\n"
+        "Description=HeHermes: ayudante que actualiza el servidor\n"
+        "CollectMode=inactive-or-failed\n"
+        "\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "ExecStart=/usr/bin/python3 -I -S -B %s --conexion\n"
+        "StandardInput=socket\n"
+        "StandardOutput=socket\n"
+        "StandardError=journal\n"
+        "StateDirectory=hehermes-actualizar\n"
+        "StateDirectoryMode=0700\n"
+        "RuntimeMaxSec=120\n"
+        "UMask=0077\n"
+        "LimitCORE=0\n"
+        "%s"
+        "# Los secretos del sistema y de HeHermes, tapados.\n"
+        "InaccessiblePaths=-/etc/shadow -/etc/shadow- -/etc/gshadow -/etc/gshadow- -/etc/sudoers -/etc/sudoers.d\n"
+        "InaccessiblePaths=-/etc/ssh -/etc/ssl/private -/etc/letsencrypt\n"
+        "InaccessiblePaths=-/etc/hehermes -/etc/hehermes-avisos -/etc/hehermes-pasarela -/var/lib/hehermes-vigia "
+        "-/var/lib/hehermes-pasarela -/var/lib/hehermes-rele-publico -/var/lib/hehermes-respaldo\n"
+        "InaccessiblePaths=-/etc/nginx -/etc/swanctl -/etc/strongswan -/etc/ipsec.secrets -/etc/ipsec.d -/etc/wireguard\n"
+    ) % (_ruta_segura(ambito.actualizar), _JAULA_ACTUALIZAR)

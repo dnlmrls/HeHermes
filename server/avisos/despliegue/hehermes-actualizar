@@ -1,0 +1,597 @@
+#!/usr/bin/python3 -IS
+"""Actualizar hehermes-servidor desde la app, con un toque. Va en /usr/local/libexec/hehermes-actualizar.
+
+Spec ``docs/superpowers/specs/2026-10-04-actualizar-el-servidor-design.md`` (§2) y contrato ``server/API-CONTRACT.md``
+§17. El vigía (``hh-vigia``) no tiene nada de root y no puede instalar nada: le pasa a este ayudante lo que pide la app,
+por ``/run/hehermes-actualizar.sock`` (``root:hh-vigia`` 0660), y systemd lo lanza como root en cada conexión
+(``Accept=yes``), con su jaula. El protocolo, el del ayudante de la copia: una línea JSON y otra de vuelta
+(``{"ok": true, …}`` o ``{"ok": false, "http": …, "codigo": …, "mensaje": …}``). Dos órdenes:
+
+- ``{"orden": "estado"}``: en qué va, con su hora: ``libre``, ``descargando``, ``comprobando``, ``instalando``,
+  ``hecho`` (con la versión) o ``fallo`` (con un motivo de ``MOTIVOS``, sin rutas ni nada de dentro). Y ``firmas``: si
+  el instalador instalado tiene alguna clave con la que comprobar una actualización.
+- ``{"orden": "actualizar", "version": "X.Y.Z", "sha256": "<64 hex>"}``: la versión y la suma que lleva la app. Lo
+  comprueba todo, lo apunta y lanza el trabajo en su propia unidad; contesta 202 sin esperar.
+
+Lo que hace que no sirva para otra cosa:
+
+- **La URL es fija**: la base del paquete instalado (``URL_BASE``, la de ``hehermes_servidor.URL_BASE`` y la de
+  ``empaquetar``) con la versión, que solo pueden ser tres números. Una petición con algo más que ``orden``,
+  ``version`` y ``sha256`` no se atiende.
+- **La suma y la firma**: lo descargado tiene que dar la suma que manda la app (la que lleva escrita, la misma que
+  ancla la primera instalación) y estar firmado con una de las claves del instalador instalado, la principal o la de
+  rescate. Por dentro, la versión pedida. Después, ``hehermes-servidor actualizar`` vuelve a comprobar la firma.
+- **Nunca hacia atrás**: ni la versión instalada ni una anterior, al pedirla y otra vez al ejecutarla.
+- **Una a la vez** (``actualizar.lock``, que el trabajo tiene mientras dura) **y tres por hora** (``intentos.json``).
+- **La instalación, en su propia unidad** (``systemd-run --unit hehermes-actualizacion``): la versión nueva reinicia
+  el vigía, la pasarela y este socket, y el trabajo no puede morir con ninguno de ellos.
+- **En el registro, lo justo**: la versión, la fase y el resultado. Lo que dice el instalador (rutas, nombres de los
+  iPhone…) va a un fichero de root, ``registro.txt``, para quien lo tenga que mirar, y no al journal.
+
+Sin dependencias, y nada del entorno: ``-IS`` en la primera línea. Corre con el Python del sistema (3.9 o más).
+"""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import pwd
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+#: De dónde se descarga, la misma que la del paquete instalado (`hehermes_servidor.URL_BASE`; una prueba las ata).
+URL_BASE = "https://github.com/dnlmrls/HeHermes/releases/download"
+PREFIJO = "/opt/hehermes-servidor"
+TRABAJO = "/var/lib/hehermes-actualizar"
+AYUDANTE = "/usr/local/libexec/hehermes-actualizar"
+PYTHON = "/usr/bin/python3"
+UNIDAD = "hehermes-actualizacion"
+#: La principal y la de rescate, como `hehermes_servidor.firma.CLAVES`.
+CLAVES = ("clave-publica.pem", "clave-rescate.pem")
+MARCADOR = "PENDIENTE-DE-DANIEL"
+USUARIO_VIGIA = "hh-vigia"
+#: El de Linux, que es donde corre; en el Mac de las pruebas no existe y se prueba con dobles.
+SO_PEERCRED = getattr(socket, "SO_PEERCRED", 17)
+
+MAX_POR_HORA = 3
+HORA = 3600
+#: Una actualización lanzada y sin el cerrojo tomado más de esto, no arrancó o murió (un reinicio, un kill): el trabajo
+#: lo toma en cuanto arranca y no lo suelta hasta acabar.
+ARRANQUE = 120
+#: Lo que espera el trabajo al cerrojo: la conexión que lo lanza lo tiene unos milisegundos más.
+ESPERA_CERROJO = 30.0
+TOPE_PAQUETE = 64 * 1024 * 1024
+#: Ed25519 «puro» (`openssl pkeyutl -rawin`): 64 bytes.
+LARGO_FIRMA = 64
+PLAZO_RED = 30
+PLAZO_DESCARGA = 600
+PLAZO_INSTALAR = 3000
+#: Lo que puede vivir la unidad del trabajo: descargar, comprobar e instalar (con el venv del canje) caben de sobra.
+PLAZO_UNIDAD = 3600
+MAX_LINEA = 4096
+
+PATRON_VERSION = re.compile(r"(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})")
+PATRON_SHA = re.compile(r"[0-9a-f]{64}")
+PATRON_VERSION_INSTALADA = re.compile(r'^VERSION = "([0-9]+\.[0-9]+\.[0-9]+)"$', re.M)
+ESTADOS = ("libre", "descargando", "comprobando", "instalando", "hecho", "fallo")
+EN_MARCHA = ("descargando", "comprobando", "instalando")
+#: Por qué ha fallado, lo único que le llega a la app (contrato §17).
+MOTIVOS = frozenset({"descarga", "suma", "firma", "sin_firmas", "version", "instalacion", "interrumpida", "interna"})
+#: Lo que puede traer cada orden, y nada más.
+CAMPOS = {"estado": {"orden"}, "actualizar": {"orden", "version", "sha256"}}
+
+
+class Rechazo(Exception):
+    def __init__(self, http_: int, codigo: str, mensaje: str, cabeceras=None):
+        super().__init__(mensaje)
+        self.http, self.codigo, self.mensaje, self.cabeceras = http_, codigo, mensaje, cabeceras or {}
+
+    def respuesta(self) -> dict:
+        r = {"ok": False, "http": self.http, "codigo": self.codigo, "mensaje": self.mensaje}
+        if self.cabeceras:
+            r["cabeceras"] = self.cabeceras
+        return r
+
+
+class Fallo(Exception):
+    """Una actualización que no sigue, con su motivo (uno de `MOTIVOS`)."""
+
+    def __init__(self, motivo: str):
+        super().__init__(motivo)
+        self.motivo = motivo
+
+
+def _decir(texto: str) -> None:
+    """El registro: la versión, la fase y el resultado. Nunca una ruta, una URL ni lo que diga el instalador."""
+    sys.stderr.write("hehermes-actualizar: %s\n" % texto)
+    sys.stderr.flush()
+
+
+def url_del_paquete(version: str) -> str:
+    """La de `empaquetar.url_del_paquete`: una por versión, con la base fija."""
+    return "%s/v%s/hehermes-servidor-%s.tar.gz" % (URL_BASE, version, version)
+
+
+def tupla(version: str) -> tuple:
+    return tuple(int(x) for x in version.split("."))
+
+
+def version_valida(valor) -> str:
+    if not isinstance(valor, str) or not PATRON_VERSION.fullmatch(valor) or not valor.isascii():
+        raise Rechazo(400, "parametro_invalido", "«version» son tres números: X.Y.Z")
+    return valor
+
+
+def sha_valido(valor) -> str:
+    if not isinstance(valor, str) or not PATRON_SHA.fullmatch(valor):
+        raise Rechazo(400, "parametro_invalido", "«sha256» son 64 hexadecimales en minúsculas")
+    return valor
+
+
+# MARK: El sistema (lo que las pruebas cambian por dobles)
+
+
+class SoloHTTPS(urllib.request.HTTPRedirectHandler):
+    """GitHub redirige cada asset a otro dominio, y eso vale; a algo que no sea https, no."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not newurl.lower().startswith("https://"):
+            raise urllib.error.HTTPError(newurl, code, "redirección fuera de https", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class Config:
+    def __init__(self, prefijo=PREFIJO, trabajo=TRABAJO, ayudante=AYUDANTE):
+        self.prefijo, self.trabajo, self.ayudante = prefijo.rstrip("/"), trabajo.rstrip("/"), ayudante
+        self.espera_cerrojo = ESPERA_CERROJO
+
+
+class Sistema:
+    """Descargar, comprobar una firma, lanzar una unidad e instalar. Las pruebas ponen dobles."""
+
+    def __init__(self, config: Config):
+        self.config = config
+
+    def ahora(self) -> float:
+        return time.time()
+
+    def descargar(self, url: str, tope: int) -> bytes:
+        """Lo de esa URL, con TLS comprobado (el contexto de serie), sin pasar de `tope` ni de `PLAZO_DESCARGA`."""
+        abridor = urllib.request.build_opener(SoloHTTPS())
+        peticion = urllib.request.Request(url, headers={"User-Agent": "hehermes-actualizar"})
+        limite = time.monotonic() + PLAZO_DESCARGA
+        try:
+            with abridor.open(peticion, timeout=PLAZO_RED) as respuesta:
+                if respuesta.status != 200:
+                    raise Fallo("descarga")
+                largo = respuesta.headers.get("Content-Length")
+                if largo is not None and (not largo.isdigit() or int(largo) > tope):
+                    raise Fallo("descarga")
+                partes, recibido = [], 0
+                while True:
+                    trozo = respuesta.read(1024 * 1024)
+                    if not trozo:
+                        break
+                    recibido += len(trozo)
+                    if recibido > tope or time.monotonic() > limite:
+                        raise Fallo("descarga")
+                    partes.append(trozo)
+                return b"".join(partes)
+        except (OSError, ValueError, urllib.error.URLError):
+            raise Fallo("descarga") from None
+
+    def verificar(self, paquete: str, firma: str, clave: str) -> bool:
+        """`openssl pkeyutl -verify -rawin`, como `hehermes_servidor.firma.verificar`: el código y el texto."""
+        try:
+            r = subprocess.run(["openssl", "pkeyutl", "-verify", "-pubin", "-inkey", clave, "-rawin", "-in", paquete,
+                                "-sigfile", firma], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, timeout=60, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return r.returncode == 0 and b"Signature Verified Successfully" in r.stdout
+
+    def lanzar(self, orden: list) -> bool:
+        try:
+            r = subprocess.run(orden, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=60, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return r.returncode == 0
+
+    def instalar(self, orden: list, registro) -> int:
+        try:
+            r = subprocess.run(orden, stdin=subprocess.DEVNULL, stdout=registro, stderr=subprocess.STDOUT,
+                               timeout=PLAZO_INSTALAR, check=False, cwd="/",
+                               env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                                    "LANG": "C.UTF-8"})
+        except (OSError, subprocess.SubprocessError):
+            return 127
+        return r.returncode
+
+
+# MARK: Lo instalado
+
+
+def version_instalada(config: Config) -> str | None:
+    try:
+        with open(os.path.join(config.prefijo, "hehermes_servidor", "__init__.py"), encoding="utf-8") as f:
+            hallada = PATRON_VERSION_INSTALADA.search(f.read(64 * 1024))
+    except (OSError, ValueError):
+        return None
+    return hallada.group(1) if hallada else None
+
+
+def claves(config: Config) -> list:
+    """Las de la carpeta del instalador que no son el marcador (ni una privada puesta en su sitio)."""
+    salida = []
+    for nombre in CLAVES:
+        ruta = os.path.join(config.prefijo, nombre)
+        try:
+            with open(ruta, encoding="utf-8", errors="replace") as f:
+                texto = f.read(16 * 1024)
+        except OSError:
+            continue
+        if MARCADOR not in texto and "-----BEGIN PUBLIC KEY-----" in texto and "PRIVATE" not in texto:
+            salida.append(ruta)
+    return salida
+
+
+def _version_por_dentro(paquete: str) -> str | None:
+    """La versión de la carpeta del paquete (`hehermes-servidor-X.Y.Z/`), de su primera entrada."""
+    try:
+        with tarfile.open(paquete, "r:gz") as tar:
+            primera = tar.next()
+    except (tarfile.TarError, OSError, EOFError):
+        return None
+    if primera is None:
+        return None
+    hallada = re.fullmatch(r"hehermes-servidor-([0-9]+\.[0-9]+\.[0-9]+)", primera.name.split("/", 1)[0])
+    return hallada.group(1) if hallada else None
+
+
+# MARK: La carpeta de trabajo
+
+
+def _escribir_json(ruta: str, datos) -> None:
+    temporal = ruta + ".nuevo"
+    with open(os.open(temporal, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600),
+              "w") as f:
+        json.dump(datos, f, sort_keys=True, separators=(",", ":"))
+    os.replace(temporal, ruta)
+
+
+def _leer_json(ruta: str):
+    try:
+        with open(ruta, "rb") as f:
+            return json.loads(f.read(64 * 1024).decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+class Trabajo:
+    """La carpeta de trabajo (0700, solo de root): el estado, los intentos, el cerrojo y el registro del instalador."""
+
+    def __init__(self, config: Config, sistema: Sistema):
+        self.config, self.sistema = config, sistema
+        os.makedirs(config.trabajo, mode=0o700, exist_ok=True)
+        os.chmod(config.trabajo, 0o700)
+        self._cerrojo = None
+
+    def ruta(self, nombre: str) -> str:
+        return os.path.join(self.config.trabajo, nombre)
+
+    # -- El cerrojo: una actualización a la vez
+
+    def tomar(self, esperar: float = 0.0) -> bool:
+        fd = os.open(self.ruta("actualizar.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        limite = time.monotonic() + esperar
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                if time.monotonic() >= limite:
+                    os.close(fd)
+                    return False
+                time.sleep(0.05)
+                continue
+            self._cerrojo = fd
+            return True
+
+    def soltar(self) -> None:
+        if self._cerrojo is not None:
+            fcntl.flock(self._cerrojo, fcntl.LOCK_UN)
+            os.close(self._cerrojo)
+            self._cerrojo = None
+
+    def tiene(self) -> bool:
+        return self._cerrojo is not None
+
+    def ocupado(self) -> bool:
+        """Si otro (otra conexión, o el trabajo) tiene el cerrojo."""
+        if self._cerrojo is not None:
+            return False
+        if not self.tomar():
+            return True
+        self.soltar()
+        return False
+
+    # -- El estado
+
+    def leer_estado(self) -> dict:
+        datos = _leer_json(self.ruta("estado.json"))
+        if not (isinstance(datos, dict) and datos.get("estado") in ESTADOS[1:]
+                and isinstance(datos.get("hora"), int) and not isinstance(datos.get("hora"), bool)):
+            return {"estado": "libre", "hora": None, "version": None, "motivo": None}
+        version = datos.get("version")
+        motivo = datos.get("motivo")
+        return {"estado": datos["estado"], "hora": datos["hora"],
+                "version": version if isinstance(version, str) and PATRON_VERSION.fullmatch(version) else None,
+                "motivo": motivo if datos["estado"] == "fallo" and motivo in MOTIVOS else None}
+
+    def poner(self, estado: str, version: str | None, motivo: str | None = None) -> dict:
+        datos = {"estado": estado, "hora": int(self.sistema.ahora()), "version": version,
+                 "motivo": motivo if estado == "fallo" else None}
+        _escribir_json(self.ruta("estado.json"), datos)
+        return datos
+
+    # -- El tope: tres por hora
+
+    def intentos(self) -> list:
+        ahora = self.sistema.ahora()
+        datos = _leer_json(self.ruta("intentos.json"))
+        return [t for t in (datos if isinstance(datos, list) else [])
+                if isinstance(t, (int, float)) and not isinstance(t, bool) and 0 <= ahora - t < HORA]
+
+    def contar(self) -> None:
+        vistos = self.intentos()
+        if len(vistos) >= MAX_POR_HORA:
+            espera = int(HORA - (self.sistema.ahora() - min(vistos))) + 1
+            raise Rechazo(429, "demasiados_intentos", "Ya van %d intentos en la última hora" % MAX_POR_HORA,
+                          {"Retry-After": str(espera)})
+        _escribir_json(self.ruta("intentos.json"), vistos + [int(self.sistema.ahora())])
+
+
+# MARK: Las órdenes
+
+
+class Ayudante:
+    """Las dos órdenes de una conexión, sin sockets: el `atender` de abajo solo traduce."""
+
+    def __init__(self, config: Config, sistema: Sistema | None = None):
+        self.config = config
+        self.sistema = sistema or Sistema(config)
+        self.trabajo = Trabajo(config, self.sistema)
+
+    def orden(self, peticion: dict) -> dict:
+        orden = peticion.get("orden")
+        if orden not in CAMPOS:
+            raise Rechazo(400, "orden_desconocida", "Orden desconocida")
+        if set(peticion) - CAMPOS[orden]:
+            raise Rechazo(400, "parametro_invalido", "La orden trae algo que no es suyo")
+        if orden == "estado":
+            return dict(self.estado(), ok=True)
+        return self.actualizar(peticion.get("version"), peticion.get("sha256"))
+
+    def estado(self) -> dict:
+        estado = self.trabajo.leer_estado()
+        if estado["estado"] in EN_MARCHA and self.sistema.ahora() - estado["hora"] > ARRANQUE:
+            # Lanzada hace rato y nadie con el cerrojo: el trabajo no arrancó o murió. (`actualizar` ya lo tiene.)
+            mio = self.trabajo.tiene()
+            if mio or self.trabajo.tomar():
+                try:
+                    estado = self.trabajo.poner("fallo", estado["version"], "interrumpida")
+                    _decir("actualizar %s: interrumpida" % estado["version"])
+                finally:
+                    if not mio:
+                        self.trabajo.soltar()
+        return dict(estado, firmas=bool(claves(self.config)))
+
+    def actualizar(self, version, sha256) -> dict:
+        version, sha256 = version_valida(version), sha_valido(sha256)
+        if not self.trabajo.tomar():
+            raise Rechazo(409, "en_curso", "Ya hay una actualización en marcha")
+        try:
+            if self.estado()["estado"] in EN_MARCHA:
+                raise Rechazo(409, "en_curso", "Ya hay una actualización en marcha")
+            instalada = version_instalada(self.config)
+            if instalada is None:
+                raise Rechazo(503, "sin_instalador", "No encuentro el instalador de este servidor")
+            if tupla(version) == tupla(instalada):
+                raise Rechazo(409, "ya_instalada", "Esa versión ya está instalada")
+            if tupla(version) < tupla(instalada):
+                raise Rechazo(409, "version_anterior", "No se vuelve a una versión anterior a la instalada")
+            if not claves(self.config):
+                raise Rechazo(409, "sin_firmas", "Este servidor no tiene con qué comprobar la firma de una "
+                                                 "actualización: hay que actualizarlo una vez a mano")
+            self.trabajo.contar()
+            estado = self.trabajo.poner("descargando", version)
+            _decir("actualizar %s: pedida" % version)
+            if not self.sistema.lanzar(orden_de_la_unidad(self.config, version, sha256)):
+                self.trabajo.poner("fallo", version, "interna")
+                _decir("actualizar %s: fallo (interna: no se ha podido lanzar)" % version)
+                raise Rechazo(500, "error", "No se ha podido lanzar la actualización")
+            return {"ok": True, "http": 202, "estado": estado["estado"], "hora": estado["hora"], "version": version}
+        finally:
+            self.trabajo.soltar()
+
+
+def orden_de_la_unidad(config: Config, version: str, sha256: str) -> list:
+    """Lo que lanza `actualizar`: el trabajo entero en su propia unidad, que systemd recoge al acabar (`--collect`). Ni
+    `--scope` ni nada que la ate a esta conexión: la versión nueva reinicia el vigía, la pasarela y este socket."""
+    return ["systemd-run", "--unit=" + UNIDAD, "--description=HeHermes: actualizar el servidor", "--collect", "--quiet",
+            "--property=RuntimeMaxSec=%d" % PLAZO_UNIDAD, "--setenv=LANG=C.UTF-8",
+            "--", PYTHON, "-I", "-S", "-B", config.ayudante, "--prefijo=" + config.prefijo,
+            "--trabajo=" + config.trabajo, "ejecutar", version, sha256]
+
+
+def ejecutar(trabajo: Trabajo, config: Config, sistema: Sistema, version, sha256) -> None:
+    """El trabajo de la unidad: descargar, comprobar e instalar, con el cerrojo tomado de principio a fin."""
+    try:
+        version, sha256 = version_valida(version), sha_valido(sha256)
+    except Rechazo:
+        _decir("ejecutar: lo que me han pasado no tiene forma de versión y suma")
+        return
+    if not trabajo.tomar(esperar=config.espera_cerrojo):
+        _decir("actualizar %s: otra tiene el cerrojo" % version)
+        return
+    inicio = time.monotonic()
+    carpeta = None
+    try:
+        instalada = version_instalada(config)
+        if instalada is None or tupla(version) <= tupla(instalada):
+            raise Fallo("version")
+        rutas = claves(config)
+        if not rutas:
+            raise Fallo("sin_firmas")
+        trabajo.poner("descargando", version)
+        _decir("actualizar %s: descargando" % version)
+        carpeta = tempfile.mkdtemp(prefix="descarga-", dir=config.trabajo)
+        paquete = os.path.join(carpeta, "hehermes-servidor-%s.tar.gz" % version)
+        firma = paquete + ".sig"
+        datos = sistema.descargar(url_del_paquete(version), TOPE_PAQUETE)
+        sello = sistema.descargar(url_del_paquete(version) + ".sig", 1024)
+        trabajo.poner("comprobando", version)
+        _decir("actualizar %s: comprobando" % version)
+        if hashlib.sha256(datos).hexdigest() != sha256:
+            raise Fallo("suma")
+        for ruta, contenido in ((paquete, datos), (firma, sello)):
+            with open(os.open(ruta, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as f:
+                f.write(contenido)
+        if len(sello) != LARGO_FIRMA or not any(sistema.verificar(paquete, firma, clave) for clave in rutas):
+            raise Fallo("firma")
+        if _version_por_dentro(paquete) != version:
+            raise Fallo("version")
+        trabajo.poner("instalando", version)
+        _decir("actualizar %s: instalando" % version)
+        with open(os.open(trabajo.ruta("registro.txt"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+            codigo = sistema.instalar([PYTHON, "-I", "-B", os.path.join(config.prefijo, "hehermes-servidor"),
+                                       "actualizar", "--paquete", paquete, "--firma", firma], f)
+        if codigo != 0:
+            _decir("actualizar %s: el instalador ha salido con %d" % (version, codigo))
+            raise Fallo("instalacion")
+        trabajo.poner("hecho", version)
+        _decir("actualizar %s: hecho en %d s" % (version, time.monotonic() - inicio))
+    except Fallo as fallo:
+        trabajo.poner("fallo", version, fallo.motivo)
+        _decir("actualizar %s: fallo (%s)" % (version, fallo.motivo))
+    except Exception as error:  # noqa: BLE001 — la actualización falla, el ayudante dice cuál
+        trabajo.poner("fallo", version, "interna")
+        _decir("actualizar %s: fallo (interna: %s)" % (version, type(error).__name__))
+    finally:
+        if carpeta is not None:
+            shutil.rmtree(carpeta, ignore_errors=True)
+        trabajo.soltar()
+
+
+# MARK: El socket
+
+
+def par_del_vigia(conexion, uid_vigia: int | None = None) -> bool:
+    """Si al otro lado del socket está root o el vigía, según el núcleo (``SO_PEERCRED``). Sin eso, nadie."""
+    try:
+        if uid_vigia is None:
+            uid_vigia = pwd.getpwnam(USUARIO_VIGIA).pw_uid
+        credenciales = conexion.getsockopt(socket.SOL_SOCKET, SO_PEERCRED, struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", credenciales)
+    except (OSError, KeyError, AttributeError, TypeError, struct.error):
+        return False
+    return uid in (0, uid_vigia)
+
+
+def leer_peticion(conexion, plazo: float = 30.0) -> dict:
+    conexion.settimeout(plazo)
+    recibido = bytearray()
+    while b"\n" not in recibido:
+        if len(recibido) > MAX_LINEA:
+            raise Rechazo(400, "peticion_invalida", "La petición es demasiado grande")
+        trozo = conexion.recv(MAX_LINEA + 1)
+        if not trozo:
+            raise Rechazo(400, "peticion_invalida", "La petición llegó cortada")
+        recibido += trozo
+    linea, _, resto = bytes(recibido).partition(b"\n")
+    if len(linea) > MAX_LINEA:
+        raise Rechazo(400, "peticion_invalida", "La petición es demasiado grande")
+    if resto:
+        raise Rechazo(400, "peticion_invalida", "Sobran bytes")
+    try:
+        peticion = json.loads(linea.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise Rechazo(400, "peticion_invalida", "La petición no es JSON") from None
+    if not isinstance(peticion, dict):
+        raise Rechazo(400, "orden_desconocida", "Orden desconocida")
+    return peticion
+
+
+def atender(conexion, ayudante_de, par_permitido=par_del_vigia) -> None:
+    """Una conexión: la petición y la respuesta. ``ayudante_de()`` crea el ``Ayudante`` solo si el par es de fiar."""
+    try:
+        if not par_permitido(conexion):
+            raise Rechazo(403, "no_autorizado", "Este ayudante solo atiende al vigía")
+        respuesta = ayudante_de().orden(leer_peticion(conexion))
+    except Rechazo as rechazo:
+        respuesta = rechazo.respuesta()
+        if rechazo.codigo != "en_curso":
+            _decir("rechazo: %s %s" % (rechazo.http, rechazo.codigo))
+    except Exception as error:  # noqa: BLE001 — la orden falla, el ayudante contesta
+        _decir("error inesperado: %s" % type(error).__name__)
+        respuesta = Rechazo(500, "error", "Error interno del ayudante").respuesta()
+    try:
+        conexion.settimeout(30)
+        conexion.sendall(json.dumps(respuesta, separators=(",", ":"), sort_keys=True).encode("utf-8") + b"\n")
+    except OSError:
+        pass
+
+
+USO = ("uso: hehermes-actualizar [--prefijo=<carpeta>] [--trabajo=<carpeta>] --conexion | estado | "
+       "ejecutar <X.Y.Z> <sha256>\n")
+
+
+def main(argv: list) -> int:
+    opciones, resto = {}, []
+    for argumento in argv:
+        if argumento.startswith("--") and "=" in argumento:
+            clave, _, valor = argumento[2:].partition("=")
+            opciones[clave] = valor
+        else:
+            resto.append(argumento)
+    prefijo, trabajo = opciones.pop("prefijo", PREFIJO), opciones.pop("trabajo", TRABAJO)
+    if opciones or not all(r.startswith("/") and r.rstrip("/") for r in (prefijo, trabajo)):
+        sys.stderr.write(USO)
+        return 2
+    config = Config(prefijo=prefijo, trabajo=trabajo)
+    if resto not in (["--conexion"], ["estado"]) and not (len(resto) == 3 and resto[0] == "ejecutar"):
+        sys.stderr.write(USO)
+        return 2
+    os.umask(0o077)
+    if resto == ["--conexion"]:
+        conexion = socket.socket(fileno=0)
+        try:
+            atender(conexion, lambda: Ayudante(config))
+            try:
+                conexion.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        finally:
+            conexion.detach()
+        return 0
+    if resto == ["estado"]:
+        print(json.dumps(Ayudante(config).estado(), indent=2, sort_keys=True))
+        return 0
+    sistema = Sistema(config)
+    ejecutar(Trabajo(config, sistema), config, sistema, resto[1], resto[2])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

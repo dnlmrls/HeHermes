@@ -50,6 +50,23 @@ ESPERAR = "esperar"
 
 
 @dataclass(frozen=True)
+class PeticionDePermiso:
+    """Lo que la app necesita para contestar desde el propio aviso una aprobación que espera (spec 2026-10-04, «Aprobar
+    y denegar desde el aviso»): el run, el ``request_id`` con el que Hermes resuelve exactamente esa petición, las
+    ``choices`` que ofrece y la petición entera, que es lo que se lee al mantener pulsado el aviso.
+
+    Solo existe con ``request_id``: sin él, ``POST …/approval`` resuelve «la más antigua», que puede no ser la del aviso.
+    """
+
+    run: str
+    peticion: str
+    # Las `choices` de Hermes, tal cual; vacías si no las da (la app entiende entonces las mínimas, `once` y `deny`).
+    opciones: tuple
+    # La petición entera, con sus líneas (`texto.entero`).
+    texto: str
+
+
+@dataclass(frozen=True)
 class Aviso:
     tipo: str
     # La sesión del api_server, o `None` si no es de ninguna conversación (la prueba).
@@ -67,6 +84,8 @@ class Aviso:
     # De qué sale el `apns-collapse-id`, si no es de `clave`: las aprobaciones de una conversación colapsan entre sí
     # (una nueva deja vieja a la anterior), aunque cada una sea un suceso distinto.
     colapsa_con: str | None = None
+    # En una aprobación con `request_id`, lo que hace falta para contestarla desde el aviso (`contenido`).
+    aprobacion: PeticionDePermiso | None = None
 
     @property
     def identidad(self) -> str:
@@ -113,6 +132,13 @@ def decidir_con_motivo(aviso: Aviso, dispositivo: Dispositivo, ahora: float) -> 
     return ENVIAR, None
 
 
+#: Lo que puede ocupar, en bytes, lo que va dentro del sobre. El push entero no puede pasar de 4096 bytes (el tope de Apple,
+#: que el relé comprueba: `rele.validacion.TOPE_CARGA`, y lo de más es un 413 que no llega nunca). Con el `aps` más largo
+#: que pone el vigía (hilo, sonido y `time-sensitive`) quedan 2876 bytes de claro; esto deja un margen. Solo lo mira la
+#: petición entera de una aprobación: todo lo demás va recortado a 200 caracteres y cabe de largo.
+TOPE_CLARO = 2800
+
+
 def contenido(aviso: Aviso, vista_previa: str) -> bytes:
     """Lo que va cifrado: ``{"sesion", "texto", "tipo", "titulo"}``, con las claves ordenadas y sin espacios.
 
@@ -120,13 +146,28 @@ def contenido(aviso: Aviso, vista_previa: str) -> bytes:
     en lugar de la respuesta; con «nunca», ni el título. Lo que no se enseña no viaja, aunque vaya cifrado: si la
     extensión recibe un texto vacío pone la frase de su tipo (``ComposicionDelAviso.textoNeutro``), que es lo mismo que
     haría con la vista previa puesta.
+
+    **Una aprobación que se puede contestar desde el aviso** (spec 2026-10-04) lleva además ``aprobacion``: ``{"run",
+    "peticion", "opciones"}``, y su ``texto`` es la petición entera, con sus líneas, que es lo que se lee al mantener
+    pulsado el aviso. Solo con «siempre» —con las otras dos el aviso no dice qué se pide, y no se aprueba lo que no se
+    ve— y solo si cabe entera en el sobre (`TOPE_CLARO`): si no, sale como las demás, recortada y sin botones, porque
+    tampoco se aprueba lo que no se ve entero.
     """
     titulo = aviso.titulo if vista_previa in ("siempre", "nombre") else ""
     cuerpo = aviso.texto if vista_previa == "siempre" else ""
-    return json.dumps({"tipo": aviso.tipo, "sesion": aviso.sesion or "",
-                       "titulo": texto.recortar(titulo, texto.TOPE_TITULO),
-                       "texto": texto.recortar(cuerpo, texto.TOPE_TEXTO)},
-                      ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    datos = {"tipo": aviso.tipo, "sesion": aviso.sesion or "", "titulo": texto.recortar(titulo, texto.TOPE_TITULO),
+             "texto": texto.recortar(cuerpo, texto.TOPE_TEXTO)}
+    pedida = aviso.aprobacion
+    if pedida is not None and vista_previa == "siempre" and pedida.texto:
+        entera = _escrito(dict(datos, texto=pedida.texto, aprobacion={
+            "run": pedida.run, "peticion": pedida.peticion, "opciones": list(pedida.opciones)}))
+        if len(entera) <= TOPE_CLARO:
+            return entera
+    return _escrito(datos)
+
+
+def _escrito(datos: dict) -> bytes:
+    return json.dumps(datos, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 # La subclave de los identificadores que viajan en claro (hilo y colapso): K_ids = HKDF-SHA256(K, sal vacía, este info).

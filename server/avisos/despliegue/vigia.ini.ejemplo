@@ -108,3 +108,17 @@ margen_mb = 1024
 # Los días que se guarda cada carpeta del día: cada hora se borran enteras las que pasan de esto (es una bandeja de
 # entrada; lo que Hermes quiera conservar, que lo copie a otro sitio). De 1 a 3650.
 dias = 30
+
+[servidor]
+# Desde la 1.5.5: lo que enseña Ajustes › Tu servidor (GET /avisos/v1/servidor), sin secretos, y actualizarlo desde la
+# app (/avisos/v1/servidor/actualizar). Dónde está el instalador, para saber su versión.
+instalador = /opt/hehermes-servidor
+# El ayudante de root de /usr/local/libexec/hehermes-actualizar, que systemd lanza por cada conexión a este socket
+# (root:hh-vigia 0660) y que lanza la actualización en su propia unidad. Vacío: sin él, la app no puede actualizar el
+# servidor (503). Aquí actualiza lo del instalador; estos avisos siguen con instalar.sh.
+ayudante = /run/hehermes-actualizar.sock
+# Las unidades de HeHermes cuyo estado se enseña, con «systemctl is-active» (no necesita root). Con «usuario:» delante,
+# una de «systemctl --user».
+servicios = hehermes-pasarela.service hehermes-vigia.service hehermes-rele.service hehermes-leer-media.socket hehermes-respaldo.socket hehermes-entrada.socket hehermes-actualizar.socket
+# La de Hermes (vacía si no tiene: en tmux, en un contenedor…).
+hermes = hermes-gateway.service
