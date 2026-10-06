@@ -1,0 +1,53 @@
+# /etc/systemd/system/hehermes-agentes-memoria.service
+# Lo lanza hehermes-agentes-memoria.timer cada minuto: entre el principal y los agentes que comparten lo que saben de
+# ti, el USER.md más nuevo va a los demás, cada uno con el flock de Hermes (despliegue/hehermes-agentes,
+# sincronizar-memoria). Si nadie comparte, no hace nada.
+#
+# Como el ayudante de los agentes, de root y sin ninguna capacidad, pero sin red y sin lanzar `hermes`: solo lee y
+# escribe las memorias de la casa de Hermes (si Hermes es de otro usuario, instalar.sh deja un añadido que lo hace como
+# él) y su carpeta de estado. Todo lo demás, de solo lectura.
+[Unit]
+Description=HeHermes: junta lo que saben de ti los agentes que lo comparten
+Documentation=file:///opt/hehermes-avisos/src/README.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -S -B /usr/local/libexec/hehermes-agentes --hermes-home=/root/.hermes --usuario-hermes=root sincronizar-memoria
+StateDirectory=hehermes-agentes
+StateDirectoryMode=0700
+# Cinco segundos por flock como mucho, y trece memorias: cabe de sobra.
+TimeoutStartSec=5min
+UMask=0077
+LimitCORE=0
+Nice=10
+IOSchedulingClass=idle
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=-/root/.hermes
+PrivateNetwork=yes
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+KeyringMode=private
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+InaccessiblePaths=-/etc/shadow -/etc/shadow- -/etc/gshadow -/etc/gshadow- -/etc/sudoers -/etc/sudoers.d
+InaccessiblePaths=-/etc/ssh -/etc/ssl/private -/etc/letsencrypt
+InaccessiblePaths=-/etc/hehermes -/etc/hehermes-avisos -/etc/hehermes-pasarela -/var/lib/hehermes-vigia -/var/lib/hehermes-pasarela -/var/lib/hehermes-rele-publico -/var/lib/hehermes-respaldo
+InaccessiblePaths=-/etc/nginx -/etc/swanctl -/etc/strongswan -/etc/ipsec.secrets -/etc/ipsec.d -/etc/wireguard

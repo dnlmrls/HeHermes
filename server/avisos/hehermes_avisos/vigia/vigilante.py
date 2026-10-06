@@ -8,6 +8,11 @@
 4. mira el estado de los turnos que la app dejó en marcha, si se los ha dicho: es lo único que deja ver las aprobaciones
    que esperan y los errores sin abrir el SSE del run, que es de un solo uso y es de la app.
 
+**Cada agente es un perfil de Hermes** (contrato §18, desde la 1.6.0): lo de arriba se hace con el principal y con cada
+perfil servido (``agentes``: los que tienen su clave), cada uno con su cliente (``/p/<perfil>/…``), y lo que se apunta
+de cada conversación va por ``(perfil, sesión)``: cada perfil tiene su state.db, y sus sesiones (y hasta sus filas)
+pueden llamarse igual. Cada aviso sale con su perfil. Un agente que no contesta no para a los demás.
+
 **Cada conversación va por su cuenta.** Se lee, se avisa de lo suyo y se apunta en SQLite antes de pasar a la
 siguiente, y un fallo en una (una fila que rompe algo, el disco lleno) no para las demás. Lo que el relé ya aceptó se
 recuerda una hora (``_aceptados``): si apuntarlo falla, la vuelta siguiente vuelve a encontrar lo mismo y no lo vuelve a
@@ -36,7 +41,7 @@ from dataclasses import dataclass, replace
 from .. import texto
 from ..comun import cola
 from . import avisos, deteccion, entregas, exportaciones
-from .almacen import Almacen, EstadoSesion
+from .almacen import PRINCIPAL, Almacen, EstadoSesion
 from .envio import ENVIADO, LIMITADO, REINTENTABLE, Mensajero
 from .hermes import ClienteHermes, ErrorHermes
 
@@ -110,10 +115,14 @@ class Vigilante:
     def __init__(self, almacen: Almacen, hermes: ClienteHermes, mensajero: Mensajero, *, intervalo: float = 5.0,
                  intervalo_en_calma: float = INTERVALO_EN_CALMA, antiguedad_maxima: float = 900.0,
                  filas_por_lectura: int = 100, caducidad_aprobacion: int = 120, reloj=time.time,
-                 reglas_entrega: ReglasDeEntrega | None = None, exportaciones=None):
+                 reglas_entrega: ReglasDeEntrega | None = None, exportaciones=None, agentes=None):
         self.almacen = almacen
-        # Los ficheros nuevos de `exports/` que hay que avisar (`exportaciones`), si se vigila la carpeta.
+        # Los ficheros nuevos de `exports/` que hay que avisar (`exportaciones`), si se vigila la carpeta: la del
+        # principal (`Exportaciones`) o la de cada perfil (`ExportacionesDeLosAgentes`, con su `de(perfil)`).
         self.exportaciones = exportaciones
+        # Los agentes servidos (`agentes.ClientesDeLosAgentes`, con su `clientes()`: perfil -> su cliente de Hermes).
+        # Sin ellos, solo el principal, como antes de la 1.6.0.
+        self.agentes = agentes
         # Sin reglas, el vigía no contesta ninguna entrega: solo avisa de ella.
         self.reglas_entrega = reglas_entrega
         # (sesión, delegation_id) → lo hecho con su entrega. En memoria: tras un reinicio, la misma clave de
@@ -127,6 +136,7 @@ class Vigilante:
         self.filas_por_lectura = filas_por_lectura
         self.caducidad_aprobacion = caducidad_aprobacion
         self.reloj = reloj
+        # (perfil, sesión) → su título en la bandeja.
         self._titulos: dict = {}
         # (token, identidad del suceso) → cuándo lo aceptó el relé.
         self._aceptados: dict = {}
@@ -142,8 +152,8 @@ class Vigilante:
         self._rebasar = False
         self._vuelta_anterior: float | None = None
         self._vuelta_guardada = -GUARDAR_VUELTA
-        # Lo que dijo la bandeja de cada conversación en la vuelta anterior: moverse es que eso cambie, no releer una
-        # conversación porque tiene algo pendiente.
+        # Lo que dijo la bandeja de cada conversación ((perfil, sesión)) en la vuelta anterior: moverse es que eso cambie,
+        # no releer una conversación porque tiene algo pendiente.
         self._en_bandeja: dict = {}
 
     # -- El bucle
@@ -199,9 +209,22 @@ class Vigilante:
                 break
         self._despertador.clear()
 
+    def _clientes(self) -> dict:
+        """El cliente de Hermes de cada perfil que se vigila: el del principal y el de cada agente servido."""
+        clientes = {PRINCIPAL: self.hermes}
+        if self.agentes is not None:
+            try:
+                for perfil, cliente in self.agentes.clientes().items():
+                    if perfil != PRINCIPAL:
+                        clientes[perfil] = cliente
+            except Exception:  # noqa: BLE001 — sin la lista de los agentes, al menos el principal
+                self._apuntar_fallo("agentes", "no se pudo saber qué agentes hay; solo el principal", excepcion=True)
+        return clientes
+
     def vuelta(self) -> None:
         ahora = self.reloj()
         self._olvidar_lo_viejo(ahora)
+        clientes = self._clientes()
         if not self.almacen.dispositivos():
             # Nadie a quien avisar: no se molesta a Hermes. Lo que pase mientras no es de nadie, así que al volver a
             # haber un iPhone se rehace la línea de base en vez de avisarle de lo de antes de darse de alta.
@@ -209,81 +232,110 @@ class Vigilante:
             self._pendiente_en_la_vuelta = False
             # Salvo los ficheros nuevos de exports/: no se avisa de ellos, pero sí se busca su conversación, para
             # que la app los enseñe en ella (`GET /avisos/v1/ficheros`) aunque no tenga los avisos puestos.
-            self._anunciar_ficheros(ahora, None)
+            self._anunciar_ficheros(clientes, ahora, None)
             return
-        bandeja = self.hermes.sesiones()
-        self._titulos = {sesion["id"]: texto.titulo_de_sesion(sesion) for sesion in bandeja}
-        self._revisar_turnos(ahora)
-        self._revisar_bandeja(bandeja, ahora, rebasar=self._rebasar)
+        # Sin el principal no hay vuelta (Hermes no contesta: se espera, `correr`). Un agente que no contesta se salta.
+        bandejas = {PRINCIPAL: self.hermes.sesiones()}
+        for perfil, cliente in clientes.items():
+            if perfil == PRINCIPAL:
+                continue
+            try:
+                bandejas[perfil] = cliente.sesiones()
+            except ErrorHermes as error:
+                self._apuntar_fallo(f"bandeja {perfil}", "no se pudo leer la bandeja del agente %s: %s", perfil, error)
+        self._titulos = {(perfil, sesion["id"]): texto.titulo_de_sesion(sesion)
+                         for perfil, bandeja in bandejas.items() for sesion in bandeja}
+        self._revisar_turnos(clientes, ahora)
+        self._revisar_bandejas(bandejas, clientes, ahora, rebasar=self._rebasar)
         self._rebasar = False
-        self._anunciar_ficheros(ahora, bandeja)
+        self._anunciar_ficheros(clientes, ahora, bandejas)
         self._podar(ahora)
 
     # -- Los ficheros nuevos de exports/
 
-    def _anunciar_ficheros(self, ahora: float, bandeja: list | None) -> None:
-        """Avisa de los ficheros nuevos que ha visto la vigilancia de ``exports/`` (``exportaciones``): primero se busca
-        a qué conversación van, y el aviso sale como cualquier otro, con sus ajustes y sus reintentos. Lo que no sale
-        se intenta en la vuelta siguiente. Sin ``bandeja`` no hay a quién avisar (ningún iPhone dado de alta): solo se
-        busca su conversación, para la app, y se dan por avisados."""
+    def _exportaciones_de(self, perfil: str):
+        """Lo de exports/ de un perfil: la de cada uno (`de(perfil)`), o, con la del principal sola, esa."""
         if self.exportaciones is None:
-            return
-        pendientes = self.exportaciones.por_anunciar(ahora)
+            return None
+        if hasattr(self.exportaciones, "de"):
+            return self.exportaciones.de(perfil)
+        return self.exportaciones if perfil == PRINCIPAL else None
+
+    def _anunciar_ficheros(self, clientes: dict, ahora: float, bandejas: dict | None) -> None:
+        for perfil, cliente in clientes.items():
+            hechas = self._exportaciones_de(perfil)
+            if hechas is None:
+                continue
+            bandeja = None if bandejas is None else bandejas.get(perfil)
+            if bandejas is not None and bandeja is None:
+                continue
+            self._anunciar_ficheros_de(perfil, cliente, hechas, ahora, bandeja, sin_iphone=bandejas is None)
+
+    def _anunciar_ficheros_de(self, perfil: str, cliente, hechas, ahora: float, bandeja: list | None,
+                              sin_iphone: bool) -> None:
+        """Avisa de los ficheros nuevos que ha visto la vigilancia del ``exports/`` de un perfil (``exportaciones``):
+        primero se busca a qué conversación van (en su historial), y el aviso sale como cualquier otro, con su perfil,
+        sus ajustes y sus reintentos. Lo que no sale se intenta en la vuelta siguiente. Sin iPhone no hay a quién
+        avisar: solo se busca su conversación, para la app, y se dan por avisados."""
+        pendientes = hechas.por_anunciar(ahora)
         if not pendientes:
             return
         sin_atribuir = [fichero for fichero in pendientes if not fichero.atribuido]
         if sin_atribuir:
             try:
-                sesiones = exportaciones.atribuir(self.hermes, sin_atribuir, ahora, bandeja)
+                sesiones = exportaciones.atribuir(cliente, sin_atribuir, ahora, bandeja)
             except ErrorHermes as error:
                 # Sin Hermes ahora, a la vuelta siguiente; si no caduca antes, se busca otra vez.
-                self._apuntar_fallo("exportaciones", "no se pudo buscar de qué conversación es un fichero nuevo: %s",
-                                    error)
+                self._apuntar_fallo(f"exportaciones {perfil}", "no se pudo buscar de qué conversación es un fichero "
+                                    "nuevo: %s", error)
                 self._pendiente_en_la_vuelta = True
                 return
-            pendientes = [self.exportaciones.atribuir(fichero, sesiones.get(fichero.nombre))
+            pendientes = [hechas.atribuir(fichero, sesiones.get(fichero.nombre))
                           if not fichero.atribuido else fichero for fichero in pendientes]
         for fichero in pendientes:
-            if bandeja is None:
-                self.exportaciones.anunciado(fichero)
+            if sin_iphone:
+                hechas.anunciado(fichero)
                 continue
             try:
-                titulo = (self._titulos.get(fichero.sesion) if fichero.sesion else None) or "Hermes"
+                titulo = (self._titulos.get((perfil, fichero.sesion)) if fichero.sesion else None) or "Hermes"
                 aviso = avisos.Aviso(tipo="segundo-plano", sesion=fichero.sesion, titulo=titulo,
                                      texto=exportaciones.TEXTO.format(fichero.nombre), instante=fichero.instante,
-                                     clave=fichero.clave, colapsa_con=f"fichero:{fichero.nombre}")
+                                     clave=fichero.clave, colapsa_con=f"fichero:{fichero.nombre}", perfil=perfil)
                 if self._avisar(aviso, ahora):
-                    self.exportaciones.anunciado(fichero)
+                    hechas.anunciado(fichero)
                     registro.info("fichero nuevo de exports avisado%s",
                                   " (con su conversación)" if fichero.sesion else " (sin conversación)")
                 else:
                     self._pendiente_en_la_vuelta = True
             except Exception:  # noqa: BLE001 — un fichero que rompe algo no puede dejar sin avisos al resto
                 self._apuntar_fallo("exportaciones", "fallo avisando de un fichero nuevo de exports", excepcion=True)
-                self.exportaciones.anunciado(fichero)
+                hechas.anunciado(fichero)
 
     # -- La bandeja
 
-    def _revisar_bandeja(self, bandeja: list, ahora: float, rebasar: bool = False) -> None:
+    def _revisar_bandejas(self, bandejas: dict, clientes: dict, ahora: float, rebasar: bool = False) -> None:
         arrancado = self.almacen.leer_estado("arrancado") == "1" and not rebasar
         anterior = (self._vuelta_anterior or _numero_de_texto(self.almacen.leer_estado("ultima_vuelta"))
                     or ahora)
         conocidas = {} if rebasar else self.almacen.sesiones()
         self._pendiente_en_la_vuelta = False
-        for sesion in bandeja:
-            sid = sesion["id"]
-            huella = (sesion.get("last_active"), sesion.get("message_count"))
-            if self._en_bandeja.get(sid) != huella:
-                self._en_bandeja[sid] = huella
-                self._ultimo_movimiento = ahora
-            try:
-                self._revisar_sesion(sesion, conocidas.get(sid), arrancado, anterior, ahora)
-            except ErrorHermes as error:
-                # Se deja como estaba, para que la vuelta siguiente la vea cambiada y lo intente otra vez.
-                self._apuntar_fallo(f"leer {sid}", "no se pudieron leer los mensajes de %s: %s", sid, error)
-            except Exception:  # noqa: BLE001 — una conversación que falla no para las demás
-                self._apuntar_fallo(f"apuntar {sid}", "fallo apuntando lo leído de %s; se vuelve a intentar en la "
-                                    "vuelta siguiente, sin repetir lo ya avisado", sid, excepcion=True)
+        for perfil, bandeja in bandejas.items():
+            for sesion in bandeja:
+                sid = sesion["id"]
+                huella = (sesion.get("last_active"), sesion.get("message_count"))
+                if self._en_bandeja.get((perfil, sid)) != huella:
+                    self._en_bandeja[(perfil, sid)] = huella
+                    self._ultimo_movimiento = ahora
+                donde = sid if perfil == PRINCIPAL else f"{perfil}/{sid}"
+                try:
+                    self._revisar_sesion(perfil, clientes[perfil], sesion, conocidas.get((perfil, sid)), arrancado,
+                                         anterior, ahora)
+                except ErrorHermes as error:
+                    # Se deja como estaba, para que la vuelta siguiente la vea cambiada y lo intente otra vez.
+                    self._apuntar_fallo(f"leer {donde}", "no se pudieron leer los mensajes de %s: %s", donde, error)
+                except Exception:  # noqa: BLE001 — una conversación que falla no para las demás
+                    self._apuntar_fallo(f"apuntar {donde}", "fallo apuntando lo leído de %s; se vuelve a intentar en "
+                                        "la vuelta siguiente, sin repetir lo ya avisado", donde, excepcion=True)
         self._vuelta_anterior = ahora
         if not arrancado or ahora - self._vuelta_guardada >= GUARDAR_VUELTA:
             self.almacen.guardar_estado("ultima_vuelta", repr(ahora))
@@ -291,10 +343,10 @@ class Vigilante:
         if not arrancado:
             self.almacen.guardar_estado("arrancado", "1")
             registro.info("%s: %d conversaciones dadas por vistas", "vuelve a haber iPhone" if rebasar else
-                          "primera vuelta", len(bandeja))
+                          "primera vuelta", sum(len(bandeja) for bandeja in bandejas.values()))
 
-    def _revisar_sesion(self, sesion: dict, estado: EstadoSesion | None, arrancado: bool, anterior: float,
-                        ahora: float) -> None:
+    def _revisar_sesion(self, perfil: str, cliente, sesion: dict, estado: EstadoSesion | None, arrancado: bool,
+                        anterior: float, ahora: float) -> None:
         sid = sesion["id"]
         actividad = _numero(sesion.get("last_active"))
         mensajes = _entero(sesion.get("message_count"))
@@ -302,24 +354,27 @@ class Vigilante:
             if not arrancado:
                 # La primera vuelta de la vida del vigía: lo que ya hay se da por visto sin leerlo. Si no, el primer
                 # arranque avisaría de todo el historial.
-                self.almacen.guardar_sesion(EstadoSesion(sid, None, actividad or ahora, actividad, mensajes, ahora))
+                self.almacen.guardar_sesion(EstadoSesion(sid, None, actividad or ahora, actividad, mensajes, ahora,
+                                                         perfil=perfil))
                 return
-            # Aparece después (nueva, o vuelve de más allá de las 200): es nuevo lo de desde la vuelta anterior.
-            estado = EstadoSesion(sid, None, anterior - MARGEN_SESION_NUEVA, None, None, ahora)
+            # Aparece después (nueva, de un agente nuevo, o vuelve de más allá de las 200): es nuevo lo de desde la
+            # vuelta anterior.
+            estado = EstadoSesion(sid, None, anterior - MARGEN_SESION_NUEVA, None, None, ahora, perfil=perfil)
         elif actividad == estado.ultima_actividad and mensajes == estado.mensajes:
             if ahora - estado.visto >= REFRESCAR_VISTO:
                 self.almacen.guardar_sesion(replace(estado, visto=ahora))
             return
-        filas, limite = self._leer(sid)
+        donde = sid if perfil == PRINCIPAL else f"{perfil}/{sid}"
+        filas, limite = self._leer(cliente, sid)
         ids = [fila["id"] for fila in filas] + ([estado.ultimo_id] if estado.ultimo_id is not None else [])
         pendiente = None
         entregas_del_vigia = None
         try:
-            entregas_del_vigia, volver = self._atender_entrega(sid, filas, ahora)
+            entregas_del_vigia, volver = self._atender_entrega(perfil, cliente, sid, filas, ahora)
             if volver:
                 pendiente = entregas_del_vigia
         except Exception:  # noqa: BLE001 — contestar una entrega no puede dejar la conversación sin avisos
-            self._apuntar_fallo(f"entrega {sid}", "fallo contestando la entrega de %s: se avisa de ella", sid,
+            self._apuntar_fallo(f"entrega {donde}", "fallo contestando la entrega de %s: se avisa de ella", donde,
                                 excepcion=True)
             entregas_del_vigia = None
         try:
@@ -328,18 +383,19 @@ class Vigilante:
                                         entregas_del_vigia=entregas_del_vigia,
                                         ultima_respuesta=estado.ultima_respuesta)
             for suceso in sucesos:
-                aviso = avisos.Aviso(tipo=suceso.tipo, sesion=sid, titulo=self._titulos.get(sid, "Hermes"),
-                                     texto=suceso.texto, instante=suceso.instante, clave=suceso.clave)
+                aviso = avisos.Aviso(tipo=suceso.tipo, sesion=sid, titulo=self._titulos.get((perfil, sid), "Hermes"),
+                                     texto=suceso.texto, instante=suceso.instante, clave=suceso.clave, perfil=perfil)
                 if not self._avisar(aviso, ahora):
                     pendiente = suceso.fila if pendiente is None else min(pendiente, suceso.fila)
         except Exception:  # noqa: BLE001 — una fila que rompe algo no puede repetirse en cada vuelta
-            self._apuntar_fallo(f"avisar {sid}", "fallo avisando de %s: lo de ahora se da por leído para no "
-                                "repetirlo en cada vuelta", sid, excepcion=True)
+            self._apuntar_fallo(f"avisar {donde}", "fallo avisando de %s: lo de ahora se da por leído para no "
+                                "repetirlo en cada vuelta", donde, excepcion=True)
             pendiente = None
         if pendiente is None:
             self.almacen.guardar_sesion(EstadoSesion(sid, max(ids) if ids else None, estado.referencia, actividad,
                                                      mensajes, ahora,
-                                                     deteccion.ultima_respuesta(filas, estado.ultima_respuesta)))
+                                                     deteccion.ultima_respuesta(filas, estado.ultima_respuesta),
+                                                     perfil=perfil))
             return
         # Queda algo por mandar: leída solo hasta justo antes, para que la vuelta siguiente lo vuelva a encontrar, y con
         # la actividad de antes, para que la bandeja la dé por cambiada y se vuelva a leer.
@@ -348,11 +404,11 @@ class Vigilante:
         self.almacen.guardar_sesion(EstadoSesion(sid, max(antes) if antes else estado.ultimo_id, estado.referencia,
                                                  estado.ultima_actividad, estado.mensajes, ahora,
                                                  deteccion.ultima_respuesta(filas, estado.ultima_respuesta,
-                                                                            hasta=pendiente)))
+                                                                            hasta=pendiente), perfil=perfil))
 
     # -- Las entregas de los subagentes
 
-    def _atender_entrega(self, sid: str, filas: list, ahora: float) -> tuple:
+    def _atender_entrega(self, perfil: str, cliente, sid: str, filas: list, ahora: float) -> tuple:
         """Contesta, si toca, la entrega sin atender más reciente de la conversación (``entregas``) lanzando el turno de
         continuación de la app. Devuelve la fila de la entrega de la que se ocupa el vigía (``None`` si de ninguna: se
         avisa de ella como antes) y si hay que volver a leer la conversación en la vuelta siguiente aunque no cambie
@@ -364,12 +420,14 @@ class Vigilante:
                                     cadena_maxima=self.reglas_entrega.cadena_maxima)
         if decision is None:
             return None, False
-        clave = (sid, decision.delegacion)
+        clave = (perfil, sid, decision.delegacion)
+        donde = sid if perfil == PRINCIPAL else f"{perfil}/{sid}"
         if decision.accion == entregas.RENUNCIAR:
             if clave not in self._continuaciones:
                 self._continuaciones[clave] = _Continuacion(desde=ahora, rendida=True)
-                registro.warning("la entrega %s de %s no se contesta: %d continuaciones seguidas sin un mensaje de "
-                                 "Daniel; se avisa de ella", decision.delegacion, sid, self.reglas_entrega.cadena_maxima)
+                registro.warning("la entrega %s de %s no se contesta: %d continuaciones seguidas sin un mensaje del "
+                                 "usuario; se avisa de ella", decision.delegacion, donde,
+                                 self.reglas_entrega.cadena_maxima)
             return None, False
         if decision.accion == entregas.ESPERAR:
             return decision.fila, True
@@ -381,52 +439,59 @@ class Vigilante:
                 return decision.fila, True
             self._continuaciones[clave] = replace(hecho, rendida=True)
             registro.warning("la continuación %s de %s no aparece en el historial; se avisa de la entrega",
-                             hecho.run_id, sid)
+                             hecho.run_id, donde)
             return None, False
         if ahora < hecho.hasta:
             return decision.fila, True
         try:
-            run_id = self.hermes.lanzar_continuacion(sid, decision.clave)
+            # La frase la leen las apps de todos los iPhone: la de antes mientras alguno no entienda la de ahora.
+            frase = entregas.texto_de_la_continuacion(self.almacen.dispositivos())
+            run_id = cliente.lanzar_continuacion(sid, decision.clave, frase)
         except ErrorHermes as error:
             if error.estado == 409 and error.codigo == "idempotency_key_conflict":
                 # La misma clave con otro cuerpo: la app ya lanzó esta continuación, con sus instrucciones. Es la buena.
                 self._continuaciones[clave] = replace(hecho, run_id=None, lanzada=ahora)
-                registro.info("la continuación de %s en %s ya la lanzó la app", decision.delegacion, sid)
+                registro.info("la continuación de %s en %s ya la lanzó la app", decision.delegacion, donde)
                 return decision.fila, True
             pasajero = error.estado is None or error.estado in (429, 503) or error.estado >= 500
             if pasajero and ahora - hecho.desde < INSISTIR_EN_LA_CONTINUACION:
                 fallos = hecho.fallos + 1
                 pausa = REINTENTOS[min(fallos, len(REINTENTOS)) - 1]
                 self._continuaciones[clave] = replace(hecho, fallos=fallos, hasta=ahora + pausa)
-                self._apuntar_fallo(f"continuar {sid}", "no se pudo lanzar la continuación de %s en %s (%s); se "
-                                    "reintenta", decision.delegacion, sid, error)
+                self._apuntar_fallo(f"continuar {donde}", "no se pudo lanzar la continuación de %s en %s (%s); se "
+                                    "reintenta", decision.delegacion, donde, error)
                 return decision.fila, True
             self._continuaciones[clave] = replace(hecho, rendida=True)
             registro.warning("no se pudo lanzar la continuación de %s en %s: %s; se avisa de la entrega",
-                             decision.delegacion, sid, error)
+                             decision.delegacion, donde, error)
             return None, False
         self._continuaciones[clave] = replace(hecho, run_id=run_id, lanzada=ahora)
         # Se vigila como los turnos de la app: si falla sin respuesta, llega el aviso de error.
-        self.almacen.vigilar_turnos([(run_id, sid)], ahora)
-        registro.info("entrega %s de %s sin contestar: continuación %s lanzada", decision.delegacion, sid, run_id)
+        self.almacen.vigilar_turnos([(run_id, sid, perfil)], ahora)
+        registro.info("entrega %s de %s sin contestar: continuación %s lanzada", decision.delegacion, donde, run_id)
         return decision.fila, True
 
-    def _leer(self, sid: str) -> tuple:
+    def _leer(self, cliente, sid: str) -> tuple:
         """Las últimas filas de una conversación, y cuántas se pidieron. Casi siempre bastan 20, las del turno que
         acaba de terminar; si en ellas no está la petición que lo abrió (un turno largo, lleno de herramientas), se
         leen `filas_por_lectura`, porque de esa petición depende de qué tipo es el aviso."""
         corta = min(LECTURA_CORTA, self.filas_por_lectura)
-        filas = self.hermes.mensajes(sid, corta)
+        filas = cliente.mensajes(sid, corta)
         if len(filas) >= corta < self.filas_por_lectura and not any(deteccion.abre_turno(f) for f in filas):
-            return self.hermes.mensajes(sid, self.filas_por_lectura), self.filas_por_lectura
+            return cliente.mensajes(sid, self.filas_por_lectura), self.filas_por_lectura
         return filas, corta
 
     # -- Los turnos que la app dejó en marcha
 
-    def _revisar_turnos(self, ahora: float) -> None:
+    def _revisar_turnos(self, clientes: dict, ahora: float) -> None:
         for turno in self.almacen.turnos():
+            cliente = clientes.get(turno.perfil)
+            if cliente is None:
+                # De un agente que ya no está (borrado, o sin clave): nadie lo puede contestar.
+                self.almacen.olvidar_turno(turno.run_id)
+                continue
             try:
-                self._revisar_turno(turno, ahora)
+                self._revisar_turno(turno, cliente, ahora)
             except ErrorHermes as error:
                 registro.debug("no se pudo leer el turno %s: %s", turno.run_id, error)
             except Exception:  # noqa: BLE001
@@ -434,17 +499,17 @@ class Vigilante:
                                     turno.run_id, excepcion=True)
                 self.almacen.olvidar_turno(turno.run_id)
 
-    def _revisar_turno(self, turno, ahora: float) -> None:
+    def _revisar_turno(self, turno, cliente, ahora: float) -> None:
         if ahora - turno.alta > VIDA_DE_UN_TURNO:
             self.almacen.olvidar_turno(turno.run_id)
             return
-        estado = self.hermes.turno(turno.run_id)
+        estado = cliente.turno(turno.run_id)
         if estado is None:
             # Hermes ya no lo conoce (pasó su hora en memoria, o se reinició sin clave de idempotencia).
             self.almacen.olvidar_turno(turno.run_id)
             return
         situacion = estado.get("status")
-        titulo = self._titulos.get(turno.sesion, "Hermes")
+        titulo = self._titulos.get((turno.perfil, turno.sesion), "Hermes")
         # Cuándo pasó: la última vez que cambió el run, que es cuando pidió permiso o cuando falló.
         instante = _numero(estado.get("updated_at")) or ahora
         if situacion == "waiting_for_approval":
@@ -455,7 +520,8 @@ class Vigilante:
             aviso = avisos.Aviso(tipo="aprobacion", sesion=turno.sesion, titulo=titulo,
                                  texto=_texto_de_aprobacion(aprobacion), instante=instante,
                                  clave=f"aprobacion:{pedida}", caduca=self.caducidad_aprobacion,
-                                 colapsa_con="aprobacion", aprobacion=_peticion_de_permiso(turno.run_id, aprobacion))
+                                 colapsa_con="aprobacion", aprobacion=_peticion_de_permiso(turno.run_id, aprobacion),
+                                 perfil=turno.perfil)
             if self._avisar(aviso, ahora):
                 self.almacen.marcar_aprobacion(turno.run_id, pedida)
         elif situacion in ("failed", "interrupted"):
@@ -464,7 +530,7 @@ class Vigilante:
             salida = estado.get("output")
             if situacion == "interrupted" or not (isinstance(salida, str) and salida.strip()):
                 aviso = avisos.Aviso(tipo="error", sesion=turno.sesion, titulo=titulo, texto=_texto_de_error(estado),
-                                     instante=instante, clave=f"error:{turno.run_id}")
+                                     instante=instante, clave=f"error:{turno.run_id}", perfil=turno.perfil)
                 if not self._avisar(aviso, ahora):
                     return
             self.almacen.olvidar_turno(turno.run_id)

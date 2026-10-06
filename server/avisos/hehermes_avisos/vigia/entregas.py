@@ -11,7 +11,8 @@ historial.
 **Qué lanza.** El mismo turno que la app (``TEXTO_CONTINUAR``), con la misma ``Idempotency-Key``
 (``continuar-<delegation_id>`` de la entrega más reciente sin atender): la app lo reconoce en el historial como una
 continuación, no lo pinta como mensaje de Daniel, y si la app y el vigía llegaran a la vez el servidor no crea dos turnos
-(la misma clave da el mismo run, o un 409).
+(la misma clave da el mismo run, o un 409). Con la frase de antes (``TEXTO_CONTINUAR_ANTIGUO``) mientras haya dado de
+alta un iPhone con una app que no conoce la de ahora (``texto_de_la_continuacion``).
 
 **Cuándo no**, que es casi todo:
 
@@ -70,6 +71,19 @@ class Entrega:
     def clave(self) -> str:
         """La ``Idempotency-Key`` del turno: la misma que pondría la app (``Motor.revisarDelegaciones``)."""
         return f"continuar-{self.delegacion}"
+
+
+def texto_de_la_continuacion(dispositivos: list) -> str:
+    """Con qué frase lanza el vigía la continuación: la de ahora, sin el nombre de quien hizo la app
+    (``deteccion.TEXTO_CONTINUAR``), si todos los iPhone dados de alta la entienden; si no, la de antes.
+
+    **Por qué.** Lo que el vigía lanza lo leen las apps de todos esos iPhone, y una app de la 1.0 (12) o anterior solo
+    esconde la frase de antes: la de ahora la pintaría como un mensaje del usuario. Cada app dice en sus ajustes qué
+    textos entiende (``Ajustes.textos``, desde la app siguiente a la 1.0 (12)); la que no lo dice es de antes. Sin
+    ningún iPhone dado de alta el vigía no lanza nada (``Vigilante.vuelta``), así que da igual."""
+    if all(dispositivo.ajustes.entiende_los_textos_sin_nombre for dispositivo in dispositivos):
+        return deteccion.TEXTO_CONTINUAR
+    return deteccion.TEXTO_CONTINUAR_ANTIGUO
 
 
 def delegacion_de(fila: dict) -> str | None:

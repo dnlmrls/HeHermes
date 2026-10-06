@@ -19,7 +19,7 @@ from .servidor import unidad_valida
 #: 1.5.5. El instalador escribe las suyas.
 SERVICIOS_DE_SERIE = ("hehermes-pasarela.service", "hehermes-vigia.service", "hehermes-rele.service",
                       "hehermes-leer-media.socket", "hehermes-respaldo.socket", "hehermes-entrada.socket",
-                      "hehermes-actualizar.socket")
+                      "hehermes-actualizar.socket", "hehermes-agentes.socket", "hehermes-agentes-memoria.timer")
 
 
 def _si_o_no(valor: str, nombre: str) -> bool:
@@ -121,6 +121,11 @@ class ConfigVigia:
     exportaciones_vigilar: bool = True
     exportaciones_estabilidad: float = 5.0
     exportaciones_antiguedad_maxima: float = 3600.0
+    # Los agentes (contrato §18, desde la 1.6.0): la carpeta de sus claves (una por perfil, `<perfil>.clave`, de root y
+    # del grupo del vigía, 0640), los que se vigilan; y el socket de su ayudante (`hehermes-agentes.socket`; vacío, las
+    # rutas de /avisos/v1/agentes contestan 503). Sin la sección (un `vigia.ini` de antes), estos.
+    agentes_claves: str = "/etc/hehermes-avisos/agentes"
+    agentes_ayudante: str = "/run/hehermes-agentes.sock"
 
     @classmethod
     def leer(cls, ruta: str) -> ConfigVigia:
@@ -155,6 +160,9 @@ class ConfigVigia:
         instalador = (texto("servidor", "instalador", base.servidor_instalador) or "").strip()
         if not instalador.startswith("/"):
             raise ValueError("[servidor] instalador tiene que ser una carpeta absoluta")
+        agentes_claves = (texto("agentes", "claves", base.agentes_claves) or "").strip()
+        if agentes_claves and not agentes_claves.startswith("/"):
+            raise ValueError("[agentes] claves tiene que ser una carpeta absoluta")
         return cls(
             escucha=direccion(texto("vigia", "escucha", "%s:%d" % base.escucha)),
             base_de_datos=texto("vigia", "base_de_datos", base.base_de_datos),
@@ -198,6 +206,8 @@ class ConfigVigia:
             exportaciones_estabilidad=max(2.0, numero("exportaciones", "estabilidad", base.exportaciones_estabilidad)),
             exportaciones_antiguedad_maxima=numero("exportaciones", "antiguedad_maxima",
                                                    base.exportaciones_antiguedad_maxima),
+            agentes_claves=agentes_claves,
+            agentes_ayudante=texto("agentes", "ayudante", base.agentes_ayudante).strip(),
         )
 
     @property

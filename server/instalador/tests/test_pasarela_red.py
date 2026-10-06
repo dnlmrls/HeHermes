@@ -117,6 +117,7 @@ class ConPasarela(unittest.TestCase):
         os.mkdir(c("estado"))
         if self.con_vigia:
             ini += "[avisos]\nvigia = 127.0.0.1:%d\nsecreto = %s\n" % (self.vigia.puerto, c("secreto"))
+        ini += self.ini_de_mas()
         with open(c("pasarela.ini"), "w") as f:
             f.write(ini)
         self.diario = []
@@ -145,6 +146,10 @@ class ConPasarela(unittest.TestCase):
             servidor.shutdown()
             servidor.server_close()
         self.carpeta.cleanup()
+
+    def ini_de_mas(self) -> str:
+        """Lo que una prueba añade a `pasarela.ini` (las de los agentes, su sección `[agentes]`)."""
+        return ""
 
     def escribir_tokens(self, entradas):
         datos = {"v": 1, "tokens": [{"nombre": n, "sha256": pa.hash_token(t)} for n, t in entradas]}

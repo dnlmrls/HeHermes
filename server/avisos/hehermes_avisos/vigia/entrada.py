@@ -27,6 +27,7 @@ import threading
 import unicodedata
 
 from ..comun import ErrorHTTP
+from .fichero import PRINCIPAL, perfil_valido
 from .respaldo import ClienteAyudante, _error_de, _exigir, _id, _numero, limpiar_cada_hora  # noqa: F401
 
 registro = logging.getLogger("vigia.entrada")
@@ -74,10 +75,13 @@ class Entradas:
     """La lógica de las rutas, sin HTTP: ``atender`` devuelve ``(estado, objeto JSON o None, cabeceras)``. ``tope`` y
     ``margen`` en bytes y ``dias``, los de ``vigia.ini``."""
 
-    def __init__(self, cliente: ClienteAyudante, tope: int, margen: int, dias: int, a_la_vez: int = MAX_A_LA_VEZ):
+    def __init__(self, cliente: ClienteAyudante, tope: int, margen: int, dias: int, a_la_vez: int = MAX_A_LA_VEZ,
+                 perfiles=lambda: []):
         self.ayudante = cliente
         self.tope, self.margen, self.dias = tope, margen, dias
         self._trozos = threading.BoundedSemaphore(a_la_vez)
+        #: Los agentes servidos (contrato §18.9), cuya entrada también se limpia cada hora.
+        self.perfiles = perfiles
 
     def _pedir(self, peticion: dict, cuerpo: bytes | None = None, plazo: float | None = None) -> dict:
         respuesta, _ = self.ayudante.pedir(peticion, cuerpo, plazo)
@@ -91,32 +95,39 @@ class Entradas:
     def _limpia(respuesta: dict) -> dict:
         return {k: v for k, v in respuesta.items() if k not in ("ok", "http", "bytes")}
 
-    def atender(self, metodo: str, ruta: str, leer_cuerpo, cabeceras) -> tuple:
+    def atender(self, metodo: str, ruta: str, leer_cuerpo, cabeceras, perfil: str = PRINCIPAL) -> tuple:
+        """`perfil`, el de `?perfil=` (contrato §18.9): la entrada de la casa de ese agente. Al ayudante le llega su
+        nombre, y él saca su casa; sin él (el principal), las órdenes de siempre."""
         encontrada = RUTA.fullmatch(ruta)
         if not encontrada:
             raise ErrorHTTP(404, "ruta_desconocida", "Ruta desconocida")
+        perfil = perfil_valido(perfil)
+
+        def pedir(peticion: dict, cuerpo: bytes | None = None, plazo: float | None = None) -> dict:
+            return self._pedir(peticion if perfil == PRINCIPAL else dict(peticion, perfil=perfil), cuerpo, plazo)
+
         que, id_, sub, n = encontrada.groups()
         if que == "estado":
             if id_ is not None:
                 raise ErrorHTTP(404, "ruta_desconocida", "Ruta desconocida")
             _exigir(metodo, "GET")
-            respuesta = self._pedir({"orden": "estado", "tope": self.tope, "margen": self.margen})
+            respuesta = pedir({"orden": "estado", "tope": self.tope, "margen": self.margen})
             return 200, dict(self._limpia(respuesta), dias=self.dias), {}
         if id_ is None:
             _exigir(metodo, "POST")
-            return self._crear(_objeto(leer_cuerpo()))
+            return self._crear(_objeto(leer_cuerpo()), pedir)
         _id(id_)
         if sub is None:
             if metodo == "DELETE":
-                self._pedir({"orden": "borrar", "id": id_})
+                pedir({"orden": "borrar", "id": id_})
                 registro.info("entrada: subida %s borrada", id_[:8])
                 return 204, None, {}
             _exigir(metodo, "GET")
-            return 200, self._limpia(self._pedir({"orden": "subida", "id": id_})), {}
+            return 200, self._limpia(pedir({"orden": "subida", "id": id_})), {}
         if sub == "terminar" and n is None:
             _exigir(metodo, "POST")
             _objeto(leer_cuerpo())
-            respuesta = self._pedir({"orden": "terminar", "id": id_}, plazo=PLAZO_TERMINAR)
+            respuesta = pedir({"orden": "terminar", "id": id_}, plazo=PLAZO_TERMINAR)
             registro.info("entrada: subida %s terminada: %s bytes", id_[:8], respuesta.get("tamano"))
             return 200, {"ruta": respuesta.get("ruta"), "nombre": respuesta.get("nombre"),
                          "tamano": respuesta.get("tamano")}, {}
@@ -129,20 +140,21 @@ class Entradas:
             datos = leer_cuerpo()
             if not datos or len(datos) > TROZO:
                 raise ErrorHTTP(400, "trozo_invalido", "Un trozo tiene de 1 byte a 4 MiB")
-            self._con_turno(lambda: self._pedir({"orden": "trozo", "id": id_, "n": numero, "sha256": sha,
+            self._con_turno(lambda: pedir({"orden": "trozo", "id": id_, "n": numero, "sha256": sha,
                                                  "margen": self.margen}, datos))
             registro.debug("entrada: subida %s, trozo %d (%d bytes)", id_[:8], numero, len(datos))
             return 204, None, {}
         raise ErrorHTTP(404, "ruta_desconocida", "Ruta desconocida")
 
-    def _crear(self, cuerpo: dict) -> tuple:
+    def _crear(self, cuerpo: dict, pedir=None) -> tuple:
+        pedir = pedir or self._pedir
         nombre, tamano, sha = cuerpo.get("nombre"), cuerpo.get("tamano"), cuerpo.get("sha256")
         nombre_valido(nombre)
         if not _entero(tamano) or tamano < 1:
             raise ErrorHTTP(400, "parametro_invalido", "«tamano» son los bytes del fichero, al menos uno")
         if not isinstance(sha, str) or not PATRON_SHA.fullmatch(sha):
             raise ErrorHTTP(400, "parametro_invalido", "«sha256» son 64 hexadecimales en minúsculas")
-        respuesta = self._pedir({"orden": "crear", "nombre": nombre, "tamano": tamano, "sha256": sha,
+        respuesta = pedir({"orden": "crear", "nombre": nombre, "tamano": tamano, "sha256": sha,
                                  "tope": self.tope, "margen": self.margen})
         nueva = respuesta.get("http") == 201
         id_ = str(respuesta.get("id"))[:8]
@@ -164,14 +176,22 @@ class Entradas:
             self._trozos.release()
 
     def limpiar(self) -> None:
-        """Lo que se lanza cada hora. Si el ayudante no está, no pasa nada: no hay nada que limpiar."""
+        """Lo que se lanza cada hora: la del principal y la de cada agente. Si el ayudante no está (o la entrada de un
+        agente aún no existe), no pasa nada: no hay nada que limpiar."""
         try:
-            respuesta = self._pedir({"orden": "limpiar", "dias": self.dias})
-        except ErrorHTTP:
-            return
-        borradas = {k: v for k, v in self._limpia(respuesta).items() if isinstance(v, int) and v}
-        if borradas:
-            registro.info("entrada: limpieza: %s", ", ".join("%s %s" % (v, k) for k, v in sorted(borradas.items())))
+            agentes = [p for p in self.perfiles() if p != PRINCIPAL]
+        except Exception:  # noqa: BLE001 — sin la lista de los agentes, al menos la del principal
+            agentes = []
+        for perfil in [PRINCIPAL] + agentes:
+            peticion = {"orden": "limpiar", "dias": self.dias}
+            try:
+                respuesta = self._pedir(peticion if perfil == PRINCIPAL else dict(peticion, perfil=perfil))
+            except ErrorHTTP:
+                continue
+            borradas = {k: v for k, v in self._limpia(respuesta).items() if isinstance(v, int) and v}
+            if borradas:
+                registro.info("entrada: limpieza%s: %s", "" if perfil == PRINCIPAL else " de un agente",
+                              ", ".join("%s %s" % (v, k) for k, v in sorted(borradas.items())))
 
 
 def _objeto(datos: bytes) -> dict:

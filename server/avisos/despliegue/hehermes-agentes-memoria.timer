@@ -1,0 +1,13 @@
+# /etc/systemd/system/hehermes-agentes-memoria.timer
+# Cada minuto, lo que saben de ti los agentes que lo comparten (contrato §18.8): hehermes-agentes-memoria.service. Sin
+# Persistent: un minuto perdido (la máquina apagada) no se recupera, lo hace el siguiente.
+[Unit]
+Description=HeHermes: la memoria que comparten los agentes, cada minuto
+
+[Timer]
+OnCalendar=minutely
+AccuracySec=5s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

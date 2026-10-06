@@ -74,6 +74,11 @@ ESPERAS = (5.0, 15.0, 60.0, 300.0)
 ESPERA_SIN_VIGILANCIA = 3600.0
 TEXTO = "Nuevo fichero listo: {}"
 MAX_NOMBRE = 255
+#: Los agentes (contrato §18.9): cada perfil tiene su exports/, y su vigilancia. El principal es `default`.
+PATRON_PERFIL = re.compile(r"[a-z0-9]{1,24}")
+PRINCIPAL = "default"
+#: Cada cuánto se mira qué agentes hay, para vigilar el exports/ de los nuevos y dejar el de los que se van.
+REPASO_DE_AGENTES = 30.0
 #: Lo que no se avisa aunque el lector lo contara: lo mismo que él se salta (ocultos, temporales), por si acaso.
 TEMPORALES = (".tmp", ".temp", ".part", ".partial", ".crdownload", ".download", ".swp", ".swx", ".lock", "~")
 
@@ -136,8 +141,11 @@ class Exportaciones:
     API (``de_la_sesion``), con un cerrojo. Se guarda en el estado de la base: un reinicio no vuelve a avisar de nada, y
     lo que no llegó a salir se intenta otra vez mientras no caduque."""
 
-    def __init__(self, almacen, *, estabilidad: float = ESTABILIDAD, antiguedad_maxima: float = ANTIGUEDAD_MAXIMA):
+    def __init__(self, almacen, *, estabilidad: float = ESTABILIDAD, antiguedad_maxima: float = ANTIGUEDAD_MAXIMA,
+                 clave: str = CLAVE):
         self.almacen = almacen
+        #: Donde se guarda lo visto: la del principal, `exportaciones`; la de un agente, `exportaciones:<perfil>`.
+        self.clave = clave
         self.estabilidad = estabilidad
         self.antiguedad_maxima = antiguedad_maxima
         self._cerrojo = threading.Lock()
@@ -159,7 +167,7 @@ class Exportaciones:
 
     def _leer(self) -> dict:
         try:
-            datos = json.loads(self.almacen.leer_estado(CLAVE) or "{}")
+            datos = json.loads(self.almacen.leer_estado(self.clave) or "{}")
         except ValueError:
             return {}
         return datos if isinstance(datos, dict) else {}
@@ -170,7 +178,7 @@ class Exportaciones:
         self._conocidos = {f.nombre: f for f in recientes}
         datos = {"base": self._base, "ficheros": {f.nombre: {k: v for k, v in asdict(f).items() if k != "nombre"}
                                                   for f in recientes}}
-        self.almacen.guardar_estado(CLAVE, json.dumps(datos, ensure_ascii=False, sort_keys=True))
+        self.almacen.guardar_estado(self.clave, json.dumps(datos, ensure_ascii=False, sort_keys=True))
 
     # -- Lo que ve el lector
 
@@ -401,12 +409,17 @@ class VigiaDeExportaciones:
     se le vuelve a preguntar cada hora."""
 
     def __init__(self, ruta_socket: str, exportaciones: Exportaciones, despertar, *, reloj=time.time,
-                 plazo: float = PLAZO_DE_LECTURA):
+                 plazo: float = PLAZO_DE_LECTURA, perfil: str | None = None):
+        if perfil is not None and (not PATRON_PERFIL.fullmatch(perfil) or perfil == PRINCIPAL):
+            raise ValueError("perfil sin la forma de uno de Hermes: %r" % (perfil,))
         self.ruta_socket = ruta_socket
         self.exportaciones = exportaciones
         self.despertar = despertar
         self.reloj = reloj
         self.plazo = plazo
+        #: Lo que se le pide al lector: la del principal, o la de un agente (`?exports <perfil>`, desde la 1.6.0), cuya
+        #: carpeta saca el lector de su propia casa: aquí solo va el nombre del perfil.
+        self.peticion = PETICION if perfil is None else b"?exports " + perfil.encode("ascii") + b"\n"
 
     def correr(self, parar: threading.Event) -> None:
         fallos = 0
@@ -433,7 +446,7 @@ class VigiaDeExportaciones:
         conexion.settimeout(self.plazo)
         try:
             conexion.connect(self.ruta_socket)
-            conexion.sendall(PETICION)
+            conexion.sendall(self.peticion)
             lineas = conexion.makefile("rb")
             vigilando = False
             for linea in lineas:
@@ -455,3 +468,68 @@ class VigiaDeExportaciones:
             return True
         finally:
             conexion.close()
+
+
+# -- Las de cada agente (contrato §18.9, desde la 1.6.0)
+
+
+class ExportacionesDeLosAgentes:
+    """Lo de ``exports/`` de cada perfil: la del principal y una por agente servido, cada una con lo suyo guardado aparte
+    (``exportaciones:<perfil>``) y con su propia vigilancia del lector (``?exports <perfil>``), que se pone y se quita
+    según los agentes que haya (``al_dia``, cada ``REPASO_DE_AGENTES`` desde ``correr``). La del principal la vigila
+    quien la creó, como antes."""
+
+    def __init__(self, almacen, principal: Exportaciones | None, ruta_socket: str | None, despertar, *,
+                 estabilidad: float = ESTABILIDAD, antiguedad_maxima: float = ANTIGUEDAD_MAXIMA, reloj=time.time,
+                 arrancar: bool = True):
+        self.almacen, self.ruta_socket, self.despertar, self.reloj = almacen, ruta_socket, despertar, reloj
+        self.estabilidad, self.antiguedad_maxima = estabilidad, antiguedad_maxima
+        #: Sin `arrancar`, no se lanza ninguna vigilancia (las pruebas le pasan lo que vería el lector).
+        self.arrancar = arrancar
+        self._cerrojo = threading.Lock()
+        self._de: dict = {PRINCIPAL: principal} if principal is not None else {}
+        # perfil -> el evento que para su vigilancia.
+        self._paradas: dict = {}
+
+    def de(self, perfil: str) -> Exportaciones | None:
+        with self._cerrojo:
+            return self._de.get(perfil)
+
+    def perfiles(self) -> list:
+        with self._cerrojo:
+            return sorted(self._de, key=lambda perfil: (perfil != PRINCIPAL, perfil))
+
+    def al_dia(self, perfiles) -> None:
+        """Los agentes servidos ahora: los nuevos empiezan a vigilarse; los que se fueron, dejan de hacerlo."""
+        quiere = {p for p in perfiles if isinstance(p, str) and PATRON_PERFIL.fullmatch(p) and p != PRINCIPAL}
+        with self._cerrojo:
+            for perfil in sorted(quiere - set(self._de)):
+                hechas = Exportaciones(self.almacen, estabilidad=self.estabilidad,
+                                       antiguedad_maxima=self.antiguedad_maxima, clave=CLAVE + ":" + perfil)
+                self._de[perfil] = hechas
+                if self.arrancar and self.ruta_socket:
+                    parar = threading.Event()
+                    self._paradas[perfil] = parar
+                    vigia = VigiaDeExportaciones(self.ruta_socket, hechas, self.despertar, reloj=self.reloj,
+                                                 perfil=perfil)
+                    threading.Thread(target=vigia.correr, args=(parar,), name="exportaciones-" + perfil,
+                                     daemon=True).start()
+                registro.info("se vigila el exports/ de un agente más (%d)", len(self._de) - 1)
+            for perfil in [p for p in self._de if p != PRINCIPAL and p not in quiere]:
+                del self._de[perfil]
+                parar = self._paradas.pop(perfil, None)
+                if parar is not None:
+                    parar.set()
+
+    def correr(self, parar: threading.Event, perfiles, cada: float = REPASO_DE_AGENTES) -> None:
+        """El hilo que mantiene las vigilancias al día con los agentes servidos (``perfiles()``)."""
+        while not parar.is_set():
+            try:
+                self.al_dia(perfiles())
+            except Exception:  # noqa: BLE001 — un repaso que falla no para la vigilancia de las demás
+                registro.exception("no se pudo repasar qué agentes hay para vigilar su exports/")
+            if parar.wait(cada):
+                break
+        with self._cerrojo:
+            for evento in self._paradas.values():
+                evento.set()

@@ -56,4 +56,15 @@ máquina se lleva este paquete entero y arranca solo su mitad.
 #        su propia unidad tras mirar la forma, el cerrojo y el tope; la descarga sale solo de la URL del paquete
 #        instalado y se comprueban la suma de la app y la firma de Daniel. El ayudante del respaldo dice cuándo hizo la
 #        última instantánea (`ultima`). [servidor] en vigia.ini.
-VERSION = "1.5.5"
+# 1.6.0: los agentes (spec 2026-10-05, contrato §18): varios perfiles de Hermes por una sola conexión. El vigía lee cada
+#        perfil con su prefijo /p/<perfil>/ y su clave ([agentes] claves), guarda lo visto por perfil (base de datos 5) y
+#        avisa con el perfil (en el sobre, el hilo y el colapso); atiende /avisos/v1/agentes/… y se lo pasa al ayudante
+#        `hehermes-agentes` (despliegue/): de root por conexión, sin capacidades, que crea (con `hermes profile create
+#        --clone`, su clave y su personalidad), cambia y borra (con una copia antes) los perfiles, y cada minuto junta lo
+#        que saben de ti los que lo comparten, con el flock de Hermes. Un Hermes que ya sirve otros perfiles sirve los
+#        nuevos en caliente, y el ayudante se lo pide por su socket de control (`rescan-profiles`); con el primer agente
+#        (aún no los sirve: lo decide al arrancar), pone `gateway.multiplex_profiles: true` y reinicia su unidad una vez,
+#        con drenaje y en un rato tranquilo (el trabajo dice su `paso`). La lista no lanza `hermes`: lee `profiles/` y
+#        mira cada agente con su clave, a la vez. La personalidad la escribe el principal. El lector y la entrada atienden
+#        lo de cada perfil (`?exports <perfil>`, `perfil=`).
+VERSION = "1.6.0"

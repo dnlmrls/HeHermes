@@ -263,9 +263,16 @@ class ElDelProbador(Base):
         # Lo que la app le manda (desde la 0.10.6), en la entrada de su perfil.
         entrada = self.sis.leer_texto("/etc/systemd/system/hehermes-entrada@.service")
         self.assertIn("--hermes-home=%s " % TRABAJO, entrada)
-        self.assertIn("BindPaths=-%s/entrada\n" % TRABAJO, entrada)
+        self.assertIn("BindPaths=-%s/entrada -%s/profiles\n" % (TRABAJO, TRABAJO), entrada)
         self.assertEqual(man["entrada"], TRABAJO + "/entrada")
         self.assertTrue(self.sis.es_carpeta(TRABAJO + "/entrada"))
+        # Los agentes (desde la 0.11.0): su ayudante, con la casa de su perfil y su unidad (la que reinicia si un agente
+        # nuevo no se sirve); y su memoria compartida, también.
+        agentes = self.sis.leer_texto("/etc/systemd/system/hehermes-agentes@.service")
+        self.assertIn("--hermes-home=%s " % TRABAJO, agentes)
+        self.assertIn("--unidad-hermes=hermes-gateway-trabajo.service ", agentes)
+        self.assertIn("--hermes-home=%s " % TRABAJO,
+                      self.sis.leer_texto("/etc/systemd/system/hehermes-agentes-memoria.service"))
 
     def test_de_noche_para_y_arranca_su_unidad(self):
         self.assertEqual(self.por_chat(), 0, self.salida)

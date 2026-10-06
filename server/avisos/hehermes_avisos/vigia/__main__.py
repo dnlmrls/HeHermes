@@ -23,13 +23,14 @@ import urllib.request
 
 from .. import VERSION, comun
 from ..comun import ErrorDeSecreto, ErrorHTTP, ServidorHTTP, cola, configurar_registro, leer_secreto
+from . import agentes as agentes_
 from .almacen import Almacen
 from .api import AppVigia, ManejadorVigia
 from .configuracion import ConfigVigia
 from .entrada import Entradas
 from .entrada import ayudante as ayudante_de_la_entrada
 from .envio import ClienteRele, Mensajero
-from .exportaciones import Exportaciones, VigiaDeExportaciones
+from .exportaciones import Exportaciones, ExportacionesDeLosAgentes, VigiaDeExportaciones
 from .fichero import ClienteLector, Ficheros, Limites
 from .hermes import ClienteHermes, ErrorHermes
 from .respaldo import ClienteAyudante, Respaldos, limpiar_cada_hora
@@ -83,17 +84,32 @@ def servir(config: ConfigVigia) -> int:
     exportaciones = (Exportaciones(almacen, estabilidad=config.exportaciones_estabilidad,
                                    antiguedad_maxima=config.exportaciones_antiguedad_maxima)
                      if config.exportaciones_vigilar and config.ficheros_lector else None)
+    # Los agentes (desde la 1.6.0): los que tienen su clave en [agentes] claves, cada uno con su cliente de Hermes
+    # (`/p/<perfil>/`) y, si se vigila exports/, con la vigilancia del suyo.
+    claves = agentes_.ClavesDeLosAgentes(config.agentes_claves) if config.agentes_claves else None
+    clientes = (agentes_.ClientesDeLosAgentes(claves, config.hermes_base, config.hermes_plazo) if claves is not None
+                else None)
+    vigilante = None
+    de_cada_perfil = (ExportacionesDeLosAgentes(almacen, exportaciones, config.ficheros_lector,
+                                                lambda: vigilante.despertar(),
+                                                estabilidad=config.exportaciones_estabilidad,
+                                                antiguedad_maxima=config.exportaciones_antiguedad_maxima)
+                      if exportaciones is not None and claves is not None else exportaciones)
     vigilante = Vigilante(almacen, hermes, mensajero, intervalo=config.intervalo,
                           intervalo_en_calma=config.intervalo_en_calma, antiguedad_maxima=config.antiguedad_maxima,
                           filas_por_lectura=config.filas_por_lectura, caducidad_aprobacion=config.caducidad_aprobacion,
-                          reglas_entrega=config.reglas_de_entrega(), exportaciones=exportaciones)
+                          reglas_entrega=config.reglas_de_entrega(), exportaciones=de_cada_perfil, agentes=clientes)
     ficheros = Ficheros(hermes, ClienteLector(config.ficheros_lector),
                         Limites(config.ficheros_por_minuto, config.ficheros_simultaneos), casa=config.ficheros_casa,
-                        exportaciones=exportaciones)
+                        exportaciones=de_cada_perfil, agentes=clientes)
     respaldos = Respaldos(ClienteAyudante(config.respaldo_ayudante)) if config.respaldo_ayudante else None
     entradas = (Entradas(ayudante_de_la_entrada(config.entrada_ayudante), tope=config.entrada_tope,
-                         margen=config.entrada_margen, dias=config.entrada_dias)
+                         margen=config.entrada_margen, dias=config.entrada_dias,
+                         perfiles=claves.perfiles if claves is not None else (lambda: []))
                 if config.entrada_ayudante else None)
+    # Las rutas de los agentes: con su ayudante (sin él, 503) y el principal, que escribe la personalidad.
+    de_los_agentes = agentes_.Agentes(agentes_.ayudante(config.agentes_ayudante) if config.agentes_ayudante else None,
+                                      ClienteHermes(config.hermes_base, clave_hermes, config.hermes_plazo))
     # Ajustes › Tu servidor (desde la 1.5.5): lo que el vigía no puede mirar se lo pregunta a los ayudantes.
     servidor = Servidor(hermes=hermes, instalador=config.servidor_instalador,
                         actualizador=_actualizador(config.servidor_ayudante) if config.servidor_ayudante else None,
@@ -103,8 +119,8 @@ def servir(config: ConfigVigia) -> int:
                         else None,
                         servicios=config.servidor_servicios, hermes_unidad=config.servidor_hermes)
     app = AppVigia(almacen, mensajero, secreto_tunel=secreto_tunel, caducidad_prueba=config.caducidad_prueba,
-                   al_moverse=vigilante.despertar, ficheros=ficheros, respaldos=respaldos, exportaciones=exportaciones,
-                   entradas=entradas, servidor=servidor)
+                   al_moverse=vigilante.despertar, ficheros=ficheros, respaldos=respaldos, exportaciones=de_cada_perfil,
+                   entradas=entradas, servidor=servidor, agentes=de_los_agentes)
     servidor = ServidorHTTP(config.escucha, ManejadorVigia, app, heredado=heredado)
     _avisar_si_no_coincide(heredado, config.escucha)
     threading.Thread(target=servidor.serve_forever, name="api", daemon=True).start()
@@ -119,6 +135,10 @@ def servir(config: ConfigVigia) -> int:
     if exportaciones is not None:
         vigia = VigiaDeExportaciones(config.ficheros_lector, exportaciones, vigilante.despertar)
         threading.Thread(target=vigia.correr, args=(parar,), name="exportaciones", daemon=True).start()
+    if isinstance(de_cada_perfil, ExportacionesDeLosAgentes):
+        # La del exports/ de cada agente, que se pone y se quita según los agentes que haya.
+        threading.Thread(target=de_cada_perfil.correr, args=(parar, claves.perfiles), name="exportaciones-agentes",
+                         daemon=True).start()
     registro.info("vigía %s escuchando en %s:%d%s; Hermes en %s%s; relé en %s", VERSION, *servidor.server_address[:2],
                   " (socket de systemd)" if heredado else "", config.hermes_base,
                   " (con clave)" if clave_hermes else "",
@@ -223,6 +243,10 @@ def comprobar(config: ConfigVigia) -> int:
         decir(*_comprobar_actualizar(config.servidor_ayudante))
     else:
         decir(True, "sin el ayudante que actualiza ([servidor] ayudante vacío): la app no puede actualizar este servidor")
+    if config.agentes_ayudante:
+        decir(*_comprobar_agentes(config))
+    else:
+        decir(True, "sin el ayudante de los agentes ([agentes] ayudante vacío): /avisos/v1/agentes contesta 503")
     if not config.con_credencial:
         return 1 if fallos else 0
     base_rele = config.rele_url.rsplit("/v1/", 1)[0]
@@ -315,6 +339,29 @@ def _comprobar_actualizar(ruta_socket: str) -> tuple:
               "sin claves de verdad todavía: la app no puede actualizar, hay que hacerlo una vez a mano")
     return True, (f"el ayudante que actualiza contesta en {ruta_socket}: {str(respuesta.get('estado'))[:20]}; "
                   f"{firmas}")
+
+
+def _comprobar_agentes(config: ConfigVigia) -> tuple:
+    """Los agentes (contrato §18): el ayudante contesta a la lista, cuántos hay, y cada uno que la pasarela sirve tiene
+    también su clave en la carpeta del vigía (sin ella, el vigía no lo vigila: sus respuestas no avisan)."""
+    try:
+        respuesta, _ = agentes_.ayudante(config.agentes_ayudante, plazo=60).pedir({"orden": "listar"})
+    except ErrorHTTP as error:
+        return False, f"agentes: el ayudante en {config.agentes_ayudante}: {error.estado} {error.codigo} (¿está en " \
+                      f"marcha hehermes-agentes.socket?)"
+    lista = respuesta.get("agentes") if respuesta.get("ok") else None
+    if not isinstance(lista, list):
+        return False, f"agentes: el ayudante en {config.agentes_ayudante} contesta " \
+                      f"«{str(respuesta.get('codigo'))[:40]}»"
+    servidos = [a.get("perfil") for a in lista if isinstance(a, dict) and a.get("servido") is True
+                and a.get("perfil") != agentes_.PRINCIPAL]
+    cuantos = sum(1 for a in lista if isinstance(a, dict) and a.get("perfil") != agentes_.PRINCIPAL)
+    claves = agentes_.ClavesDeLosAgentes(config.agentes_claves)
+    sin_clave = [str(p)[:24] for p in servidos if claves.clave(p) is None]
+    if sin_clave:
+        return False, (f"agentes: el ayudante contesta; {cuantos} agentes; sin su clave en {config.agentes_claves}: "
+                       f"{', '.join(sin_clave)}")
+    return True, f"agentes: el ayudante contesta; {cuantos} agentes; claves en su sitio"
 
 
 def _sin_clave(error: urllib.error.HTTPError) -> bool:

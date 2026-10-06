@@ -9,6 +9,7 @@ de una versión anterior dejando la pasarela, sin dejar restos.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 
@@ -19,9 +20,10 @@ from .plan import registro_de_dispositivos
 
 # El lector de ficheros primero: su socket es de root y es lo único de los avisos que lee como root.
 UNIDADES_AVISOS = ("hehermes-leer-media.socket", "hehermes-respaldo.socket", "hehermes-entrada.socket",
-                   "hehermes-actualizar.socket", "hehermes-vigia.socket", "hehermes-vigia.service",
-                   "hehermes-rele.socket", "hehermes-rele.service")
-CARPETAS_AVISOS = ("/opt/hehermes-avisos", "/etc/hehermes-avisos", "/etc/nginx/hehermes-avisos", "/var/lib/hehermes-vigia")
+                   "hehermes-actualizar.socket", "hehermes-agentes.socket", "hehermes-agentes-memoria.timer",
+                   "hehermes-vigia.socket", "hehermes-vigia.service", "hehermes-rele.socket", "hehermes-rele.service")
+CARPETAS_AVISOS = ("/opt/hehermes-avisos", "/etc/hehermes-avisos", "/etc/nginx/hehermes-avisos", "/var/lib/hehermes-vigia",
+                   "/var/lib/hehermes-agentes")
 # La plantilla del lector (se para con sus instancias, no se deshabilita: no tiene [Install]), su añadido si Hermes
 # vive fuera de /root/.hermes (el fichero y luego su carpeta, que solo se borra vacía) y el propio lector.
 FICHEROS_AVISOS = ("/etc/systemd/system/hehermes-leer-media@.service",
@@ -33,7 +35,13 @@ FICHEROS_AVISOS = ("/etc/systemd/system/hehermes-leer-media@.service",
                    "/etc/systemd/system/hehermes-entrada@.service",
                    "/etc/systemd/system/hehermes-entrada@.service.d/hermes.conf",
                    "/etc/systemd/system/hehermes-entrada@.service.d", "/usr/local/libexec/hehermes-entrada",
-                   "/etc/systemd/system/hehermes-actualizar@.service", "/usr/local/libexec/hehermes-actualizar")
+                   "/etc/systemd/system/hehermes-actualizar@.service", "/usr/local/libexec/hehermes-actualizar",
+                   "/etc/systemd/system/hehermes-agentes@.service",
+                   "/etc/systemd/system/hehermes-agentes@.service.d/hermes.conf",
+                   "/etc/systemd/system/hehermes-agentes@.service.d",
+                   "/etc/systemd/system/hehermes-agentes-memoria.service",
+                   "/etc/systemd/system/hehermes-agentes-memoria.service.d/hermes.conf",
+                   "/etc/systemd/system/hehermes-agentes-memoria.service.d", "/usr/local/libexec/hehermes-agentes")
 NGINX = (p.SITIO_ENLACE, p.SITIO, p.SITIO_CONF_D, p.BEARER, p.DROP_IN_NGINX)
 
 
@@ -64,6 +72,28 @@ def _borrar_subidas(sis, carpeta: str) -> None:
         os.unlink(real)
     elif os.path.isdir(real):
         shutil.rmtree(real, ignore_errors=True)
+
+
+#: Lo que el ayudante de los agentes deja en cada carpeta de claves: `<perfil>.clave`, y la que se estaba escribiendo
+#: (`.<perfil>.clave.<8 hexadecimales>`) si algo lo cortó.
+CLAVE_DE_AGENTE = re.compile(r"[a-z0-9]{1,24}\.clave|\.[a-z0-9]{1,24}\.clave\.[0-9a-f]{8}")
+
+
+def _borrar_claves_de_agentes(sis, carpeta: str) -> bool:
+    """Las claves de los agentes de una carpeta (las escribe su ayudante y no van al manifiesto) y la carpeta, si se
+    queda vacía. Solo lo que tiene nombre de clave, y solo si la carpeta es una carpeta de verdad: un enlace en su sitio
+    se quita él, sin llevar el borrado a donde apunta. Devuelve si queda algo."""
+    real = sis.ruta(carpeta)
+    if os.path.islink(real):
+        sis.borrar(carpeta)
+        return False
+    if not os.path.isdir(real):
+        return False
+    for nombre in sis.listar(carpeta):
+        if CLAVE_DE_AGENTE.fullmatch(nombre):
+            sis.borrar(carpeta + "/" + nombre)
+    sis.borrar(carpeta)
+    return sis.existe(carpeta)
 
 
 def _iphones(sis, man=None):
@@ -118,6 +148,11 @@ def resumen(sis, man, ambito=None, modo=None) -> str:
     if man.datos.get("entrada") and que.tls:
         lineas.append("  %s/%s (lo que la app dejó a medias) y %s, si se queda vacía (lo entregado es de Hermes)"
                       % (man.datos["entrada"], SUBIDAS, man.datos["entrada"]))
+    if ambito.unidad_agentes_socket in man.ficheros and que.tls:
+        lineas.append("  las claves de los agentes (%s y %s) y lo que apunta su ayudante (%s). Los agentes, que son "
+                      "perfiles de Hermes, y sus copias se quedan" % (ambito.claves_agentes_pasarela,
+                                                                      ambito.claves_agentes_vigia,
+                                                                      ambito.carpeta_agentes))
     if que.tls:
         from . import alma
         lineas += alma.resumen(man)
@@ -197,7 +232,8 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
     if que.tls:
         salida("==> la pasarela")
         for unidad in (p.UNIDAD_PASARELA, "hehermes-pasarela-clave.path", p.UNIDAD_VIGIA, p.SOCKET_VIGIA,
-                       p.SOCKET_LECTOR, p.SOCKET_RESPALDO, p.SOCKET_ENTRADA, p.SOCKET_ACTUALIZAR):
+                       p.SOCKET_LECTOR, p.SOCKET_RESPALDO, p.SOCKET_ENTRADA, p.SOCKET_ACTUALIZAR, p.SOCKET_AGENTES,
+                       p.TEMPORIZADOR_AGENTES_MEMORIA):
             if unidad in man.unidades:
                 sis.ejecutar(ambito.systemctl + ["disable", "--now", unidad])
         if p.SOCKET_LECTOR in man.unidades:
@@ -215,6 +251,18 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
     if entrada_en_marcha:
         quedan.append("la entrada de ficheros: su ayudante está colocando un fichero (journalctl %s-u "
                       "'hehermes-entrada@*'): lo dejo acabar" % ("" if ambito.root else "--user "))
+    # Un agente a medio crear o borrar tampoco (sigue en su proceso, con la conexión ya cerrada): se deja acabar, y su
+    # carpeta de trabajo se queda. Las claves sí se van: sin la pasarela, ya no sirven a nadie.
+    con_agentes = ambito.unidad_agentes_socket in man.ficheros and que.tls
+    # Las carpetas de sus claves: la de la pasarela, siempre que se va la pasarela; la del vigía, si el vigía es mío (la
+    # de unos avisos a mano es de instalar.sh).
+    claves_de_agentes = [ambito.claves_agentes_pasarela] + ([ambito.claves_agentes_vigia] if man.datos.get("vigia")
+                                                            else [])
+    agentes_en_marcha = con_agentes and sis.ejecutar(ambito.systemctl + ["is-active", "hehermes-agentes@*.service"]).bien
+    if agentes_en_marcha:
+        quedan.append("los agentes: su ayudante está creando o borrando uno (journalctl %s-u 'hehermes-agentes@*'): lo "
+                      "dejo acabar, y su carpeta (%s) se queda" % ("" if ambito.root else "--user ",
+                                                                   ambito.carpeta_agentes))
     # 1. Los iPhone: sin esto, las sesiones vivas siguen aunque se borre su conexión.
     if sis.existe(p.DISPOSITIVO) and que.vpn:
         for nombre in de_la_vpn:
@@ -322,7 +370,8 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
         if not que.de(md.de_unidad(unidad)):
             continue
         sis.ejecutar((ambito.systemctl if unidad in (p.UNIDAD_PASARELA, p.UNIDAD_VIGIA, p.SOCKET_LECTOR,
-                                                     p.SOCKET_RESPALDO, p.SOCKET_ENTRADA, p.SOCKET_ACTUALIZAR)
+                                                     p.SOCKET_RESPALDO, p.SOCKET_ENTRADA, p.SOCKET_ACTUALIZAR,
+                                                     p.SOCKET_AGENTES, p.TEMPORIZADOR_AGENTES_MEMORIA)
                       else ["systemctl"]) + ["disable", "--now", unidad])
         if not que.todo:
             man.unidades.remove(unidad)
@@ -361,6 +410,14 @@ def desinstalar(sis, man, quitar_paquetes=False, salida=print, ambito=None, modo
                           "No la borro: si no la quieres, bórrala tú" % antes)
         else:
             sis.borrar_arbol(ambito.carpeta_respaldo)
+    #    Las claves de los agentes (`claves_de_agentes`), y lo que apunta su ayudante (el estado de cada trabajo y lo
+    #    visto de la memoria) si no tiene un trabajo en marcha. Los perfiles de Hermes y sus copias, no.
+    if que.tls:
+        for carpeta in claves_de_agentes:
+            if _borrar_claves_de_agentes(sis, carpeta):
+                quedan.append("%s: hay algo que no es la clave de un agente; no lo toco" % carpeta)
+    if con_agentes and not agentes_en_marcha:
+        sis.borrar_arbol(ambito.carpeta_agentes)
     #    La del ayudante que actualiza (el estado de la última, sus intentos y lo que dijo el instalador): de HeHermes.
     if que.tls and ambito.carpeta_actualizar and sis.es_carpeta(ambito.carpeta_actualizar):
         sis.borrar_arbol(ambito.carpeta_actualizar)

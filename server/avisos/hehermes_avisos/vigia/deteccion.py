@@ -37,7 +37,14 @@ from .. import texto
 # Los textos que escribe la app al lanzar turnos que no son de Daniel (`Motor.textoContinuar`, `HistorialHermes`). Se
 # reconocen como los reconoce la app: con la frase entera, donde la escribe el envío.
 MARCA_CONTINUAR = "⟦hehermes:continuar⟧"
-TEXTO_CONTINUAR = MARCA_CONTINUAR + " Ha llegado el resultado de la tarea en segundo plano. Contesta a Daniel con él."
+# «Al usuario» y no un nombre: la app es de cualquiera, y su Hermes ya sabe quién es.
+TEXTO_CONTINUAR = MARCA_CONTINUAR + " Ha llegado el resultado de la tarea en segundo plano. Contesta al usuario con él."
+# La de la app 1.0 (12) y anteriores, y la de este vigía hasta la 1.5.5, con el nombre de quien hizo la app: la guardan
+# los historiales, la mandan esa app y un vigía de antes, y es la única que esa app sabe esconder. Se reconoce como la de
+# ahora, y se manda solo mientras haya dado de alta un iPhone que no entiende la de ahora
+# (`entregas.texto_de_la_continuacion`).
+TEXTO_CONTINUAR_ANTIGUO = MARCA_CONTINUAR + " Ha llegado el resultado de la tarea en segundo plano. Contesta a Daniel con él."
+TEXTOS_CONTINUAR = (TEXTO_CONTINUAR, TEXTO_CONTINUAR_ANTIGUO)
 APERTURA_RETIRADA = "⟦hehermes:retira⟧ Ignora mi mensaje «"
 CIERRE_RETIRADA = "»: lo he retirado."
 PREFIJO_INTERRUPCION = "Operation interrupted"
@@ -80,7 +87,9 @@ def es_interrupcion(contenido: str) -> bool:
 
 
 def es_continuacion(contenido: str) -> bool:
-    return contenido.startswith(TEXTO_CONTINUAR)
+    """La continuación entera, la de ahora o la de antes (``TEXTOS_CONTINUAR``): lo que solo empieza por la marca lo
+    escribió el usuario."""
+    return contenido.startswith(TEXTOS_CONTINUAR)
 
 
 def es_retirada(contenido: str) -> bool:

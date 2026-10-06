@@ -448,6 +448,8 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
     sis.carpeta(ambito.carpeta_pasarela, 0o750 if ambito.root else 0o700)
     if ambito.root:
         _orden(sis, ["chown", "root:" + p.USUARIO_PASARELA, ambito.carpeta_pasarela], "chown de la pasarela")
+    # Y la de las claves de los agentes (desde la 0.11.0, `[agentes] claves` de pasarela.ini): la escribe su ayudante.
+    vigias.crear_claves_de_agentes(sis, ambito, ambito.claves_agentes_pasarela, p.USUARIO_PASARELA, _orden)
     man.guardar(sis)
 
     from .porchat import ParadaDelCanje, _venv

@@ -64,6 +64,12 @@ vuelve atrás y se instala en su propia unidad. Las firmas valen con dos claves,
 ([abajo](#la-firma-de-las-actualizaciones)), y `actualizar` ya no toma el cerrojo que necesita el `instalar` de la
 versión nueva. El vigía enseña además el estado del servidor (Ajustes › Tu servidor).
 
+**La 0.11.0 trae los agentes: varios Hermes por una sola conexión** ([abajo](#los-agentes-desde-la-0110)), y lleva
+los avisos 1.6.0. Cada agente es un perfil de Hermes, que la pasarela sirve bajo `/p/<perfil>/` cambiando el token del
+iPhone por la clave de ese perfil (`[agentes] claves` de `pasarela.ini`); la app los crea, los cambia y los borra por el
+vigía, que se lo pasa al ayudante `hehermes-agentes`, con su socket como los otros y un temporizador que junta cada
+minuto lo que saben de ti los que lo comparten.
+
 **La 0.10.5 lleva el vigía 1.5.1.** Lo que cambia está en los avisos (`server/avisos`): las marcas de un fichero se buscan en la conversación entera (también lo compactado), un fichero nuevo en `exports/` se avisa en cuanto deja de crecer y se puede descargar sin esperar a su `MEDIA:`, y un cliente que se corta a media petición deja una línea en el registro, no una traza. El instalador en sí no cambia.
 
 **La 0.10.4 mira el Hermes del probador antes de dar nada, y deja el chat abierto hasta que se use.** Tres cosas:
@@ -266,6 +272,30 @@ con qué comprobar una firma: los dos se actualizan una vez con el comando de la
 ahí, con un toque. **En el VPS de Daniel**, con los avisos de `instalar.sh`, el ayudante lo pone ese script; actualizar
 desde la app pone lo del instalador (la pasarela) y los avisos siguen con su script.
 
+### Los agentes (desde la 0.11.0)
+
+Spec `docs/superpowers/specs/2026-10-05-agentes-design.md`, contrato `server/API-CONTRACT.md` §18. Cada agente es un
+**perfil de Hermes** (`<HERMES_HOME>/profiles/<perfil>`), servido por el mismo Hermes bajo `/p/<perfil>/` con su propia
+clave. La pasarela lleva cada petición de `/p/<perfil>/…` con la clave de ese perfil, que lee de su carpeta en cuanto
+cambia (sin reiniciarse); sin clave, `404 agente_desconocido`. La app los crea, los cambia y los borra por
+`/avisos/v1/agentes/…` del vigía, que se lo pasa al ayudante `hehermes-agentes` (de `server/avisos/despliegue`); sin
+él, esas rutas contestan 503.
+
+| | Con root | Sin root |
+|---|---|---|
+| El ayudante | `/usr/local/libexec/hehermes-agentes` (root 0755), el mismo que pone `instalar.sh` en el VPS de Daniel, y su copia en `/opt/hehermes-servidor` | La copia que va con el instalador (`~/.local/share/hehermes-servidor/hehermes-agentes`) |
+| Su socket | `hehermes-agentes.socket`: `/run/hehermes-agentes.sock`, `root:hh-vigia` 0660, `Accept=yes` | `%t/hehermes-agentes.sock`, 0600, unidad de usuario |
+| Cada orden | `hehermes-agentes@.service`, **de root y sin ninguna capacidad** (con un Hermes de otro usuario, `CAP_SETUID` y `CAP_SETGID`, para hacer lo de su casa como él): `/etc` de solo lectura salvo las carpetas de las claves, solo `127.0.0.1`, y los secretos de HeHermes tapados. Crear y borrar siguen con la conexión cerrada. Un Hermes que ya sirve otros perfiles sirve los nuevos en caliente, sin reiniciarlo: se lo pide por su socket de control y lo espera hasta 2 minutos. Con el primer agente (Hermes aún no sirve otros: lo decide al arrancar), pone `gateway.multiplex_profiles: true` con `hermes config set` y reinicia **una vez** la unidad de Hermes (la de su perfil, como el de la copia), con drenaje y en un rato tranquilo, solo si está en marcha con Hermes dentro (`server/avisos/README.md`, «Los agentes»). Esa unidad es también para encontrar su `hermes` | Como el usuario de Hermes, con `--usuario` (solo atiende a su uid), y sus claves en su casa |
+| La memoria | `hehermes-agentes-memoria.timer`, cada minuto: el mismo ayudante, sin red y sin `hermes`, con su casa de lectura y escritura | Lo mismo, de usuario |
+| Las claves | Una por perfil (`<perfil>.clave`, 0640), en `/etc/hehermes-pasarela/agentes` (`root:hh-pasarela` 2750) y en `/etc/hehermes-avisos/agentes` (`root:hh-vigia` 2750): con setgid, cada una nace del grupo de quien la lee | En `~/.config/hehermes-pasarela/agentes` y `~/.config/hehermes-avisos/agentes`, 0700 |
+| Su carpeta | `/var/lib/hehermes-agentes` (0700, `StateDirectory`): el estado de cada trabajo y lo visto de la memoria | `~/.local/state/hehermes-agentes` |
+| El vigía | `[agentes]` en `vigia.ini`: la carpeta de las claves (los perfiles que vigila) y `ayudante = /run/hehermes-agentes.sock`; su unidad lo quiere (`Wants=`) | `ayudante = /run/user/<uid>/hehermes-agentes.sock` |
+| Desinstalar | Quita el ayudante, sus unidades, las claves y su carpeta (no con un agente a medio crear: la deja). **Los agentes, que son perfiles de Hermes, y sus copias** (`~/hehermes-copias/agentes`) **se quedan** | Lo mismo |
+
+`comprobar` dice si su socket y su temporizador están en marcha, y del vigía: «agentes: el ayudante contesta; N
+agentes; claves en su sitio». Un Hermes que ya es un perfil de otro (`hermes -p <nombre>`) no crea agentes: sus perfiles
+irían al lado del suyo, y eso no se ha probado con un Hermes de verdad.
+
 Lo del código de avisos (la 0.7.0), que sigue valiendo: el código lo da Daniel (`sudo hehermes-rele credencial alta
 <nombre>`, en su VPS):
 
@@ -378,7 +408,7 @@ Hay que saber:
   - /usr/local/sbin/hehermes-dispositivo no es mío: no lo toco. Para los iPhone de la pasarela usa el mío: sudo /opt/hehermes-servidor/hehermes-dispositivo alta <nombre>
   - Aquí ya hay unos avisos puestos a mano (/opt/hehermes-avisos, los de server/avisos/despliegue/instalar.sh): ni el vigía ni el lector de ficheros los pongo yo, y lo suyo no lo toco
 
-57 cambios.
+58 cambios.
 ```
 <!-- /pasarela-de-daniel -->
 
@@ -414,8 +444,9 @@ server/instalador/empaquetar --firmar hehermes-firma.pem       # y el .sig (hace
   `clave-publica.pem` y, desde la 0.10.10, `clave-rescate.pem`, `requirements-canje.txt`, este README, desde la 0.7.0 el
   código de los avisos (`hehermes_avisos/`, sus `.py`: el vigía) y, desde la 0.8.0, el lector de ficheros
   (`hehermes-leer-media`, de `server/avisos/despliegue`), desde la 0.10.0, el ayudante de la copia en iCloud
-  (`hehermes-respaldo`, de ahí también), desde la 0.10.6, el de la entrada (`hehermes-entrada`) y, desde la 0.10.10, el
-  que actualiza (`hehermes-actualizar`). Ni pruebas ni `__pycache__`, ni el resto del despliegue a mano del relé.
+  (`hehermes-respaldo`, de ahí también), desde la 0.10.6, el de la entrada (`hehermes-entrada`), desde la 0.10.10, el
+  que actualiza (`hehermes-actualizar`) y, desde la 0.11.0, el de los agentes (`hehermes-agentes`). Ni pruebas ni
+  `__pycache__`, ni el resto del despliegue a mano del relé.
 
 ### La firma de las actualizaciones
 
@@ -455,6 +486,8 @@ terminal, una vez (hace falta OpenSSL 3, `brew install openssl@3`: el LibreSSL d
 **Publicar firma.** `scripts/publicar-instalador.sh` no publica sin la principal en el llavero (como sin la lista de
 prohibidos): firma el paquete con ella (`scripts/firma/firmar.sh`, que comprueba antes que es la de
 `clave-publica.pem` y después que la firma se comprueba con ella) y deja el `.sig` junto al paquete, para la Release.
+Antes de nada pasa los `requirements` que se publican por `pip-audit` (`scripts/espejo/auditar-dependencias.sh`): con
+una vulnerabilidad conocida en una versión fijada, o sin `pip-audit` (`pipx install pip-audit`), no publica.
 
 **Si la clave principal se pierde o se compromete.** No se automatiza; a mano y en este orden:
 

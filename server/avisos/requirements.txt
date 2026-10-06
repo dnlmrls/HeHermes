@@ -10,9 +10,13 @@
 #
 # Con hash porque el relé tiene la clave .p8 de APNs: una dependencia cambiada por el camino la tendría también. Van los
 # hashes de todos los ficheros de cada versión (ruedas de cada plataforma y el código fuente), para que valgan igual en
-# el VPS y en el Mac. Se sacaron de https://pypi.org/pypi/<paquete>/<versión>/json el 2026-09-23.
+# el VPS y en el Mac. Se sacaron de https://pypi.org/pypi/<paquete>/<versión>/json el 2026-09-23; anyio, h2 y hpack, el
+# 2026-10-06, al subirlos por fallos conocidos que encontró pip-audit (PYSEC-2026-4024, -4025, -3628 y -4053).
 #
-# Todas funcionan con Python 3.9 o más nuevo: el VPS usa 3.10+, y las pruebas corren también con el python3 de Xcode.
+# Un servidor usa Python 3.10 o más nuevo (instalar.sh no sigue con otro), y las pruebas corren también con el python3
+# de Xcode, que es 3.9. Las versiones arregladas de anyio, h2 y hpack ya no van con 3.9: esas tres llevan además la de
+# antes con `python_version < "3.10"`, solo para las pruebas en el Mac. Ningún servidor la instala, y por eso
+# scripts/espejo/auditar-dependencias.sh no la audita (y audita las demás sin mirar su marcador).
 
 # -- cryptography
 cryptography==50.0.1 \
@@ -161,7 +165,10 @@ httpcore==1.0.9 \
 h11==0.16.0 \
     --hash=sha256:4e35b956cf45792e4caa5885e69fba00bdbc6ffafbfa020300e549b208ee5ff1 \
     --hash=sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86
-anyio==4.12.1 \
+anyio==4.14.2 ; python_version >= "3.10" \
+    --hash=sha256:9f505dda5ac9f0c8309b5e8bd445a8c2bf7246f3ce950121e45ea15bc41d1494 \
+    --hash=sha256:cfa139f3ed1a23ee8f88a145ddb5ac7605b8bbfd8592baacd7ce3d8bb4313c7f
+anyio==4.12.1 ; python_version < "3.10" \
     --hash=sha256:41cfcc3a4c85d3f05c932da7c26d0201ac36f72abd4435ba90d0464a3ffed703 \
     --hash=sha256:d405828884fc140aa80a3c667b8beed277f1dfedec42ba031bd6ac3db606ab6c
 idna==3.20 \
@@ -170,10 +177,16 @@ idna==3.20 \
 certifi==2026.7.22 \
     --hash=sha256:62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775 \
     --hash=sha256:741e2c3b351ddf169a738da9f2c048608ff7f2c5cc02f1ebc6b118bb090d5d55
-h2==4.3.0 \
+h2==4.4.1 ; python_version >= "3.10" \
+    --hash=sha256:0e25f1462b23c9cb82d9eb02e28bc706dac2a68cb457c6a0d74d63c8a2a5d0e6 \
+    --hash=sha256:4e866ffb1a869ae14dd9b5e6beb5c24a13da0495ad72b65925ded182521c1516
+h2==4.3.0 ; python_version < "3.10" \
     --hash=sha256:6c59efe4323fa18b47a632221a1888bd7fde6249819beda254aeca909f221bf1 \
     --hash=sha256:c438f029a25f7945c69e0ccf0fb951dc3f73a5f6412981daee861431b70e2bdd
-hpack==4.1.0 \
+hpack==4.2.0 ; python_version >= "3.10" \
+    --hash=sha256:858ac0b02280fa582b5080d68db0899c62a80375e0e5413a74970c5e518b6986 \
+    --hash=sha256:0895cfa3b5531fc65fe439c05eb65144f123bf7a394fcaa56aa423548d8e45c0
+hpack==4.1.0 ; python_version < "3.10" \
     --hash=sha256:157ac792668d995c657d93111f46b4535ed114f0c9c8d672271bbec7eae1b496 \
     --hash=sha256:ec5eca154f7056aa06f196a557655c5b009b382873ac8d1e66e79e87535f1dca
 hyperframe==6.1.0 \

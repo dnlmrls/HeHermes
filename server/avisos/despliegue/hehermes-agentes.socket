@@ -1,0 +1,21 @@
+# /etc/systemd/system/hehermes-agentes.socket
+# La puerta del ayudante de los agentes (despliegue/hehermes-agentes, contrato §18): crear, cambiar y borrar los perfiles
+# de Hermes que la app enseña como agentes. Solo root y el grupo hh-vigia pueden conectarse (0660), y el ayudante lo
+# vuelve a mirar con SO_PEERCRED. Con Accept=yes, systemd lanza un ayudante de root por cada conexión, con su jaula
+# (hehermes-agentes@.service): el vigía no tiene nada de root, ni sudo, y conserva su NoNewPrivileges.
+[Unit]
+Description=HeHermes: el socket del ayudante de los agentes
+
+[Socket]
+ListenStream=/run/hehermes-agentes.sock
+SocketUser=root
+SocketGroup=hh-vigia
+SocketMode=0660
+Accept=yes
+# La lista, un trabajo (crear o borrar, que sigue con la conexión cerrada), su estado y un cambio: esto es el tope por
+# si algo va mal, no el límite de la app.
+MaxConnections=8
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

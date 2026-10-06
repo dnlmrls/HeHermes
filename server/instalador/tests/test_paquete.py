@@ -76,7 +76,7 @@ class Paquete(unittest.TestCase):
                              ("clave-rescate.pem", 0o644),
                              ("hehermes-dispositivo", 0o755), ("README.md", 0o644), ("hehermes-leer-media", 0o755),
                              ("hehermes-respaldo", 0o755), ("hehermes-entrada", 0o755),
-                             ("hehermes-actualizar", 0o755),
+                             ("hehermes-actualizar", 0o755), ("hehermes-agentes", 0o755),
                              ("requirements-canje.txt", 0o644), ("hehermes_servidor/canje.py", 0o644),
                              ("hehermes_servidor/porchat.py", 0o644)):
             with self.subTest(fichero=nombre):
@@ -93,7 +93,8 @@ class Paquete(unittest.TestCase):
         self.assertEqual(ficheros, sorted(["README.md", "clave-publica.pem", "clave-rescate.pem", "hehermes-dispositivo",
                                            "hehermes-pasarela",
                                            "hehermes-servidor", "requirements-canje.txt", "hehermes-leer-media",
-                                           "hehermes-respaldo", "hehermes-entrada", "hehermes-actualizar"]
+                                           "hehermes-respaldo", "hehermes-entrada", "hehermes-actualizar",
+                                           "hehermes-agentes"]
                                           + modulos + avisos))
         # El dispositivo es el de server/vpn, y el lector (desde la 0.8.0) y los ayudantes, los de
         # server/avisos/despliegue, byte a byte.
@@ -102,12 +103,15 @@ class Paquete(unittest.TestCase):
             lector = tar.extractfile(prefijo + "hehermes-leer-media").read()
             de_la_entrada = tar.extractfile(prefijo + "hehermes-entrada").read()
             el_que_actualiza = tar.extractfile(prefijo + "hehermes-actualizar").read()
+            el_de_los_agentes = tar.extractfile(prefijo + "hehermes-agentes").read()
         self.assertEqual(dentro, (apoyo.REPO / "server" / "vpn" / "hehermes-dispositivo").read_bytes())
         self.assertEqual(lector, (apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-leer-media").read_bytes())
         self.assertEqual(de_la_entrada,
                          (apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-entrada").read_bytes())
         self.assertEqual(el_que_actualiza,
                          (apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-actualizar").read_bytes())
+        self.assertEqual(el_de_los_agentes,
+                         (apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-agentes").read_bytes())
 
     def test_desempaquetado_se_encuentra_todo_sin_el_repositorio(self):
         ruta, _ = self.construir()

@@ -28,6 +28,11 @@ su propio uid. Igual los ayudantes de la copia en iCloud (desde la 0.10.0) y de 
 app le manda a Hermes, en `<HERMES_HOME>/entrada`, que crea el instalador como `exports/`). Y desde la 0.10.10, solo con
 root, el que actualiza el servidor desde la app (`hehermes-actualizar`), con lo que enseña Ajustes › Tu servidor en la
 sección `[servidor]` de `vigia.ini`.
+
+Desde la 0.11.0, los agentes (contrato §18): el ayudante `hehermes-agentes`, que crea, cambia y borra los perfiles de
+Hermes que la app enseña como agentes, con su socket y su plantilla como los demás, y su temporizador de la memoria que
+comparten (`hehermes-agentes-memoria.timer`, cada minuto). Sus claves, una por perfil, en dos carpetas que crea el
+instalador: la de la pasarela (`modo_tls`) y la del vigía (`aplicar_secretos`).
 """
 
 from __future__ import annotations
@@ -178,6 +183,7 @@ def planear(sis, det, man, op, origen, acciones, bloqueos, fichero, avisos=None)
     respaldo = planear_respaldo(sis, det, origen, acciones, bloqueos, avisos, fichero)
     entrada = planear_entrada(sis, det, origen, acciones, bloqueos, avisos, fichero)
     actualizar = planear_actualizar(sis, det, origen, acciones, bloqueos, fichero)
+    agentes = planear_agentes(sis, det, origen, acciones, bloqueos, avisos, fichero)
     credencial = (vigia["credencial"] + "\n").encode() if vigia["credencial"] else None
     secreto = sis.leer(ambito.secreto_vigia)
     propias = [
@@ -189,8 +195,9 @@ def planear(sis, det, man, op, origen, acciones, bloqueos, fichero, avisos=None)
                                               entrada=ambito.socket_entrada if entrada else None,
                                               actualizar=ambito.socket_actualizar if actualizar else None,
                                               servicios=servicios_del_vigia(ambito, lector, respaldo, entrada,
-                                                                            actualizar),
-                                              hermes_unidad=unidad_de_hermes_para_el_vigia(det.hermes, ambito)),
+                                                                            actualizar, agentes),
+                                              hermes_unidad=unidad_de_hermes_para_el_vigia(det.hermes, ambito),
+                                              agentes=ambito.socket_agentes if agentes else None),
                 0o640 if ambito.root else 0o600, detalle=detalle),
         _secreto(sis, man, acciones, ambito.secreto_vigia,
                  (secrets.token_urlsafe(32) + "\n").encode() if secreto is None else None, reemplazar,
@@ -331,12 +338,51 @@ def planear_actualizar(sis, det, origen, acciones, bloqueos, fichero) -> bool:
     return True
 
 
-def servicios_del_vigia(ambito, lector, respaldo, entrada, actualizar) -> list:
+def planear_agentes(sis, det, origen, acciones, bloqueos, avisos, fichero) -> bool:
+    """El ayudante de los agentes (desde la 0.11.0, contrato §18): el script (con root, en /usr/local/libexec; sin root,
+    el que ya va en su casa con el instalador), su socket y su plantilla, y el temporizador de la memoria que comparten
+    con su servicio. Devuelve si se pone: sin él, el vigía va igual y /avisos/v1/agentes contesta 503. Las carpetas de
+    las claves se crean al aplicar (`aplicar_secretos` y `modo_tls`)."""
+    ambito = det.ambito
+    casa = det.hermes.home.rstrip("/")
+    if not p._RUTA_VALIDA.fullmatch(casa):
+        if avisos is not None:
+            avisos.append("La carpeta de Hermes (%r) no la sé poner en una unidad de systemd: no pongo los agentes, y "
+                          "/avisos/v1/agentes contesta 503" % casa)
+        return False
+    from .plan import fuente_de_agentes
+    fuente = fuente_de_agentes(origen)
+    if fuente is None:
+        bloqueos.append(bloqueo("paquete", "el paquete no trae el ayudante de los agentes (hehermes-agentes)"))
+        return False
+    if ambito.root:
+        # Suelto, como el lector: cambiarlo no pide reiniciar nada, cada conexión (y cada minuto) lanza el que haya.
+        with open(fuente, "rb") as f:
+            fichero(ambito.agentes, f.read(), 0o755)
+    usuario = det.hermes.usuario if ambito.root else None
+    # La unidad de Hermes, para encontrar su `hermes` (de su ExecStart) y reiniciarla una vez con el primer agente: la
+    # que maneja también el de la copia.
+    unidades = [fichero(ambito.unidad_agentes_socket, p.unidad_agentes_socket(ambito)),
+                fichero(ambito.unidad_agentes, p.unidad_agentes(ambito, casa, usuario,
+                                                                _unidad_para_el_respaldo(det.hermes, ambito)))]
+    _unidad(sis, acciones, p.SOCKET_AGENTES, unidades, "los agentes (/avisos/v1/agentes), %s"
+            % ("un ayudante de root por conexión, enjaulado, que crea, cambia y borra los perfiles de Hermes"
+               if ambito.root else "como %s, uno por conexión" % ambito.usuario), "restart", ambito.systemctl)
+    memoria = [fichero(ambito.unidad_agentes_memoria, p.unidad_agentes_memoria(ambito, casa, usuario)),
+               fichero(ambito.temporizador_agentes_memoria, p.temporizador_agentes_memoria())]
+    _unidad(sis, acciones, p.TEMPORIZADOR_AGENTES_MEMORIA, memoria, "lo que saben de ti los agentes que lo comparten, "
+            "cada minuto (sin red)", "restart", ambito.systemctl)
+    return True
+
+
+def servicios_del_vigia(ambito, lector, respaldo, entrada, actualizar, agentes=False) -> list:
     """Las unidades de HeHermes cuyo estado enseña Ajustes › Tu servidor: las que se ponen aquí, de usuario sin root."""
     unidades = [p.UNIDAD_PASARELA, p.UNIDAD_VIGIA] + [u for u, si in ((p.SOCKET_LECTOR, lector),
                                                                      (p.SOCKET_RESPALDO, respaldo),
                                                                      (p.SOCKET_ENTRADA, entrada),
-                                                                     (p.SOCKET_ACTUALIZAR, actualizar)) if si]
+                                                                     (p.SOCKET_ACTUALIZAR, actualizar),
+                                                                     (p.SOCKET_AGENTES, agentes),
+                                                                     (p.TEMPORIZADOR_AGENTES_MEMORIA, agentes)) if si]
     return unidades if ambito.root else ["usuario:" + u for u in unidades]
 
 
@@ -367,7 +413,8 @@ def rutas(ambito) -> set:
     return {ambito.vigia_ini, ambito.secreto_vigia, ambito.credencial_rele, ambito.clave_hermes_vigia,
             ambito.unidad_vigia, ambito.socket_vigia, ambito.unidad_lector_socket, ambito.unidad_lector,
             ambito.unidad_respaldo_socket, ambito.unidad_respaldo, ambito.unidad_entrada_socket, ambito.unidad_entrada,
-            ambito.unidad_actualizar_socket, ambito.unidad_actualizar}
+            ambito.unidad_actualizar_socket, ambito.unidad_actualizar, ambito.unidad_agentes_socket,
+            ambito.unidad_agentes, ambito.unidad_agentes_memoria, ambito.temporizador_agentes_memoria}
 
 
 # MARK: Aplicar
@@ -388,6 +435,7 @@ def aplicar_secretos(sis, man, acciones, ambito, salida, orden) -> None:
         sis.carpeta(ambito.carpeta_estado_vigia, 0o700)
     if ambito.root:
         orden(sis, ["chown", "root:" + p.USUARIO_VIGIA, ambito.carpeta_vigia], "chown de la carpeta del vigía")
+    crear_claves_de_agentes(sis, ambito, ambito.claves_agentes_vigia, p.USUARIO_VIGIA, orden)
     man.guardar(sis)
     tx = Transaccion(sis, man)
     try:
@@ -404,6 +452,19 @@ def aplicar_secretos(sis, man, acciones, ambito, salida, orden) -> None:
     if escritos:
         salida("==> los avisos: %d ficheros del vigía" % len(escritos))
     man.guardar(sis)
+
+
+def crear_claves_de_agentes(sis, ambito, carpeta, grupo, orden) -> None:
+    """La carpeta de las claves de los agentes de la pasarela o del vigía (contrato §18.1): la escribe el ayudante, de
+    root, y la lee la pasarela o el vigía. Con root, `root:<su grupo>` y 2750: con el bit setgid, cada clave nace del
+    grupo de la carpeta (el ayudante no tiene CAP_CHOWN para dárselo). Sin root, 0700. No va al manifiesto (quitar la
+    VPN de antes se llevaría una carpeta vacía que no lleva ficheros suyos): desinstalar la pasarela se lleva las claves
+    y la carpeta por su nombre (`desinstalar._borrar_claves_de_agentes`)."""
+    sis.carpeta(carpeta, 0o2750 if ambito.root else 0o700)
+    if ambito.root:
+        orden(sis, ["chown", "root:" + grupo, carpeta], "chown de %s" % carpeta)
+        # Un chown no le quita el setgid a una carpeta, pero así queda dicho y no depende de eso.
+        sis.carpeta(carpeta, 0o2750)
 
 
 def crear_exportaciones(sis, man, hermes, ambito, salida) -> None:
@@ -465,6 +526,15 @@ def aplicar_unidades(sis, man, acciones, ambito, salida, hermes=None) -> None:
                                                             p.SOCKET_ACTUALIZAR)]
     if del_actualizar:
         _con_unidad(sis, man, del_actualizar, p.SOCKET_ACTUALIZAR, salida, systemctl=ambito.systemctl)
+    de_los_agentes = [a for a in acciones if a.objeto in (ambito.unidad_agentes_socket, ambito.unidad_agentes,
+                                                            p.SOCKET_AGENTES)]
+    if de_los_agentes:
+        _con_unidad(sis, man, de_los_agentes, p.SOCKET_AGENTES, salida, systemctl=ambito.systemctl)
+    de_la_memoria = [a for a in acciones if a.objeto in (ambito.unidad_agentes_memoria,
+                                                           ambito.temporizador_agentes_memoria,
+                                                           p.TEMPORIZADOR_AGENTES_MEMORIA)]
+    if de_la_memoria:
+        _con_unidad(sis, man, de_la_memoria, p.TEMPORIZADOR_AGENTES_MEMORIA, salida, systemctl=ambito.systemctl)
     if ambito.root:
         _con_unidad(sis, man, [a for a in acciones if a.objeto in (ambito.socket_vigia, p.SOCKET_VIGIA)],
                     p.SOCKET_VIGIA, salida)
@@ -511,6 +581,15 @@ def comprobar(sis, man, ambito, mira, hermes_pendiente=False, intentos=3, espera
              % ambito.socket_actualizar,
              "actualizar desde la app: el socket de su ayudante está parado (sudo systemctl start %s)"
              % p.SOCKET_ACTUALIZAR)
+    if ambito.unidad_agentes_socket in man.ficheros:
+        como = ("sudo " if ambito.root else "", "" if ambito.root else "--user ")
+        mira(sis.ejecutar(ambito.systemctl + ["is-active", p.SOCKET_AGENTES]).bien,
+             "agentes: el socket de su ayudante está en marcha (%s)" % ambito.socket_agentes,
+             "agentes: el socket de su ayudante está parado (%ssystemctl %sstart %s)" % (como + (p.SOCKET_AGENTES,)))
+        mira(sis.ejecutar(ambito.systemctl + ["is-active", p.TEMPORIZADOR_AGENTES_MEMORIA]).bien,
+             "agentes: la memoria que comparten se junta cada minuto (%s)" % p.TEMPORIZADOR_AGENTES_MEMORIA,
+             "agentes: la memoria que comparten no se junta: su temporizador está parado (%ssystemctl %sstart %s)"
+             % (como + (p.TEMPORIZADOR_AGENTES_MEMORIA,)))
     if hermes_pendiente:
         return
     orden = [ambito.python_venv, "-I", "-B", "-m", "hehermes_avisos.vigia", "--config", ambito.vigia_ini, "comprobar"]
@@ -525,4 +604,6 @@ def comprobar(sis, man, ambito, mira, hermes_pendiente=False, intentos=3, espera
         mira(False, "", "vigía: su comprobación no dice nada (%s)" % ((r.error or r.salida).strip()[-200:] or r.codigo))
     for linea in lineas:
         bien, texto = linea.startswith("bien: "), linea[6:].strip()
-        mira(bien, "vigía: " + texto, "vigía: " + texto)
+        # Lo de los agentes lo mira el vigía (le pregunta a su ayudante), pero se dice como suyo: «agentes: …».
+        texto = texto if texto.startswith("agentes: ") else "vigía: " + texto
+        mira(bien, texto, texto)

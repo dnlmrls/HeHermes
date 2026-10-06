@@ -58,9 +58,11 @@ SystemCallErrorNumber=EPERM
 
 # Lo que el código decide, otra vez, pero ahora lo hace cumplir el núcleo: /root y /home, vacíos (un tmpfs), y dentro
 # solo <HERMES_HOME>/entrada, de lectura y escritura. Si aún no existe se salta (el «-»): el ayudante contesta 503
-# (entrada_no_disponible) hasta que el instalador la cree.
+# (entrada_no_disponible) hasta que el instalador la cree. Desde la 1.6.0, también los perfiles de los agentes
+# (profiles/), enteros: cada uno tiene su entrada, y se crean y se borran sin tocar esta unidad. Dentro, el ayudante solo
+# escribe en profiles/<perfil>/entrada, bajando sin seguir enlaces.
 ProtectHome=tmpfs
-BindPaths=-/root/.hermes/entrada
+BindPaths=-/root/.hermes/entrada -/root/.hermes/profiles
 # Y fuera de las casas, los secretos del sistema y de HeHermes, tapados (también la copia de antes de restaurar, que
 # lleva las claves de Hermes: un ayudante de root sin capacidades podría leer lo que es de root).
 InaccessiblePaths=-/etc/shadow -/etc/shadow- -/etc/gshadow -/etc/gshadow- -/etc/sudoers -/etc/sudoers.d

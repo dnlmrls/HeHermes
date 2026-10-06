@@ -22,7 +22,7 @@ UNIDADES_VPN = frozenset(("hehermes-xfrm.service", "hehermes-clave.path", "stron
 #: los lleva también.
 UNIDADES_TLS = frozenset((p.UNIDAD_PASARELA, "hehermes-pasarela-clave.path", p.UNIDAD_VIGIA, p.SOCKET_VIGIA,
                           p.SOCKET_LECTOR, p.SOCKET_RESPALDO, p.SOCKET_ENTRADA, p.SOCKET_ACTUALIZAR,
-                          "hehermes-borrado.timer"))
+                          p.SOCKET_AGENTES, p.TEMPORIZADOR_AGENTES_MEMORIA, "hehermes-borrado.timer"))
 USUARIOS_TLS = frozenset((p.USUARIO_PASARELA, p.USUARIO_VIGIA))
 #: El único paquete que pueden pedir los dos (el venv de `cryptography`); los demás son de strongSwan y nginx.
 PAQUETES_COMUNES = frozenset(("python3-venv",))
@@ -38,10 +38,12 @@ def de_fichero(ruta: str, ambito) -> str | None:
     if (ruta.startswith((ambito.carpeta_avisos + "/", ambito.prefijo + "/hehermes_avisos/"))
             or ruta in (ambito.unidad_vigia, ambito.socket_vigia, ambito.unidad_lector_socket, ambito.unidad_lector,
                         ambito.unidad_respaldo_socket, ambito.unidad_respaldo, ambito.unidad_entrada_socket,
-                        ambito.unidad_entrada, ambito.unidad_actualizar_socket, ambito.unidad_actualizar)):
+                        ambito.unidad_entrada, ambito.unidad_actualizar_socket, ambito.unidad_actualizar,
+                        ambito.unidad_agentes_socket, ambito.unidad_agentes, ambito.unidad_agentes_memoria,
+                        ambito.temporizador_agentes_memoria)):
         return TLS
     # El lector con root (/usr/local/libexec); sin root es la copia que va con el instalador, que es de los dos.
-    if ambito.root and ruta in (ambito.lector, ambito.respaldo, ambito.entrada, ambito.actualizar):
+    if ambito.root and ruta in (ambito.lector, ambito.respaldo, ambito.entrada, ambito.actualizar, ambito.agentes):
         return TLS
     return None
 

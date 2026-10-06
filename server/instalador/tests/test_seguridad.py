@@ -82,7 +82,7 @@ class TrasInstalar(Base):
         _, publica = apoyo.ed25519()
         self.sis.poner(p.PREFIJO + "/clave-rescate.pem", publica)
         self.assertEqual(self.estados("actualizar:"), [("bien", "actualizar: solo con un paquete firmado con una clave "
-                                                                "de Daniel (la principal o la de rescate)")])
+                                                                "de HeHermes (la principal o la de rescate)")])
 
     def test_un_mal_hace_salir_con_uno(self):
         self.instalar()

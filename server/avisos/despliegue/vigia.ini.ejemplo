@@ -119,6 +119,14 @@ instalador = /opt/hehermes-servidor
 ayudante = /run/hehermes-actualizar.sock
 # Las unidades de HeHermes cuyo estado se enseña, con «systemctl is-active» (no necesita root). Con «usuario:» delante,
 # una de «systemctl --user».
-servicios = hehermes-pasarela.service hehermes-vigia.service hehermes-rele.service hehermes-leer-media.socket hehermes-respaldo.socket hehermes-entrada.socket hehermes-actualizar.socket
+servicios = hehermes-pasarela.service hehermes-vigia.service hehermes-rele.service hehermes-leer-media.socket hehermes-respaldo.socket hehermes-entrada.socket hehermes-actualizar.socket hehermes-agentes.socket hehermes-agentes-memoria.timer
 # La de Hermes (vacía si no tiene: en tmux, en un contenedor…).
 hermes = hermes-gateway.service
+
+[agentes]
+# Desde la 1.6.0: los agentes, cada uno un perfil de Hermes (contrato §18). La carpeta de sus claves, una por perfil
+# (<perfil>.clave, root:hh-vigia 0640, las escribe el ayudante): los que el vigía vigila, como al principal.
+claves = /etc/hehermes-avisos/agentes
+# El ayudante de root de /usr/local/libexec/hehermes-agentes, que systemd lanza por cada conexión a este socket
+# (root:hh-vigia 0660): crea, cambia y borra los agentes. Vacío: sin él, /avisos/v1/agentes contesta 503.
+ayudante = /run/hehermes-agentes.sock

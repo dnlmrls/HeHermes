@@ -40,6 +40,16 @@
 #                                                   ayudante de root por conexión, sin capacidades ni red, que solo mira
 #                                                   y lanza: la actualización va en su propia unidad
 #                                                   (hehermes-actualizacion); su carpeta, /var/lib/hehermes-actualizar
+#   /usr/local/libexec/hehermes-agentes             el ayudante de los agentes (root 0755, desde la 1.6.0, contrato §18):
+#                                                   crea, cambia y borra los perfiles de Hermes que la app enseña como
+#                                                   agentes, y junta lo que saben de ti los que lo comparten
+#   /etc/systemd/system/hehermes-agentes.socket y hehermes-agentes@.service   su socket (root:hh-vigia 0660) y un
+#                                                   ayudante de root, sin capacidades, por conexión; su carpeta,
+#                                                   /var/lib/hehermes-agentes (0700, la crea systemd)
+#   /etc/systemd/system/hehermes-agentes-memoria.{timer,service}   cada minuto, la memoria que comparten (sin red)
+#   /etc/hehermes-avisos/agentes/                   las claves de los agentes para el vigía (root:hh-vigia 2750); y si
+#                                                   está la pasarela, /etc/hehermes-pasarela/agentes/ (root:hh-pasarela
+#                                                   2750). Las escribe el ayudante, una por perfil (0640)
 #
 #   sudo …/instalar.sh --desinstalar-lector         quita solo el lector (y con él, GET /avisos/v1/fichero da 503)
 #   sudo …/instalar.sh --desinstalar-respaldo       quita solo el ayudante de la copia (/avisos/v1/respaldo da 503); su
@@ -48,6 +58,9 @@
 #                                                   carpeta de entrada, con lo que ya recibió Hermes, se queda
 #   sudo …/instalar.sh --desinstalar-actualizar     quita solo el ayudante que actualiza (la app ya no puede actualizar
 #                                                   este servidor: POST /avisos/v1/servidor/actualizar da 503)
+#   sudo …/instalar.sh --desinstalar-agentes        quita solo el ayudante de los agentes y sus claves
+#                                                   (/avisos/v1/agentes da 503 y la app no llega a ellos); los agentes,
+#                                                   que son perfiles de Hermes, y sus copias se quedan
 #
 # La entrada pública del relé (spec 2026-09-28, «El relé para los probadores»): por donde llegan los avisos de los
 # vigías de otros servidores. Se pone una vez, y desde entonces cada pasada la mantiene:
@@ -170,6 +183,8 @@ instalar_lector() {
     return 0
   fi
   for permitida in $PERMITIDAS_HERMES; do vistas="$vistas -$casa/$permitida"; done
+  # Y los perfiles de los agentes (desde la 1.6.0): de cada uno, el lector lee lo mismo que de la casa.
+  vistas="$vistas -$casa/profiles"
   # Sin capacidades, el lector lee como el dueño de la casa de Hermes: si no es root, como él.
   dueno="$(stat -c %U "$casa" 2>/dev/null || echo root)"
   [[ "$dueno" =~ ^[a-z_][a-z0-9_-]*$ && "$dueno" != root ]] && usuario="
@@ -350,7 +365,7 @@ User=$dueno"
 ExecStart=
 ExecStart=/usr/bin/python3 -I -S -B $ENTRADA --hermes-home=$casa --conexion
 BindPaths=
-BindPaths=-$casa/entrada$usuario"
+BindPaths=-$casa/entrada -$casa/profiles$usuario"
   if [[ ! -f "$ANADIDO_ENTRADA" || "$(cat "$ANADIDO_ENTRADA")" != "$texto" ]]; then
     install -d -m 0755 -o root -g root "$(dirname "$ANADIDO_ENTRADA")"
     printf '%s\n' "$texto" > "$ANADIDO_ENTRADA.nuevo"
@@ -453,6 +468,125 @@ desinstalar_actualizar() {
 }
 # --- fin del ayudante que actualiza ------------------------------------------------------------------------------------
 
+# --- El ayudante de los agentes (funciones) ----------------------------------------------------------------------------
+# Lo usan la instalación y --desinstalar-agentes. Como los demás: un ayudante de root por conexión a su socket, sin
+# capacidades (con un Hermes de otro usuario, CAP_SETUID y CAP_SETGID, para hacer lo de su casa como él), y cada minuto
+# el que junta la memoria que comparten. Las claves de cada agente, en dos carpetas: la de la pasarela y la del vigía.
+AGENTES=/usr/local/libexec/hehermes-agentes
+UNIDADES_AGENTES="hehermes-agentes.socket hehermes-agentes@.service hehermes-agentes-memoria.service hehermes-agentes-memoria.timer"
+ANADIDO_AGENTES="$SYSTEMD/hehermes-agentes@.service.d/hermes.conf"
+ANADIDO_MEMORIA="$SYSTEMD/hehermes-agentes-memoria.service.d/hermes.conf"
+CLAVES_AGENTES_VIGIA=/etc/hehermes-avisos/agentes
+CLAVES_AGENTES_PASARELA=/etc/hehermes-pasarela/agentes
+AGENTES_CAMBIADO=0
+
+poner_anadido() {
+  # Un añadido a una unidad, escrito al lado y renombrado. Sale bien solo si ha cambiado.
+  local ruta="$1" texto="$2"
+  [[ -f "$ruta" && "$(cat "$ruta")" == "$texto" ]] && return 1
+  install -d -m 0755 -o root -g root "$(dirname "$ruta")"
+  printf '%s\n' "$texto" > "$ruta.nuevo"
+  chmod 0644 "$ruta.nuevo"
+  mv -f "$ruta.nuevo" "$ruta"
+}
+
+instalar_agentes() {
+  install -d -m 0755 -o root -g root "$(dirname "$AGENTES")"
+  if ! cmp -s "$AQUI/hehermes-agentes" "$AGENTES"; then
+    install -m 0755 -o root -g root "$AQUI/hehermes-agentes" "$AGENTES.nuevo"
+    mv -f "$AGENTES.nuevo" "$AGENTES"
+    echo "    ayudante de los agentes puesto en $AGENTES"
+  fi
+  local unidad
+  for unidad in $UNIDADES_AGENTES; do
+    if ! cmp -s "$AQUI/$unidad" "$SYSTEMD/$unidad"; then
+      install -m 0644 -o root -g root "$AQUI/$unidad" "$SYSTEMD/$unidad"
+      AGENTES_CAMBIADO=1
+    fi
+  done
+  # Las carpetas de las claves: de root y del grupo de quien las lee, con setgid, que cada clave nazca de su grupo (el
+  # ayudante no tiene CAP_CHOWN para dárselo). La de la pasarela, solo si está la pasarela (la pone el instalador).
+  install -d -m 2750 -o root -g hh-vigia "$CLAVES_AGENTES_VIGIA"
+  if [[ -d "$(dirname "$CLAVES_AGENTES_PASARELA")" ]] && getent group hh-pasarela >/dev/null 2>&1; then
+    install -d -m 2750 -o root -g hh-pasarela "$CLAVES_AGENTES_PASARELA"
+  else
+    echo "    sin la pasarela ($(dirname "$CLAVES_AGENTES_PASARELA")): los agentes se crean, pero la app no llega a" \
+      "ellos hasta que esté (la pone el instalador)"
+  fi
+  # Si Hermes no vive en /root/.hermes o no es de root, un añadido le dice al ayudante dónde y de quién, y le deja
+  # hacerse él (CAP_SETUID y CAP_SETGID); otro, igual, al de la memoria, con su casa de lectura y escritura.
+  local casa dueno capacidades=""
+  casa="$(hermes_del_gateway)"
+  dueno="$(stat -c %U "$casa" 2>/dev/null || echo root)"
+  [[ "$dueno" =~ ^[a-z_][a-z0-9_-]*$ ]] || dueno=root
+  if [[ "$casa" == "$HERMES_DE_SERIE" && "$dueno" == root ]]; then
+    if [[ -e "$ANADIDO_AGENTES" || -e "$ANADIDO_MEMORIA" ]]; then
+      rm -f "$ANADIDO_AGENTES" "$ANADIDO_MEMORIA"
+      rmdir "$(dirname "$ANADIDO_AGENTES")" "$(dirname "$ANADIDO_MEMORIA")" 2>/dev/null || true
+      AGENTES_CAMBIADO=1
+    fi
+    return 0
+  fi
+  [[ "$dueno" != root ]] && capacidades="
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID"
+  poner_anadido "$ANADIDO_AGENTES" "# Lo escribe instalar.sh: el HERMES_HOME de hermes-gateway es $casa, de $dueno.
+[Service]
+ExecStart=
+ExecStart=/usr/bin/python3 -I -S -B $AGENTES --hermes-home=$casa --usuario-hermes=$dueno --unidad-hermes=hermes-gateway.service --conexion$capacidades" \
+    && AGENTES_CAMBIADO=1
+  poner_anadido "$ANADIDO_MEMORIA" "# Lo escribe instalar.sh: el HERMES_HOME de hermes-gateway es $casa, de $dueno.
+[Service]
+ExecStart=
+ExecStart=/usr/bin/python3 -I -S -B $AGENTES --hermes-home=$casa --usuario-hermes=$dueno sincronizar-memoria
+ReadWritePaths=
+ReadWritePaths=-$casa$capacidades" \
+    && AGENTES_CAMBIADO=1
+  echo "    el ayudante de los agentes usa la casa de Hermes $casa, de $dueno"
+}
+
+arrancar_agentes() {
+  # Como el lector: solo el socket, y el temporizador de la memoria. Reiniciarlo no corta un agente a medio crear (sigue
+  # en su propio proceso).
+  systemctl enable --quiet hehermes-agentes.socket hehermes-agentes-memoria.timer
+  if [[ $AGENTES_CAMBIADO -eq 1 ]]; then
+    systemctl restart hehermes-agentes.socket hehermes-agentes-memoria.timer
+  else
+    systemctl start hehermes-agentes.socket hehermes-agentes-memoria.timer
+  fi
+}
+
+desinstalar_agentes() {
+  paso "quitando el ayudante de los agentes"
+  systemctl disable --now --quiet hehermes-agentes.socket hehermes-agentes-memoria.timer 2>/dev/null || true
+  # Un agente a medio crear o borrar no se corta: si hay un ayudante en marcha, se espera a que acabe.
+  if systemctl list-units --no-legend --state=active 'hehermes-agentes@*.service' 2>/dev/null | grep -q .; then
+    fallar "hay un agente creándose o borrándose (journalctl -u 'hehermes-agentes@*'): espera a que acabe"
+  fi
+  local unidad carpeta ruta nombre
+  for unidad in $UNIDADES_AGENTES; do
+    rm -f "$SYSTEMD/$unidad"
+  done
+  rm -f "$ANADIDO_AGENTES" "$ANADIDO_AGENTES.nuevo" "$ANADIDO_MEMORIA" "$ANADIDO_MEMORIA.nuevo"
+  rmdir "$(dirname "$ANADIDO_AGENTES")" "$(dirname "$ANADIDO_MEMORIA")" 2>/dev/null || true
+  rm -f "$AGENTES" "$AGENTES.nuevo"
+  # Las claves: son copias de las del .env de cada perfil (volver a instalar las vuelve a copiar). Solo lo que tiene
+  # nombre de clave, y en una carpeta de verdad; lo demás se queda, y se dice.
+  for carpeta in "$CLAVES_AGENTES_PASARELA" "$CLAVES_AGENTES_VIGIA"; do
+    [[ -d "$carpeta" && ! -L "$carpeta" ]] || continue
+    while IFS= read -r -d '' ruta; do
+      nombre="${ruta##*/}"
+      if [[ "$nombre" =~ ^[a-z0-9]{1,24}\.clave$ || "$nombre" =~ ^\.[a-z0-9]{1,24}\.clave\.[0-9a-f]{8}$ ]]; then
+        rm -f -- "$ruta"
+      fi
+    done < <(find "$carpeta" -mindepth 1 -maxdepth 1 -type f -print0)
+    rmdir "$carpeta" 2>/dev/null || echo "    $carpeta tiene algo que no es la clave de un agente: se queda"
+  done
+  systemctl daemon-reload
+  echo "    quitado: /avisos/v1/agentes contesta 503 y la app no llega a los agentes. Los agentes (perfiles de Hermes) y"
+  echo "    sus copias se quedan, y /var/lib/hehermes-agentes también (lo que apuntaba el ayudante): bórrala tú si quieres"
+}
+# --- fin del ayudante de los agentes -----------------------------------------------------------------------------------
+
 # --- La entrada pública del relé (funciones) ---------------------------------------------------------------------------
 PUBLICO_INI="$CONF/rele-publico.ini"
 PUBLICO_CARPETA="$CONF/rele-publico"
@@ -507,13 +641,14 @@ quitar_rele_publico() {
 
 RELE_PUBLICO=0
 if [[ $# -gt 0 ]]; then
-  USO="uso: instalar.sh [--desinstalar-lector | --desinstalar-respaldo | --desinstalar-entrada | --desinstalar-actualizar | --rele-publico | --quitar-rele-publico]"
+  USO="uso: instalar.sh [--desinstalar-lector | --desinstalar-respaldo | --desinstalar-entrada | --desinstalar-actualizar | --desinstalar-agentes | --rele-publico | --quitar-rele-publico]"
   [[ $# -eq 1 ]] || fallar "$USO"
   case "$1" in
     --desinstalar-lector) desinstalar_lector; exit 0 ;;
     --desinstalar-respaldo) desinstalar_respaldo; exit 0 ;;
     --desinstalar-entrada) desinstalar_entrada; exit 0 ;;
     --desinstalar-actualizar) desinstalar_actualizar; exit 0 ;;
+    --desinstalar-agentes) desinstalar_agentes; exit 0 ;;
     --quitar-rele-publico) quitar_rele_publico; exit 0 ;;
     --rele-publico) RELE_PUBLICO=1 ;;
     *) fallar "$USO" ;;
@@ -541,7 +676,7 @@ command -v "$PY" >/dev/null || fallar "no hay $PY"
 # El lector de ficheros y los ayudantes de la copia y de la entrada corren con el Python del sistema, sin venv (no tienen
 # dependencias).
 /usr/bin/python3 -I -S -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' \
-  || fallar "el lector de ficheros y los ayudantes (la copia, la entrada y el que actualiza) necesitan /usr/bin/python3, 3.9 o más nuevo"
+  || fallar "el lector de ficheros y los ayudantes (la copia, la entrada, el que actualiza y el de los agentes) necesitan /usr/bin/python3, 3.9 o más nuevo"
 if ! "$PY" -I -c 'import ensurepip, venv' 2>/dev/null; then
   # En Debian y Ubuntu, venv sin ensurepip viene aparte.
   paso "instalando python3-venv"
@@ -770,11 +905,12 @@ instalar_lector
 instalar_respaldo
 instalar_entrada
 instalar_actualizar
+instalar_agentes
 systemctl daemon-reload
 systemd-analyze verify /etc/systemd/system/hehermes-vigia.socket /etc/systemd/system/hehermes-vigia.service \
   /etc/systemd/system/hehermes-rele.socket /etc/systemd/system/hehermes-rele.service \
   "$SYSTEMD/hehermes-leer-media.socket" "$SYSTEMD/hehermes-respaldo.socket" "$SYSTEMD/hehermes-entrada.socket" \
-  "$SYSTEMD/hehermes-actualizar.socket" \
+  "$SYSTEMD/hehermes-actualizar.socket" "$SYSTEMD/hehermes-agentes.socket" "$SYSTEMD/hehermes-agentes-memoria.timer" \
   || echo "    (systemd-analyze avisa de algo en las unidades: míralo arriba)"
 for unidad in hehermes-vigia hehermes-rele; do
   systemctl enable --quiet "$unidad.socket" "$unidad.service"
@@ -791,6 +927,7 @@ arrancar_lector
 arrancar_respaldo
 arrancar_entrada
 arrancar_actualizar
+arrancar_agentes
 # Con los dos puertos ya de systemd, los servicios: con el código nuevo, y el relé con la clave si Daniel ya la ha
 # puesto (sin ella, arranca igual y contesta 503).
 for unidad in hehermes-vigia hehermes-rele; do

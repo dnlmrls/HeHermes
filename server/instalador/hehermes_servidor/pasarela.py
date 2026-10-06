@@ -26,6 +26,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import time
 
 from .entorno import leer_env
@@ -78,6 +79,10 @@ PREFIJO_RESPALDO = "/avisos/v1/respaldo/"
 #: como un servidor que todavía no sabe recibir ficheros.
 MAX_CUERPO_ENTRADA = 4 * 1024 * 1024 + 64 * 1024
 PREFIJO_ENTRADA = "/avisos/v1/entrada/"
+#: Las rutas de un agente (contrato §18.1, desde la 0.11.0): las de Hermes con `/p/<perfil>` delante, que van tal cual y
+#: con la clave de ese perfil. El perfil, como lo quiere Hermes: minúsculas y cifras, hasta 24.
+PREFIJO_AGENTE = re.compile(r"/p/([a-z0-9]{1,24})(/.*)?")
+PERFIL_VALIDO = re.compile(r"[a-z0-9]{1,24}")
 #: Cada cuánto se mira si ha cambiado tokens.json (y se cortan las conexiones de un token dado de baja).
 REVISION_TOKENS = 1.0
 
@@ -481,6 +486,65 @@ class Secreto:
         return self._valor
 
 
+#: Lo más largo que se acepta como clave de un agente: la que pone el ayudante tiene 43 caracteres (32 bytes en
+#: base64url); la de un perfil que ya estaba, lo que dijera su .env.
+_TOPE_CLAVE_AGENTE = 512
+
+
+def leer_clave_de_agente(texto) -> str | None:
+    """La clave sola de `<perfil>.clave`, en una línea, con lo que puede ir en una cabecera; si no, None."""
+    if not isinstance(texto, str):
+        return None
+    clave = texto.strip()
+    if not clave or len(clave) > _TOPE_CLAVE_AGENTE or not _CLAVE_VALIDA.fullmatch(clave) or '"' in clave:
+        return None
+    return clave
+
+
+class ClavesDeAgentes:
+    """Las claves de los agentes (contrato §18.1): la carpeta de `[agentes] claves`, con un fichero por perfil
+    (`<perfil>.clave`, la clave sola) que escribe el ayudante `hehermes-agentes`. Cada una se vuelve a leer en cuanto
+    cambia, como la del principal (`Secreto`): un agente nuevo vale al momento, sin reiniciar la pasarela.
+
+    El nombre llega de la ruta de la app: solo uno con forma de perfil se convierte en un nombre de fichero, y nunca
+    `default` (el principal no va por aquí). Se abre sin seguir enlaces y tiene que ser un fichero normal: un enlace en
+    la carpeta no lleva a otro fichero que la pasarela pueda leer. Solo se recuerdan las que existen, así que pedir
+    perfiles que no hay no hace crecer nada."""
+
+    def __init__(self, carpeta: str):
+        self.carpeta = carpeta
+        #: perfil -> (firma del fichero, clave)
+        self._vistas = {}
+
+    def clave(self, perfil) -> str | None:
+        if not isinstance(perfil, str) or not PERFIL_VALIDO.fullmatch(perfil) or perfil == "default":
+            return None
+        try:
+            fd = os.open(os.path.join(self.carpeta, perfil + ".clave"),
+                         os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        except OSError:
+            self._vistas.pop(perfil, None)
+            return None
+        clave = None
+        try:
+            datos = os.fstat(fd)
+            firma = (datos.st_ino, datos.st_mtime_ns, datos.st_size)
+            vista = self._vistas.get(perfil)
+            if vista is not None and vista[0] == firma:
+                return vista[1]
+            if stat.S_ISREG(datos.st_mode) and datos.st_size <= _TOPE_CLAVE_AGENTE + 2:
+                clave = leer_clave_de_agente(os.read(fd, _TOPE_CLAVE_AGENTE + 2).decode("utf-8", "replace"))
+        except OSError:
+            clave = None
+        finally:
+            os.close(fd)
+        if clave is None:
+            self._vistas.pop(perfil, None)
+            return None
+        self._vistas[perfil] = (firma, clave)
+        return clave
+
+
 # MARK: La huella del certificado, sin cryptography
 
 
@@ -544,6 +608,8 @@ class Configuracion:
         self.clave_hermes = None
         self.vigia = None
         self.secreto_vigia = None
+        #: La carpeta de las claves de los agentes (`[agentes] claves`, desde la 0.11.0). Sin ella, `/p/…` no se reenvía.
+        self.claves_agentes = None
 
     @classmethod
     def leer(cls, ruta: str, credenciales=None) -> "Configuracion":
@@ -573,6 +639,8 @@ class Configuracion:
                     raise ValueError("el vigía tiene que estar en 127.0.0.1, no en %s" % host)
                 c.vigia = (host, _puerto(puerto))
                 c.secreto_vigia = _absoluta(ini.get("avisos", "secreto"))
+            agentes = ini.get("agentes", "claves", fallback="").strip()
+            c.claves_agentes = _absoluta(agentes) if agentes else None
         except (configparser.Error, ValueError) as error:
             raise ValueError("%s: %s" % (ruta, error))
         if credenciales:
@@ -628,8 +696,10 @@ _QUITAR_DE_LA_APP = {"connection", "keep-alive", "proxy-connection", "proxy-auth
                      "transfer-encoding", "upgrade", "expect", "host", "authorization", "x-hehermes-vigia",
                      "x-forwarded-for", "content-length"}
 _QUITAR_DE_HERMES = {"server", "connection", "keep-alive", "proxy-connection", "upgrade", "trailer"}
-_TEXTOS = {400: "Bad Request", 413: "Payload Too Large", 502: "Bad Gateway", 503: "Service Unavailable"}
+_TEXTOS = {400: "Bad Request", 404: "Not Found", 413: "Payload Too Large", 502: "Bad Gateway",
+           503: "Service Unavailable"}
 _MENSAJES = {"peticion_invalida": "La petición no tiene una forma que la pasarela acepte",
+             "agente_desconocido": "Este servidor no tiene ese agente",
              "cuerpo_demasiado_grande": "El cuerpo es más grande de lo que la pasarela acepta",
              "hermes_no_contesta": "Hermes no contesta en este servidor",
              "avisos_no_instalados": "Los avisos no están instalados en este servidor",
@@ -764,6 +834,9 @@ class Pasarela:
         self.limites = limites if limites is not None else Limites()
         self.clave_hermes = Secreto(config.clave_hermes, leer_clave_hermes)
         self.secreto_vigia = Secreto(config.secreto_vigia, leer_secreto_vigia) if config.vigia else None
+        #: Las claves de los agentes (`/p/<perfil>/…`). La entrada pública del relé no tiene: su configuración no la lleva.
+        carpeta_agentes = getattr(config, "claves_agentes", None)
+        self.claves_agentes = ClavesDeAgentes(carpeta_agentes) if carpeta_agentes else None
         self.diario = diario or (lambda texto: print(texto, flush=True))
         self.contexto = contexto_tls(config, tls_minimo)
         self.huellas = {"actual": _huella_de_pem(config.certificado),
@@ -1093,6 +1166,16 @@ class Pasarela:
             if secreto is None:
                 raise _Error(503, "avisos_no_instalados")
             return self.config.vigia, [("X-HeHermes-Vigia", secreto)], "vigia_no_contesta"
+        base = peticion.ruta.split("?", 1)[0]
+        if base == "/p" or base.startswith("/p/"):
+            # Un agente (contrato §18.1): la ruta tal cual, con la clave de su perfil y nunca la del principal. Sin ella
+            # (un perfil que no hay, otra forma, `default` o una pasarela sin `[agentes]`), no llega a Hermes.
+            coincide = PREFIJO_AGENTE.fullmatch(base)
+            clave = self.claves_agentes.clave(coincide.group(1)) if coincide and self.claves_agentes else None
+            if clave is None:
+                raise _Error(404, "agente_desconocido")
+            return ("127.0.0.1", self.config.puerto_hermes), [("Authorization", "Bearer " + clave)], \
+                "hermes_no_contesta"
         clave = self.clave_hermes.valor()
         if clave is None:
             self.diario("%s sin la clave de Hermes: no la puedo leer" % ip)

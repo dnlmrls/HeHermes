@@ -31,6 +31,7 @@ LECTOR = apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-leer-media"
 RESPALDO = apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-respaldo"
 ENTRADA = apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-entrada"
 ACTUALIZAR = apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-actualizar"
+AGENTES = apoyo.REPO / "server" / "avisos" / "despliegue" / "hehermes-agentes"
 
 
 def codigo(credencial=CREDENCIAL, direccion=RELE, puerto=61999, huella=HUELLA):
@@ -360,7 +361,7 @@ class SinCodigo(Base):
                       "100.64.0.0/10 fc00::/7 fe80::/10\n", unidad)
         self.assertNotIn("IPAddressDeny=any", unidad)
         self.assertIn("Wants=network-online.target hehermes-leer-media.socket hehermes-respaldo.socket "
-                      "hehermes-entrada.socket hehermes-actualizar.socket\n", unidad)
+                      "hehermes-entrada.socket hehermes-actualizar.socket hehermes-agentes.socket\n", unidad)
         for linea in ("User=hh-vigia", "ProtectSystem=strict", "ProtectHome=yes", "NoNewPrivileges=yes",
                       "CapabilityBoundingSet=", "PrivateTmp=yes"):
             self.assertIn(linea + "\n", unidad, "la jaula de siempre")
@@ -375,8 +376,9 @@ class SinCodigo(Base):
         self.assertIn("ExecStart=/usr/bin/python3 -I -S -B /usr/local/libexec/hehermes-leer-media "
                       "--hermes-home=/root/.hermes --conexion\n", servicio)
         self.assertNotIn("--usuario", servicio)
-        self.assertIn("BindReadOnlyPaths=-/root/.hermes/image_cache -/root/.hermes/audio_cache -/root/.hermes/exports\n",
-                      servicio)
+        # Y desde la 0.11.0 los perfiles de los agentes (contrato §18.9): dentro, el lector mira lo de cada uno.
+        self.assertIn("BindReadOnlyPaths=-/root/.hermes/image_cache -/root/.hermes/audio_cache -/root/.hermes/exports "
+                      "-/root/.hermes/profiles\n", servicio)
         self.assertIn("ProtectHome=tmpfs\n", servicio)
         self.assertIn("CapabilityBoundingSet=\n", servicio, "desde la 0.9.0, ninguna capacidad")
         self.assertNotIn("CAP_DAC_READ_SEARCH", servicio)
@@ -544,7 +546,8 @@ class SinRoot(Base):
         self.assertNotIn("CapabilityBoundingSet=CAP", servicio)
         self.assertNotIn("InaccessiblePaths=", servicio)
         vigia = self.sis.leer_texto(a.unidad_vigia)
-        self.assertIn("Wants=hehermes-leer-media.socket hehermes-respaldo.socket hehermes-entrada.socket\n", vigia)
+        self.assertIn("Wants=hehermes-leer-media.socket hehermes-respaldo.socket hehermes-entrada.socket "
+                      "hehermes-agentes.socket\n", vigia)
         self.assertNotIn("IPAddress", vigia.replace("IPAddressDeny necesita", ""))
         self.assertTrue({"hehermes-leer-media.socket", "hehermes-vigia"} <= self.falso.activos_usuario)
         self.assertFalse({"hehermes-leer-media.socket", "hehermes-vigia"} & self.falso.activos)
@@ -679,7 +682,7 @@ class EntradaDeFicheros(Base):
         self.assertEqual(servicio["ExecStart"], ["/usr/bin/python3 -I -S -B /usr/local/libexec/hehermes-entrada "
                                                  "--hermes-home=/root/.hermes --conexion"])
         self.assertEqual((servicio["CapabilityBoundingSet"], servicio["BindPaths"], servicio["LimitFSIZE"]),
-                         ([""], ["-/root/.hermes/entrada"], ["16G"]))
+                         ([""], ["-/root/.hermes/entrada -/root/.hermes/profiles"], ["16G"]))
         self.assertNotIn("User", servicio)
         # La carpeta, creada y apuntada (desinstalar la quita solo si está vacía).
         self.assertTrue(self.sis.es_carpeta("/root/.hermes/entrada"))
@@ -740,7 +743,7 @@ class EntradaDeFicheros(Base):
         unidad = p.unidad_entrada(self.ambito(), "/srv/hermes", "hermes")
         self.assertIn("--hermes-home=/srv/hermes --conexion\n", unidad)
         self.assertIn("User=hermes\n", unidad)
-        self.assertIn("BindPaths=-/srv/hermes/entrada\n", unidad)
+        self.assertIn("BindPaths=-/srv/hermes/entrada -/srv/hermes/profiles\n", unidad)
         self.assertNotIn("User=", p.unidad_entrada(self.ambito(), "/srv/hermes", "root"))
         for malo in ("root;x", "Hermes", "a b"):
             with self.assertRaises(ValueError):
@@ -799,7 +802,8 @@ class ActualizarDesdeLaApp(Base):
         self.assertIn("instalador = /opt/hehermes-servidor\n", ini)
         self.assertIn("ayudante = /run/hehermes-actualizar.sock\n", ini)
         self.assertIn("servicios = hehermes-pasarela.service hehermes-vigia.service hehermes-leer-media.socket "
-                      "hehermes-respaldo.socket hehermes-entrada.socket hehermes-actualizar.socket\n", ini)
+                      "hehermes-respaldo.socket hehermes-entrada.socket hehermes-actualizar.socket "
+                      "hehermes-agentes.socket hehermes-agentes-memoria.timer\n", ini)
         self.assertIn("hermes = hermes-gateway.service\n", ini)
         # El socket y la jaula son los de server/avisos/despliegue, línea a línea (menos los comentarios).
         for nuestra, suya in ((a.unidad_actualizar_socket, "hehermes-actualizar.socket"),
@@ -892,8 +896,277 @@ class ActualizarDesdeLaAppSinRoot(Base):
         self.assertIn("\nayudante =\n", ini.split("[servidor]")[1])
         self.assertIn("servicios = usuario:hehermes-pasarela.service usuario:hehermes-vigia.service "
                       "usuario:hehermes-leer-media.socket usuario:hehermes-respaldo.socket "
-                      "usuario:hehermes-entrada.socket\n", ini)
+                      "usuario:hehermes-entrada.socket usuario:hehermes-agentes.socket "
+                      "usuario:hehermes-agentes-memoria.timer\n", ini)
         self.assertNotIn("hehermes-actualizar", self.sis.leer_texto(a.unidad_vigia))
+
+
+def opciones_del_ayudante_de_los_agentes():
+    """Las opciones que entiende `hehermes-agentes` (su `OPCIONES`), leídas de su código sin ejecutarlo."""
+    import ast
+    arbol = ast.parse(AGENTES.read_text())
+    for nodo in arbol.body:
+        if isinstance(nodo, ast.Assign) and [getattr(o, "id", None) for o in nodo.targets] == ["OPCIONES"]:
+            return set(ast.literal_eval(nodo.value))
+    raise AssertionError("hehermes-agentes no tiene OPCIONES")
+
+
+class LosAgentes(Base):
+    """El ayudante de los agentes (desde la 0.11.0, contrato §18), con root: como en el VPS de Daniel."""
+
+    def instalar(self):
+        with mock.patch.object(self.sis, "carpeta", wraps=self.sis.carpeta) as carpeta:
+            self.assertEqual(self.orden("instalar", "--si", "--iphone", "mi-iphone"), 0, self.salida)
+        return [c.args for c in carpeta.call_args_list]
+
+    def test_con_root_el_ayudante_su_socket_su_jaula_su_temporizador_y_sus_claves(self):
+        carpetas = self.instalar()
+        a = self.ambito()
+        self.assertEqual(self.sis.leer(a.agentes), AGENTES.read_bytes())
+        self.assertEqual(self.sis.modo(a.agentes), 0o755)
+        self.assertEqual(self.sis.leer("/opt/hehermes-servidor/hehermes-agentes"), AGENTES.read_bytes(),
+                         "y su copia con el instalador, para repararlo desde lo instalado")
+        ini = self.sis.leer_texto(a.vigia_ini)
+        self.assertIn("\n[agentes]\n", ini)
+        self.assertIn("claves = /etc/hehermes-avisos/agentes\n", ini.split("[agentes]")[1])
+        self.assertIn("ayudante = /run/hehermes-agentes.sock\n", ini.split("[agentes]")[1])
+        self.assertIn("[agentes]\n# Las claves de los agentes (/p/<perfil>/…), una por perfil: las escribe "
+                      "hehermes-agentes.\nclaves = /etc/hehermes-pasarela/agentes\n", self.sis.leer_texto(a.pasarela_ini))
+        # El socket, la plantilla, el servicio de la memoria y su temporizador son los de server/avisos/despliegue,
+        # línea a línea (menos los comentarios).
+        for nuestra, suya in ((a.unidad_agentes_socket, "hehermes-agentes.socket"),
+                              (a.unidad_agentes, "hehermes-agentes@.service"),
+                              (a.unidad_agentes_memoria, "hehermes-agentes-memoria.service"),
+                              (a.temporizador_agentes_memoria, "hehermes-agentes-memoria.timer")):
+            unidad = activas(self.sis.leer_texto(nuestra))
+            despliegue = activas((AGENTES.parent / suya).read_text())
+            for clave in set(despliegue) | set(unidad):
+                if clave != "Documentation":
+                    self.assertEqual(unidad.get(clave), despliegue.get(clave), (suya, clave))
+        # Lo que pone en su ExecStart lo entiende el ayudante.
+        for ruta in (a.unidad_agentes, a.unidad_agentes_memoria):
+            orden = activas(self.sis.leer_texto(ruta))["ExecStart"][0].split()
+            self.assertEqual(orden[:5], ["/usr/bin/python3", "-I", "-S", "-B", a.agentes])
+            opciones = {o[2:].split("=", 1)[0] for o in orden[5:] if o.startswith("--") and "=" in o}
+            self.assertLessEqual(opciones, opciones_del_ayudante_de_los_agentes(), ruta)
+        # Las carpetas de las claves: de root y del grupo de quien las lee, con setgid (cada clave nace de su grupo).
+        for carpeta, grupo in ((a.claves_agentes_pasarela, "hh-pasarela"), (a.claves_agentes_vigia, "hh-vigia")):
+            self.assertTrue(self.sis.es_carpeta(carpeta), carpeta)
+            self.assertIn((carpeta, 0o2750), carpetas)
+            self.assertEqual(self.falso.dueños.get(carpeta), "root:" + grupo)
+            self.assertNotIn(carpeta, self.manifiesto()["carpetas"], "se van por su nombre, no por el manifiesto")
+        vigia = activas(self.sis.leer_texto(a.unidad_vigia))
+        self.assertIn("hehermes-agentes.socket", " ".join(vigia["Wants"]).split())
+        self.assertNotIn("hehermes-agentes.socket", " ".join(vigia.get("Requires", [])))
+        self.assertIn("servicios = hehermes-pasarela.service hehermes-vigia.service hehermes-leer-media.socket "
+                      "hehermes-respaldo.socket hehermes-entrada.socket hehermes-actualizar.socket "
+                      "hehermes-agentes.socket hehermes-agentes-memoria.timer\n", ini)
+        for unidad in ("hehermes-agentes.socket", "hehermes-agentes-memoria.timer"):
+            self.assertIn(unidad, self.falso.activos)
+            self.assertIn(unidad, self.falso.habilitados)
+            self.assertIn(unidad, self.manifiesto()["unidades"])
+        self.assertIn("bien agentes: el socket de su ayudante está en marcha (/run/hehermes-agentes.sock)", self.salida)
+        self.assertIn("bien agentes: la memoria que comparten se junta cada minuto (hehermes-agentes-memoria.timer)",
+                      self.salida)
+        self.assertEqual(self.orden("instalar", "--plan"), 0, self.salida)
+        self.assertIn("Todo al día: 0 cambios.", self.salida)
+
+    def test_desinstalar_se_lleva_las_claves_y_deja_los_agentes(self):
+        self.instalar()
+        a = self.ambito()
+        for carpeta in (a.claves_agentes_pasarela, a.claves_agentes_vigia):
+            self.sis.poner(carpeta + "/investigador.clave", b"clave-de-un-agente-de-las-pruebas\n", modo=0o640)
+            self.sis.poner(carpeta + "/.redactor.clave.0123abcd", b"a medio escribir\n", modo=0o640)
+        self.sis.poner(a.carpeta_agentes + "/trabajos/" + "a" * 32 + ".json", b'{"estado": "hecho"}', modo=0o600)
+        self.sis.poner("/root/.hermes/profiles/investigador/SOUL.md", b"Eres un investigador.\n", modo=0o600)
+        self.sis.poner("/root/hehermes-copias/agentes/investigador-1.tar.gz", b"la copia", modo=0o600)
+        self.assertEqual(self.orden("desinstalar", "--si"), 0, self.salida)
+        self.assertIn("las claves de los agentes (/etc/hehermes-pasarela/agentes y /etc/hehermes-avisos/agentes) y lo "
+                      "que apunta su ayudante (/var/lib/hehermes-agentes). Los agentes, que son perfiles de Hermes, y "
+                      "sus copias se quedan", self.salida, "el resumen lo dice antes")
+        for ruta in (a.agentes, a.unidad_agentes_socket, a.unidad_agentes, a.unidad_agentes_memoria,
+                     a.temporizador_agentes_memoria, a.claves_agentes_pasarela, a.claves_agentes_vigia,
+                     a.carpeta_agentes, "/opt/hehermes-servidor/hehermes-agentes"):
+            self.assertFalse(self.sis.existe(ruta), ruta)
+        self.assertEqual(self.sis.leer("/root/.hermes/profiles/investigador/SOUL.md"), b"Eres un investigador.\n")
+        self.assertEqual(self.sis.leer("/root/hehermes-copias/agentes/investigador-1.tar.gz"), b"la copia")
+        self.assertFalse({"hehermes-agentes.socket", "hehermes-agentes-memoria.timer"} & self.falso.activos)
+        self.assertNotIn("Se queda", self.salida)
+
+    def test_lo_que_no_es_una_clave_se_queda_y_un_enlace_no_lleva_el_borrado_a_otro_sitio(self):
+        self.instalar()
+        a = self.ambito()
+        self.sis.poner(a.claves_agentes_vigia + "/investigador.clave", b"clave\n", modo=0o640)
+        self.sis.poner(a.claves_agentes_vigia + "/notas.txt", b"de alguien", modo=0o640)
+        self.sis.poner("/srv/otra/investigador.clave", b"no se borra", modo=0o600)
+        self.sis.borrar(a.claves_agentes_pasarela)
+        self.sis.enlazar(a.claves_agentes_pasarela, self.sis.ruta("/srv/otra"))
+        self.assertEqual(self.orden("desinstalar", "--si"), 0, self.salida)
+        self.assertEqual(self.sis.leer("/srv/otra/investigador.clave"), b"no se borra")
+        self.assertFalse(self.sis.existe(a.claves_agentes_pasarela), "el enlace se va; lo de dentro, no")
+        self.assertFalse(self.sis.existe(a.claves_agentes_vigia + "/investigador.clave"))
+        self.assertEqual(self.sis.leer(a.claves_agentes_vigia + "/notas.txt"), b"de alguien")
+        self.assertIn("/etc/hehermes-avisos/agentes: hay algo que no es la clave de un agente; no lo toco", self.salida)
+
+    def test_un_agente_a_medio_crear_no_se_corta(self):
+        self.instalar()
+        a = self.ambito()
+        self.sis.poner(a.carpeta_agentes + "/trabajos/" + "b" * 32 + ".json", b'{"estado": "creando"}', modo=0o600)
+        self.falso.activos.add("hehermes-agentes@*")
+        self.assertEqual(self.orden("desinstalar", "--si"), 0, self.salida)
+        self.assertIn("los agentes: su ayudante está creando o borrando uno", self.salida)
+        self.assertTrue(self.sis.existe(a.carpeta_agentes + "/trabajos/" + "b" * 32 + ".json"))
+
+    def test_lo_que_dice_el_vigia_de_los_agentes_es_de_los_agentes(self):
+        self.falso.vigia_comprueba = self.falso.vigia_comprueba + [
+            "bien: agentes: el ayudante contesta; 2 agentes; claves en su sitio"]
+        self.instalar()
+        self.assertEqual(self.orden("comprobar"), 0, self.salida)
+        self.assertIn("bien  agentes: el ayudante contesta; 2 agentes; claves en su sitio", self.salida)
+        self.assertNotIn("vigía: agentes:", self.salida)
+        self.assertIn("bien  vigía: Hermes contesta", self.salida, "lo demás, como siempre")
+
+    def test_el_vigia_de_verdad_lo_lee(self):
+        import os
+        import tempfile
+        sys.path.insert(0, str(apoyo.REPO / "server" / "avisos"))
+        self.addCleanup(sys.path.remove, str(apoyo.REPO / "server" / "avisos"))
+        from hehermes_avisos.vigia.configuracion import ConfigVigia
+        self.instalar()
+        with tempfile.TemporaryDirectory() as carpeta:
+            ruta = os.path.join(carpeta, "vigia.ini")
+            with open(ruta, "w") as f:
+                f.write(self.sis.leer_texto(self.ambito().vigia_ini))
+            config = ConfigVigia.leer(ruta)
+            self.assertEqual((config.agentes_claves, config.agentes_ayudante),
+                             ("/etc/hehermes-avisos/agentes", "/run/hehermes-agentes.sock"))
+            with open(ruta, "w") as f:
+                f.write(p.vigia_ini(self.ambito(), 8642, "/root/.hermes/.env", "/root"))
+            config = ConfigVigia.leer(ruta)
+            self.assertEqual((config.agentes_claves, config.agentes_ayudante), ("/etc/hehermes-avisos/agentes", ""),
+                             "sin el ayudante, vacío: esas rutas contestan 503")
+
+    def test_con_hermes_de_otro_usuario_lo_de_su_casa_como_el(self):
+        unidad = p.unidad_agentes(self.ambito(), "/srv/hermes", "hermes", "hermes-gateway.service")
+        self.assertIn("--hermes-home=/srv/hermes --usuario-hermes=hermes --unidad-hermes=hermes-gateway.service "
+                      "--conexion\n", unidad)
+        self.assertIn("CapabilityBoundingSet=CAP_SETUID CAP_SETGID\n", unidad)
+        self.assertNotIn("User=", unidad, "de root: escribe las claves, que son de root")
+        de_root = p.unidad_agentes(self.ambito(), "/root/.hermes")
+        self.assertIn("CapabilityBoundingSet=\n", de_root)
+        self.assertIn("--usuario-hermes=root ", de_root)
+        memoria = p.unidad_agentes_memoria(self.ambito(), "/srv/hermes", "hermes")
+        self.assertIn("--hermes-home=/srv/hermes --usuario-hermes=hermes sincronizar-memoria\n", memoria)
+        self.assertIn("CapabilityBoundingSet=CAP_SETUID CAP_SETGID\n", memoria)
+        self.assertIn("ReadWritePaths=-/srv/hermes\n", memoria)
+        self.assertIn("PrivateNetwork=yes\n", memoria)
+        for malo in ("root;x", "Hermes", "a b"):
+            with self.assertRaises(ValueError):
+                p.unidad_agentes(self.ambito(), "/srv/hermes", malo)
+            with self.assertRaises(ValueError):
+                p.unidad_agentes_memoria(self.ambito(), "/srv/hermes", malo)
+        for mala in ("hermes gateway.service", "x.socket", "a;b.service"):
+            with self.assertRaises(ValueError):
+                p.unidad_agentes(self.ambito(), "/srv/hermes", "hermes", mala)
+        with self.assertRaises(ValueError):
+            p.unidad_agentes(self.ambito(), "/srv/her mes")
+
+    def test_con_los_avisos_a_mano_no_lo_pone_el_instalador_pero_la_pasarela_tiene_su_carpeta(self):
+        """En el VPS de Daniel lo pone `instalar.sh` con los avisos (y la carpeta del vigía); el instalador, la de la
+        pasarela, que es suya, y su copia en /opt."""
+        self.sis.carpeta(avisos.A_MANO, 0o755)
+        self.sis.poner("/etc/hehermes-avisos/agentes/investigador.clave", b"de instalar.sh\n", modo=0o640)
+        self.instalar()
+        a = self.ambito()
+        for ruta in (a.agentes, a.unidad_agentes_socket, a.unidad_agentes, a.unidad_agentes_memoria,
+                     a.temporizador_agentes_memoria):
+            self.assertFalse(self.sis.existe(ruta), ruta)
+        self.assertTrue(self.sis.existe("/opt/hehermes-servidor/hehermes-agentes"))
+        self.assertTrue(self.sis.es_carpeta(a.claves_agentes_pasarela))
+        self.assertEqual(self.falso.dueños.get(a.claves_agentes_pasarela), "root:hh-pasarela")
+        self.assertNotIn(a.claves_agentes_vigia, self.falso.dueños, "la del vigía es de instalar.sh")
+        self.assertEqual(self.orden("desinstalar", "--si"), 0, self.salida)
+        self.assertFalse(self.sis.existe(a.claves_agentes_pasarela))
+        self.assertEqual(self.sis.leer("/etc/hehermes-avisos/agentes/investigador.clave"), b"de instalar.sh\n")
+
+
+class LosAgentesConHermesDeOtroUsuario(Base):
+    """Con root y un Hermes de otro usuario: el ayudante es de root (escribe las claves), con CAP_SETUID y CAP_SETGID
+    para hacer lo de la casa de Hermes como él."""
+
+    def servidor(self):
+        return sf.servidor(usuario="hermes")
+
+    def test_lo_de_su_casa_como_el(self):
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+        a = self.ambito()
+        servicio = activas(self.sis.leer_texto(a.unidad_agentes))
+        self.assertEqual(servicio["ExecStart"], ["/usr/bin/python3 -I -S -B /usr/local/libexec/hehermes-agentes "
+                                                 "--hermes-home=/home/hermes/.hermes --usuario-hermes=hermes "
+                                                 "--unidad-hermes=hermes-gateway.service --conexion"])
+        self.assertEqual(servicio["CapabilityBoundingSet"], ["CAP_SETUID CAP_SETGID"])
+        self.assertNotIn("User", servicio)
+        memoria = activas(self.sis.leer_texto(a.unidad_agentes_memoria))
+        self.assertEqual(memoria["ExecStart"], ["/usr/bin/python3 -I -S -B /usr/local/libexec/hehermes-agentes "
+                                                "--hermes-home=/home/hermes/.hermes --usuario-hermes=hermes "
+                                                "sincronizar-memoria"])
+        self.assertEqual((memoria["CapabilityBoundingSet"], memoria["ReadWritePaths"]),
+                         (["CAP_SETUID CAP_SETGID"], ["-/home/hermes/.hermes"]))
+
+
+class LosAgentesSinRoot(Base):
+    euid = 1000
+    cuenta = ("hermes", "/home/hermes", 1000)
+
+    def servidor(self):
+        sis, falso = sf.servidor(usuario="hermes")
+        sis.carpeta("/run/user/1000", 0o700)
+        return sis, falso
+
+    def test_como_el_usuario_de_hermes_en_su_casa(self):
+        self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
+        a = self.ambito()
+        self.assertEqual(a.agentes, "/home/hermes/.local/share/hehermes-servidor/hehermes-agentes")
+        self.assertEqual(self.sis.leer(a.agentes), AGENTES.read_bytes())
+        ini = self.sis.leer_texto(a.vigia_ini).split("[agentes]")[1]
+        self.assertIn("claves = /home/hermes/.config/hehermes-avisos/agentes\n", ini)
+        self.assertIn("ayudante = /run/user/1000/hehermes-agentes.sock\n", ini)
+        self.assertIn("claves = /home/hermes/.config/hehermes-pasarela/agentes\n", self.sis.leer_texto(a.pasarela_ini))
+        self.assertIn("ListenStream=%t/hehermes-agentes.sock\nSocketMode=0600\n",
+                      self.sis.leer_texto(a.unidad_agentes_socket))
+        servicio = self.sis.leer_texto(a.unidad_agentes)
+        self.assertIn("ExecStart=/usr/bin/python3 -I -S -B %s --usuario --hermes-home=/home/hermes/.hermes "
+                      "--trabajo=/home/hermes/.local/state/hehermes-agentes "
+                      "--claves-pasarela=/home/hermes/.config/hehermes-pasarela/agentes "
+                      "--claves-vigia=/home/hermes/.config/hehermes-avisos/agentes "
+                      "--unidad-hermes=hermes-gateway.service --conexion\n" % a.agentes, servicio)
+        memoria = self.sis.leer_texto(a.unidad_agentes_memoria)
+        self.assertIn("--usuario --hermes-home=/home/hermes/.hermes --trabajo=/home/hermes/.local/state/hehermes-agentes "
+                      "--claves-pasarela=/home/hermes/.config/hehermes-pasarela/agentes "
+                      "--claves-vigia=/home/hermes/.config/hehermes-avisos/agentes sincronizar-memoria\n", memoria)
+        for texto in (servicio, memoria):
+            for nunca in ("CapabilityBoundingSet=", "ProtectSystem=", "User=", "--usuario-hermes"):
+                self.assertNotIn(nunca, texto)
+            orden = activas(texto)["ExecStart"][0].split()
+            opciones = {o[2:].split("=", 1)[0] for o in orden[5:] if o.startswith("--") and "=" in o}
+            self.assertLessEqual(opciones, opciones_del_ayudante_de_los_agentes())
+        for carpeta in (a.claves_agentes_pasarela, a.claves_agentes_vigia):
+            self.assertEqual(self.sis.modo(carpeta), 0o700, carpeta)
+            self.assertNotIn(carpeta, self.falso.dueños)
+        for unidad in ("hehermes-agentes.socket", "hehermes-agentes-memoria.timer"):
+            self.assertIn(unidad, self.falso.activos_usuario)
+            self.assertNotIn(unidad, self.falso.activos)
+        self.assertIn("Wants=hehermes-leer-media.socket hehermes-respaldo.socket hehermes-entrada.socket "
+                      "hehermes-agentes.socket\n", self.sis.leer_texto(a.unidad_vigia))
+        self.sis.poner(a.claves_agentes_vigia + "/investigador.clave", b"clave\n", modo=0o600)
+        self.sis.poner(a.carpeta_agentes + "/trabajos/x.json", b"{}", modo=0o600)
+        self.assertEqual(self.orden("desinstalar", "--si"), 0, self.salida)
+        for ruta in (a.agentes, a.unidad_agentes_socket, a.unidad_agentes, a.unidad_agentes_memoria,
+                     a.temporizador_agentes_memoria, a.claves_agentes_pasarela, a.claves_agentes_vigia,
+                     a.carpeta_agentes):
+            self.assertFalse(self.sis.existe(ruta), ruta)
+        for unidad in ("hehermes-agentes.socket", "hehermes-agentes-memoria.timer"):
+            self.assertIn(["systemctl", "--user", "disable", "--now", unidad], self.sis.ordenes)
 
 
 class ElPaquete(unittest.TestCase):

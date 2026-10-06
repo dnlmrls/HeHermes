@@ -6,7 +6,7 @@ Guarda tres cosas, y ninguna es texto de una conversación:
   el relé (spec 2026-09-28, «Avisos sin comandos»). La clave es la que cifra los avisos de ese iPhone, y el permiso deja
   pedir avisos para él: el fichero se crea 0600 y el directorio es del usuario del vigía y de nadie más;
 - hasta dónde se ha leído cada **sesión** (el id de la última fila vista), para no avisar dos veces tras un reinicio ni
-  de todo el historial la primera vez;
+  de todo el historial la primera vez; desde la versión 5, por perfil de Hermes (los agentes, contrato §18);
 - los **turnos** que la app dejó en marcha al irse, si los manda (ampliación propuesta del contrato: ver el README).
 """
 
@@ -26,8 +26,12 @@ registro = logging.getLogger("vigia.almacen")
 # La versión de la base de datos (`PRAGMA user_version`). Cada cambio sube uno, con su paso en `_migrar`, y una base de
 # una versión anterior se pone al día al abrirla. La 2 añadió el latido del primer plano (`delante_latido`,
 # `delante_caduca`); la 3, el permiso de cada iPhone para el relé (`permiso*`); la 4, la hora de la última respuesta vista
-# de cada conversación (`sesiones.ultima_respuesta`), para no avisar otra vez de las copias que deja una compactación.
-ESQUEMA = 4
+# de cada conversación (`sesiones.ultima_respuesta`), para no avisar otra vez de las copias que deja una compactación; la
+# 5, el perfil de Hermes de cada conversación y de cada turno (los agentes, contrato §18): cada perfil tiene su propio
+# state.db, así que la clave de una conversación es `(perfil, id)`. Lo de antes es del principal (`default`).
+ESQUEMA = 5
+#: El perfil del principal, el de todo lo de antes de los agentes.
+PRINCIPAL = "default"
 
 # Lo que se da por visto antes de que la app dijera «estoy delante»: el aviso de «delante» llega un momento después de
 # que la app ya esté en pantalla. Por arriba no hace falta margen: el «ya no estoy delante» se apunta al llegar, que es
@@ -123,6 +127,8 @@ class EstadoSesion:
     # La hora de la última fila `assistant` vista (`deteccion.ultima_respuesta`): tras una compactación, Hermes vuelve a
     # escribir la cola con ids nuevos y sus horas de siempre, y lo que no es posterior a esta hora es una copia.
     ultima_respuesta: float | None = None
+    # El perfil de Hermes de la conversación (un agente, contrato §18; `default`, el principal).
+    perfil: str = PRINCIPAL
 
 
 @dataclass(frozen=True)
@@ -132,6 +138,7 @@ class Turno:
     alta: float
     aprobacion_avisada: str | None
     visto: float
+    perfil: str = PRINCIPAL
 
 
 # Una base nueva, ya en la última versión. Lo que añade cada paso de `_migrar` tiene que estar también aquí (lo mira una
@@ -158,20 +165,23 @@ _CREAR = f"""
         permiso_rechazado REAL
     );
     CREATE TABLE IF NOT EXISTS sesiones (
-        id TEXT PRIMARY KEY,
+        perfil TEXT NOT NULL DEFAULT 'default',
+        id TEXT NOT NULL,
         ultimo_id INTEGER,
         referencia REAL NOT NULL,
         ultima_actividad REAL,
         mensajes INTEGER,
         visto REAL NOT NULL,
-        ultima_respuesta REAL
+        ultima_respuesta REAL,
+        PRIMARY KEY (perfil, id)
     );
     CREATE TABLE IF NOT EXISTS turnos (
         run_id TEXT PRIMARY KEY,
         sesion TEXT NOT NULL,
         alta REAL NOT NULL,
         aprobacion_avisada TEXT,
-        visto REAL NOT NULL
+        visto REAL NOT NULL,
+        perfil TEXT NOT NULL DEFAULT 'default'
     );
     CREATE TABLE IF NOT EXISTS estado (clave TEXT PRIMARY KEY, valor TEXT NOT NULL);
     PRAGMA user_version = {ESQUEMA};
@@ -243,6 +253,33 @@ class Almacen:
                     BEGIN;
                     ALTER TABLE sesiones ADD COLUMN ultima_respuesta REAL;
                     PRAGMA user_version = 4;
+                    COMMIT;
+                """)
+            if version < 5:
+                registro.info("base de datos de la versión %d: se pone al día (el perfil de cada conversación y de "
+                              "cada turno: lo de antes, del principal)", max(version, 4))
+                # SQLite no cambia la clave primaria de una tabla: se hace otra con la nueva y se pasa todo.
+                self._con.executescript("""
+                    BEGIN;
+                    CREATE TABLE sesiones_5 (
+                        perfil TEXT NOT NULL DEFAULT 'default',
+                        id TEXT NOT NULL,
+                        ultimo_id INTEGER,
+                        referencia REAL NOT NULL,
+                        ultima_actividad REAL,
+                        mensajes INTEGER,
+                        visto REAL NOT NULL,
+                        ultima_respuesta REAL,
+                        PRIMARY KEY (perfil, id)
+                    );
+                    INSERT INTO sesiones_5 (perfil, id, ultimo_id, referencia, ultima_actividad, mensajes, visto,
+                                            ultima_respuesta)
+                        SELECT 'default', id, ultimo_id, referencia, ultima_actividad, mensajes, visto, ultima_respuesta
+                        FROM sesiones;
+                    DROP TABLE sesiones;
+                    ALTER TABLE sesiones_5 RENAME TO sesiones;
+                    ALTER TABLE turnos ADD COLUMN perfil TEXT NOT NULL DEFAULT 'default';
+                    PRAGMA user_version = 5;
                     COMMIT;
                 """)
 
@@ -366,23 +403,25 @@ class Almacen:
     # -- Sesiones
 
     def sesiones(self) -> dict:
+        """`{(perfil, id): EstadoSesion}`: la misma sesión en dos perfiles son dos conversaciones."""
         with self._cerrojo:
             filas = self._con.execute(
-                "SELECT id, ultimo_id, referencia, ultima_actividad, mensajes, visto, ultima_respuesta "
+                "SELECT id, ultimo_id, referencia, ultima_actividad, mensajes, visto, ultima_respuesta, perfil "
                 "FROM sesiones").fetchall()
-        return {fila[0]: EstadoSesion(*fila) for fila in filas}
+        return {(fila[7], fila[0]): EstadoSesion(*fila) for fila in filas}
 
     def guardar_sesion(self, estado: EstadoSesion) -> None:
         """Una sola conversación, en cuanto se ha avisado de lo suyo: si la vuelta se rompe después, lo de esta ya
         consta."""
         with self._cerrojo:
             self._con.execute(
-                "INSERT INTO sesiones (id, ultimo_id, referencia, ultima_actividad, mensajes, visto, ultima_respuesta) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET ultimo_id = excluded.ultimo_id, "
-                "referencia = excluded.referencia, ultima_actividad = excluded.ultima_actividad, "
-                "mensajes = excluded.mensajes, visto = excluded.visto, ultima_respuesta = excluded.ultima_respuesta",
-                (estado.id, estado.ultimo_id, estado.referencia, estado.ultima_actividad, estado.mensajes,
-                 estado.visto, estado.ultima_respuesta))
+                "INSERT INTO sesiones (perfil, id, ultimo_id, referencia, ultima_actividad, mensajes, visto, "
+                "ultima_respuesta) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(perfil, id) DO UPDATE SET "
+                "ultimo_id = excluded.ultimo_id, referencia = excluded.referencia, "
+                "ultima_actividad = excluded.ultima_actividad, mensajes = excluded.mensajes, visto = excluded.visto, "
+                "ultima_respuesta = excluded.ultima_respuesta",
+                (estado.perfil, estado.id, estado.ultimo_id, estado.referencia, estado.ultima_actividad,
+                 estado.mensajes, estado.visto, estado.ultima_respuesta))
 
     def podar_sesiones(self, antes_de: float) -> int:
         """Olvida las sesiones que hace mucho que no salen en la bandeja (archivadas, borradas, o muy atrás)."""
@@ -405,7 +444,8 @@ class Almacen:
     # -- Turnos que la app dejó en marcha
 
     def vigilar_turnos(self, turnos: list, ahora: float) -> None:
-        """``turnos``: pares (run_id, sesión). Un turno que ya se vigilaba conserva lo que ya se avisó de él.
+        """``turnos``: (run_id, sesión) o (run_id, sesión, perfil), del principal si no lo dice. Un turno que ya se
+        vigilaba conserva lo que ya se avisó de él.
 
         Como mucho ``MAX_TURNOS`` en total, los más recientes: cada uno es una consulta a Hermes en cada vuelta, y la
         app tiene uno o dos en marcha; más que eso es algo que no va bien, no más trabajo que vigilar.
@@ -414,16 +454,16 @@ class Almacen:
             return
         with self._cerrojo:
             self._con.executemany(
-                "INSERT INTO turnos (run_id, sesion, alta, visto) VALUES (?, ?, ?, ?) "
+                "INSERT INTO turnos (run_id, sesion, alta, visto, perfil) VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT(run_id) DO UPDATE SET visto = excluded.visto",
-                [(run_id, sesion, ahora, ahora) for run_id, sesion in turnos])
+                [(turno[0], turno[1], ahora, ahora, turno[2] if len(turno) > 2 else PRINCIPAL) for turno in turnos])
             self._con.execute("DELETE FROM turnos WHERE run_id IN (SELECT run_id FROM turnos ORDER BY visto DESC, "
                               "alta DESC LIMIT -1 OFFSET ?)", (MAX_TURNOS,))
 
     def turnos(self) -> list[Turno]:
         with self._cerrojo:
             filas = self._con.execute(
-                "SELECT run_id, sesion, alta, aprobacion_avisada, visto FROM turnos ORDER BY alta").fetchall()
+                "SELECT run_id, sesion, alta, aprobacion_avisada, visto, perfil FROM turnos ORDER BY alta").fetchall()
         return [Turno(*fila) for fila in filas]
 
     def marcar_aprobacion(self, run_id: str, request_id: str) -> None:

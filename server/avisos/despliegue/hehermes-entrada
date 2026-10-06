@@ -93,6 +93,18 @@ LECTURA = MIB
 USUARIO_VIGIA = "hh-vigia"
 HERMES_HOME = "/root/.hermes"
 ENTRADA = "entrada"
+# Los agentes (desde la 1.6.0 de los avisos, contrato §18.9): cada uno es un perfil de Hermes con su casa en
+# `<casa>/profiles/<perfil>` y su propia entrada. El perfil llega como nombre (minúsculas y cifras, hasta 24), nunca
+# como ruta; `default` es el principal.
+PRINCIPAL = "default"
+PERFILES = "profiles"
+LETRAS_DE_PERFIL = frozenset("abcdefghijklmnopqrstuvwxyz0123456789")
+
+
+def es_perfil(texto) -> bool:
+    """El de un agente: de 1 a 24 minúsculas y cifras, y no el del principal."""
+    return (isinstance(texto, str) and 0 < len(texto) <= 24 and set(texto) <= LETRAS_DE_PERFIL
+            and texto != PRINCIPAL)
 SUBIDAS = ".subidas"
 CERROJO = ".cerrojo"
 CREADAS = "creadas.json"
@@ -404,9 +416,14 @@ class Entrada:
     """``<HERMES_HOME>/entrada`` y todas las órdenes, sin sockets (``atender`` solo traduce). ``reloj`` y ``libre`` son
     para las pruebas: la hora y los bytes libres del disco, que en el servidor son los de verdad (``statvfs``)."""
 
-    def __init__(self, casa: str = HERMES_HOME, reloj=time.time, libre=None):
+    def __init__(self, casa: str = HERMES_HOME, reloj=time.time, libre=None, perfil: str = PRINCIPAL):
         self.casa = validar_casa(casa)
-        self.carpeta = self.casa.rstrip("/") + "/" + ENTRADA
+        if not es_perfil(perfil) and perfil != PRINCIPAL:
+            raise Rechazo(400, "parametro_invalido", "El perfil son de 1 a 24 minúsculas y cifras")
+        #: El de un agente (contrato §18.9): su entrada es la de su casa, `profiles/<perfil>/entrada`.
+        self.perfil = perfil
+        dentro = "" if perfil == PRINCIPAL else "/" + PERFILES + "/" + perfil
+        self.carpeta = self.casa.rstrip("/") + dentro + "/" + ENTRADA
         self.reloj = reloj
         self._libre = libre
 
@@ -431,6 +448,17 @@ class Entrada:
             casa = os.open(self.casa, os.O_RDONLY | os.O_DIRECTORY | _CLOEXEC)
         except OSError:
             raise no_disponible from None
+        if self.perfil != PRINCIPAL:
+            # La casa de un agente, sin seguir enlaces: `profiles` y su perfil tienen que ser carpetas de verdad.
+            perfiles = None
+            try:
+                perfiles = _abrir_carpeta(PERFILES, casa)
+                del_perfil = _abrir_carpeta(self.perfil, perfiles)
+            except OSError:
+                raise no_disponible from None
+            finally:
+                _cerrar(perfiles, casa)
+            casa = del_perfil
         entrada = subidas = None
         try:
             try:
@@ -915,7 +943,12 @@ class Entrada:
         return {"ok": True, "subidas": a_medias, "registros": registros, "carpetas": carpetas}
 
     def orden(self, peticion: dict, cuerpo: bytes | None = None) -> dict:
-        """La respuesta a una orden, o ``Rechazo``. Solo un trozo lleva bytes."""
+        """La respuesta a una orden, o ``Rechazo``. Solo un trozo lleva bytes. Con ``perfil`` (el de un agente), en su
+        entrada."""
+        perfil = peticion.get("perfil", PRINCIPAL)
+        if perfil != self.perfil:
+            # La forma del perfil la mira la propia Entrada (400 si no la tiene).
+            return Entrada(self.casa, self.reloj, self._libre, perfil=perfil).orden(peticion, cuerpo)
         orden = peticion.get("orden")
         if cuerpo is not None and orden != "trozo":
             raise Rechazo(400, "peticion_invalida", "Solo un trozo lleva bytes")

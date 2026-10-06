@@ -53,6 +53,11 @@ lector de root solo atiende a root y a ``hh-vigia``, como siempre.
 
 En los dos, el código de salida dice qué pasó (``SALIDAS``). Nunca apunta el contenido ni la ruta.
 
+Desde la 1.6.0, **los agentes** (contrato §18.9): cada uno es un perfil de Hermes con su casa en
+``<casa>/profiles/<perfil>``, y sus caches y su ``exports/`` son permitidas como las de la casa, cada una con su perfil
+en el nombre (lo de un perfil no vale por lo de otro, tampoco por un enlace). Lo demás de un perfil, no. Y
+``?exports <perfil>`` vigila la de ese perfil, que el lector saca de su nombre (nunca de una ruta).
+
 Y desde la 1.5.1, la **vigilancia de la carpeta de exportaciones**: con la línea ``?exports`` en lugar de una ruta, el
 lector cuenta cada dos segundos qué ficheros hay en ``exports/`` (``vigilar``: nombre, tamaño y horas de modificación y
 de cambio de los ficheros normales de la carpeta misma, sin ocultos ni temporales, con un solo enlace duro), durante diez
@@ -112,6 +117,20 @@ HERMES_HOME = "/root/.hermes"
 CACHES_DE_HERMES = ("image_cache", "audio_cache")
 EXPORTACIONES = "exports"
 PERMITIDAS_EN_LA_CASA = CACHES_DE_HERMES + (EXPORTACIONES,)
+# Los agentes (desde la 1.6.0 de los avisos, contrato §18.9): cada uno es un perfil de Hermes, con su casa en
+# `<casa>/profiles/<perfil>` y sus propias caches y exports/, que son permitidas como las de la casa. Lo demás de un
+# perfil (su .env, su SOUL.md, su memoria…), no. El perfil, minúsculas y cifras, hasta 24; `default` es el principal.
+PERFILES = "profiles"
+LETRAS_DE_PERFIL = frozenset("abcdefghijklmnopqrstuvwxyz0123456789")
+#: El nombre con el que se marca, en la lista de permitidas, la carpeta de los perfiles (no es una permitida: lo son las
+#: suyas de cada perfil, `permitida_de`).
+_DE_LOS_PERFILES = "?perfiles"
+
+
+def es_perfil(texto: object) -> bool:
+    """Un perfil de Hermes de un agente: de 1 a 24 minúsculas y cifras, y no `default` (el principal)."""
+    return (isinstance(texto, str) and 0 < len(texto) <= 24 and set(texto) <= LETRAS_DE_PERFIL
+            and texto != "default")
 
 # La lista de prohibidas de antes, que ahora es la segunda red: dentro de una permitida no debería haber nada de esto,
 # y si lo hay (un enlace a /etc que alguien dejó en exports/, una carpeta .ssh), tampoco sale.
@@ -166,18 +185,40 @@ def permitidas(hermes: str = HERMES_HOME, exportaciones: str | None = None) -> t
             if nombre == EXPORTACIONES and exportaciones is not None:
                 continue
             lista.append((nombre, casa.rstrip("/") + "/" + nombre))
+        lista.append((_DE_LOS_PERFILES, casa.rstrip("/") + "/" + PERFILES))
     if exportaciones is not None:
         lista.append((EXPORTACIONES, canonica(exportaciones)))
     return tuple(lista)
 
 
 def permitida_de(ruta: str, lista: tuple) -> str | None:
-    """El nombre de la permitida en la que está la ruta (estrictamente dentro: la carpeta misma no), o ``None``."""
+    """El nombre de la permitida en la que está la ruta (estrictamente dentro: la carpeta misma no), o ``None``. Las de
+    un perfil se llaman con él (``<perfil>/exports``): lo de un perfil no vale por lo de otro."""
     ruta = canonica(ruta)
     for nombre, carpeta in lista:
-        if ruta.startswith(carpeta.rstrip("/") + "/"):
+        if not ruta.startswith(carpeta.rstrip("/") + "/"):
+            continue
+        if nombre != _DE_LOS_PERFILES:
             return nombre
+        partes = ruta[len(carpeta.rstrip("/")) + 1:].split("/")
+        if len(partes) >= 3 and es_perfil(partes[0]) and partes[1] in PERMITIDAS_EN_LA_CASA:
+            return partes[0] + "/" + partes[1]
     return None
+
+
+def lleva_a_una_permitida(ruta: str, lista: tuple) -> bool:
+    """Si la ruta es una permitida, o una carpeta por la que se llega a una (la casa, `profiles/<perfil>`…): es una
+    carpeta, no algo que Hermes pueda copiar a exports/."""
+    ruta = canonica(ruta).rstrip("/")
+    for nombre, carpeta in lista:
+        carpeta = carpeta.rstrip("/")
+        if ruta == carpeta or carpeta.startswith(ruta + "/"):
+            return True
+        if nombre == _DE_LOS_PERFILES and ruta.startswith(carpeta + "/"):
+            partes = ruta[len(carpeta) + 1:].split("/")
+            if es_perfil(partes[0]) and (len(partes) == 1 or (len(partes) == 2 and partes[1] in PERMITIDAS_EN_LA_CASA)):
+                return True
+    return False
 
 
 def es_prohibida(ruta: str) -> bool:
@@ -250,8 +291,7 @@ def abrir(ruta: str, *, prohibidas=es_prohibida, hermes: str = HERMES_HOME, expo
     pedida = canonica(ruta)
     donde = permitida_de(pedida, lista)
     # Una permitida, o una carpeta que lleva a una, es una carpeta y no algo que Hermes pueda copiar a exports/.
-    if prohibidas(pedida) or any(pedida == carpeta or carpeta.startswith(pedida.rstrip("/") + "/")
-                                 for _, carpeta in lista):
+    if prohibidas(pedida) or lleva_a_una_permitida(pedida, lista):
         raise Rechazo("prohibida")
     if donde is None:
         # Fuera de las permitidas, solo por el texto (sin mirar el disco): el vigía se lo dice a la app, para que pueda
@@ -372,8 +412,14 @@ def _leer_linea(conexion, plazo: float) -> str:
         raise Rechazo("invalida") from None
 
 
-def carpeta_de_exportaciones(hermes: str = HERMES_HOME, exportaciones: str | None = None) -> str:
-    """La carpeta de exportaciones, la que se vigila: la dada aparte o la de dentro de la casa de Hermes."""
+def carpeta_de_exportaciones(hermes: str = HERMES_HOME, exportaciones: str | None = None,
+                             perfil: str | None = None) -> str:
+    """La carpeta de exportaciones, la que se vigila: la dada aparte o la de dentro de la casa de Hermes; la de un
+    agente, la de su perfil (`<casa>/profiles/<perfil>/exports`), que se saca aquí de su nombre."""
+    if perfil is not None:
+        if not es_perfil(perfil):
+            raise Rechazo("invalida")
+        return canonica(validar_casa(hermes)).rstrip("/") + "/" + PERFILES + "/" + perfil + "/" + EXPORTACIONES
     if exportaciones is not None:
         return canonica(validar_casa(exportaciones))
     return canonica(validar_casa(hermes)).rstrip("/") + "/" + EXPORTACIONES
@@ -440,11 +486,13 @@ def atender(conexion, *, prohibidas=es_prohibida, par_permitido=par_del_vigia, p
         if not par_permitido(conexion):
             raise Rechazo("no_autorizado")
         linea = _leer_linea(conexion, plazo)
-        if linea == VIGILAR:
-            # Sin apuntarlo: es una por cada diez minutos, todo el día, y no dice nada.
+        if linea == VIGILAR or linea.startswith(VIGILAR + " "):
+            # La del principal, o la de un agente (`?exports <perfil>`, desde la 1.6.0): su carpeta se saca de su
+            # nombre, nunca de una ruta. Sin apuntarlo: es una por cada diez minutos, todo el día, y no dice nada.
+            perfil = linea[len(VIGILAR) + 1:] if linea != VIGILAR else None
+            carpeta = carpeta_de_exportaciones(hermes, exportaciones, perfil)
             conexion.settimeout(60)
-            return vigilar(conexion.sendall, carpeta_de_exportaciones(hermes, exportaciones), prohibidas=prohibidas,
-                           **(vigilancia or {}))
+            return vigilar(conexion.sendall, carpeta, prohibidas=prohibidas, **(vigilancia or {}))
         fd, tamano = abrir(linea, prohibidas=prohibidas, hermes=hermes, exportaciones=exportaciones)
     except Rechazo as rechazo:
         _decir(rechazo.estado)

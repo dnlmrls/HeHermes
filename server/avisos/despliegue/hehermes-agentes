@@ -1,0 +1,2179 @@
+#!/usr/bin/python3 -IS
+"""Los agentes de HeHermes, del lado del servidor. Va en /usr/local/libexec/hehermes-agentes.
+
+Spec ``docs/superpowers/specs/2026-10-05-agentes-design.md`` («Revisión del 2026-10-05») y contrato
+``server/API-CONTRACT.md`` §18. Cada agente es un **perfil de Hermes** (``<HERMES_HOME>/profiles/<perfil>``), que la
+pasarela de Hermes 0.21 sirve en su mismo proceso bajo ``/p/<perfil>/`` y con su propia ``API_SERVER_KEY``. El vigía
+(``hh-vigia``) no puede tocar la casa de Hermes ni escribir las claves que leen la pasarela y él mismo: le pasa a este
+ayudante lo que pide la app, por ``/run/hehermes-agentes.sock`` (``root:hh-vigia`` 0660), y systemd lo lanza en cada
+conexión (``Accept=yes``) con su jaula. Las órdenes:
+
+- ``listar``: los agentes (el principal el primero) y cuántos caben más, en menos de un segundo: sin lanzar ``hermes``,
+  de las carpetas de ``profiles/`` con la regla con la que Hermes elige los que sirve (``profiles_to_serve``), y si
+  cada uno se sirve, preguntándoselo con su clave, todos a la vez y con un plazo corto. Los perfiles que ya estaban se
+  adoptan: si su ``.env`` tiene clave, se copia para la pasarela y el vigía. No toca el cerrojo de los trabajos.
+- ``ver``, ``cambiar``: un agente, con su personalidad; cambiar su nombre, su cara, su descripción o su personalidad.
+- ``crear`` y ``borrar``: un **trabajo**, que contesta al momento (``202``) y sigue en este mismo proceso con la
+  conexión ya cerrada; su estado va en ``<trabajo>/trabajos/<id>.json`` (``trabajo``). Uno a la vez (``trabajo.lock``),
+  con su latido aunque espere minutos a ``hermes``. Un Hermes que ya sirve otros perfiles sirve en caliente los nuevos
+  (``gateway/run_profile_reconcile.py`` de la 0.21.5): al crear, la clave nueva va a su ``.env`` lo primero (el
+  ``--clone`` le deja la del principal, y Hermes aparca un perfil con la clave de otro hasta que su ``.env`` cambia);
+  después se le pide que lo vuelva a mirar por su socket de control (``rescan-profiles``) y se le espera hasta 2
+  minutos, **sin reiniciarlo**. Pero si aún no los sirve (contesta ``multiplex: false``: lo decide al arrancar, y arrancó
+  con el principal solo), con el **primer agente** se le reinicia **una vez**: en un rato tranquilo, tras fijar
+  ``gateway.multiplex_profiles: true`` con ``hermes config set``, ``systemctl restart`` de su unidad, con drenaje
+  (``CALMA``).
+- ``sincronizar-memoria``: lo que sabe de ti, entre el principal y los que lo comparten (§18.8). Lo lanza cada minuto
+  ``hehermes-agentes-memoria.timer``.
+
+Lo que hace que no sirva para otra cosa:
+
+- **No acepta rutas.** Perfiles de ``[a-z0-9]{1,24}``, ids de 32 hexadecimales y los campos de §18, cada uno con su
+  forma y sus topes (8 KB los textos). Una petición con algo más no se atiende.
+- **Las claves**: 32 bytes del generador del sistema, en base64url. **Nunca** en un argumento de un proceso, en el
+  registro ni en una respuesta: van al ``.env`` del perfil y a ``<carpeta>/<perfil>.clave`` (0640, del grupo de la
+  carpeta: ``hh-pasarela`` o ``hh-vigia``), escritas al lado y renombradas, sin seguir enlaces.
+- **Lo de la casa de Hermes, como su dueño.** Con root y un Hermes que no es de root, lo que se escribe en su casa (el
+  ``SOUL.md``, la ficha, la memoria, el ``.env``) lo hace un proceso hijo que ya es ese usuario (``como_hermes``): un
+  enlace que dejara Hermes en su casa no lleva a root a escribir en otro sitio. Y ``hermes`` corre siempre como él.
+  Todo se baja carpeta a carpeta, sin seguir enlaces (``dir_fd``, ``O_NOFOLLOW``).
+- **La memoria, con el flock de Hermes.** Hermes escribe ``USER.md`` reemplazándolo de golpe, con un ``flock``
+  exclusivo sobre ``USER.md.lock``: aquí, igual. Un ``USER.md`` que es un enlace no se lee ni se escribe.
+- **Antes de borrar, una copia** (``hermes profile export``); sin ella, no se borra. **El principal, nunca.**
+- **Solo atiende al vigía** (root o ``hh-vigia``, por ``SO_PEERCRED``), o con ``--usuario`` solo a su propio uid.
+- **En el registro**, el perfil, el principio del id, la orden y el resultado: ni una clave, ni una personalidad, ni lo
+  que sabe de ti.
+
+**El ``hermes`` de verdad**: ``hermes profile create <p> --clone --description=…``, ``describe <p> <texto>``,
+``export <p> --output <fichero>`` y ``delete <p> --yes`` (``hermes_cli/profiles.py`` de la 0.21.5), y con el primer
+agente ``hermes config set gateway.multiplex_profiles true`` (``hermes_cli/config.py``), solo en los trabajos y al
+cambiar la descripción, que lo esperan: arrancar ``hermes`` tarda segundos, y la copia y el borrado de un perfil,
+minutos. Todos con ``-p default`` delante (``_hermes_principal``): sin él, la CLI corre con el perfil que dejara pegado
+``hermes profile use`` y ``--clone`` copiaría ese, no el principal. Su socket de control (``<casa>/gateway.sock``,
+``gateway/control_socket.py``), una línea JSON y otra de vuelta.
+Y su unidad, con ``systemctl``: ``show`` y, con el primer agente, un ``restart``.
+
+El protocolo, el del ayudante que actualiza: una línea JSON (``{"orden": …}``) y otra de vuelta (``{"ok": true, …}`` o
+``{"ok": false, "http": …, "codigo": …, "mensaje": …}``).
+
+Sin dependencias, y nada del entorno: ``-IS`` en la primera línea. Corre con el Python del sistema (3.9 o más).
+"""
+
+from __future__ import annotations
+
+import base64
+import contextlib
+import errno
+import fcntl
+import hashlib
+import http.client
+import json
+import os
+import pwd
+import re
+import secrets
+import shutil
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+
+# MARK: Los números y las formas (contrato §18)
+
+PRINCIPAL = "default"
+#: Lo que no puede ser el perfil de un agente nuevo: el del principal y lo que ya es una ruta del vigía
+#: (`/avisos/v1/agentes/personalidad`, `/avisos/v1/agentes/trabajos/…`).
+RESERVADOS = frozenset({PRINCIPAL, "personalidad", "trabajos"})
+PATRON_PERFIL = re.compile(r"[a-z0-9]{1,24}")
+PATRON_ID = re.compile(r"[0-9a-f]{32}")
+COLORES = ("indigo", "azul", "violeta", "rosa", "coral", "menta", "grafito", "oro")
+EXPRESIONES = ("serena", "curiosa", "alegre", "concentrada", "traviesa", "seria")
+MEMORIAS = ("comparte", "copia", "cero")
+#: Los agentes que caben (el principal no cuenta), y lo que tiene que quedar libre en el disco para otro.
+TOPE_AGENTES = 12
+LIBRE_MINIMO = 500 * 1024 * 1024
+#: Los textos (la descripción, la personalidad), en bytes de UTF-8; el nombre, en caracteres.
+MAX_TEXTO = 8 * 1024
+MAX_NOMBRE = 40
+MAX_LINEA = 128 * 1024
+#: Lo que deja el ayudante en la casa de cada perfil (y en la del principal, sin la memoria): el nombre y la cara.
+FICHA = "hehermes-agente.json"
+ALMA = "SOUL.md"
+ENV = ".env"
+CARPETA_MEMORIA = "memories"
+USER = "USER.md"
+TRABAJO_DE_HERMES = "MEMORY.md"
+CERROJO_DE_USER = "USER.md.lock"
+#: Las carpetas del perfil para el iPhone (contrato §11 y §16), como las del principal.
+CARPETAS_DEL_IPHONE = ("exports", "entrada")
+#: Lo que se espera al flock de Hermes antes de saltarse ese perfil (o dar la memoria por fallida al crear).
+ESPERA_FLOCK = 5.0
+#: Lo que se espera a que Hermes sirva un perfil nuevo (si ya sirve otros, sin reiniciarlo: lo recoge en caliente),
+#: mirándolo cada `CADA` segundos; y lo que se espera cada mirada de `listar`, todas a la vez.
+PLAZO_SERVIDO = 120.0
+CADA = 2.0
+PLAZO_MIRADA = 1.0
+#: **El primer agente.** Con `gateway.multiplex_profiles` sin poner, Hermes decide al arrancar si sirve otros perfiles:
+#: solo si hay dos o más y nada lo impide (`resolve_multiplex_mode` de `hermes_cli/gateway_multiplex_mode.py`, en la
+#: 0.21.5 y en main). Uno que arrancó con el principal solo contesta `multiplex: false` a `rescan-profiles` y no sirve
+#: el primer agente hasta que se reinicie. Entonces se fija el flag (`hermes config set`: con `true`, multiplexa siempre
+#: al arrancar) y se reinicia su unidad UNA vez, con drenaje, en un rato tranquilo: sin turnos en marcha (el
+#: `active_agents` de su gateway_state.json, que su pasarela apunta en cada turno: chats, API, cron y lo de segundo
+#: plano) y sin escribir en el state.db (ni en su -wal) de ningún perfil que sirve en `CALMA` segundos. Se mira cada
+#: `CADA_CALMA` segundos, hasta `PLAZO_CALMA`; tras reiniciarlo, se le espera `PLAZO_TRAS_REINICIO` (arrancar Hermes,
+#: con sus MCP, tarda más que mirar un perfil).
+CALMA = 120
+CADA_CALMA = 10.0
+PLAZO_CALMA = 600.0
+PLAZO_TRAS_REINICIO = 240.0
+#: `systemctl restart` espera a que la unidad se pare con su drenaje (su TimeoutStopSec: 210 s en la del VPS de pruebas)
+#: y a que arranque otra vez.
+PLAZO_REINICIO = 300
+#: Lo que Hermes dice de sí mismo en su casa (`gateway/status.py`): su estado, con su proceso y sus turnos en marcha;
+#: su proceso, si no lo dice ahí; y sus bases, en la casa de cada perfil.
+ESTADO_DE_HERMES = "gateway_state.json"
+PID_DE_HERMES = "gateway.pid"
+BASES = ("state.db", "state.db-wal")
+#: Lo que se dice en el registro cuando no se puede servir el primer agente: el flag, si se llegó a poner, o la decisión
+#: de Hermes al arrancar con dos perfiles, hacen el resto.
+LUEGO = "lo servirá en su próximo reinicio"
+#: En qué está un trabajo de crear el primer agente (`paso` en su estado, §18.4).
+PASOS = ("esperando_a_hermes", "reiniciando_hermes")
+#: Lo que hace de una carpeta de `profiles/` un perfil para Hermes 0.21.5 (`hermes_constants.py`): alguno de estos
+#: ficheros (o un enlace con su nombre). Y lo que lo deja fuera de los que sirve (`profiles_to_serve`): su lápida,
+#: `profiles/.deleted/<perfil>`; `gateway.parked` en su casa (`hermes -p <perfil> gateway stop`), o
+#: `gateway.standalone: true` en su config.yaml (tiene su propia pasarela).
+MARCAS_DE_PERFIL = ("config.yaml", ".env", "SOUL.md", "profile.yaml", "auth.json", "state.db")
+LAPIDAS = ".deleted"
+APARCADO = "gateway.parked"
+CONFIG = "config.yaml"
+#: El socket de control de la pasarela de Hermes (`gateway/control_socket.py`): en su casa, o donde diga el puntero si
+#: la ruta no cabía en un socket. Una petición por conexión.
+SOCKET_DE_CONTROL = "gateway.sock"
+PUNTERO_DEL_SOCKET = "gateway.sock.path"
+PLAZO_CONTROL = 8.0
+#: Un trabajo en marcha sin latido en este tiempo, y sin nadie con el cerrojo, murió a medias. Y lo que vive su estado.
+SIN_LATIDO = 120
+VIDA_TRABAJO = 24 * 3600
+#: Cada cuánto late un trabajo mientras espera a algo que tarda (un `hermes` de minutos, un reinicio con drenaje).
+LATIDO = 15.0
+#: Lo que se le da a cada `hermes`; a `profile export` y `profile delete`, más: en el VPS de pruebas, los dos de un
+#: agente recién creado tardaron 261 s (la copia pasa el redactor de secretos por cada fichero de texto; el borrado
+#: arranca la CLI entera y, con una pasarela que no multiplexa, purga la identidad del perfil abriendo el state.db del
+#: principal). Borrar, con los dos, cabe en la media hora de su unidad (`RuntimeMaxSec`). Y a `config set`, menos.
+PLAZO_HERMES = 300
+PLAZO_HERMES_LARGO = 600
+PLAZO_CONFIG = 120
+USUARIO_VIGIA = "hh-vigia"
+SO_PEERCRED = getattr(socket, "SO_PEERCRED", 17)
+ESTADOS = ("en_cola", "creando", "borrando", "hecho", "fallo")
+EN_MARCHA = ("en_cola", "creando", "borrando")
+MOTIVOS = frozenset({"hermes", "memoria", "clave", "no_se_sirve", "copia", "interrumpido", "interna"})
+#: Lo que puede traer cada orden, y nada más.
+CAMPOS = {
+    "listar": {"orden"},
+    "ver": {"orden", "perfil"},
+    "crear": {"orden", "nombre", "color", "expresion", "descripcion", "personalidad", "memoria", "modelo"},
+    "cambiar": {"orden", "perfil", "nombre", "color", "expresion", "descripcion", "personalidad"},
+    "borrar": {"orden", "perfil"},
+    "trabajo": {"orden", "id"},
+    "sincronizar-memoria": {"orden"},
+}
+CAMBIABLES = ("nombre", "color", "expresion", "descripcion", "personalidad")
+PATRON_CLAVE_ENV = re.compile(r"^\s*(?:export\s+)?API_SERVER_KEY\s*=")
+#: Lo que puede ir en una cabecera (lo mismo que acepta la pasarela, `pasarela.leer_clave_de_agente`).
+PATRON_CLAVE = re.compile(r"[\x21-\x7e]{1,512}")
+#: Un sí de `gateway.standalone` (lo que Hermes toma por verdadero de su YAML: true, yes, on o un número que no sea 0).
+SI_EN_YAML = re.compile(r"(?i)(true|yes|on|[+-]?0*[1-9][0-9]*(\.[0-9]*)?|[+-]?0*\.0*[1-9][0-9]*)")
+
+_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_CARPETA = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | _CLOEXEC
+
+
+class Rechazo(Exception):
+    def __init__(self, http_: int, codigo: str, mensaje: str):
+        super().__init__(mensaje)
+        self.http, self.codigo, self.mensaje = http_, codigo, mensaje
+
+    def respuesta(self) -> dict:
+        return {"ok": False, "http": self.http, "codigo": self.codigo, "mensaje": self.mensaje}
+
+
+class Fallo(Exception):
+    """Un trabajo que no sigue, con su motivo (uno de `MOTIVOS`)."""
+
+    def __init__(self, motivo: str):
+        super().__init__(motivo)
+        self.motivo = motivo
+
+
+def _decir(texto: str) -> None:
+    """El registro: el perfil, el principio del id, la orden y el resultado. Nunca una clave ni un contenido."""
+    sys.stderr.write("hehermes-agentes: %s\n" % texto)
+    sys.stderr.flush()
+
+
+def _invalido(que: str) -> Rechazo:
+    return Rechazo(400, "parametro_invalido", que)
+
+
+# MARK: Lo que llega
+
+
+def _texto(valor, maximo: int, lineas: bool, vacio: bool, que: str) -> str:
+    """Un texto de la app: hasta `maximo` bytes en UTF-8, sin caracteres de control (salvo los saltos de línea y los
+    tabuladores, si van en `lineas`) y, si no puede ir `vacio`, con algo más que espacios."""
+    if not isinstance(valor, str):
+        raise _invalido("«%s» tiene que ser un texto" % que)
+    try:
+        largo = len(valor.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise _invalido("«%s» no es UTF-8" % que) from None
+    if largo > maximo:
+        raise _invalido("«%s» pasa de %d bytes" % (que, maximo))
+    for caracter in valor:
+        categoria = unicodedata.category(caracter)
+        if categoria in ("Cc", "Cs", "Zl", "Zp") and not (lineas and caracter in "\n\r\t"):
+            raise _invalido("«%s» lleva caracteres de control" % que)
+    if not vacio and not valor.strip():
+        raise _invalido("«%s» no puede ir vacío" % que)
+    return valor
+
+
+def validar_nombre(valor) -> str:
+    nombre = _texto(valor, 4 * MAX_NOMBRE, lineas=False, vacio=False, que="nombre").strip()
+    if len(nombre) > MAX_NOMBRE:
+        raise _invalido("«nombre» pasa de %d caracteres" % MAX_NOMBRE)
+    return nombre
+
+
+def validar_de_la_lista(valor, lista, que: str) -> str:
+    if valor not in lista:
+        raise _invalido("«%s» tiene que ser uno de: %s" % (que, ", ".join(lista)))
+    return valor
+
+
+def validar_descripcion(valor) -> str:
+    """Una frase: sin saltos de línea, y sin un «-» al principio (va de argumento a `hermes profile describe`)."""
+    descripcion = _texto(valor, MAX_TEXTO, lineas=False, vacio=True, que="descripcion").strip()
+    if descripcion.startswith("-"):
+        raise _invalido("«descripcion» no puede empezar por «-»")
+    return descripcion
+
+
+def validar_personalidad(valor) -> str:
+    return _texto(valor, MAX_TEXTO, lineas=True, vacio=False, que="personalidad")
+
+
+def validar_perfil(valor) -> str:
+    if not isinstance(valor, str) or not PATRON_PERFIL.fullmatch(valor):
+        raise _invalido("El perfil son de 1 a 24 minúsculas y cifras")
+    return valor
+
+
+def validar_id(valor) -> str:
+    if not isinstance(valor, str) or not PATRON_ID.fullmatch(valor):
+        raise _invalido("El id de un trabajo son 32 hexadecimales")
+    return valor
+
+
+def validar_creacion(peticion: dict) -> dict:
+    if peticion.get("modelo") is not None:
+        raise _invalido("«modelo», por ahora, solo null: el del principal")
+    return {"nombre": validar_nombre(peticion.get("nombre")),
+            "color": validar_de_la_lista(peticion.get("color"), COLORES, "color"),
+            "expresion": validar_de_la_lista(peticion.get("expresion"), EXPRESIONES, "expresion"),
+            "descripcion": validar_descripcion(peticion.get("descripcion")),
+            "personalidad": validar_personalidad(peticion.get("personalidad")),
+            "memoria": validar_de_la_lista(peticion.get("memoria"), MEMORIAS, "memoria")}
+
+
+def validar_cambios(peticion: dict) -> dict:
+    """Lo que cambia, con su forma: al menos una cosa."""
+    validar = {"nombre": validar_nombre, "descripcion": validar_descripcion, "personalidad": validar_personalidad,
+               "color": lambda v: validar_de_la_lista(v, COLORES, "color"),
+               "expresion": lambda v: validar_de_la_lista(v, EXPRESIONES, "expresion")}
+    cambios = {campo: validar[campo](peticion[campo]) for campo in CAMBIABLES if campo in peticion}
+    if not cambios:
+        raise _invalido("No hay nada que cambiar")
+    return cambios
+
+
+def perfil_de(nombre: str, ocupados) -> str:
+    """El perfil que sale de un nombre (contrato §18.3): en minúsculas, sin tildes, solo letras latinas y cifras, hasta
+    24; `agente` si no queda nada; y si ya está (o es el del principal, o una ruta del vigía), con un número detrás."""
+    plano = unicodedata.normalize("NFKD", nombre).lower()
+    base = "".join(c for c in plano if c in "abcdefghijklmnopqrstuvwxyz0123456789")[:24] or "agente"
+    ocupados = set(ocupados) | RESERVADOS
+    if base not in ocupados:
+        return base
+    numero = 2
+    while True:
+        sufijo = str(numero)
+        candidato = base[:24 - len(sufijo)] + sufijo
+        if candidato not in ocupados:
+            return candidato
+        numero += 1
+
+
+def clave_nueva() -> str:
+    """32 bytes del generador del sistema, en base64url sin relleno: lo mismo que los tokens de la pasarela."""
+    return base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+
+
+# MARK: El SOUL.md
+
+
+#: El párrafo que le dice a un agente cómo mandar ficheros al iPhone: el del instalador para el principal
+#: (`hehermes_servidor.alma`, una prueba los ata), con la carpeta `exports` de su perfil.
+TITULO_FICHEROS = "## Ficheros para el iPhone (HeHermes)"
+
+
+def parrafo_de_ficheros(carpeta: str) -> str:
+    return ("%s\n\nCuando quieras mandarme un fichero al iPhone (un PDF, una imagen, un informe…), guárdalo como un "
+            "fichero normal (no un enlace ni una carpeta) en %s y, en tu respuesta, pon una línea aparte con MEDIA: y "
+            "su ruta absoluta; por ejemplo, MEDIA:%s/informe.pdf. La app HeHermes solo descarga lo que está en esa "
+            "carpeta.\n" % (TITULO_FICHEROS, carpeta, carpeta))
+
+
+def alma_de(personalidad: str, exportaciones: str) -> str:
+    return personalidad.rstrip("\n") + "\n\n" + parrafo_de_ficheros(exportaciones)
+
+
+def personalidad_de(alma: str) -> str:
+    """Lo que escribió la app, sin el párrafo de los ficheros: lo que se enseña para editar."""
+    principio = alma.find(TITULO_FICHEROS)
+    texto = alma if principio < 0 else alma[:principio]
+    return texto.rstrip("\n")[:MAX_TEXTO]
+
+
+# MARK: Descriptores, sin seguir enlaces
+
+
+def _cerrar(*fds) -> None:
+    for fd in fds:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _abrir_carpeta(nombre: str, dentro: int) -> int:
+    return os.open(nombre, _CARPETA, dir_fd=dentro)
+
+
+def _abrir_o_crear_carpeta(nombre: str, dentro: int, modo: int = 0o700) -> int:
+    try:
+        os.mkdir(nombre, modo, dir_fd=dentro)
+    except FileExistsError:
+        pass
+    return _abrir_carpeta(nombre, dentro)
+
+
+def abrir_casa(casa: str, perfil: str) -> int:
+    """La casa de un perfil, abierta: la del principal es la de Hermes (que sí puede ser un enlace: la da la unidad);
+    la de otro, `profiles/<perfil>` dentro, sin seguir enlaces."""
+    raiz = os.open(casa, os.O_RDONLY | os.O_DIRECTORY | _CLOEXEC)
+    if perfil == PRINCIPAL:
+        return raiz
+    perfiles = None
+    try:
+        perfiles = _abrir_carpeta("profiles", raiz)
+        return _abrir_carpeta(perfil, perfiles)
+    finally:
+        _cerrar(perfiles, raiz)
+
+
+def _leer(carpeta: int, nombre: str, tope: int = 1024 * 1024) -> bytes | None:
+    """Un fichero normal de `carpeta`, sin seguir enlaces, o None si no está. Un enlace es un `OSError` (ELOOP)."""
+    try:
+        fd = os.open(nombre, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | _CLOEXEC, dir_fd=carpeta)
+    except FileNotFoundError:
+        return None
+    try:
+        visto = os.fstat(fd)
+        if not stat.S_ISREG(visto.st_mode) or visto.st_size > tope:
+            raise OSError(errno.EINVAL, "no es un fichero normal o es demasiado grande")
+        partes = []
+        while True:
+            trozo = os.read(fd, 65536)
+            if not trozo:
+                break
+            partes.append(trozo)
+        return b"".join(partes)
+    finally:
+        os.close(fd)
+
+
+def _escribir_todo(fd: int, datos: bytes) -> None:
+    vista = memoryview(datos)
+    while vista:
+        escritos = os.write(fd, vista)
+        vista = vista[escritos:]
+
+
+def _escribir(carpeta: int, nombre: str, datos: bytes, modo: int = 0o600, mtime_ns: int | None = None) -> None:
+    """Al lado y renombrado: o queda el nuevo entero, o el de antes. Sin seguir enlaces (un enlace con ese nombre se
+    sustituye, no se sigue). Con `mtime_ns`, con esa hora (la copia de una memoria lleva la de su original)."""
+    temporal = ".%s.%s.hehermes" % (nombre, secrets.token_hex(4))
+    fd = os.open(temporal, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | _CLOEXEC, modo, dir_fd=carpeta)
+    try:
+        try:
+            os.fchmod(fd, modo)
+            _escribir_todo(fd, datos)
+            if mtime_ns is not None:
+                os.utime(fd, ns=(mtime_ns, mtime_ns))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temporal, nombre, src_dir_fd=carpeta, dst_dir_fd=carpeta)
+    except BaseException:
+        try:
+            os.unlink(temporal, dir_fd=carpeta)
+        except OSError:
+            pass
+        raise
+
+
+def _quitar(carpeta: int, nombre: str) -> None:
+    """Un fichero (o un enlace, que se quita sin seguirlo), si está."""
+    try:
+        if not stat.S_ISDIR(os.stat(nombre, dir_fd=carpeta, follow_symlinks=False).st_mode):
+            os.unlink(nombre, dir_fd=carpeta)
+    except FileNotFoundError:
+        pass
+
+
+@contextlib.contextmanager
+def flock_de_hermes(carpeta: int, espera: float):
+    """El flock exclusivo de `USER.md.lock`, el que toma Hermes al escribir su memoria (`_file_lock`, que también
+    abre el `.lock` sin seguir enlaces). True si se ha tomado en `espera` segundos; False si no (y no se tiene)."""
+    fd = os.open(CERROJO_DE_USER, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | _CLOEXEC, 0o600, dir_fd=carpeta)
+    try:
+        limite = time.monotonic() + espera
+        tomado = False
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                tomado = True
+                break
+            except OSError as error:
+                if error.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    raise
+            if time.monotonic() >= limite:
+                break
+            time.sleep(0.05)
+        try:
+            yield tomado
+        finally:
+            if tomado:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+# MARK: La casa de cada perfil (lo que corre como el dueño de Hermes, `Sistema.como_hermes`)
+
+
+def _carpeta_de_perfiles(casa: str) -> tuple:
+    """`(casa, profiles)` abiertas, o `(None, None)` si no hay."""
+    try:
+        raiz = os.open(casa, os.O_RDONLY | os.O_DIRECTORY | _CLOEXEC)
+    except OSError:
+        return None, None
+    try:
+        return raiz, _abrir_carpeta("profiles", raiz)
+    except OSError:
+        os.close(raiz)
+        return None, None
+
+
+def nombres_en_profiles(casa: str) -> list:
+    """Todo lo que hay en `<casa>/profiles`, sea lo que sea: para no repetir un nombre al crear."""
+    raiz, perfiles = _carpeta_de_perfiles(casa)
+    if perfiles is None:
+        return []
+    try:
+        return sorted(os.listdir(perfiles))
+    finally:
+        _cerrar(perfiles, raiz)
+
+
+def _hay(nombre: str, dentro: int) -> bool:
+    """Si hay algo con ese nombre (sin seguirlo, si es un enlace)."""
+    try:
+        os.stat(nombre, dir_fd=dentro, follow_symlinks=False)
+        return True
+    except OSError:
+        return False
+
+
+def _es_marca(carpeta: int, nombre: str) -> bool:
+    """Lo que Hermes toma por una marca de perfil: un fichero normal, o un enlace aunque no lleve a nada."""
+    try:
+        modo = os.stat(nombre, dir_fd=carpeta, follow_symlinks=False).st_mode
+    except OSError:
+        return False
+    return stat.S_ISREG(modo) or stat.S_ISLNK(modo)
+
+
+def _valor_yaml(texto: str) -> str | None:
+    """Un valor de una línea de YAML, sin comillas; None si es nulo (vacío, `~` o `null`)."""
+    valor = texto.strip().strip("'\"")
+    return None if valor in ("", "~", "null", "Null", "NULL") else valor
+
+
+def _valores_del_config(texto: str, clave: str) -> tuple:
+    """`(arriba, en gateway)`: el último valor de `clave` en el primer nivel de un config.yaml, y en el primer nivel de su
+    bloque `gateway:` de arriba (o en `gateway: {…}`); None donde no está. Hermes lo lee con YAML; aquí, sin dependencias,
+    lo justo."""
+    arriba = en_gateway = None
+    dentro, nivel = False, None
+    propia = re.compile(r"\s*%s\s*:\s*(.*)" % re.escape(clave))
+    for linea in texto.splitlines():
+        limpia = re.sub(r"\s+#.*$", "", linea).rstrip()
+        if not limpia.strip() or limpia.lstrip().startswith("#"):
+            continue
+        sangria = len(limpia) - len(limpia.lstrip())
+        if sangria == 0:
+            bloque = re.fullmatch(r"gateway\s*:\s*(.*)", limpia)
+            dentro, nivel = bloque is not None and bloque.group(1) == "", None
+            if bloque and bloque.group(1).startswith("{"):
+                en_linea = re.search(r"[{,]\s*%s\s*:\s*([^,}]*)" % re.escape(clave), bloque.group(1))
+                if en_linea:
+                    en_gateway = _valor_yaml(en_linea.group(1))
+            suya = propia.fullmatch(limpia)
+            if suya:
+                arriba = _valor_yaml(suya.group(1))
+            continue
+        if not dentro:
+            continue
+        nivel = sangria if nivel is None else nivel
+        suya = propia.fullmatch(limpia)
+        if sangria == nivel and suya:
+            en_gateway = _valor_yaml(suya.group(1))
+    return arriba, en_gateway
+
+
+def _es_un_si(valor: str | None) -> bool:
+    return valor is not None and SI_EN_YAML.fullmatch(valor) is not None
+
+
+def config_independiente(texto: str) -> bool:
+    """Si un config.yaml dice `gateway.standalone: true` (el perfil tiene su propia pasarela y Hermes no lo sirve): la
+    clave `standalone` en el bloque `gateway:`, con un valor que YAML da por verdadero."""
+    return _es_un_si(_valores_del_config(texto, "standalone")[1])
+
+
+def config_multiplexa(texto: str) -> bool:
+    """Si el config.yaml del principal le dice a Hermes que sirva todos los perfiles, como lo lee él
+    (`explicit_multiplex_flag`): el alias de arriba, `multiplex_profiles`, si está; si no, `gateway.multiplex_profiles`."""
+    arriba, en_gateway = _valores_del_config(texto, "multiplex_profiles")
+    return _es_un_si(arriba if arriba is not None else en_gateway)
+
+
+def perfiles_de_hermes(casa: str) -> list:
+    """Los perfiles de `<casa>/profiles` que Hermes serviría (`profiles_to_serve` de la 0.21.5), sin lanzar `hermes`:
+    carpetas de verdad (no enlaces) con nombre de perfil (el de §18, que cabe en el suyo) y sin `default`, con alguna de
+    sus marcas, sin lápida, sin aparcar y sin `gateway.standalone`."""
+    raiz, perfiles = _carpeta_de_perfiles(casa)
+    if perfiles is None:
+        return []
+    try:
+        nombres = []
+        for nombre in sorted(os.listdir(perfiles)):
+            if not PATRON_PERFIL.fullmatch(nombre) or nombre == PRINCIPAL or _hay(LAPIDAS + "/" + nombre, perfiles):
+                continue
+            try:
+                carpeta = _abrir_carpeta(nombre, perfiles)
+            except OSError:
+                continue
+            try:
+                if not any(_es_marca(carpeta, marca) for marca in MARCAS_DE_PERFIL) or _hay(APARCADO, carpeta):
+                    continue
+                try:
+                    config = (_leer(carpeta, CONFIG, 256 * 1024) or b"").decode("utf-8", "replace")
+                except OSError:
+                    config = ""
+                if not config_independiente(config):
+                    nombres.append(nombre)
+            finally:
+                os.close(carpeta)
+        return nombres
+    finally:
+        _cerrar(perfiles, raiz)
+
+
+def leer_ficha(carpeta: int) -> dict:
+    """La ficha de un perfil, con lo que tenga su forma; lo demás no está."""
+    try:
+        datos = json.loads((_leer(carpeta, FICHA, 64 * 1024) or b"{}").decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return {}
+    if not isinstance(datos, dict):
+        return {}
+    ficha = {}
+    for campo, valido in (("nombre", validar_nombre), ("descripcion", validar_descripcion),
+                          ("color", lambda v: validar_de_la_lista(v, COLORES, "color")),
+                          ("expresion", lambda v: validar_de_la_lista(v, EXPRESIONES, "expresion")),
+                          ("memoria", lambda v: validar_de_la_lista(v, MEMORIAS, "memoria"))):
+        try:
+            ficha[campo] = valido(datos.get(campo))
+        except Rechazo:
+            continue
+    return ficha
+
+
+def clave_del_env(texto: bytes | None) -> str | None:
+    """La `API_SERVER_KEY` de un .env (la última, como la lee Hermes), o None."""
+    clave = None
+    for linea in (texto or b"").decode("utf-8", "replace").splitlines():
+        if PATRON_CLAVE_ENV.match(linea):
+            clave = linea.split("=", 1)[1].strip().strip("'\"")
+    return clave if clave and PATRON_CLAVE.fullmatch(clave) and '"' not in clave else None
+
+
+def leer_perfiles(casa: str, perfiles: list, alma: bool = False, preparar: bool = False) -> dict:
+    """De cada perfil (y del principal): su ficha y la clave de su .env; con `alma`, su SOUL.md; con `preparar`, le
+    crea las carpetas para el iPhone que le falten (las de un perfil que ya estaba)."""
+    leidos = {}
+    for perfil in [PRINCIPAL] + [p for p in perfiles if p != PRINCIPAL]:
+        try:
+            carpeta = abrir_casa(casa, perfil)
+        except OSError:
+            continue
+        try:
+            datos = {"ficha": leer_ficha(carpeta), "clave": None, "alma": None}
+            try:
+                datos["clave"] = clave_del_env(_leer(carpeta, ENV))
+            except OSError:
+                pass
+            if alma:
+                try:
+                    datos["alma"] = (_leer(carpeta, ALMA, 4 * MAX_TEXTO) or b"").decode("utf-8", "replace")
+                except OSError:
+                    datos["alma"] = ""
+            if preparar and perfil != PRINCIPAL:
+                for nombre in CARPETAS_DEL_IPHONE:
+                    try:
+                        os.mkdir(nombre, 0o700, dir_fd=carpeta)
+                    except OSError:
+                        pass
+            leidos[perfil] = datos
+        finally:
+            os.close(carpeta)
+    return leidos
+
+
+def ficha_nueva(datos: dict, creado: int) -> bytes:
+    ficha = {"v": 1, "nombre": datos["nombre"], "color": datos["color"], "expresion": datos["expresion"],
+             "descripcion": datos["descripcion"], "memoria": datos["memoria"], "creado": creado}
+    return json.dumps(ficha, ensure_ascii=False, sort_keys=True, indent=1).encode("utf-8") + b"\n"
+
+
+def leer_user_del_principal(casa: str, espera: float) -> tuple | None:
+    """`(contenido, hora en ns)` del USER.md del principal, leído con su flock (lo que sabe de ti). None si no tiene (o
+    es un enlace)."""
+    raiz = memoria = None
+    try:
+        raiz = abrir_casa(casa, PRINCIPAL)
+        try:
+            memoria = _abrir_carpeta(CARPETA_MEMORIA, raiz)
+        except FileNotFoundError:
+            return None
+        with flock_de_hermes(memoria, espera) as tomado:
+            if not tomado:
+                raise Fallo("memoria")
+            visto = _mirar_user(memoria)
+            try:
+                datos = _leer(memoria, USER)
+            except OSError:
+                return None
+            return None if datos is None or not isinstance(visto, list) else (datos, visto[0])
+    finally:
+        _cerrar(memoria, raiz)
+
+
+def poner_clave_del_perfil(casa: str, perfil: str, clave: str) -> None:
+    """La clave nueva en el .env de un perfil recién creado (`poner_clave_en_el_env`)."""
+    try:
+        carpeta = abrir_casa(casa, perfil)
+    except OSError:
+        raise Fallo("hermes") from None
+    try:
+        poner_clave_en_el_env(carpeta, clave)
+    except OSError:
+        raise Fallo("clave") from None
+    finally:
+        os.close(carpeta)
+
+
+def preparar_perfil(casa: str, perfil: str, datos: dict, exportaciones: str, espera: float, creado: int) -> None:
+    """Lo que hace el ayudante en la casa de un perfil recién creado, tras `hermes profile create --clone` y su clave:
+    su alma, su ficha, sus carpetas para el iPhone y su memoria según el modo."""
+    try:
+        carpeta = abrir_casa(casa, perfil)
+    except OSError:
+        raise Fallo("hermes") from None
+    memoria = None
+    try:
+        try:
+            _escribir(carpeta, ALMA, alma_de(datos["personalidad"], exportaciones).encode("utf-8"))
+            _escribir(carpeta, FICHA, ficha_nueva(datos, creado))
+            for nombre in CARPETAS_DEL_IPHONE:
+                dentro = _abrir_o_crear_carpeta(nombre, carpeta)
+                try:
+                    os.fchmod(dentro, 0o700)
+                finally:
+                    os.close(dentro)
+        except OSError:
+            raise Fallo("interna") from None
+        try:
+            memoria = _abrir_o_crear_carpeta(CARPETA_MEMORIA, carpeta)
+            # Lo de su trabajo es siempre suyo: empieza sin nada, lo que traiga el clon.
+            for nombre in (USER, TRABAJO_DE_HERMES):
+                _quitar(memoria, nombre)
+            if datos["memoria"] != "cero":
+                lo_que_sabe = leer_user_del_principal(casa, espera)
+                if lo_que_sabe is not None:
+                    with flock_de_hermes(memoria, espera) as tomado:
+                        if not tomado:
+                            raise Fallo("memoria")
+                        # Con la hora del original: una copia no es «lo más nuevo» para la memoria compartida.
+                        _escribir(memoria, USER, lo_que_sabe[0], mtime_ns=lo_que_sabe[1])
+        except OSError:
+            raise Fallo("memoria") from None
+    finally:
+        _cerrar(memoria, carpeta)
+
+
+def poner_clave_en_el_env(carpeta: int, clave: str) -> None:
+    """La clave nueva en el .env del perfil, una sola vez: fuera las que trajera el clon (la del principal)."""
+    antes = _leer(carpeta, ENV) or b""
+    quedan = [linea for linea in antes.decode("utf-8", "surrogateescape").splitlines()
+              if not PATRON_CLAVE_ENV.match(linea)]
+    nuevo = "\n".join(quedan + ["API_SERVER_KEY=" + clave]) + "\n"
+    _escribir(carpeta, ENV, nuevo.encode("utf-8", "surrogateescape"))
+
+
+def cambiar_perfil(casa: str, perfil: str, cambios: dict, exportaciones: str) -> None:
+    carpeta = abrir_casa(casa, perfil)
+    try:
+        en_la_ficha = {k: v for k, v in cambios.items() if k != "personalidad"}
+        if en_la_ficha:
+            try:
+                bruta = json.loads((_leer(carpeta, FICHA, 64 * 1024) or b"{}").decode("utf-8"))
+            except (OSError, ValueError, UnicodeDecodeError):
+                bruta = {}
+            ficha = dict(bruta) if isinstance(bruta, dict) else {}
+            ficha.update(en_la_ficha, v=1)
+            _escribir(carpeta, FICHA, json.dumps(ficha, ensure_ascii=False, sort_keys=True, indent=1).encode("utf-8")
+                      + b"\n")
+        if "personalidad" in cambios:
+            _escribir(carpeta, ALMA, alma_de(cambios["personalidad"], exportaciones).encode("utf-8"))
+    finally:
+        os.close(carpeta)
+
+
+def preparar_copias(carpeta: str) -> list:
+    """La carpeta de las copias (0700, del dueño de Hermes), y lo que ya hay en ella."""
+    os.makedirs(carpeta, mode=0o700, exist_ok=True)
+    os.chmod(carpeta, 0o700)
+    return sorted(os.listdir(carpeta))
+
+
+def copias_nuevas(carpeta: str, antes: list) -> list:
+    """Lo que ha aparecido en la carpeta de las copias desde `antes`: ficheros normales y no vacíos."""
+    nuevas = []
+    for nombre in os.listdir(carpeta):
+        if nombre in antes:
+            continue
+        try:
+            visto = os.stat(os.path.join(carpeta, nombre), follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISREG(visto.st_mode) and visto.st_size > 0:
+            nuevas.append(nombre)
+    return nuevas
+
+
+# MARK: La memoria que se comparte (§18.8)
+
+
+def _sha(datos: bytes) -> str:
+    return hashlib.sha256(datos).hexdigest()
+
+
+def _mirar_user(memoria: int):
+    """`[mtime en ns, sha256]` del USER.md de una carpeta `memories`, `None` si no está, o `"enlace"` si no es un
+    fichero normal (un enlace no se sigue ni se toca)."""
+    try:
+        visto = os.stat(USER, dir_fd=memoria, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(visto.st_mode):
+        return "enlace"
+    try:
+        datos = _leer(memoria, USER)
+    except OSError:
+        return "enlace"
+    return None if datos is None else [visto.st_mtime_ns, _sha(datos)]
+
+
+def _carpeta_de_memoria(casa: str, perfil: str, crear: bool = False) -> int | None:
+    carpeta = None
+    try:
+        carpeta = abrir_casa(casa, perfil)
+        return (_abrir_o_crear_carpeta if crear else _abrir_carpeta)(CARPETA_MEMORIA, carpeta)
+    except OSError:
+        return None
+    finally:
+        _cerrar(carpeta)
+
+
+def sincronizar(casa: str, perfiles: list, previo: dict, espera: float) -> dict:
+    """Entre el principal y los perfiles que comparten (`perfiles`): el USER.md más nuevo (por su hora) va a los demás.
+    De cada uno se toma su flock; el de origen se lee con el suyo y cada destino se escribe con el suyo, de golpe y
+    0600, solo si sigue como se vio (si Hermes lo ha cambiado entretanto, a la vuelta siguiente, que será el más nuevo).
+    Cada copia lleva la hora de su original: así una copia nunca gana a lo que Hermes escriba después, aunque llegue
+    mientras se copia. Un destino cuyo flock no llega en `espera` segundos se salta esta vuelta. `previo` es lo visto en
+    la vuelta anterior (para saber cuántos cambiaron); devuelve lo de esta, para la siguiente."""
+    vistos = {}
+    for perfil in perfiles:
+        memoria = _carpeta_de_memoria(casa, perfil)
+        visto = None
+        if memoria is not None:
+            try:
+                visto = _mirar_user(memoria)
+            finally:
+                os.close(memoria)
+        if visto == "enlace":
+            continue
+        vistos[perfil] = visto
+    con_algo = {p: v for p, v in vistos.items() if v}
+    resultado = {"estado": {}, "copiados": 0, "saltados": [], "cambiados": [], "ganador": None}
+    if not con_algo:
+        return resultado
+    ganador = max(con_algo, key=lambda p: (con_algo[p][0], p))
+    resultado["ganador"] = ganador
+    resultado["cambiados"] = sorted(p for p, v in con_algo.items() if previo.get(p) != v)
+    memoria = _carpeta_de_memoria(casa, ganador)
+    if memoria is None:
+        return resultado
+    try:
+        with flock_de_hermes(memoria, espera) as tomado:
+            if not tomado:
+                resultado["saltados"].append(ganador)
+                return resultado
+            datos = _leer(memoria, USER)
+            visto = _mirar_user(memoria)
+    except OSError:
+        return resultado
+    finally:
+        os.close(memoria)
+    if datos is None or not isinstance(visto, list):
+        return resultado
+    sha = _sha(datos)
+    resultado["estado"][ganador] = visto
+    for perfil, antes in vistos.items():
+        if perfil == ganador:
+            continue
+        if antes and antes[1] == sha:
+            resultado["estado"][perfil] = antes
+            continue
+        memoria = _carpeta_de_memoria(casa, perfil, crear=True)
+        if memoria is None:
+            continue
+        try:
+            with flock_de_hermes(memoria, espera) as tomado:
+                if not tomado:
+                    resultado["saltados"].append(perfil)
+                    continue
+                if _mirar_user(memoria) != antes:
+                    continue
+                _escribir(memoria, USER, datos, mtime_ns=visto[0])
+                ahora = _mirar_user(memoria)
+                if isinstance(ahora, list):
+                    resultado["estado"][perfil] = ahora
+                resultado["copiados"] += 1
+        except OSError:
+            continue
+        finally:
+            os.close(memoria)
+    return resultado
+
+
+# MARK: Las claves para la pasarela y el vigía
+
+
+def escribir_clave(carpeta: str, perfil: str, clave: str, modo: int) -> None:
+    """`<carpeta>/<perfil>.clave`, al lado y renombrado, sin seguir enlaces. Del grupo de la carpeta: con root, la de la
+    pasarela es `root:hh-pasarela` y la del vigía `root:hh-vigia`, con el bit setgid, así que lo nuevo nace de su
+    grupo; si no lo tuviera, se le da."""
+    dentro = os.open(carpeta, os.O_RDONLY | os.O_DIRECTORY | _CLOEXEC)
+    temporal = ".%s.clave.%s" % (perfil, secrets.token_hex(4))
+    try:
+        grupo = os.fstat(dentro).st_gid
+        fd = os.open(temporal, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | _CLOEXEC, modo, dir_fd=dentro)
+        try:
+            os.fchmod(fd, modo)
+            if os.fstat(fd).st_gid != grupo:
+                os.fchown(fd, -1, grupo)
+            _escribir_todo(fd, (clave + "\n").encode("ascii"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temporal, perfil + ".clave", src_dir_fd=dentro, dst_dir_fd=dentro)
+    except BaseException:
+        try:
+            os.unlink(temporal, dir_fd=dentro)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(dentro)
+
+
+def leer_clave(carpeta: str, perfil: str) -> str | None:
+    try:
+        dentro = os.open(carpeta, os.O_RDONLY | os.O_DIRECTORY | _CLOEXEC)
+    except OSError:
+        return None
+    try:
+        texto = (_leer(dentro, perfil + ".clave", 1024) or b"").decode("ascii", "replace").strip()
+    except OSError:
+        return None
+    finally:
+        os.close(dentro)
+    return texto if texto and PATRON_CLAVE.fullmatch(texto) and '"' not in texto else None
+
+
+def quitar_clave(carpeta: str, perfil: str) -> None:
+    try:
+        dentro = os.open(carpeta, os.O_RDONLY | os.O_DIRECTORY | _CLOEXEC)
+    except OSError:
+        return
+    try:
+        _quitar(dentro, perfil + ".clave")
+    finally:
+        os.close(dentro)
+
+
+# MARK: El primer agente: la calma de Hermes, su flag y su unidad
+
+
+def _json_de(carpeta: int, nombre: str):
+    """El JSON de un fichero normal de `carpeta` (sin seguir enlaces), o None."""
+    try:
+        return json.loads((_leer(carpeta, nombre) or b"null").decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def _pid(valor) -> int | None:
+    return valor if isinstance(valor, int) and not isinstance(valor, bool) and 0 < valor < 2 ** 31 else None
+
+
+def vista_de_hermes(casa: str, servidos: list) -> dict:
+    """Lo que dice Hermes de sí mismo en su casa, para saber si está tranquilo (`rato_tranquilo`) y qué proceso es su
+    pasarela. De su `gateway_state.json` (`gateway/status.py`): `active_agents`, los turnos en marcha que su pasarela
+    apunta en cada turno (`_persist_active_agents`: los chats, la API, cron y lo de segundo plano), y su `pid` (o el de
+    su `gateway.pid`). Y la última vez que se escribió el `state.db` (o su `-wal`) de cada perfil que sirve, que es donde
+    escribe cada turno. Sin seguir enlaces. `{"activos": int | None, "pid": int | None, "escrito": segundos | None}`: lo
+    que no está o no tiene su forma, None."""
+    vista = {"activos": None, "pid": None, "escrito": None}
+    try:
+        raiz = abrir_casa(casa, PRINCIPAL)
+    except OSError:
+        return vista
+    try:
+        estado = _json_de(raiz, ESTADO_DE_HERMES)
+        if isinstance(estado, dict):
+            activos = estado.get("active_agents")
+            if isinstance(activos, int) and not isinstance(activos, bool) and activos >= 0:
+                vista["activos"] = activos
+            vista["pid"] = _pid(estado.get("pid"))
+        if vista["pid"] is None:
+            try:
+                bruto = (_leer(raiz, PID_DE_HERMES, 64 * 1024) or b"").decode("utf-8", "replace").strip()
+            except OSError:
+                bruto = ""
+            if bruto.isdigit():
+                vista["pid"] = _pid(int(bruto))
+            elif bruto.startswith("{"):
+                try:
+                    registro = json.loads(bruto)
+                except ValueError:
+                    registro = None
+                vista["pid"] = _pid(registro.get("pid")) if isinstance(registro, dict) else None
+    finally:
+        os.close(raiz)
+    escritos = []
+    for perfil in [PRINCIPAL] + [p for p in servidos if isinstance(p, str) and PATRON_PERFIL.fullmatch(p)
+                                 and p != PRINCIPAL]:
+        try:
+            carpeta = abrir_casa(casa, perfil)
+        except OSError:
+            continue
+        try:
+            for nombre in BASES:
+                try:
+                    visto = os.stat(nombre, dir_fd=carpeta, follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISREG(visto.st_mode):
+                    escritos.append(visto.st_mtime)
+        finally:
+            os.close(carpeta)
+    vista["escrito"] = max(escritos) if escritos else None
+    return vista
+
+
+def rato_tranquilo(vista: dict, ahora: float, calma: float = CALMA) -> tuple:
+    """`(sí o no, qué lo impide, por qué)`: sin turnos en marcha y sin escribir en ninguna de sus bases en `calma`
+    segundos (`qué` es `turnos` o `base`). Lo que Hermes no dice (un gateway_state.json sin `active_agents`, una casa
+    sin state.db) no cuenta: queda lo demás."""
+    activos = vista.get("activos")
+    if isinstance(activos, int) and not isinstance(activos, bool) and activos > 0:
+        return False, "turnos", "tiene %d %s en marcha" % (activos, "turno" if activos == 1 else "turnos")
+    escrito = vista.get("escrito")
+    if isinstance(escrito, (int, float)) and ahora - escrito < calma:
+        return False, "base", "ha escrito en su base hace %d s" % max(0, ahora - escrito)
+    return True, None, "tranquilo"
+
+
+def unidad_del_cgroup(texto: str) -> str | None:
+    """La unidad de systemd (del sistema o de un usuario) en la que corre un proceso, según su `/proc/<pid>/cgroup`: la
+    última `.service` de su camino (el de la cgroup v2, o la línea `name=systemd` de la v1) que no sea el `user@….service`
+    de un usuario, con sus escapes `\\xNN` deshechos. None si no corre en ninguna: una sesión, tmux, un contenedor."""
+    camino = None
+    for linea in (texto or "").splitlines():
+        jerarquia, _, resto = linea.partition(":")
+        controladores, _, ruta = resto.partition(":")
+        if jerarquia == "0" and controladores == "" and ruta.strip() not in ("", "/"):
+            camino = ruta.strip()
+            break
+        if "name=systemd" in controladores.split(",") and camino is None:
+            camino = ruta.strip()
+    if not camino:
+        return None
+    servicios = [parte for parte in camino.split("/")
+                 if parte.endswith(".service") and not re.fullmatch(r"user@\d+\.service", parte)]
+    if not servicios:
+        return None
+    unidad = re.sub(r"\\x([0-9a-fA-F]{2})", lambda escape: chr(int(escape.group(1), 16)), servicios[-1])
+    return unidad if re.fullmatch(r"[A-Za-z0-9:_.@-]{1,200}\.service", unidad) else None
+
+
+def config_de_hermes_multiplexa(casa: str) -> bool:
+    """Si el config.yaml del principal ya le dice a Hermes que sirva todos los perfiles (`config_multiplexa`)."""
+    carpeta = abrir_casa(casa, PRINCIPAL)
+    try:
+        texto = (_leer(carpeta, CONFIG) or b"").decode("utf-8", "replace")
+    except OSError:
+        texto = ""
+    finally:
+        os.close(carpeta)
+    return config_multiplexa(texto)
+
+
+# MARK: El sistema (lo que las pruebas cambian por dobles)
+
+
+class Config:
+    def __init__(self, casa="/root/.hermes", usuario_hermes="root", trabajo="/var/lib/hehermes-agentes",
+                 claves_pasarela="/etc/hehermes-pasarela/agentes", claves_vigia="/etc/hehermes-avisos/agentes",
+                 copias=None, unidad="hermes-gateway.service", puerto=None, hermes=None, usuario=False,
+                 espera_flock=ESPERA_FLOCK):
+        self.casa = casa.rstrip("/") or "/"
+        self.usuario_hermes, self.trabajo = usuario_hermes, trabajo.rstrip("/")
+        self.claves_pasarela, self.claves_vigia = claves_pasarela.rstrip("/"), claves_vigia.rstrip("/")
+        self.copias, self.unidad, self.puerto, self.hermes = copias, unidad, puerto, hermes
+        self.usuario, self.espera_flock = usuario, espera_flock
+
+
+class Sistema:
+    """`hermes` como el dueño de Hermes, lo de su casa como él, su API en 127.0.0.1, su socket de control y su unidad.
+    Las pruebas ponen dobles (`server/avisos/tests/agentes_apoyo.py`); nunca el Hermes de verdad."""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self._puerto = None
+
+    def _del_dueno(self):
+        """El usuario de Hermes, si este proceso es root y Hermes no: hay que hacerse él. Si no, None."""
+        if os.geteuid() != 0 or self.config.usuario_hermes in ("", "root"):
+            return None
+        return pwd.getpwnam(self.config.usuario_hermes)
+
+    def ejecutar(self, argv, entorno, plazo=PLAZO_HERMES, carpeta=None) -> tuple:
+        """`(código, salida)` de una orden, como el dueño de Hermes: lo cambia el propio Python (setgid, setgroups,
+        setuid) antes del exec, sin runuser ni PAM. Sin entrada, con su salida y sus errores juntos."""
+        extra = {}
+        dueno = self._del_dueno()
+        if dueno is not None:
+            extra = {"user": dueno.pw_uid, "group": dueno.pw_gid,
+                     "extra_groups": os.getgrouplist(dueno.pw_name, dueno.pw_gid)}
+        try:
+            r = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               env=entorno, timeout=plazo, cwd=carpeta, check=False, **extra)
+        except (OSError, subprocess.SubprocessError):
+            return 127, ""
+        return r.returncode, r.stdout[-64 * 1024:].decode("utf-8", "replace")
+
+    def como_hermes(self, funcion):
+        """Lo que se hace en la casa de Hermes, como su dueño. Con root y un Hermes de otro usuario, en un proceso hijo
+        que se hace ese usuario y devuelve lo suyo por una tubería (en JSON): un enlace que dejara Hermes en su casa no
+        lleva a root a ningún sitio. Si no, aquí mismo."""
+        dueno = self._del_dueno()
+        if dueno is None:
+            return funcion()
+        lectura, escritura = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # pragma: no cover — solo con root, en el servidor
+            try:
+                os.close(lectura)
+                os.setgroups(os.getgrouplist(dueno.pw_name, dueno.pw_gid))
+                os.setgid(dueno.pw_gid)
+                os.setuid(dueno.pw_uid)
+                try:
+                    salida = {"valor": funcion()}
+                except Fallo as fallo:
+                    salida = {"fallo": fallo.motivo}
+                except Rechazo as rechazo:
+                    salida = {"rechazo": [rechazo.http, rechazo.codigo, rechazo.mensaje]}
+                except Exception as error:  # noqa: BLE001
+                    salida = {"error": type(error).__name__}
+                _escribir_todo(escritura, json.dumps(salida).encode("utf-8"))
+            finally:
+                os._exit(0)
+        os.close(escritura)
+        partes = []
+        try:
+            while True:
+                trozo = os.read(lectura, 65536)
+                if not trozo:
+                    break
+                partes.append(trozo)
+        finally:
+            os.close(lectura)
+            os.waitpid(pid, 0)
+        try:
+            salida = json.loads(b"".join(partes).decode("utf-8"))
+        except ValueError:
+            raise Fallo("interna") from None
+        if "fallo" in salida:
+            raise Fallo(salida["fallo"] if salida["fallo"] in MOTIVOS else "interna")
+        if "rechazo" in salida:
+            raise Rechazo(*salida["rechazo"])
+        if "valor" not in salida:
+            raise OSError(errno.EIO, "como_hermes: %s" % salida.get("error"))
+        return salida["valor"]
+
+    def hermes(self) -> str | None:
+        """El `hermes` de esa casa: el que se dio, el de la unidad de Hermes, o uno de los de siempre."""
+        if self.config.hermes:
+            return self.config.hermes
+        candidatas = []
+        if self.config.unidad:
+            codigo, salida = self._systemctl(["show", self.config.unidad, "-p", "ExecStart", "--value"], 20)
+            for trozo in salida.replace(";", " ").split():
+                if trozo.startswith("path=") and trozo.endswith("/hermes"):
+                    candidatas.append(trozo[5:])
+        casa = self.casa_del_dueno()
+        candidatas += ["/usr/local/bin/hermes", casa + "/.local/bin/hermes" if casa else None, "/usr/bin/hermes"]
+        for candidata in candidatas:
+            if candidata and os.path.isfile(candidata) and os.access(candidata, os.X_OK):
+                return candidata
+        return None
+
+    def casa_del_dueno(self) -> str | None:
+        try:
+            return pwd.getpwnam(self.config.usuario_hermes).pw_dir
+        except KeyError:
+            return None
+
+    def entorno_de_hermes(self) -> dict:
+        casa = self.casa_del_dueno() or os.path.dirname(self.config.casa)
+        return {"HERMES_HOME": self.config.casa, "HOME": casa, "USER": self.config.usuario_hermes,
+                "LOGNAME": self.config.usuario_hermes, "LANG": "C.UTF-8", "NO_COLOR": "1", "TERM": "dumb",
+                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+
+    def _systemctl(self, argumentos, plazo) -> tuple:
+        orden = ["systemctl"] + (["--user"] if self.config.usuario else []) + list(argumentos)
+        try:
+            r = subprocess.run(orden, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               timeout=plazo, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return 127, ""
+        return r.returncode, r.stdout.decode("utf-8", "replace")
+
+    def estado_de_la_unidad(self) -> dict:
+        """`LoadState`, `ActiveState` y `MainPID` de la unidad de Hermes, según systemd. Vacío si no contesta."""
+        codigo, salida = self._systemctl(["show", self.config.unidad, "-p", "LoadState", "-p", "ActiveState", "-p",
+                                          "MainPID"], 20)
+        estado = {}
+        for linea in salida.splitlines() if codigo == 0 else ():
+            clave, igual, valor = linea.partition("=")
+            if igual and clave in ("LoadState", "ActiveState", "MainPID"):
+                estado[clave] = valor.strip()
+        return estado
+
+    def cgroup(self, pid: int) -> str | None:
+        """Lo que dice `/proc/<pid>/cgroup` (en qué unidad corre ese proceso), o None si no está."""
+        try:
+            with open("/proc/%d/cgroup" % pid, "rb") as fichero:
+                return fichero.read(64 * 1024).decode("utf-8", "replace")
+        except (OSError, TypeError, ValueError):
+            return None
+
+    def reiniciar_hermes(self) -> bool:
+        """`systemctl restart` de la unidad de Hermes: systemd la para como diga ella (la del VPS de pruebas,
+        `KillMode=mixed` y `TimeoutStopSec=210`: SIGTERM a la pasarela, que drena lo que tenga en marcha,
+        `runner.stop()`) y la vuelve a arrancar. La misma unidad: nunca otra, ni otra pasarela suelta, ni se reescribe
+        nada de ella (lo que haría `hermes gateway restart`, `refresh_systemd_unit_if_needed`)."""
+        codigo, _ = self._systemctl(["restart", self.config.unidad], PLAZO_REINICIO)
+        return codigo == 0
+
+    def repasar_perfiles(self) -> dict | None:
+        """Le pide a la pasarela de Hermes que vuelva a mirar `profiles/` ya (`rescan-profiles`, lo mismo que hace
+        `hermes profile create`), en vez de esperar a su repaso de cada 30 s. Como el dueño de Hermes: su socket es
+        suyo (0600). Lo que contesta (`served_profiles`, `multiplex`…), o None si no contesta."""
+        casa = self.config.casa
+        try:
+            return self.como_hermes(lambda: pedir_al_socket_de_control(casa, "rescan-profiles", PLAZO_CONTROL))
+        except (OSError, Fallo):
+            return None
+
+    def puerto(self) -> int:
+        """El de la API de Hermes: el que se dio, o el `API_SERVER_PORT` de su .env (8642 si no dice). Se lee una vez."""
+        if self.config.puerto:
+            return self.config.puerto
+        if self._puerto is None:
+            self._puerto = self._puerto_del_env()
+        return self._puerto
+
+    def _puerto_del_env(self) -> int:
+        try:
+            texto = self.como_hermes(lambda: (_leer_env_principal(self.config.casa) or b"").decode("utf-8", "replace"))
+        except (OSError, Fallo):
+            texto = ""
+        for linea in texto.splitlines():
+            nombre, _, valor = linea.partition("=")
+            valor = valor.strip().strip("'\"")
+            if nombre.replace("export", "").strip() == "API_SERVER_PORT" and valor.isdigit() and \
+                    0 < int(valor) < 65536:
+                return int(valor)
+        return 8642
+
+    def http(self, ruta: str, clave: str | None = None, plazo: float = 5.0) -> tuple:
+        """`GET` a la API de Hermes en 127.0.0.1, con la clave en su cabecera (nunca en la ruta ni en el registro)."""
+        try:
+            conexion = http.client.HTTPConnection("127.0.0.1", self.puerto(), timeout=plazo)
+            try:
+                conexion.request("GET", ruta, headers={"Authorization": "Bearer " + clave} if clave else {})
+                respuesta = conexion.getresponse()
+                return respuesta.status, respuesta.read(1024 * 1024)
+            finally:
+                conexion.close()
+        except (OSError, http.client.HTTPException):
+            return None, b""
+
+    def libre(self, ruta: str) -> int:
+        return shutil.disk_usage(ruta).free
+
+    def ahora(self) -> float:
+        return time.time()
+
+    def dormir(self, segundos: float) -> None:
+        time.sleep(segundos)
+
+
+def pedir_al_socket_de_control(casa: str, verbo: str, plazo: float) -> dict | None:
+    """Un verbo del socket de control de la pasarela de Hermes (`gateway/control_socket.py` de la 0.21.5): una línea
+    JSON (`{"verb", "id", "protocol": 1}`) y otra de vuelta (`{"ok": true, "result": {…}}`), una por conexión. El
+    socket es `<casa>/gateway.sock`, o el que diga `gateway.sock.path` si su ruta no cabía. Lo que contesta en `result`,
+    o None si no hay socket, no contesta a tiempo o contesta otra cosa."""
+    ruta = os.path.join(casa, SOCKET_DE_CONTROL)
+    if not os.path.exists(ruta):
+        try:
+            with open(os.path.join(casa, PUNTERO_DEL_SOCKET), encoding="utf-8") as fichero:
+                ruta = fichero.read(4096).strip()
+        except (OSError, UnicodeDecodeError):
+            return None
+        if not ruta.startswith("/") or not os.path.exists(ruta):
+            return None
+    peticion = json.dumps({"verb": verbo, "id": 1, "protocol": 1}).encode("utf-8") + b"\n"
+    limite = time.monotonic() + plazo
+    recibido = b""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conexion:
+            conexion.settimeout(plazo)
+            conexion.connect(ruta)
+            conexion.sendall(peticion)
+            while b"\n" not in recibido and len(recibido) <= 512 * 1024 and time.monotonic() < limite:
+                trozo = conexion.recv(65536)
+                if not trozo:
+                    break
+                recibido += trozo
+    except OSError:
+        return None
+    try:
+        respuesta = json.loads(recibido.partition(b"\n")[0].decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    resultado = respuesta.get("result") if isinstance(respuesta, dict) and respuesta.get("ok") is True else None
+    return resultado if isinstance(resultado, dict) else None
+
+
+def _leer_env_principal(casa: str) -> bytes | None:
+    carpeta = abrir_casa(casa, PRINCIPAL)
+    try:
+        return _leer(carpeta, ENV)
+    finally:
+        os.close(carpeta)
+
+
+# MARK: Los trabajos
+
+
+def _escribir_json(ruta: str, datos) -> None:
+    temporal = ruta + ".nuevo"
+    with open(os.open(temporal, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600), "w") as f:
+        json.dump(datos, f, sort_keys=True, separators=(",", ":"))
+    os.replace(temporal, ruta)
+
+
+def _leer_json(ruta: str):
+    try:
+        with open(ruta, "rb") as f:
+            return json.loads(f.read(64 * 1024).decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+class Trabajos:
+    """La carpeta de trabajo (0700, solo del ayudante): el estado de cada trabajo, el cerrojo (uno a la vez) y lo que
+    se vio de la memoria en la vuelta anterior. Se crea al hacer falta, no antes."""
+
+    def __init__(self, config: Config, sistema: Sistema):
+        self.config, self.sistema = config, sistema
+        self._cerrojo = None
+
+    def ruta(self, *partes) -> str:
+        return os.path.join(self.config.trabajo, *partes)
+
+    def _preparar(self) -> None:
+        os.makedirs(self.ruta("trabajos"), mode=0o700, exist_ok=True)
+        os.chmod(self.config.trabajo, 0o700)
+
+    def tomar(self) -> bool:
+        """El cerrojo, sin esperar. False si lo tiene otro (otra conexión, o un trabajo que sigue)."""
+        if self._cerrojo is not None:
+            return True
+        self._preparar()
+        fd = os.open(self.ruta("trabajo.lock"), os.O_RDWR | os.O_CREAT | _CLOEXEC, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        self._cerrojo = fd
+        return True
+
+    def soltar(self) -> None:
+        if self._cerrojo is not None:
+            fcntl.flock(self._cerrojo, fcntl.LOCK_UN)
+            os.close(self._cerrojo)
+            self._cerrojo = None
+
+    def en_marcha(self) -> bool:
+        """Si hay un trabajo en marcha, por lo que dice su estado y su latido: sin tocar el cerrojo, así que `listar` ni
+        espera a nadie ni estorba a quien lo pide en ese momento."""
+        try:
+            nombres = os.listdir(self.ruta("trabajos"))
+        except OSError:
+            return False
+        ahora = self.sistema.ahora()
+        for nombre in nombres:
+            datos = _leer_json(self.ruta("trabajos", nombre))
+            if isinstance(datos, dict) and datos.get("estado") in EN_MARCHA and isinstance(datos.get("latido"), int) \
+                    and ahora - datos["latido"] <= SIN_LATIDO:
+                return True
+        return False
+
+    def ocupado(self) -> bool:
+        """Si hay un trabajo en marcha, aquí o en otro proceso: por el cerrojo (solo para dar por muerto uno sin
+        latido)."""
+        if self._cerrojo is not None:
+            return True
+        if not os.path.exists(self.ruta("trabajo.lock")):
+            return False
+        if not self.tomar():
+            return True
+        self.soltar()
+        return False
+
+    def nuevo(self, tipo: str, perfil: str) -> str:
+        id_ = secrets.token_hex(16)
+        ahora = int(self.sistema.ahora())
+        _escribir_json(self.ruta("trabajos", id_ + ".json"), {"id": id_, "tipo": tipo, "perfil": perfil,
+                                                              "estado": "en_cola", "motivo": None, "creado": ahora,
+                                                              "latido": ahora})
+        return id_
+
+    def poner(self, id_: str, **cambios) -> None:
+        ruta = self.ruta("trabajos", id_ + ".json")
+        datos = _leer_json(ruta)
+        if not isinstance(datos, dict):
+            return
+        datos.update(cambios)
+        datos["latido"] = int(self.sistema.ahora())
+        _escribir_json(ruta, datos)
+
+    def leer(self, id_: str) -> dict | None:
+        datos = _leer_json(self.ruta("trabajos", id_ + ".json"))
+        if not (isinstance(datos, dict) and datos.get("estado") in ESTADOS and datos.get("tipo") in ("crear", "borrar")
+                and isinstance(datos.get("perfil"), str) and PATRON_PERFIL.fullmatch(datos["perfil"])):
+            return None
+        latido = datos.get("latido") if isinstance(datos.get("latido"), int) else 0
+        if datos["estado"] in EN_MARCHA and self.sistema.ahora() - latido > SIN_LATIDO and not self.ocupado():
+            # Nadie con el cerrojo y sin latido: el proceso murió a medias (un reinicio, un kill).
+            self.poner(id_, estado="fallo", motivo="interrumpido")
+            _decir("trabajo %s (%s %s): interrumpido" % (id_[:8], datos["tipo"], datos["perfil"]))
+            datos.update(estado="fallo", motivo="interrumpido")
+        motivo = datos.get("motivo")
+        salida = {"estado": datos["estado"], "tipo": datos["tipo"], "perfil": datos["perfil"],
+                  "motivo": motivo if datos["estado"] == "fallo" and motivo in MOTIVOS else None}
+        # En qué está, solo mientras crea el primer agente (espera a Hermes o lo reinicia): opcional en §18.4.
+        if datos["estado"] == "creando" and datos.get("paso") in PASOS:
+            salida["paso"] = datos["paso"]
+        return salida
+
+    def limpiar(self) -> None:
+        """Los de hace más de un día se olvidan: ninguno sigue en marcha (systemd no deja a un ayudante más de media
+        hora, `RuntimeMaxSec`)."""
+        try:
+            nombres = os.listdir(self.ruta("trabajos"))
+        except OSError:
+            return
+        ahora = self.sistema.ahora()
+        for nombre in nombres:
+            ruta = self.ruta("trabajos", nombre)
+            datos = _leer_json(ruta)
+            creado = datos.get("creado") if isinstance(datos, dict) and isinstance(datos.get("creado"), int) else 0
+            if ahora - creado > VIDA_TRABAJO:
+                try:
+                    os.unlink(ruta)
+                except OSError:
+                    pass
+
+
+# MARK: Las órdenes
+
+
+class Ayudante:
+    """Todas las órdenes, sin sockets: el `atender` de abajo solo traduce. `orden` devuelve `(respuesta, continuación o
+    None)`: la continuación es el trabajo, que corre con la conexión ya cerrada."""
+
+    def __init__(self, config: Config, sistema: Sistema | None = None):
+        self.config = config
+        self.sistema = sistema or Sistema(config)
+        self.trabajos = Trabajos(config, self.sistema)
+
+    def orden(self, peticion) -> tuple:
+        orden = peticion.get("orden") if isinstance(peticion, dict) else None
+        if orden not in CAMPOS:
+            raise Rechazo(400, "orden_desconocida", "Orden desconocida")
+        if set(peticion) - CAMPOS[orden]:
+            raise _invalido("La orden trae algo que no es suyo")
+        if orden == "listar":
+            return self.listar(), None
+        if orden == "ver":
+            return self.ver(peticion.get("perfil")), None
+        if orden == "crear":
+            return self.crear(peticion)
+        if orden == "cambiar":
+            return self.cambiar(peticion)
+        if orden == "borrar":
+            return self.borrar(peticion.get("perfil"))
+        if orden == "trabajo":
+            datos = self.trabajos.leer(validar_id(peticion.get("id")))
+            if datos is None:
+                raise Rechazo(404, "trabajo_desconocido", "Ese trabajo no existe o ya caducó")
+            return dict(datos, ok=True), None
+        return self.sincronizar_memoria(), None
+
+    # -- Lo común
+
+    def _hermes_principal(self, argumentos: list, carpeta: str | None = None, plazo: float = PLAZO_HERMES) -> tuple:
+        """`hermes -p default …`: todo lo que lanza el ayudante es del principal. Con HERMES_HOME en la raíz, la CLI
+        sigue el perfil que dejara pegado `hermes profile use` (`_apply_profile_override`), y `profile create --clone`
+        clona el ACTIVO (`_resolve_clone_source(None)`: `get_hermes_home()`): sin `-p`, el agente nuevo saldría clonado
+        de ese y no del principal. `delete`, `describe`, `export` y `config set` tampoco han de depender de él."""
+        hermes = self.sistema.hermes()
+        if not hermes:
+            _decir("no encuentro hermes")
+            return 127, ""
+        return self.sistema.ejecutar([hermes, "-p", PRINCIPAL] + argumentos, self.sistema.entorno_de_hermes(),
+                                     plazo=plazo, carpeta=carpeta)
+
+    def _mientras(self, id_: str, funcion):
+        """Lo que devuelve `funcion()`, que corre en otro hilo mientras este le da latido al trabajo cada `LATIDO`
+        segundos: un `hermes` de minutos (la copia y el borrado) o un reinicio con drenaje no lo dejan sin latido, y la
+        lista no lo da por acabado (ni adopta lo de un perfil a medias)."""
+        resultado = {}
+
+        def correr():
+            try:
+                resultado["valor"] = funcion()
+            except BaseException as error:  # noqa: BLE001 — se vuelve a lanzar en este hilo
+                resultado["error"] = error
+
+        hilo = threading.Thread(target=correr, daemon=True)
+        hilo.start()
+        while True:
+            hilo.join(LATIDO)
+            if not hilo.is_alive():
+                break
+            self.trabajos.poner(id_)
+        if "error" in resultado:
+            raise resultado["error"]
+        return resultado.get("valor")
+
+    def perfiles(self) -> list:
+        """Los agentes: los perfiles que Hermes serviría (`perfiles_de_hermes`), sin lanzar `hermes`, que tarda."""
+        return self.sistema.como_hermes(lambda: perfiles_de_hermes(self.config.casa))
+
+    def _exportaciones(self, perfil: str) -> str:
+        casa = self.config.casa if perfil == PRINCIPAL else os.path.join(self.config.casa, "profiles", perfil)
+        return os.path.join(casa, "exports")
+
+    def _modo_de_las_claves(self) -> int:
+        return 0o600 if self.config.usuario else 0o640
+
+    def _servidos(self, perfiles: list) -> dict:
+        """Si Hermes sirve cada agente con su clave: una mirada corta a cada uno (`/p/<perfil>/api/sessions`, con la
+        clave que usa la pasarela), todas a la vez. Sin su clave, no; la que no contesta en su plazo, tampoco."""
+        servidos = {perfil: False for perfil in perfiles if perfil != PRINCIPAL}
+        claves = {perfil: leer_clave(self.config.claves_pasarela, perfil) for perfil in servidos}
+
+        def mirar(perfil: str, clave: str) -> None:
+            estado, _ = self.sistema.http("/p/%s/api/sessions?limit=1" % perfil, clave, plazo=PLAZO_MIRADA)
+            servidos[perfil] = estado == 200
+
+        hilos = [threading.Thread(target=mirar, args=(perfil, clave), daemon=True)
+                 for perfil, clave in claves.items() if clave is not None]
+        if hilos:
+            self.sistema.puerto()  # antes de los hilos: con un Hermes de otro usuario, leerlo es un proceso hijo
+        for hilo in hilos:
+            hilo.start()
+        limite = time.monotonic() + PLAZO_MIRADA + 0.5
+        for hilo in hilos:
+            hilo.join(max(0.0, limite - time.monotonic()))
+        return dict(servidos)
+
+    def _agente(self, perfil: str, leido: dict, servido: bool = False) -> dict:
+        ficha = leido.get("ficha") or {}
+        if perfil == PRINCIPAL:
+            return {"perfil": PRINCIPAL, "nombre": ficha.get("nombre", "Hermes"), "color": ficha.get("color", "indigo"),
+                    "expresion": ficha.get("expresion", "serena"), "descripcion": ficha.get("descripcion", ""),
+                    "memoria": "propia", "principal": True, "servido": True}
+        return {"perfil": perfil, "nombre": ficha.get("nombre", perfil), "color": ficha.get("color", "grafito"),
+                "expresion": ficha.get("expresion", "serena"), "descripcion": ficha.get("descripcion", ""),
+                "memoria": ficha.get("memoria", "propia"), "principal": False, "servido": servido}
+
+    def _leer(self, perfiles: list, alma: bool = False, preparar: bool = False) -> dict:
+        return self.sistema.como_hermes(lambda: leer_perfiles(self.config.casa, perfiles, alma, preparar))
+
+    def _casa_es_un_perfil(self) -> bool:
+        """Un Hermes que ya es un perfil de otro (`<raíz>/profiles/<nombre>`: el de quien corre `hermes -p <nombre>`).
+        Sus perfiles no irían dentro de su casa sino al lado, y lo que haría ahí Hermes no se ha comprobado (tarea 7 del
+        plan): no se crean agentes."""
+        return os.path.basename(os.path.dirname(self.config.casa)) == "profiles"
+
+    def _caben(self, cuantos: int) -> int:
+        if self._casa_es_un_perfil():
+            return 0
+        try:
+            libre = self.sistema.libre(self.config.casa)
+        except OSError:
+            libre = 0
+        return 0 if libre < LIBRE_MINIMO else max(0, TOPE_AGENTES - cuantos)
+
+    # -- Listar y ver
+
+    def listar(self) -> dict:
+        """En menos de un segundo: sin `hermes`, sin esperar al cerrojo de un trabajo, y con una mirada a cada agente."""
+        self.trabajos.limpiar()
+        perfiles = self.perfiles()
+        en_marcha = self.trabajos.en_marcha()
+        leidos = self._leer(perfiles, preparar=not en_marcha)
+        if not en_marcha:
+            # Con un trabajo en marcha no: un perfil a medio crear tiene todavía en su .env la clave del principal.
+            self._adoptar(leidos)
+        servidos = self._servidos(perfiles)
+        return {"ok": True, "agentes": [self._agente(PRINCIPAL, leidos.get(PRINCIPAL, {}))]
+                + [self._agente(perfil, leidos.get(perfil, {}), servidos.get(perfil, False)) for perfil in perfiles],
+                "caben": self._caben(len(perfiles))}
+
+    def _adoptar(self, leidos: dict) -> None:
+        """La clave del .env de cada perfil, para la pasarela y el vigía, si no la tienen ya: la de un perfil que ya
+        estaba, o la de uno que una copia restaurada ha cambiado (manda el .env). Su .env no se toca."""
+        for perfil, leido in leidos.items():
+            clave = leido.get("clave")
+            if perfil == PRINCIPAL or clave is None:
+                continue
+            for carpeta in (self.config.claves_pasarela, self.config.claves_vigia):
+                if leer_clave(carpeta, perfil) != clave:
+                    try:
+                        escribir_clave(carpeta, perfil, clave, self._modo_de_las_claves())
+                        _decir("perfil %s: su clave, copiada de su .env" % perfil)
+                    except OSError as error:
+                        _decir("perfil %s: no puedo copiar su clave (%s)" % (perfil, type(error).__name__))
+
+    def ver(self, perfil) -> dict:
+        perfil = validar_perfil(perfil)
+        if perfil != PRINCIPAL and perfil not in self.perfiles():
+            raise Rechazo(404, "agente_desconocido", "Ese agente no existe")
+        leido = self._leer([perfil], alma=True).get(perfil)
+        if leido is None:
+            raise Rechazo(404, "agente_desconocido", "Ese agente no existe")
+        personalidad = None if perfil == PRINCIPAL else personalidad_de(leido.get("alma") or "")
+        servido = self._servidos([perfil]).get(perfil, False)
+        return dict(self._agente(perfil, leido, servido), personalidad=personalidad, ok=True)
+
+    # -- Crear
+
+    def crear(self, peticion: dict) -> tuple:
+        datos = validar_creacion(peticion)
+        if self._casa_es_un_perfil():
+            raise Rechazo(409, "tope_de_agentes", "Este Hermes es un perfil de otro: aquí no caben agentes")
+        if not self.trabajos.tomar():
+            raise Rechazo(409, "en_curso", "Ya hay un trabajo de los agentes en marcha")
+        try:
+            perfiles = self.perfiles()
+            if len(perfiles) >= TOPE_AGENTES:
+                raise Rechazo(409, "tope_de_agentes", "Ya hay %d agentes" % TOPE_AGENTES)
+            if self.sistema.libre(self.config.casa) < LIBRE_MINIMO:
+                raise Rechazo(507, "sin_espacio", "No hay sitio en el disco para otro agente")
+            ocupados = set(perfiles) | set(self.sistema.como_hermes(lambda: nombres_en_profiles(self.config.casa)))
+            perfil = perfil_de(datos["nombre"], ocupados)
+            id_ = self.trabajos.nuevo("crear", perfil)
+        except BaseException:
+            self.trabajos.soltar()
+            raise
+        _decir("crear %s (trabajo %s): pedido, memoria %s" % (perfil, id_[:8], datos["memoria"]))
+
+        def continuar():
+            try:
+                self._crear(id_, perfil, datos)
+            finally:
+                self.trabajos.soltar()
+
+        return {"ok": True, "http": 202, "trabajo": id_, "perfil": perfil}, continuar
+
+    def _crear(self, id_: str, perfil: str, datos: dict) -> None:
+        self.trabajos.poner(id_, estado="creando")
+        creado = False
+        try:
+            orden = ["profile", "create", perfil, "--clone"]
+            if datos["descripcion"]:
+                orden.append("--description=" + datos["descripcion"])
+            codigo, _ = self._mientras(id_, lambda: self._hermes_principal(orden))
+            if codigo != 0:
+                _decir("crear %s: hermes profile create ha salido con %d" % (perfil, codigo))
+                raise Fallo("hermes")
+            creado = True
+            # Lo primero, su clave: el --clone le ha dejado la del principal, y Hermes aparca un perfil con la clave de
+            # otro hasta que cambia su .env.
+            clave = clave_nueva()
+            self.sistema.como_hermes(lambda: poner_clave_del_perfil(self.config.casa, perfil, clave))
+            self.trabajos.poner(id_)
+            exportaciones = self._exportaciones(perfil)
+            creado_en = int(self.sistema.ahora())
+            self.sistema.como_hermes(lambda: preparar_perfil(self.config.casa, perfil, datos, exportaciones,
+                                                             self.config.espera_flock, creado_en))
+            self.trabajos.poner(id_)
+            try:
+                for carpeta in (self.config.claves_pasarela, self.config.claves_vigia):
+                    escribir_clave(carpeta, perfil, clave, self._modo_de_las_claves())
+            except OSError:
+                raise Fallo("clave") from None
+            self._que_lo_sirva(id_, perfil, clave)
+        except Fallo as fallo:
+            if creado and fallo.motivo != "no_se_sirve":
+                self._deshacer(id_, perfil)
+            self.trabajos.poner(id_, estado="fallo", motivo=fallo.motivo)
+            _decir("crear %s (trabajo %s): fallo (%s)" % (perfil, id_[:8], fallo.motivo))
+            return
+        except Exception as error:  # noqa: BLE001 — el trabajo falla, el ayudante dice cuál
+            if creado:
+                self._deshacer(id_, perfil)
+            self.trabajos.poner(id_, estado="fallo", motivo="interna")
+            _decir("crear %s (trabajo %s): fallo (interna: %s)" % (perfil, id_[:8], type(error).__name__))
+            return
+        self.trabajos.poner(id_, estado="hecho")
+        _decir("crear %s (trabajo %s): hecho" % (perfil, id_[:8]))
+
+    def _deshacer(self, id_: str, perfil: str) -> None:
+        """Lo de un perfil a medio crear: él (recién nacido, no tiene nada que copiar) y sus claves."""
+        codigo, _ = self._mientras(id_, lambda: self._hermes_principal(["profile", "delete", perfil, "--yes"],
+                                                                       plazo=PLAZO_HERMES_LARGO))
+        for carpeta in (self.config.claves_pasarela, self.config.claves_vigia):
+            quitar_clave(carpeta, perfil)
+        _decir("crear %s: deshecho%s" % (perfil, "" if codigo == 0 else " (hermes profile delete ha salido con %d)"
+                                          % codigo))
+
+    def _contesta(self, id_: str, perfil: str, clave: str, plazo: float) -> bool:
+        """Si Hermes sirve el perfil con su clave (`/p/<perfil>/api/sessions`), mirándolo cada `CADA` segundos hasta
+        `plazo`."""
+        limite = self.sistema.ahora() + plazo
+        while True:
+            estado, _ = self.sistema.http("/p/%s/api/sessions?limit=1" % perfil, clave, plazo=CADA)
+            if estado == 200:
+                return True
+            if self.sistema.ahora() >= limite:
+                return False
+            self.trabajos.poner(id_)
+            self.sistema.dormir(CADA)
+
+    def _que_lo_sirva(self, id_: str, perfil: str, clave: str) -> None:
+        """Un Hermes que ya sirve otros perfiles sirve en caliente los nuevos, y vuelve a mirar el que cambia su .env,
+        al pedírselo por su socket de control y en su repaso de cada 30 s (`gateway/run_profile_reconcile.py`): se le
+        pide ya, y se le espera hasta `PLAZO_SERVIDO`, **sin reiniciarlo**. Si contesta que aún no sirve otros perfiles
+        (`multiplex: false`), es el primer agente: `_servirlo_reiniciando`. Si no lo sirve a tiempo, `no_se_sirve`, y el
+        perfil se queda (la lista dice cuándo se sirve)."""
+        respuesta = self.sistema.repasar_perfiles()
+        if respuesta is None:
+            _decir("crear %s: el socket de control de Hermes no contesta: lo verá en su repaso" % perfil)
+        elif respuesta.get("multiplex") is False:
+            self._servirlo_reiniciando(id_, perfil, clave, respuesta)
+            return
+        if not self._contesta(id_, perfil, clave, PLAZO_SERVIDO):
+            _decir("crear %s: Hermes no lo sirve en %d s" % (perfil, PLAZO_SERVIDO))
+            raise Fallo("no_se_sirve")
+
+    def _servirlo_reiniciando(self, id_: str, perfil: str, clave: str, respuesta: dict) -> None:
+        """El primer agente (`CALMA`): Hermes aún no sirve otros perfiles, porque lo decide al arrancar y arrancó con el
+        principal solo. Se reinicia su unidad **una vez**, con drenaje, en un rato tranquilo y con
+        `gateway.multiplex_profiles: true` ya en su config.yaml. Solo así: nunca con `hermes gateway migrate`, que si no
+        reconoce la unidad instala otra o lanza otra pasarela suelta (`_restart_default` de
+        `hermes_cli/gateway_migrate.py`), ni con `hermes gateway restart`, que puede reescribir la unidad
+        (`refresh_systemd_unit_if_needed`); ni una unidad que no esté en marcha con la pasarela de Hermes dentro. Si algo
+        no sale, `no_se_sirve`: el perfil se queda, y Hermes lo servirá en su próximo reinicio."""
+        servidos = [PRINCIPAL] + sorted({p for p in respuesta.get("served_profiles") or []
+                                         if isinstance(p, str) and PATRON_PERFIL.fullmatch(p) and p != PRINCIPAL})
+        _decir("crear %s: este Hermes aún no sirve otros perfiles (gateway.multiplex_profiles se decide al arrancar): "
+               "lo reinicio una vez, con drenaje, en un rato tranquilo" % perfil)
+        self._que_se_pueda_reiniciar(perfil, servidos)
+        self.trabajos.poner(id_, paso="esperando_a_hermes")
+        self._esperar_calma_y_poner_el_flag(id_, perfil, servidos)
+        # Otra vez, justo antes: en los minutos de espera alguien ha podido reiniciarlo (y ya los sirve), pararlo o
+        # cambiarle el proceso. Sin confirmar que sigue sin servir otros perfiles, no se reinicia.
+        otra = self.sistema.repasar_perfiles()
+        if otra is not None and otra.get("multiplex") is not False:
+            _decir("crear %s: Hermes ya sirve otros perfiles: no lo reinicio" % perfil)
+            if not self._contesta(id_, perfil, clave, PLAZO_SERVIDO):
+                _decir("crear %s: Hermes no lo sirve en %d s" % (perfil, PLAZO_SERVIDO))
+                raise Fallo("no_se_sirve")
+            return
+        if otra is None:
+            _decir("crear %s: no reinicio Hermes: su socket de control ya no contesta; %s" % (perfil, LUEGO))
+            raise Fallo("no_se_sirve")
+        self._que_se_pueda_reiniciar(perfil, servidos)
+        self.trabajos.poner(id_, paso="reiniciando_hermes")
+        _decir("crear %s: reinicio %s (una vez, con drenaje)" % (perfil, self.config.unidad))
+        inicio = self.sistema.ahora()
+        if not self._mientras(id_, self.sistema.reiniciar_hermes):
+            _decir("crear %s: systemctl restart %s ha fallado: %s" % (perfil, self.config.unidad, LUEGO))
+            raise Fallo("no_se_sirve")
+        _decir("crear %s: Hermes reiniciado en %d s; lo espero hasta %d s" % (perfil, self.sistema.ahora() - inicio,
+                                                                            PLAZO_TRAS_REINICIO))
+        if not self._contesta(id_, perfil, clave, PLAZO_TRAS_REINICIO):
+            _decir("crear %s: Hermes, reiniciado, no lo sirve en %d s" % (perfil, PLAZO_TRAS_REINICIO))
+            raise Fallo("no_se_sirve")
+
+    def _vista(self, servidos: list) -> dict | None:
+        """`vista_de_hermes`, como el dueño de Hermes; None si no se puede mirar."""
+        try:
+            return self.sistema.como_hermes(lambda: vista_de_hermes(self.config.casa, servidos))
+        except (OSError, Fallo):
+            return None
+
+    def _que_se_pueda_reiniciar(self, perfil: str, servidos: list) -> None:
+        """Que su unidad esté en marcha y, si se sabe qué proceso es la pasarela de Hermes, que corra dentro de ella
+        (por su cgroup). Arrancar una unidad parada sería otra pasarela al lado de la que sirve (en tmux, en un
+        contenedor), y reiniciar otra no cambiaría nada; reiniciar la suya en marcha nunca añade otra pasarela."""
+        unidad = self.config.unidad
+        estado = self.sistema.estado_de_la_unidad()
+        porque = None
+        if estado.get("LoadState") != "loaded" or estado.get("ActiveState") != "active":
+            porque = "su unidad %s no está en marcha (%s)" % (unidad, estado.get("ActiveState")
+                                                               or "systemd no contesta")
+        else:
+            pid = (self._vista(servidos) or {}).get("pid")
+            texto = self.sistema.cgroup(pid) if pid else None
+            suya = unidad if texto is None else unidad_del_cgroup(texto)
+            if suya != unidad:
+                porque = "no corre en su unidad %s (sino en %s)" % (unidad, suya or "ninguna")
+        if porque:
+            _decir("crear %s: no reinicio Hermes: %s; %s" % (perfil, porque, LUEGO))
+            raise Fallo("no_se_sirve")
+
+    def _esperar_calma_y_poner_el_flag(self, id_: str, perfil: str, servidos: list) -> None:
+        """Hasta `PLAZO_CALMA`, mirándolo cada `CADA_CALMA`: en cuanto está tranquilo, el flag (`_poner_el_flag`), y
+        otra mirada, que la orden tarda unos segundos. Sin un rato tranquilo, ni flag ni reinicio."""
+        limite = self.sistema.ahora() + PLAZO_CALMA
+        puesto, dicho = False, None
+        while True:
+            vista = self._vista(servidos)
+            if vista is None:
+                tranquilo, que, porque = False, "nada", "no puedo mirar lo que hace"
+            else:
+                tranquilo, que, porque = rato_tranquilo(vista, self.sistema.ahora())
+            if tranquilo and puesto:
+                return
+            if tranquilo:
+                self._poner_el_flag(id_, perfil)
+                puesto = True
+                continue
+            if que != dicho:
+                _decir("crear %s: espero a un rato tranquilo de Hermes (%s)" % (perfil, porque))
+                dicho = que
+            if self.sistema.ahora() >= limite:
+                _decir("crear %s: Hermes no ha estado tranquilo en %d s (%s): no lo reinicio; %s"
+                       % (perfil, PLAZO_CALMA, porque, LUEGO))
+                raise Fallo("no_se_sirve")
+            self.trabajos.poner(id_)
+            self.sistema.dormir(CADA_CALMA)
+
+    def _poner_el_flag(self, id_: str, perfil: str) -> None:
+        """`gateway.multiplex_profiles: true` en el config.yaml del principal, con la orden de Hermes (`hermes config
+        set`: el mismo escritor, que conserva los comentarios, que usa su `gateway migrate`, `_write_multiplex_flag`).
+        Y que de verdad esté: una orden que sale bien sin escribir nada (una instalación gestionada) no vale."""
+        _decir("crear %s: hermes config set gateway.multiplex_profiles true" % perfil)
+        codigo, _ = self._mientras(id_, lambda: self._hermes_principal(
+            ["config", "set", "gateway.multiplex_profiles", "true"], plazo=PLAZO_CONFIG))
+        if codigo != 0:
+            _decir("crear %s: hermes config set ha salido con %d: no lo reinicio; %s" % (perfil, codigo, LUEGO))
+            raise Fallo("no_se_sirve")
+        try:
+            puesto = self.sistema.como_hermes(lambda: config_de_hermes_multiplexa(self.config.casa))
+        except (OSError, Fallo):
+            puesto = False
+        if not puesto:
+            _decir("crear %s: hermes config set no ha dejado gateway.multiplex_profiles en su config.yaml: no lo "
+                   "reinicio; %s" % (perfil, LUEGO))
+            raise Fallo("no_se_sirve")
+
+    # -- Cambiar
+
+    def cambiar(self, peticion: dict) -> tuple:
+        """Lo de la casa del perfil, al momento. La descripción va también a Hermes (`hermes profile describe`, que
+        tarda): después de contestar, con la conexión ya cerrada y el cerrojo tomado hasta acabar."""
+        perfil = validar_perfil(peticion.get("perfil"))
+        cambios = validar_cambios(peticion)
+        if perfil == PRINCIPAL and "personalidad" in cambios:
+            raise Rechazo(409, "no_se_cambia_el_principal", "Del principal solo se cambian el nombre, la cara y la "
+                                                            "descripción")
+        if not self.trabajos.tomar():
+            raise Rechazo(409, "en_curso", "Ya hay un trabajo de los agentes en marcha")
+        try:
+            if perfil != PRINCIPAL and perfil not in self.perfiles():
+                raise Rechazo(404, "agente_desconocido", "Ese agente no existe")
+            exportaciones = self._exportaciones(perfil)
+            try:
+                self.sistema.como_hermes(lambda: cambiar_perfil(self.config.casa, perfil, cambios, exportaciones))
+            except (OSError, Fallo):
+                raise Rechazo(500, "error", "No se ha podido cambiar el agente") from None
+            leido = self._leer([perfil]).get(perfil, {})
+            servido = self._servidos([perfil]).get(perfil, False)
+        except BaseException:
+            self.trabajos.soltar()
+            raise
+        _decir("cambiar %s: %s" % (perfil, ", ".join(sorted(cambios))))
+        respuesta = dict(self._agente(perfil, leido, servido), ok=True, http=200)
+        if "descripcion" not in cambios or perfil == PRINCIPAL:
+            self.trabajos.soltar()
+            return respuesta, None
+
+        def continuar():
+            try:
+                codigo, _ = self._hermes_principal(["profile", "describe", perfil, cambios["descripcion"]])
+                if codigo != 0:
+                    _decir("cambiar %s: hermes profile describe ha salido con %d" % (perfil, codigo))
+            finally:
+                self.trabajos.soltar()
+
+        return respuesta, continuar
+
+    # -- Borrar
+
+    def borrar(self, perfil) -> tuple:
+        perfil = validar_perfil(perfil)
+        if perfil == PRINCIPAL:
+            raise Rechazo(409, "no_se_borra_el_principal", "El principal no se borra")
+        if not self.trabajos.tomar():
+            raise Rechazo(409, "en_curso", "Ya hay un trabajo de los agentes en marcha")
+        try:
+            if perfil not in self.perfiles():
+                raise Rechazo(404, "agente_desconocido", "Ese agente no existe")
+            id_ = self.trabajos.nuevo("borrar", perfil)
+        except BaseException:
+            self.trabajos.soltar()
+            raise
+        _decir("borrar %s (trabajo %s): pedido" % (perfil, id_[:8]))
+
+        def continuar():
+            try:
+                self._borrar(id_, perfil)
+            finally:
+                self.trabajos.soltar()
+
+        return {"ok": True, "http": 202, "trabajo": id_}, continuar
+
+    def _carpeta_de_copias(self) -> str:
+        if self.config.copias:
+            return self.config.copias
+        return os.path.join(self.sistema.casa_del_dueno() or "/root", "hehermes-copias", "agentes")
+
+    def _borrar(self, id_: str, perfil: str) -> None:
+        self.trabajos.poner(id_, estado="borrando")
+        try:
+            copias = self._carpeta_de_copias()
+            try:
+                antes = self.sistema.como_hermes(lambda: preparar_copias(copias))
+            except OSError:
+                raise Fallo("copia") from None
+            nombre = "%s-%s.tar.gz" % (perfil, time.strftime("%Y%m%d-%H%M%S", time.gmtime(self.sistema.ahora())))
+            # Los dos `hermes` de borrar tardan minutos (`PLAZO_HERMES_LARGO`); mientras, el trabajo late.
+            codigo, _ = self._mientras(id_, lambda: self._hermes_principal(
+                ["profile", "export", perfil, "--output", os.path.join(copias, nombre)], carpeta=copias,
+                plazo=PLAZO_HERMES_LARGO))
+            nuevas = self.sistema.como_hermes(lambda: copias_nuevas(copias, antes)) if codigo == 0 else []
+            if not nuevas:
+                _decir("borrar %s: sin copia (hermes profile export ha salido con %d): no se borra" % (perfil, codigo))
+                raise Fallo("copia")
+            self.trabajos.poner(id_)
+            codigo, _ = self._mientras(id_, lambda: self._hermes_principal(["profile", "delete", perfil, "--yes"],
+                                                                           plazo=PLAZO_HERMES_LARGO))
+            if perfil in self.perfiles():
+                _decir("borrar %s: hermes profile delete ha salido con %d" % (perfil, codigo))
+                raise Fallo("hermes")
+            if codigo != 0:
+                # Sale con error si no pudo cerrar la identidad del perfil en la base del principal
+                # (`ProfileIdentitySettlementPending`), con su lápida puesta y su carpeta ya borrada: para Hermes, el
+                # perfil ya no está, y aquí tampoco.
+                _decir("borrar %s: hermes profile delete ha salido con %d, pero el perfil ya no está: lo doy por "
+                       "borrado" % (perfil, codigo))
+            for carpeta in (self.config.claves_pasarela, self.config.claves_vigia):
+                quitar_clave(carpeta, perfil)
+        except Fallo as fallo:
+            self.trabajos.poner(id_, estado="fallo", motivo=fallo.motivo)
+            _decir("borrar %s (trabajo %s): fallo (%s)" % (perfil, id_[:8], fallo.motivo))
+            return
+        except Exception as error:  # noqa: BLE001
+            self.trabajos.poner(id_, estado="fallo", motivo="interna")
+            _decir("borrar %s (trabajo %s): fallo (interna: %s)" % (perfil, id_[:8], type(error).__name__))
+            return
+        self.trabajos.poner(id_, estado="hecho")
+        _decir("borrar %s (trabajo %s): hecho, con su copia" % (perfil, id_[:8]))
+
+    # -- La memoria que se comparte
+
+    def sincronizar_memoria(self) -> dict:
+        perfiles = self.perfiles()
+        leidos = self._leer(perfiles)
+        comparten = [p for p in perfiles if (leidos.get(p, {}).get("ficha") or {}).get("memoria") == "comparte"]
+        if not comparten:
+            return {"ok": True, "copiados": 0, "saltados": 0}
+        previo = _leer_json(self.trabajos.ruta("memoria.json"))
+        previo = previo if isinstance(previo, dict) else {}
+        espera = self.config.espera_flock
+        hecho = self.sistema.como_hermes(lambda: sincronizar(self.config.casa, [PRINCIPAL] + comparten, previo,
+                                                             espera))
+        if len(hecho["cambiados"]) > 1:
+            _decir("memoria compartida: %d cambiaron desde la vuelta anterior; gana la de %s"
+                   % (len(hecho["cambiados"]), hecho["ganador"]))
+        for perfil in hecho["saltados"]:
+            _decir("memoria compartida: %s se salta esta vuelta (su flock no llega en %g s)" % (perfil, espera))
+        if hecho["copiados"]:
+            _decir("memoria compartida: la de %s, copiada a %d" % (hecho["ganador"], hecho["copiados"]))
+        estado = dict(previo)
+        estado.update(hecho["estado"])
+        try:
+            self.trabajos._preparar()
+            _escribir_json(self.trabajos.ruta("memoria.json"),
+                           {p: v for p, v in estado.items() if p in [PRINCIPAL] + comparten})
+        except OSError as error:
+            _decir("memoria compartida: no puedo apuntar lo visto (%s)" % type(error).__name__)
+        return {"ok": True, "copiados": hecho["copiados"], "saltados": len(hecho["saltados"])}
+
+
+# MARK: El socket
+
+
+def par_del_vigia(conexion, uid_vigia: int | None = None) -> bool:
+    """Si al otro lado del socket está root o el vigía, según el núcleo (``SO_PEERCRED``). Sin eso, nadie."""
+    try:
+        if uid_vigia is None:
+            uid_vigia = pwd.getpwnam(USUARIO_VIGIA).pw_uid
+        credenciales = conexion.getsockopt(socket.SOL_SOCKET, SO_PEERCRED, struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", credenciales)
+    except (OSError, KeyError, AttributeError, TypeError, struct.error):
+        return False
+    return uid in (0, uid_vigia)
+
+
+def par_del_mismo_usuario(conexion, uid_propio: int | None = None) -> bool:
+    """Con ``--usuario``: solo este mismo usuario (el vigía sin root corre como él). Ni root ni nadie más."""
+    try:
+        if uid_propio is None:
+            uid_propio = os.geteuid()
+        credenciales = conexion.getsockopt(socket.SOL_SOCKET, SO_PEERCRED, struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", credenciales)
+    except (OSError, AttributeError, TypeError, struct.error):
+        return False
+    return uid_propio != 0 and uid == uid_propio
+
+
+def leer_peticion(conexion, plazo: float = 30.0) -> dict:
+    conexion.settimeout(plazo)
+    recibido = bytearray()
+    while b"\n" not in recibido:
+        if len(recibido) > MAX_LINEA:
+            raise Rechazo(400, "peticion_invalida", "La petición es demasiado grande")
+        trozo = conexion.recv(MAX_LINEA + 1)
+        if not trozo:
+            raise Rechazo(400, "peticion_invalida", "La petición llegó cortada")
+        recibido += trozo
+    linea, _, resto = bytes(recibido).partition(b"\n")
+    if len(linea) > MAX_LINEA:
+        raise Rechazo(400, "peticion_invalida", "La petición es demasiado grande")
+    if resto:
+        raise Rechazo(400, "peticion_invalida", "Sobran bytes")
+    try:
+        peticion = json.loads(linea.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise Rechazo(400, "peticion_invalida", "La petición no es JSON") from None
+    if not isinstance(peticion, dict):
+        raise Rechazo(400, "orden_desconocida", "Orden desconocida")
+    return peticion
+
+
+def atender(conexion, ayudante_de, par_permitido=par_del_vigia):
+    """Una conexión: la petición y la respuesta. Devuelve la continuación de un trabajo (o None), que se ejecuta con la
+    conexión ya cerrada. ``ayudante_de()`` crea el ``Ayudante`` solo si el par es de fiar."""
+    seguir = None
+    try:
+        if not par_permitido(conexion):
+            raise Rechazo(403, "no_autorizado", "Este ayudante solo atiende al vigía")
+        respuesta, seguir = ayudante_de().orden(leer_peticion(conexion))
+    except Rechazo as rechazo:
+        respuesta = rechazo.respuesta()
+        if rechazo.codigo not in ("en_curso", "trabajo_desconocido"):
+            _decir("rechazo: %s %s" % (rechazo.http, rechazo.codigo))
+    except Exception as error:  # noqa: BLE001 — la orden falla, el ayudante contesta
+        _decir("error inesperado: %s" % type(error).__name__)
+        respuesta = Rechazo(500, "error", "Error interno del ayudante").respuesta()
+    try:
+        conexion.settimeout(30)
+        conexion.sendall(json.dumps(respuesta, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+                         .encode("utf-8") + b"\n")
+    except OSError:
+        pass
+    return seguir
+
+
+USO = ("uso: hehermes-agentes [--hermes-home=<carpeta>] [--usuario-hermes=<usuario>] [--trabajo=<carpeta>] "
+       "[--claves-pasarela=<carpeta>] [--claves-vigia=<carpeta>] [--copias=<carpeta>] [--unidad-hermes=<unidad>] "
+       "[--puerto-hermes=<n>] [--hermes=<ruta>] [--usuario] --conexion | listar | sincronizar-memoria\n")
+OPCIONES = {"hermes-home", "usuario-hermes", "trabajo", "claves-pasarela", "claves-vigia", "copias", "unidad-hermes",
+            "puerto-hermes", "hermes"}
+CARPETAS = ("hermes-home", "trabajo", "claves-pasarela", "claves-vigia", "copias", "hermes")
+
+
+def main(argv: list) -> int:
+    opciones, resto = {}, []
+    for argumento in argv:
+        if argumento.startswith("--") and "=" in argumento:
+            clave, _, valor = argumento[2:].partition("=")
+            opciones[clave] = valor
+        else:
+            resto.append(argumento)
+    if set(opciones) - OPCIONES:
+        sys.stderr.write(USO)
+        return 2
+    for nombre in CARPETAS:
+        if nombre in opciones and (not opciones[nombre].startswith("/") or opciones[nombre].rstrip("/") == ""):
+            sys.stderr.write("hehermes-agentes: --%s tiene que ser una ruta absoluta\n" % nombre)
+            return 2
+    try:
+        puerto = int(opciones["puerto-hermes"]) if "puerto-hermes" in opciones else None
+    except ValueError:
+        puerto = 0
+    if puerto is not None and not 0 < puerto < 65536:
+        sys.stderr.write("hehermes-agentes: --puerto-hermes no vale\n")
+        return 2
+    unidad = opciones.get("unidad-hermes", "hermes-gateway.service")
+    if not re.fullmatch(r"[A-Za-z0-9:_.@-]{1,200}\.service", unidad):
+        sys.stderr.write("hehermes-agentes: --unidad-hermes no vale\n")
+        return 2
+    usuario = "--usuario" in resto
+    if usuario and os.geteuid() == 0:
+        sys.stderr.write("hehermes-agentes: --usuario es para el ayudante sin root\n")
+        return 2
+    resto = [r for r in resto if r != "--usuario"]
+    if resto not in (["--conexion"], ["listar"], ["sincronizar-memoria"]):
+        sys.stderr.write(USO)
+        return 2
+    usuario_hermes = opciones.get("usuario-hermes") or ("root" if os.geteuid() == 0 else
+                                                        pwd.getpwuid(os.geteuid()).pw_name)
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", usuario_hermes):
+        sys.stderr.write("hehermes-agentes: --usuario-hermes no vale\n")
+        return 2
+    config = Config(casa=opciones.get("hermes-home", "/root/.hermes"), usuario_hermes=usuario_hermes,
+                    trabajo=opciones.get("trabajo", "/var/lib/hehermes-agentes"),
+                    claves_pasarela=opciones.get("claves-pasarela", "/etc/hehermes-pasarela/agentes"),
+                    claves_vigia=opciones.get("claves-vigia", "/etc/hehermes-avisos/agentes"),
+                    copias=opciones.get("copias"), unidad=unidad, puerto=puerto, hermes=opciones.get("hermes"),
+                    usuario=usuario)
+    os.umask(0o077)
+    if resto == ["--conexion"]:
+        conexion = socket.socket(fileno=0)
+        try:
+            seguir = atender(conexion, lambda: Ayudante(config), par_del_mismo_usuario if usuario else par_del_vigia)
+            try:
+                conexion.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        finally:
+            conexion.detach()
+        for fd in (0, 1):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if seguir is not None:
+            seguir()
+        return 0
+    try:
+        if resto == ["listar"]:
+            respuesta = Ayudante(config).listar()
+        else:
+            respuesta = Ayudante(config).sincronizar_memoria()
+    except Rechazo as rechazo:
+        sys.stderr.write("hehermes-agentes: %d %s: %s\n" % (rechazo.http, rechazo.codigo, rechazo.mensaje))
+        return 1
+    print(json.dumps(respuesta, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

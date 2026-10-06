@@ -75,8 +75,8 @@ Con `server/` del repo copiado al VPS (a donde sea: el instalador busca el códi
    cambiar el código), código, configuración, credencial del vigía ante el relé, secreto entre nginx y el vigía, la
    clave de Hermes del vigía (con `hehermes-dispositivo clave --solo-vigia`, que no toca nginx), el fragmento de nginx y
    las unidades de systemd (dos sockets, que tienen los puertos, y dos servicios), además del lector y de los ayudantes
-   de la copia y de la entrada, con sus sockets. Deja los dos en marcha: el relé, sin su clave, contesta 503 a los
-   avisos.
+   de la copia, de la entrada, el que actualiza y el de los agentes (con su temporizador y las carpetas de sus claves),
+   con sus sockets. Deja los dos en marcha: el relé, sin su clave, contesta 503 a los avisos.
 4. La clave de APNs (developer.apple.com › Certificates, IDs & Profiles › Keys, con «Apple Push Notifications service»):
    `sudo install -m 0600 -o hh-rele -g hh-rele AuthKey_XXXXXXXXXX.p8 /etc/hehermes-avisos/rele/AuthKey.p8`, y su Key ID
    en `/etc/hehermes-avisos/rele.ini` (`clave_id = …`). El Team ID (`8X7L8YHD9M`) y el tema ya están.
@@ -329,6 +329,99 @@ enseña en Ajustes › Tu servidor cómo está el servidor y, si su instalador e
 instalador (que puede llevar rutas y nombres de los iPhone), en `/var/lib/hehermes-actualizar/registro.txt`, de root, y
 no en el journal.
 
+## Los agentes (desde la 1.6.0)
+
+Spec `docs/superpowers/specs/2026-10-05-agentes-design.md` («Revisión del 2026-10-05»), contrato
+`server/API-CONTRACT.md` §18. Cada agente es un **perfil de Hermes** (`<HERMES_HOME>/profiles/<perfil>`), que la
+pasarela de Hermes 0.21 sirve en su mismo proceso bajo `/p/<perfil>/`, con su propia `API_SERVER_KEY`. La app habla con
+todos por la misma conexión: la pasarela de HeHermes cambia el token del iPhone por la clave de cada perfil
+(`[agentes] claves` de `pasarela.ini`, `<perfil>.clave`), y a un perfil sin clave le contesta `404 agente_desconocido`.
+
+- **El vigía** vigila todos los perfiles: el principal como siempre y cada agente con su prefijo y su clave (la carpeta
+  `[agentes] claves`, `/etc/hehermes-avisos/agentes`, de root y del grupo `hh-vigia`). Lo visto va por perfil (base de
+  datos 5: la clave es `(perfil, id)`; lo de antes, del principal) y cada aviso lleva su `perfil` dentro del sobre; el
+  hilo y el colapso de un agente llevan `<perfil>/` delante (el principal, como antes). Un agente que no contesta no para
+  a los demás. Atiende `/avisos/v1/agentes/…` (listar, crear, ver, cambiar, borrar y el estado de un trabajo) y se lo
+  pasa al ayudante; `POST /avisos/v1/agentes/personalidad` se lo pide al principal (`/v1/chat/completions`, con un
+  mensaje de sistema fijo y la descripción como mensaje del usuario), uno a la vez. El lector y la entrada atienden lo
+  de cada perfil (`?exports <perfil>`, `perfil=`), nunca una ruta.
+- **El ayudante** es `/usr/local/libexec/hehermes-agentes` (`despliegue/`), Python sin dependencias, lanzado por
+  `hehermes-agentes.socket` (`/run/hehermes-agentes.sock`, `root:hh-vigia 0660`, `Accept=yes`) en un
+  `hehermes-agentes@.service` por conexión, **de root y sin ninguna capacidad** (con un Hermes de otro usuario,
+  `CAP_SETUID` y `CAP_SETGID`: lo de su casa lo hace un hijo que ya es ese usuario), `/etc` de solo lectura salvo las
+  dos carpetas de las claves, y solo `127.0.0.1`. Crear y borrar son **trabajos**: contestan al momento y siguen en el
+  mismo proceso con la conexión cerrada, uno a la vez (su estado en `/var/lib/hehermes-agentes/trabajos`). Todo `hermes`
+  que lanza va con `-p default` delante (el principal, aunque `hermes profile use` haya dejado otro perfil activo: sin
+  él, el `--clone` saldría de ese). Crear es
+  `hermes profile create <perfil> --clone` y, lo primero, una clave nueva en su `.env` (32 bytes; el `--clone` le deja
+  la del principal, y Hermes aparca un perfil con la clave de otro), su `SOUL.md`, su memoria (compartida, copiada o
+  de cero) y su clave en las dos carpetas (0640); luego le pide a la pasarela de Hermes que lo vuelva a mirar (el
+  verbo `rescan-profiles` de su socket de control, `<casa>/gateway.sock`) y espera hasta 2 minutos a que lo sirva,
+  mirándolo cada 2 s. Un Hermes que ya sirve otros perfiles sirve en caliente los nuevos (y vuelve a mirar cada 30 s el
+  que cambia su `.env`), **sin reiniciarlo**; si no lo sirve a tiempo, `fallo` con `no_se_sirve`, y el perfil se queda.
+  La lista no lanza `hermes` (tarda segundos): lee `profiles/` con la regla con la que Hermes elige los que sirve
+  (alguna de sus marcas, sin lápida, sin `gateway.parked` ni `gateway.standalone`) y pregunta a cada uno con su
+  clave, todos a la vez y con un plazo de 1 s (`servido`). Borrar hace antes una copia (`hermes profile export`, en
+  `~/hehermes-copias/agentes/` del dueño de Hermes): sin ella, no se borra. El principal no se borra nunca.
+- **El primer agente reinicia Hermes, una vez.** Con `gateway.multiplex_profiles` sin poner, Hermes decide al arrancar
+  si sirve otros perfiles: solo si hay dos o más (`resolve_multiplex_mode`, en la 0.21.5 y en main). El del VPS de
+  pruebas arrancó con el principal solo, así que contestó `multiplex: false` y no sirvió el primero. Cuando pasa eso, y
+  solo entonces, el ayudante:
+  1. mira que la unidad de Hermes (`--unidad-hermes`) esté en marcha y que la pasarela de Hermes corra dentro (el
+     `pid` de su `gateway_state.json` y su `/proc/<pid>/cgroup`): si no, no la toca, porque arrancar una parada sería
+     otra pasarela al lado de la que sirve;
+  2. espera hasta 10 minutos a un rato tranquilo, mirándolo cada 10 s: sin turnos en marcha (`active_agents` de su
+     `gateway_state.json`, que su pasarela apunta en cada turno: los chats, la API, cron y lo de segundo plano) y sin
+     escribir en el `state.db` ni en el `-wal` de ningún perfil que sirve en 2 minutos. La actividad de la pasarela de
+     HeHermes no sirve para esto: la app pregunta por el trabajo a través de ella cada pocos segundos;
+  3. pone el flag con la orden de Hermes, `hermes -p default config set gateway.multiplex_profiles true` (en el
+     principal aunque `hermes profile use` haya dejado otro activo; el mismo escritor, que conserva los comentarios,
+     que usa su `gateway migrate`), y comprueba que está en su `config.yaml`;
+  4. le vuelve a preguntar (`rescan-profiles`: si ya los sirve, no lo reinicia; si no contesta, tampoco), vuelve a
+     mirar la unidad y la reinicia una vez: `systemctl restart`, que para Hermes como diga ella (con la del VPS de
+     pruebas, `KillMode=mixed` y `TimeoutStopSec=210`: SIGTERM, y Hermes drena lo que tenga en marcha);
+  5. espera hasta 4 minutos a que lo sirva.
+
+  **No** usa `hermes gateway migrate --multiplex`: deja su manifiesto, activa la unidad al arrancar la máquina y, si no
+  reconoce la unidad por su nombre, instala otra o mata la pasarela y lanza otra suelta (`_restart_default` de
+  `hermes_cli/gateway_migrate.py`); y su reinicio (`hermes gateway restart`) puede reescribir la unidad
+  (`refresh_systemd_unit_if_needed`). Nunca reinicia si Hermes ya sirve otros perfiles, ni dos veces en un trabajo. Si
+  no llega un rato tranquilo, o la orden o el reinicio fallan, `no_se_sirve`: el perfil se queda, y el registro dice que
+  Hermes lo servirá en su próximo reinicio. Mientras, el trabajo dice en qué está (`paso`: `esperando_a_hermes` o
+  `reiniciando_hermes`, §18.4). **Deshacerlo**: borrar los agentes y quitar la línea `multiplex_profiles: true` del
+  bloque `gateway:` del `config.yaml` de Hermes (`false` está retirado: Hermes lo reescribe a `true`); con el principal
+  solo, en su siguiente arranque vuelve a servir solo a él.
+- **Borrar tarda minutos, y es de Hermes**: en el VPS de pruebas, la copia y el borrado de un agente recién creado,
+  261 s entre los dos (1 min 18 s de CPU, 368 MB de pico). `hermes profile export` copia el perfil a una carpeta
+  temporal y le pasa el redactor de secretos a cada fichero de texto (las habilidades que trajo el `--clone`) antes de
+  comprimirlo; `hermes profile delete` arranca la CLI entera, para lo del perfil (servicios, procesos, su socket) y, con
+  una pasarela que no multiplexa (no apunta `served_profiles`), purga su identidad abriendo él mismo el `state.db` del
+  principal (`purge_profile_identity`: unas filas de `gateway_routing`, `gateway_heartbeats`, `delivery_obligations` y
+  las de Telegram; el historial no se toca); con una que multiplexa, se lo pide a ella por su socket. Nada de eso es del
+  ayudante, que solo los espera: cada uno con hasta 10 minutos, con el trabajo latiendo mientras (la lista lo sigue
+  viendo en marcha), y el vigía no espera a ninguno (cada orden contesta al momento; el estado del trabajo, también). Si
+  `hermes profile delete` sale con error pero el perfil ya no está, se da por borrado.
+- **La memoria que comparten**: `hehermes-agentes-memoria.timer`, cada minuto, lanza el mismo ayudante
+  (`sincronizar-memoria`, sin red y sin `hermes`): entre el principal y los que comparten, el `USER.md` más nuevo va a
+  los demás, cada uno con el `flock` de Hermes (`memories/USER.md.lock`).
+- **Las claves nunca** van en un argumento, en el registro ni en una respuesta. En el registro, el perfil, el principio
+  del trabajo, la orden y el resultado: ni una personalidad ni lo que sabe de ti.
+- **En el VPS de Daniel** lo pone `instalar.sh`, con los demás ayudantes, y las dos carpetas de las claves (la de la
+  pasarela, si está). **Quitarlo:** `sudo …/instalar.sh --desinstalar-agentes` (no con un agente a medio crear): se
+  van el ayudante, sus unidades y sus claves; los agentes, que son perfiles de Hermes, y sus copias se quedan, y volver
+  a instalarlo copia otra vez sus claves de su `.env`.
+
+**Para root, a mano:** `sudo /usr/bin/python3 -I -S /usr/local/libexec/hehermes-agentes listar` (los agentes y cuántos
+caben). Lo que pasa, en `journalctl -u 'hehermes-agentes@*' -u hehermes-agentes-memoria`.
+
+**Comprobado en el VPS de Daniel** (tarea 7; su Hermes es la rama main del 2026-10-05, no la 0.21.5 etiquetada, y en
+la App Store puede haber de las dos): crear, la copia antes de borrar y borrar, sin tocar el `USER.md` del principal.
+Y que Hermes sirve un perfil nuevo en caliente, pero aparca el que trae la clave del principal hasta que vuelve a
+mirarlo: de ahí la clave lo primero y el `rescan-profiles`. Ese día, con su Hermes arrancado con el principal solo,
+crear dio `no_se_sirve` a los 7 s (`multiplex: false`) y borrar tardó 261 s: de ahí el reinicio del primer agente y
+los plazos largos de borrar. **Sin comprobar todavía:** el reinicio del primer agente en el VPS, y un Hermes que ya es
+un perfil de otro (`hermes -p <nombre>`): ahí no se crean agentes.
+
 ## Probar de punta a punta
 
 1. Con la VPN puesta, en Safari del iPhone: `http://10.77.0.1/avisos/v1/salud` → `{"estado": "ok", "servicio": "vigia", …}`.
@@ -501,3 +594,8 @@ la de Apple), `tests/test_permisos.py` y, por TLS, `tests/test_rele_publico.py`.
   propia location, y el vigía no depende de ese agujero (lee a Hermes directo, con su copia de la clave), así que
   cerrarlo no rompe nada: en la `location /` del túnel, antes de lo demás, lo mismo que lleva la de los avisos,
   `deny 10.77.0.1; allow 10.77.0.0/24; allow 10.77.1.0/24; deny all;`.
+- Los agentes (1.6.0): la limpieza de noche de lo que la app borra (`hehermes-borrado`, del instalador) compacta solo
+  el `state.db` del principal; lo que se borra de un agente queda en el suyo hasta que Hermes lo compacte. Y el lector y
+  la entrada ven `profiles/` entero por el núcleo (`BindReadOnlyPaths`, `BindPaths`): dentro, lo que leen y escriben de
+  cada perfil lo decide su lista de permitidas, no la jaula. Un perfil que ya estaba antes del ayudante, sin clave en su
+  `.env`, sale en la lista con `servido: false` hasta que la tenga.

@@ -117,11 +117,12 @@ def ficheros_propios(origen: str, prefijo: str = p.PREFIJO) -> list:
     if fuente is not None:
         with open(fuente, "rb") as f:
             salida.append((prefijo + "/hehermes-leer-media", f.read(), 0o755))
-    # Y el ayudante de la copia en iCloud (desde la 0.10.0), el de la entrada (desde la 0.10.6) y el que actualiza
-    # (desde la 0.10.10), igual.
+    # Y el ayudante de la copia en iCloud (desde la 0.10.0), el de la entrada (desde la 0.10.6), el que actualiza
+    # (desde la 0.10.10) y el de los agentes (desde la 0.11.0), igual.
     for nombre, fuente in (("hehermes-respaldo", fuente_del_respaldo(origen)),
                            ("hehermes-entrada", fuente_de_la_entrada(origen)),
-                           ("hehermes-actualizar", fuente_del_actualizar(origen))):
+                           ("hehermes-actualizar", fuente_del_actualizar(origen)),
+                           ("hehermes-agentes", fuente_de_agentes(origen))):
         if fuente is not None:
             with open(fuente, "rb") as f:
                 salida.append((prefijo + "/" + nombre, f.read(), 0o755))
@@ -151,6 +152,11 @@ def fuente_de_la_entrada(origen: str) -> str | None:
 def fuente_del_actualizar(origen: str) -> str | None:
     """`hehermes-actualizar`: en el paquete, junto al instalador; en el repositorio, en `server/avisos/despliegue`."""
     return buscar_en_origen(origen, "hehermes-actualizar", "../avisos/despliegue/hehermes-actualizar")
+
+
+def fuente_de_agentes(origen: str) -> str | None:
+    """`hehermes-agentes`: en el paquete, junto al instalador; en el repositorio, en `server/avisos/despliegue`."""
+    return buscar_en_origen(origen, "hehermes-agentes", "../avisos/despliegue/hehermes-agentes")
 
 
 def buscar_en_origen(origen: str, *candidatas: str) -> str | None:

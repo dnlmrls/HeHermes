@@ -86,10 +86,12 @@ class Aviso:
     colapsa_con: str | None = None
     # En una aprobación con `request_id`, lo que hace falta para contestarla desde el aviso (`contenido`).
     aprobacion: PeticionDePermiso | None = None
+    # El perfil de Hermes del que es (un agente, contrato §18; `default`, el principal).
+    perfil: str = "default"
 
     @property
     def identidad(self) -> str:
-        return f"{self.sesion or ''}\n{self.clave}"
+        return f"{self.perfil}\n{self.sesion or ''}\n{self.clave}"
 
 
 def aviso_de_prueba(ahora: float, caduca: int) -> Aviso:
@@ -140,7 +142,7 @@ TOPE_CLARO = 2800
 
 
 def contenido(aviso: Aviso, vista_previa: str) -> bytes:
-    """Lo que va cifrado: ``{"sesion", "texto", "tipo", "titulo"}``, con las claves ordenadas y sin espacios.
+    """Lo que va cifrado: ``{"perfil", "sesion", "texto", "tipo", "titulo"}``, con las claves ordenadas y sin espacios.
 
     **Se manda lo que se va a enseñar y nada más.** Con «solo el nombre», la extensión enseña el título y una frase fija
     en lugar de la respuesta; con «nunca», ni el título. Lo que no se enseña no viaja, aunque vaya cifrado: si la
@@ -155,8 +157,9 @@ def contenido(aviso: Aviso, vista_previa: str) -> bytes:
     """
     titulo = aviso.titulo if vista_previa in ("siempre", "nombre") else ""
     cuerpo = aviso.texto if vista_previa == "siempre" else ""
+    # Desde la 1.6.0, el perfil (contrato §18.9): la app abre el chat de ese agente y pone su cara.
     datos = {"tipo": aviso.tipo, "sesion": aviso.sesion or "", "titulo": texto.recortar(titulo, texto.TOPE_TITULO),
-             "texto": texto.recortar(cuerpo, texto.TOPE_TEXTO)}
+             "texto": texto.recortar(cuerpo, texto.TOPE_TEXTO), "perfil": aviso.perfil}
     pedida = aviso.aprobacion
     if pedida is not None and vista_previa == "siempre" and pedida.texto:
         entera = _escrito(dict(datos, texto=pedida.texto, aprobacion={
@@ -184,16 +187,23 @@ def _hmac(clave_ids: bytes, mensaje: str) -> str:
     return hmac.new(clave_ids, mensaje.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
 
 
-def hilo(clave: bytes, sesion: str) -> str:
+def _de(perfil: str | None, sesion: str) -> str:
+    """La sesión con su perfil delante (contrato §18.9): la del principal, sola, como siempre; la de un agente, con
+    `<perfil>/`. Ni el perfil ni la sesión llevan nunca una barra."""
+    return sesion if perfil in (None, "default") else perfil + "/" + sesion
+
+
+def hilo(clave: bytes, sesion: str, perfil: str = "default") -> str:
     """El ``thread-id`` de una conversación para un iPhone: HMAC-SHA256 con ``K_ids`` (la subclave de su clave) de
-    ``"hilo:" + sesión``, en hexadecimal, los 32 primeros caracteres.
+    ``"hilo:" + sesión``, en hexadecimal, los 32 primeros caracteres. La de un agente lleva su perfil delante de la
+    sesión (``"hilo:" + perfil + "/" + sesión``): la misma sesión en dos perfiles son dos conversaciones.
 
     iOS agrupa por hilo, así que tiene que ser el mismo para todos los avisos de una conversación. Pero viaja en claro, y
     el id de la sesión lleva su fecha (``api_<epoch>_…``): Apple y el relé verían qué avisos son de la misma
     conversación y desde cuándo existe. Así solo ven 32 caracteres que cambian de un iPhone a otro. La app, que tiene la
     clave, calcula lo mismo para reagrupar y abrir la conversación de un aviso que no pudo descifrar.
     """
-    return _hmac(clave_de_ids(clave), "hilo:" + sesion)
+    return _hmac(clave_de_ids(clave), "hilo:" + _de(perfil, sesion))
 
 
 def carga(aviso: Aviso, dispositivo: Dispositivo, nonce: bytes | None = None) -> dict:
@@ -201,7 +211,7 @@ def carga(aviso: Aviso, dispositivo: Dispositivo, nonce: bytes | None = None) ->
     aps: dict = {"alert": {"title": TITULO_DE_RESERVA, "body": CUERPO_DE_RESERVA}, "mutable-content": 1}
     if aviso.sesion:
         # iOS agrupa por hilo: los avisos de un chat van juntos, como en Mensajes. La prueba no es de ningún chat.
-        aps["thread-id"] = hilo(dispositivo.clave, aviso.sesion)
+        aps["thread-id"] = hilo(dispositivo.clave, aviso.sesion, aviso.perfil)
     if dispositivo.ajustes.sonido == "mensajes":
         aps["sound"] = "default"
     if aviso.tipo == "aprobacion":
@@ -219,9 +229,11 @@ def colapso(aviso: Aviso, clave: bytes) -> str:
     suceso``, en hexadecimal, los 32 primeros caracteres; la sesión va vacía en la prueba. Sale del suceso, no del envío: si el mismo se manda dos veces (un
     reintento cuyo primer intento sí llegó, un reinicio entre mandar y apuntarlo), el iPhone enseña uno. Las
     aprobaciones de una conversación colapsan entre sí («aprobacion»), porque una nueva deja vieja a la anterior: el
-    turno está parado esperando solo a la última. Con HMAC, como el hilo, no dice nada a quien lo ve en claro.
+    turno está parado esperando solo a la última. Con HMAC, como el hilo, no dice nada a quien lo ve en claro. El de un
+    agente, con su perfil delante de la sesión, como el hilo.
     """
-    return _hmac(clave_de_ids(clave), "colapso:" + (aviso.sesion or "") + "\n" + (aviso.colapsa_con or aviso.clave))
+    return _hmac(clave_de_ids(clave), "colapso:" + _de(aviso.perfil, aviso.sesion or "") + "\n"
+                 + (aviso.colapsa_con or aviso.clave))
 
 
 def peticion_al_rele(aviso: Aviso, dispositivo: Dispositivo, nonce: bytes | None = None) -> dict:

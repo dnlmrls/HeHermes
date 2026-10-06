@@ -67,11 +67,12 @@ class Instalar(Base):
         self.assertEqual(self.sis.modo(p.DISPOSITIVO), 0o750)
         self.assertEqual(self.sis.enlace(p.ORDEN), p.PREFIJO + "/hehermes-servidor")
         # Desde la 0.8.0, también el lector de ficheros y el vigía (sin credencial), después de la pasarela; desde la
-        # 0.10.0, el ayudante de la copia en iCloud; desde la 0.10.6, el de la entrada, y desde la 0.10.10, el que
-        # actualiza (con root).
+        # 0.10.0, el ayudante de la copia en iCloud; desde la 0.10.6, el de la entrada; desde la 0.10.10, el que
+        # actualiza (con root), y desde la 0.11.0, el de los agentes y su temporizador.
         self.assertEqual(man.unidades, ["hehermes-pasarela.service", "hehermes-leer-media.socket",
                                         "hehermes-respaldo.socket", "hehermes-entrada.socket",
-                                        "hehermes-actualizar.socket", "hehermes-vigia.socket",
+                                        "hehermes-actualizar.socket", "hehermes-agentes.socket",
+                                        "hehermes-agentes-memoria.timer", "hehermes-vigia.socket",
                                         "hehermes-vigia.service", "hehermes-borrado.timer",
                                         "hehermes-pasarela-clave.path", "hehermes-cortafuegos.service"])
         self.assertEqual((man.modos, man.paquetes, man.reglas), (["tls"], [], []))

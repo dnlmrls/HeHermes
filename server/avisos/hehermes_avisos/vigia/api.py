@@ -14,6 +14,9 @@
   desde la 1.5.2): las subidas y sus trozos, en binario, con cuerpos de hasta 4 MiB + 64 KiB
 - ``/avisos/v1/servidor``, ``…/servidor/actualizar``       Ajustes › Tu servidor (``servidor.py``, contrato §17, desde
   la 1.5.5): el estado del servidor, sin secretos, y actualizarlo con el ayudante que actualiza
+- ``/avisos/v1/agentes…``                                 los agentes (``agentes.py``, contrato §18, desde la 1.6.0):
+  listarlos, crearlos, verlos, cambiarlos y borrarlos con su ayudante, y escribir la personalidad de uno nuevo. Y las
+  rutas que llevan ``sesion`` (el fichero, los ficheros dejados) y las de la entrada aceptan ``perfil=``
 
 Todo contesta 204 si va bien, y los errores con el envoltorio del api_server de Hermes, que es el que entiende la app.
 Menos dos (spec 2026-09-28, «Avisos sin comandos», Contrato C): el alta contesta ``200 {"envio": …}``, con qué va a
@@ -44,13 +47,16 @@ import time
 from .. import VERSION, cifrado
 from ..comun import ENTORNOS, PATRON_TOKEN, ErrorHTTP, ManejadorJSON, cola, es_ip_publica, es_nombre_dns
 from . import avisos
+from .agentes import PREFIJO as PREFIJO_AGENTES
+from .agentes import Agentes
 from .ajustes import MAX_ID_SESION, Ajustes
-from .almacen import Almacen, Permiso
+from .almacen import PRINCIPAL, Almacen, Permiso
 from .entrada import PREFIJO as PREFIJO_ENTRADA
 from .entrada import TOPE_CUERPO as TOPE_ENTRADA
 from .entrada import Entradas
 from .envio import BAJA, ENVIADO, LIMITADO, PERMISO, REINTENTABLE, SIN_PERMISO, Mensajero
-from .fichero import PATRON_SESION, Descarga, Ficheros, disposicion, parametros
+from .fichero import (PATRON_PERFIL, PATRON_SESION, Descarga, Ficheros, disposicion, parametros, perfil_de_la_consulta,
+                      perfil_valido)
 from .respaldo import PREFIJO as PREFIJO_RESPALDO
 from .respaldo import TOPE_CUERPO as TOPE_RESPALDO
 from .respaldo import Respaldos
@@ -125,7 +131,7 @@ class AppVigia:
     def __init__(self, almacen: Almacen, mensajero: Mensajero, *, secreto_tunel: str, caducidad_prueba: int = 300,
                  reloj=time.time, al_moverse=None, ficheros: Ficheros | None = None,
                  respaldos: Respaldos | None = None, exportaciones=None, entradas: Entradas | None = None,
-                 servidor: Servidor | None = None):
+                 servidor: Servidor | None = None, agentes: Agentes | None = None):
         if not secreto_tunel:
             raise ValueError("sin el secreto del túnel, la API del vigía quedaría abierta a cualquier proceso local")
         self.almacen = almacen
@@ -146,6 +152,8 @@ class AppVigia:
         self.entradas = entradas
         # Ajustes › Tu servidor (`servidor.py`). Sin él, como un vigía de antes: 404 `ruta_desconocida`.
         self.servidor = servidor
+        # Los agentes (`agentes.py`, contrato §18). Sin ellos, como un vigía de antes: 404 `ruta_desconocida`.
+        self.agentes = agentes
 
     def viene_del_tunel(self, valor: str | None) -> bool:
         """Si la petición trae el secreto que pone nginx. Comparado en tiempo constante."""
@@ -239,18 +247,26 @@ class AppVigia:
     def fichero(self, consulta: dict) -> Descarga:
         if self.ficheros is None:
             raise ErrorHTTP(503, "lector_no_disponible", "Este vigía no tiene el lector de ficheros")
-        return self.ficheros.preparar(consulta.get("sesion"), consulta.get("ruta"))
+        return self.ficheros.preparar(consulta.get("sesion"), consulta.get("ruta"), consulta.get("perfil", PRINCIPAL))
 
-    def ficheros_dejados(self, sesion: object) -> dict:
-        """``GET /avisos/v1/ficheros?sesion=``: lo que Hermes ha dejado en ``exports/`` para esa conversación
-        (``exportaciones``), del más reciente al más antiguo. La app lo enseña como «Hermes ha dejado un fichero», aunque
-        Hermes aún no haya escrito su línea ``MEDIA:``. Solo nombres, tamaños y horas de lo que ya es del iPhone."""
+    def ficheros_dejados(self, sesion: object, perfil: object = PRINCIPAL) -> dict:
+        """``GET /avisos/v1/ficheros?sesion=&perfil=``: lo que Hermes ha dejado en el ``exports/`` de ese perfil para
+        esa conversación (``exportaciones``), del más reciente al más antiguo. La app lo enseña como «Hermes ha dejado un
+        fichero», aunque Hermes aún no haya escrito su línea ``MEDIA:``. Solo nombres, tamaños y horas de lo que ya es
+        del iPhone."""
         if not (isinstance(sesion, str) and PATRON_SESION.fullmatch(sesion)):
             raise ErrorHTTP(400, "parametro_invalido", "Falta la sesión, o no tiene forma de sesión")
+        perfil = perfil_valido(perfil)
         if self.exportaciones is None:
             return {"ficheros": []}
+        if hasattr(self.exportaciones, "de"):
+            de_ese = self.exportaciones.de(perfil)
+        else:
+            de_ese = self.exportaciones if perfil == PRINCIPAL else None
+        if de_ese is None:
+            return {"ficheros": []}
         return {"ficheros": [{"ruta": f.ruta, "nombre": f.nombre, "tamano": f.tamano, "instante": f.instante}
-                             for f in self.exportaciones.de_la_sesion(sesion)]}
+                             for f in de_ese.de_la_sesion(sesion)]}
 
     def baja(self, token: str) -> None:
         if not self.almacen.borrar_dispositivo(token):
@@ -271,21 +287,25 @@ def _si_no_avisa_de_nada(token: str, ajustes: Ajustes) -> None:
 
 
 def _turnos(lista: object) -> list:
-    """Los turnos de ``{"turnos": [{"run_id": …, "sesion": …}]}``, si vienen. Lo que no tenga forma se ignora: es una
-    ampliación opcional y una app que la mande mal no puede quedarse sin su primer plano."""
+    """Los turnos de ``{"turnos": [{"run_id": …, "sesion": …, "perfil": …}]}``, si vienen (``perfil``, desde la 1.6.0:
+    el de un agente; sin él, el principal). Lo que no tenga forma se ignora: es una ampliación opcional y una app que la
+    mande mal no puede quedarse sin su primer plano."""
     if not isinstance(lista, list):
         return []
     turnos = []
     for turno in lista[:MAX_TURNOS]:
         if isinstance(turno, dict):
-            run_id, sesion = turno.get("run_id"), turno.get("sesion")
+            run_id, sesion, perfil = turno.get("run_id"), turno.get("sesion"), turno.get("perfil", PRINCIPAL)
             if (isinstance(run_id, str) and PATRON_ID.fullmatch(run_id) and isinstance(sesion, str)
-                    and PATRON_ID.fullmatch(sesion)):
-                turnos.append((run_id, sesion))
+                    and PATRON_ID.fullmatch(sesion) and isinstance(perfil, str) and PATRON_PERFIL.fullmatch(perfil)):
+                turnos.append((run_id, sesion, perfil))
     return turnos
 
 
 class ManejadorVigia(ManejadorJSON):
+    # Cambiar un agente (`PATCH /avisos/v1/agentes/{perfil}`, desde la 1.6.0): el único PATCH del vigía.
+    do_PATCH = ManejadorJSON._despachar
+
     def nombre_registro(self) -> str:
         return "vigia.api"
 
@@ -309,14 +329,19 @@ class ManejadorVigia(ManejadorJSON):
             return self._entrada(app)
         elif ruta == PREFIJO_SERVIDOR or ruta.startswith(PREFIJO_SERVIDOR + "/"):
             return self._servidor(app)
+        elif ruta == PREFIJO_AGENTES or ruta.startswith(PREFIJO_AGENTES + "/"):
+            return self._agentes(app)
         elif ruta == "/avisos/v1/fichero":
             self._exigir(metodo, "GET")
-            sesion, ruta_fichero = parametros(self.path.partition("?")[2])
-            return self._enviar_descarga(app.fichero({"sesion": sesion, "ruta": ruta_fichero}))
+            consulta = self.path.partition("?")[2]
+            sesion, ruta_fichero = parametros(consulta)
+            return self._enviar_descarga(app.fichero({"sesion": sesion, "ruta": ruta_fichero,
+                                                      "perfil": perfil_de_la_consulta(consulta)}))
         elif ruta == "/avisos/v1/ficheros":
             self._exigir(metodo, "GET")
-            sesion, _ = parametros(self.path.partition("?")[2])
-            return self.enviar_json(200, app.ficheros_dejados(sesion))
+            consulta = self.path.partition("?")[2]
+            sesion, _ = parametros(consulta)
+            return self.enviar_json(200, app.ficheros_dejados(sesion, perfil_de_la_consulta(consulta)))
         else:
             encontrada = RUTA_DISPOSITIVO.fullmatch(ruta)
             if not encontrada:
@@ -363,7 +388,16 @@ class ManejadorVigia(ManejadorJSON):
         if app.entradas is None:
             raise ErrorHTTP(503, "entrada_no_disponible", "Este vigía no tiene el ayudante de la entrada")
         self.tope_cuerpo = TOPE_ENTRADA
-        estado, objeto, cabeceras = app.entradas.atender(self.command, self.ruta, self.leer_cuerpo, self.headers)
+        perfil = perfil_de_la_consulta(self.path.partition("?")[2])
+        estado, objeto, cabeceras = app.entradas.atender(self.command, self.ruta, self.leer_cuerpo, self.headers,
+                                                         perfil=perfil)
+        return self.enviar_json(estado, objeto, cabeceras)
+
+    def _agentes(self, app: AppVigia) -> None:
+        """Los agentes (contrato §18): la lista, crear, ver, cambiar y borrar con su ayudante, y la personalidad."""
+        if app.agentes is None:
+            raise ErrorHTTP(404, "ruta_desconocida", "Ruta desconocida")
+        estado, objeto, cabeceras = app.agentes.atender(self.command, self.ruta, self.leer_cuerpo)
         return self.enviar_json(estado, objeto, cabeceras)
 
     def _servidor(self, app: AppVigia) -> None:

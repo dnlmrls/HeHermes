@@ -59,9 +59,12 @@ SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
 # La lista de permitidas, otra vez, pero ahora la hace cumplir el núcleo: /root y /home, vacíos (un tmpfs), y dentro solo
-# las carpetas permitidas, de solo lectura. La que aún no exista se salta (el «-»): el lector contesta que no está.
+# las carpetas permitidas, de solo lectura. La que aún no exista se salta (el «-»): el lector contesta que no está. Desde
+# la 1.6.0, también los perfiles de los agentes (profiles/), enteros: los agentes se crean y se borran sin tocar esta
+# unidad, así que aquí no se pueden nombrar sus carpetas. Dentro de ellos, lo que se lee lo decide el lector (sus caches
+# y su exports/, como en la casa; su .env, nunca).
 ProtectHome=tmpfs
-BindReadOnlyPaths=-/root/.hermes/image_cache -/root/.hermes/audio_cache -/root/.hermes/exports
+BindReadOnlyPaths=-/root/.hermes/image_cache -/root/.hermes/audio_cache -/root/.hermes/exports -/root/.hermes/profiles
 # Y fuera de las casas, lo que la segunda red del lector prohíbe por su nombre, tapado. /proc, /sys, /dev y /run ya los
 # recortan las líneas de arriba.
 InaccessiblePaths=-/etc/shadow -/etc/shadow- -/etc/gshadow -/etc/gshadow- -/etc/sudoers -/etc/sudoers.d

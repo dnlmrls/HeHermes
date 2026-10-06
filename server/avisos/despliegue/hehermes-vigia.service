@@ -13,8 +13,11 @@ Wants=hehermes-respaldo.socket
 Wants=hehermes-entrada.socket
 # Actualizar el servidor desde la app (/avisos/v1/servidor/actualizar, desde la 1.5.5). Sin él, esas rutas dan 503.
 Wants=hehermes-actualizar.socket
+# Los agentes (/avisos/v1/agentes, desde la 1.6.0): crear, cambiar y borrar los perfiles de Hermes. Sin él, esas rutas
+# dan 503.
+Wants=hehermes-agentes.socket
 After=network-online.target nginx.service hehermes-vigia.socket hehermes-rele.socket hehermes-leer-media.socket
-After=hehermes-respaldo.socket hehermes-entrada.socket hehermes-actualizar.socket
+After=hehermes-respaldo.socket hehermes-entrada.socket hehermes-actualizar.socket hehermes-agentes.socket
 
 [Service]
 Type=simple

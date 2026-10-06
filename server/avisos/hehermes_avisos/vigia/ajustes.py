@@ -6,6 +6,10 @@
 Se leen con la mano floja, igual que en la app: lo que falte o no se entienda vale lo de fábrica. Un ajuste de una
 versión más nueva de la app no puede dejar al vigía sin saber qué hacer, y lo de fábrica es avisar de todo, que es lo que
 Daniel aprobó.
+
+Las apps posteriores a la 1.0 (12) traen también ``"textos": 2``: qué textos fijos de la app entiende ese iPhone
+(``ContratoDeAjustes.textos``). No es un ajuste, pero viaja con ellos, en el alta y en cada cambio. Sin él es una app de
+antes (``1``), que solo sabe esconder la continuación de antes (``entregas.texto_de_la_continuacion``).
 """
 
 from __future__ import annotations
@@ -21,6 +25,11 @@ INTERRUPTOR_DE = {"respuesta": "respuestas", "aprobacion": "aprobaciones", "segu
 # cada alta pese megas.
 MAX_SILENCIADOS = 1000
 MAX_ID_SESION = 256
+# Los textos fijos de la app: los de antes (con el nombre de quien la hizo), que entiende cualquier app, y los de ahora.
+TEXTOS_DE_ANTES = 1
+TEXTOS_SIN_NOMBRE = 2
+# Lo más alto que se cree: un número absurdo es un cliente roto, no una app del futuro.
+MAX_TEXTOS = 1000
 
 
 @dataclass(frozen=True)
@@ -35,6 +44,8 @@ class Ajustes:
     # push). Se guarda para devolver los ajustes tal cual si algún día hace falta.
     numero: bool = True
     silenciados: tuple = field(default_factory=tuple)
+    # Qué textos fijos de la app entiende este iPhone (arriba). Sin decirlo, los de antes.
+    textos: int = TEXTOS_DE_ANTES
 
     @classmethod
     def desde_json(cls, objeto: object) -> Ajustes:
@@ -56,13 +67,23 @@ class Ajustes:
         if isinstance(silenciados, list):
             validos = sorted({s for s in silenciados if isinstance(s, str) and 0 < len(s) <= MAX_ID_SESION})
             ajustes = replace(ajustes, silenciados=tuple(validos[:MAX_SILENCIADOS]))
+        textos = objeto.get("textos")
+        # Un entero de JSON y no un booleano (en Python, `True` también es un `int`).
+        if isinstance(textos, int) and not isinstance(textos, bool) and TEXTOS_DE_ANTES <= textos <= MAX_TEXTOS:
+            ajustes = replace(ajustes, textos=textos)
         return ajustes
 
     def a_json(self) -> dict:
         return {"tipos": {"respuestas": self.respuestas, "aprobaciones": self.aprobaciones,
                           "segundo_plano": self.segundo_plano, "errores": self.errores},
                 "vista_previa": self.vista_previa, "sonido": self.sonido, "numero": self.numero,
-                "silenciados": list(self.silenciados)}
+                "silenciados": list(self.silenciados), "textos": self.textos}
+
+    @property
+    def entiende_los_textos_sin_nombre(self) -> bool:
+        """Si este iPhone esconde la continuación de ahora (``deteccion.TEXTO_CONTINUAR``): una app de antes la pintaría
+        como un mensaje suyo."""
+        return self.textos >= TEXTOS_SIN_NOMBRE
 
     def avisa_de(self, tipo: str) -> bool:
         """Si este tipo de aviso está encendido. Un tipo que no depende de ningún interruptor (la prueba) siempre."""

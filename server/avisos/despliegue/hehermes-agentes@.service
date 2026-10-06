@@ -1,0 +1,67 @@
+# /etc/systemd/system/hehermes-agentes@.service
+# Un ayudante por conexión a /run/hehermes-agentes.sock (hehermes-agentes.socket, Accept=yes): lee una orden y
+# contesta por el mismo socket. Crear y borrar un agente contestan al momento y siguen en este mismo proceso, con la
+# conexión ya cerrada (el estado, en /var/lib/hehermes-agentes/trabajos).
+#
+# Corre como root, sin ninguna capacidad: lo de la casa de Hermes es de root (si Hermes es de otro usuario, instalar.sh
+# deja un añadido con CAP_SETUID y CAP_SETGID, para que lo haga como él), y escribe las claves de cada agente en las
+# carpetas de la pasarela y del vigía, que son de root (con el grupo de cada uno). Lanza `hermes profile …`, le pide
+# a la pasarela de Hermes por su socket de control que vuelva a mirar los perfiles y mira su API en 127.0.0.1: un Hermes
+# que ya sirve otros perfiles sirve los nuevos en caliente, sin reiniciarlo. Con el primer agente (Hermes aún no sirve
+# otros perfiles: lo decide al arrancar), `hermes config set gateway.multiplex_profiles true` y `systemctl restart` de
+# la unidad de Hermes, una vez, con drenaje y en un rato tranquilo: el socket de systemd de /run (root, aunque sin
+# capacidades, puede pedírselo). Lo que no necesita, fuera: /usr, /boot y /etc de solo lectura (menos las dos carpetas
+# de las claves), su propio /tmp, sin dispositivos, solo 127.0.0.1, y los secretos de HeHermes y del sistema, tapados.
+# Sin SystemCallFilter ni MemoryDenyWriteExecute: `hermes` es el Python de Hermes, con sus extensiones.
+[Unit]
+Description=HeHermes: ayudante de los agentes
+Documentation=file:///opt/hehermes-avisos/src/README.md
+# Cada rechazo es una respuesta, no un fallo: que no se acumulen en `systemctl --failed`. Lo que pasó queda en el
+# registro (journalctl -u 'hehermes-agentes@*'): el perfil, el trabajo y el resultado, nunca una clave.
+CollectMode=inactive-or-failed
+
+[Service]
+Type=simple
+# Python del sistema, sin nada del entorno ni del directorio (-I), sin site (-S) y sin escribir bytecode (-B). La casa
+# de Hermes, de quién es y su unidad: si hermes-gateway dice otras, instalar.sh deja un añadido
+# (hehermes-agentes@.service.d/hermes.conf) que cambia esta línea. El puerto de la API lo lee del .env de Hermes.
+ExecStart=/usr/bin/python3 -I -S -B /usr/local/libexec/hehermes-agentes --hermes-home=/root/.hermes --usuario-hermes=root --unidad-hermes=hermes-gateway.service --conexion
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+# El estado de los trabajos (un día) y lo que se vio de la memoria compartida. Solo de root.
+StateDirectory=hehermes-agentes
+StateDirectoryMode=0700
+# Crear cabe (con el primer agente, hasta diez minutos de espera a un rato tranquilo, el reinicio de Hermes con su
+# drenaje y cuatro minutos más), y borrar también (la copia y el borrado de Hermes, hasta diez minutos cada uno).
+RuntimeMaxSec=30min
+UMask=0077
+LimitCORE=0
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=full
+ReadWritePaths=-/etc/hehermes-pasarela/agentes -/etc/hehermes-avisos/agentes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+KeyringMode=private
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+# Nada de HeHermes que no sean las claves de los agentes, ni los secretos del sistema.
+InaccessiblePaths=-/etc/shadow -/etc/shadow- -/etc/gshadow -/etc/gshadow- -/etc/sudoers -/etc/sudoers.d
+InaccessiblePaths=-/etc/ssh -/etc/ssl/private -/etc/letsencrypt
+InaccessiblePaths=-/etc/hehermes -/etc/hehermes-pasarela/clave.pem -/etc/hehermes-pasarela/siguiente -/etc/hehermes-pasarela/anterior -/etc/hehermes-pasarela/clave-hermes -/etc/hehermes-pasarela/tokens.json -/etc/hehermes-avisos/vigia -/etc/hehermes-avisos/rele -/etc/hehermes-avisos/rele-publico
+InaccessiblePaths=-/var/lib/hehermes-vigia -/var/lib/hehermes-pasarela -/var/lib/hehermes-rele-publico -/var/lib/hehermes-respaldo -/var/lib/hehermes-actualizar
+InaccessiblePaths=-/etc/nginx -/etc/swanctl -/etc/strongswan -/etc/ipsec.secrets -/etc/ipsec.d -/etc/wireguard

@@ -104,6 +104,22 @@ class Ambito:
         self.carpeta_actualizar = "/var/lib/hehermes-actualizar" if root else None
         self.unidad_actualizar_socket = self.unidades + "/hehermes-actualizar.socket"
         self.unidad_actualizar = self.unidades + "/hehermes-actualizar@.service"
+        # El ayudante de los agentes (desde la 0.11.0, contrato §18): crea, cambia y borra los perfiles de Hermes que la
+        # app enseña como agentes, y cada minuto junta lo que saben de ti los que lo comparten. Como los demás: con root,
+        # en /usr/local/libexec con su socket en /run; sin root, el que va en su casa, con su socket en su /run/user. Su
+        # carpeta de trabajo (el estado de cada trabajo y lo visto de la memoria), con root la hace systemd.
+        if root:
+            self.agentes = "/usr/local/libexec/hehermes-agentes"
+            self.socket_agentes = "/run/hehermes-agentes.sock"
+            self.carpeta_agentes = "/var/lib/hehermes-agentes"
+        else:
+            self.agentes = self.prefijo + "/hehermes-agentes"
+            self.socket_agentes = "/run/user/%d/hehermes-agentes.sock" % uid
+            self.carpeta_agentes = casa + "/.local/state/hehermes-agentes"
+        self.unidad_agentes_socket = self.unidades + "/hehermes-agentes.socket"
+        self.unidad_agentes = self.unidades + "/hehermes-agentes@.service"
+        self.unidad_agentes_memoria = self.unidades + "/hehermes-agentes-memoria.service"
+        self.temporizador_agentes_memoria = self.unidades + "/hehermes-agentes-memoria.timer"
         self.manifiesto = self.carpeta_config + "/instalacion.json"
         self.pasarela_ini = self.carpeta_pasarela + "/pasarela.ini"
         self.cert = self.carpeta_pasarela + "/cert.pem"
@@ -122,6 +138,11 @@ class Ambito:
         self.temporizador_borrado = self.unidades + "/hehermes-borrado.timer"
         self.tokens = self.carpeta_pasarela + "/tokens.json"
         self.clave_hermes = self.carpeta_pasarela + "/clave-hermes"
+        # Las claves de los agentes (desde la 0.11.0, contrato §18): una por perfil, `<perfil>.clave`, que escribe el
+        # ayudante `hehermes-agentes`. La de la pasarela (`[agentes] claves` de pasarela.ini) y la del vigía (la de
+        # vigia.ini): con root, `root:hh-pasarela` y `root:hh-vigia`, 2750; sin root, 0700.
+        self.claves_agentes_pasarela = self.carpeta_pasarela + "/agentes"
+        self.claves_agentes_vigia = self.carpeta_avisos + "/agentes"
         self.unidad = self.unidades + "/hehermes-pasarela.service"
         self.python_venv = self.venv + "/bin/python"
 

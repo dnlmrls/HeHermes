@@ -168,8 +168,7 @@ def disposicion(nombre: str) -> str:
     return "attachment; filename=\"%s\"; filename*=UTF-8''%s" % (ascii_, urllib.parse.quote(nombre, safe=""))
 
 
-def parametros(consulta: str) -> tuple:
-    """``(sesion, ruta)`` de la consulta. Con porcentajes, y un ``+`` es un ``+`` (``URLComponents`` no lo codifica)."""
+def _consulta(consulta: str) -> dict:
     vistos: dict = {}
     for trozo in consulta.split("&") if consulta else []:
         nombre, igual, valor = trozo.partition("=")
@@ -179,7 +178,32 @@ def parametros(consulta: str) -> tuple:
             vistos[nombre] = urllib.parse.unquote(valor, errors="strict")
         except UnicodeDecodeError:
             raise _invalido("La consulta no es UTF-8") from None
+    return vistos
+
+
+def parametros(consulta: str) -> tuple:
+    """``(sesion, ruta)`` de la consulta. Con porcentajes, y un ``+`` es un ``+`` (``URLComponents`` no lo codifica)."""
+    vistos = _consulta(consulta)
     return vistos.get("sesion"), vistos.get("ruta")
+
+
+#: El perfil de Hermes de un agente (contrato §18.9): minúsculas y cifras, hasta 24. `default`, el principal.
+PATRON_PERFIL = re.compile(r"[a-z0-9]{1,24}")
+PRINCIPAL = "default"
+
+
+def perfil_valido(perfil: object) -> str:
+    """El perfil de una consulta, con su forma (sin él, el principal), o ``400 parametro_invalido``."""
+    if perfil is None:
+        return PRINCIPAL
+    if not (isinstance(perfil, str) and PATRON_PERFIL.fullmatch(perfil)):
+        raise _invalido("El perfil son de 1 a 24 minúsculas y cifras")
+    return perfil
+
+
+def perfil_de_la_consulta(consulta: str) -> str:
+    """``perfil=`` de la consulta (contrato §18.9): las rutas que llevan ``sesion`` lo aceptan; sin él, el principal."""
+    return perfil_valido(_consulta(consulta).get("perfil"))
 
 
 class Limites:
@@ -371,7 +395,7 @@ class Ficheros:
     """Lo que hace la ruta, sin HTTP."""
 
     def __init__(self, hermes, lector: ClienteLector, limites: Limites, casa: str = "/root", marcas: Marcas = None,
-                 recorridas: Recorridas = None, exportaciones=None):
+                 recorridas: Recorridas = None, exportaciones=None, agentes=None):
         self.hermes = hermes
         self.lector = lector
         self.limites = limites
@@ -379,18 +403,28 @@ class Ficheros:
         self.marcas = marcas if marcas is not None else Marcas()
         self.recorridas = recorridas if recorridas is not None else Recorridas(reloj=self.marcas.reloj)
         # La vigilancia de `exports/` (`exportaciones.py`), que sabe dónde está de verdad esa carpeta (se lo dice el
-        # lector). Sin ella, la de la casa de Hermes.
+        # lector): la del principal, o la de cada perfil (`ExportacionesDeLosAgentes`, con su `de`). Sin ella, la de la
+        # casa de Hermes.
         self.exportaciones = exportaciones
+        # Los agentes servidos (`agentes.ClientesDeLosAgentes`, con su `cliente(perfil)`): la marca de un fichero de un
+        # agente se busca en su historial.
+        self.agentes = agentes
 
-    def preparar(self, sesion: object, ruta: object) -> Descarga:
+    def _cliente(self, perfil: str):
+        if perfil == PRINCIPAL:
+            return self.hermes
+        return self.agentes.cliente(perfil) if self.agentes is not None else None
+
+    def preparar(self, sesion: object, ruta: object, perfil: object = PRINCIPAL) -> Descarga:
         if not (isinstance(sesion, str) and PATRON_SESION.fullmatch(sesion)):
             raise _invalido("Falta la sesión, o no tiene forma de sesión")
         if not (isinstance(ruta, str) and ruta.startswith(("/", "~")) and len(ruta.encode("utf-8")) <= MAX_RUTA
                 and not any(ord(c) < 0x20 or ord(c) == 0x7F for c in ruta)):
             raise _invalido("Falta la ruta, o no tiene forma de ruta")
+        perfil = perfil_valido(perfil)
         self.limites.entrar()
         try:
-            descarga = self._preparar(sesion, ruta)
+            descarga = self._preparar(sesion, ruta, perfil)
         except ErrorHTTP as error:
             self.limites.salir()
             registro.info("fichero: %d %s", error.estado, error.codigo)
@@ -401,21 +435,23 @@ class Ficheros:
         registro.info("fichero: 200, .%s, %d bytes", _extension(descarga.nombre), descarga.tamano)
         return descarga
 
-    def _marcada(self, sesion: str, ruta: str) -> bool:
+    def _marcada(self, cliente, perfil: str, sesion: str, ruta: str) -> bool:
         """Las 50 últimas filas de la conversación entera (con lo compactado); si vuelven llenas y sin la marca, las 500
         (las mismas que pinta la app al abrirla); y si tampoco, de 500 en 500 hacia atrás hasta ``FILAS_MAXIMAS``, salvo
-        que se acabe de recorrer (``Recorridas``). Todo lo marcado que se ve se recuerda (``Marcas``)."""
-        if self.marcas.vista(sesion, ruta):
+        que se acabe de recorrer (``Recorridas``). Todo lo marcado que se ve se recuerda (``Marcas``), por perfil: la
+        misma sesión en dos perfiles son dos conversaciones."""
+        donde = sesion if perfil == PRINCIPAL else (perfil, sesion)
+        if self.marcas.vista(donde, ruta):
             return True
         lecturas = [(FILAS_PRIMERO, 0), (FILAS, 0)]
-        if not self.recorridas.reciente(sesion):
+        if not self.recorridas.reciente(donde):
             lecturas += [(FILAS, desde) for desde in range(FILAS, FILAS_MAXIMAS, FILAS)]
         recorrida = True
         for limite, desde in lecturas:
-            filas = self._leer(sesion, limite, desde)
+            filas = self._leer(cliente, sesion, limite, desde)
             vistas = marcadas(filas)
             for vista in vistas:
-                self.marcas.apuntar(sesion, vista)
+                self.marcas.apuntar(donde, vista)
             if ruta in vistas:
                 return True
             if len(filas) < limite:
@@ -424,22 +460,25 @@ class Ficheros:
             # Se llegó al tope sin acabar la conversación: lo de más atrás no se ha visto.
             recorrida = len(lecturas) > 2
         if recorrida:
-            self.recorridas.apuntar(sesion)
+            self.recorridas.apuntar(donde)
         return False
 
-    def _leer(self, sesion: str, limite: int, desde: int) -> list:
+    def _leer(self, cliente, sesion: str, limite: int, desde: int) -> list:
         try:
-            return self.hermes.mensajes(sesion, limite, desde=desde, compactadas=True)
+            return cliente.mensajes(sesion, limite, desde=desde, compactadas=True)
         except ErrorHermes as error:
             if error.estado == 404:
                 raise _no_disponible() from None
             raise ErrorHTTP(502, "hermes_no_disponible", "No se ha podido leer el historial de Hermes") from None
 
-    def _preparar(self, sesion: str, ruta: str) -> Descarga:
+    def _preparar(self, sesion: str, ruta: str, perfil: str = PRINCIPAL) -> Descarga:
         # Antes que nada, la marca: sin ella no se pregunta al lector, y lo que conteste (también que está fuera de las
         # permitidas, el 409) no sale nunca para una ruta que Hermes no marcó. Salvo lo de `exports/`, que es para el
-        # iPhone por contrato (`en_exportaciones`).
-        if not self.en_exportaciones(ruta) and not self._marcada(sesion, ruta):
+        # iPhone por contrato (`en_exportaciones`). Lo de un agente, con su historial y su exports/.
+        cliente = self._cliente(perfil)
+        if cliente is None:
+            raise _no_disponible()
+        if not self.en_exportaciones(ruta, perfil) and not self._marcada(cliente, perfil, sesion, ruta):
             raise _no_disponible()
         en_disco = self.casa.rstrip("/") + ruta[1:] if ruta == "~" or ruta.startswith("~/") else ruta
         conexion, tamano, adelantado = self.lector.abrir(en_disco)
@@ -447,17 +486,22 @@ class Ficheros:
                         self.limites.salir)
 
 
-    def en_exportaciones(self, ruta: str) -> bool:
+    def en_exportaciones(self, ruta: str, perfil: str = PRINCIPAL) -> bool:
         """Si la ruta está, por su texto, dentro de la carpeta de Hermes para el iPhone (``exports/``). Lo de ahí se da
         sin buscar su marca (desde la 1.5.1): Hermes lo deja para el iPhone, y un subagente que trabaja horas lo deja
         mucho antes de escribir ninguna línea ``MEDIA:`` (``exportaciones.py``). Solo con la ruta limpia —sin ``.``, ``..``
         ni barras de más—, y el lector sigue mirando todo lo demás: que esté de verdad dentro, sin enlaces que salgan, un
         solo enlace duro, el tamaño. Lo de cualquier otro sitio, también las caches de Hermes, sigue necesitando su
-        marca."""
+        marca. La de un agente es la de su perfil (``~/.hermes/profiles/<perfil>/exports``), y solo para él."""
         if "//" in ruta or any(parte in (".", "..") for parte in ruta.split("/")[1:]):
             return False
-        carpetas = {"~/.hermes/" + CARPETA_PERMITIDA, self.casa.rstrip("/") + "/.hermes/" + CARPETA_PERMITIDA}
-        vista = getattr(self.exportaciones, "carpeta", None)
+        dentro = ".hermes" if perfil == PRINCIPAL else ".hermes/profiles/" + perfil
+        carpetas = {"~/%s/%s" % (dentro, CARPETA_PERMITIDA),
+                    self.casa.rstrip("/") + "/%s/%s" % (dentro, CARPETA_PERMITIDA)}
+        if self.exportaciones is not None and hasattr(self.exportaciones, "de"):
+            vista = getattr(self.exportaciones.de(perfil), "carpeta", None)
+        else:
+            vista = getattr(self.exportaciones, "carpeta", None) if perfil == PRINCIPAL else None
         if vista:
             carpetas.add(vista.rstrip("/"))
         return any(ruta.startswith(carpeta + "/") and len(ruta) > len(carpeta) + 1 for carpeta in carpetas)
