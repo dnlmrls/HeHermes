@@ -26,7 +26,7 @@ EJECUTABLES_PROPIOS = ("hehermes-servidor", "hehermes-pasarela")
 class Opciones:
     def __init__(self, iphone=None, direccion=None, hermes_home=None, reemplazar=(), si=False, solo_plan=False,
                  por_chat=False, llave=None, activar_api=False, qr_png=None, cortafuegos_a_mano=False,
-                 corregir_exposicion=False, avisos=None):
+                 corregir_exposicion=False, avisos=None, volver_atras=False):
         #: Si hay alguien delante de un terminal (el QR de la pasarela solo se pinta ahí).
         self.terminal = True
         self.iphone = iphone
@@ -46,6 +46,8 @@ class Opciones:
         self.corregir_exposicion = corregir_exposicion
         #: El código de avisos ya leído (`avisos.leer_codigo`): el vigía, con el relé de ese código. Lleva la credencial.
         self.avisos = avisos
+        #: Instalar esta versión aunque la instalada sea más nueva (`comprobar_version`).
+        self.volver_atras = volver_atras
 
 
 class Accion:
@@ -227,6 +229,183 @@ def _unidad(sis, acciones, unidad, ficheros, detalle, como_recargar, systemctl=(
     acciones.append(accion)
 
 
+# MARK: Cómo se instaló (desde la 0.11.1)
+#
+# `actualizar` (el de la app, por `hehermes-actualizar`) lanza el `instalar --si` de la versión nueva a secas. Sin lo
+# que se dio al instalar, detrás de un NAT (AWS, Google Cloud, Oracle, Azure, un servidor en casa) se paraba siempre
+# con `nat`, y con varios Hermes, con `varios-hermes`. Lo que cambia el resultado se apunta en el manifiesto al instalar
+# y se vuelve a usar mientras no se dé otra cosa.
+
+_FORMA_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+_VERSION_DEL_CODIGO = re.compile(r'^VERSION = "([0-9]+\.[0-9]+\.[0-9]+)"$', re.M)
+
+
+def opciones_recordadas(man) -> dict:
+    """Las que se dieron al instalar y cambian el resultado (`direccion`, `hermes_home` y `cortafuegos_a_mano`), como
+    se apuntaron en el manifiesto (`opciones`): solo las que tienen su forma."""
+    guardadas = man.datos.get("opciones")
+    if not isinstance(guardadas, dict):
+        return {}
+    salida = {nombre: guardadas[nombre].strip() for nombre in ("direccion", "hermes_home")
+              if isinstance(guardadas.get(nombre), str) and guardadas[nombre].strip()}
+    if guardadas.get("cortafuegos_a_mano") is True:
+        salida["cortafuegos_a_mano"] = True
+    return salida
+
+
+def completar_opciones(opciones, man) -> list:
+    """Lo que no se ha dado y se dio al instalar. Devuelve lo que dice el plan («Hay que saber:»): que sigue como se
+    instaló, y cómo se cambia."""
+    guardadas, usadas = opciones_recordadas(man), []
+    if opciones.direccion is None and "direccion" in guardadas:
+        opciones.direccion = guardadas["direccion"]
+        usadas.append("--direccion " + opciones.direccion)
+    if opciones.hermes_home is None and "hermes_home" in guardadas:
+        opciones.hermes_home = guardadas["hermes_home"]
+        usadas.append("--hermes-home " + opciones.hermes_home)
+    if not opciones.cortafuegos_a_mano and guardadas.get("cortafuegos_a_mano"):
+        opciones.cortafuegos_a_mano = True
+        usadas.append("--cortafuegos-a-mano")
+    if not usadas:
+        return []
+    return ["Sigo como me instalaste: %s (lo que me des ahora manda)" % " ".join(usadas)]
+
+
+def direccion_de_la_pasarela(sis, ambito) -> str | None:
+    """La dirección del QR que dejó la instalación en `pasarela.ini` (`[qr] direccion`), si tiene la forma de una."""
+    import configparser
+    from .deteccion import DIRECCION_VALIDA
+    ini = configparser.ConfigParser(interpolation=None)
+    try:
+        ini.read_string(sis.leer_texto(ambito.pasarela_ini) or "")
+        direccion = ini.get("qr", "direccion", fallback="").strip()
+    except configparser.Error:
+        return None
+    return direccion if direccion != "PENDIENTE" and DIRECCION_VALIDA.fullmatch(direccion) else None
+
+
+def segun_lo_instalado(sis, man, ambito, opciones, det, detectar) -> tuple:
+    """Una instalación de antes de la 0.11.1 no apuntaba sus opciones: lo que se sabe de cómo quedó. Detrás de un NAT
+    (o sin saber la dirección pública), la dirección del QR de su `pasarela.ini`; con varios Hermes, el que tiene
+    conectado (`mantenimiento.casa`), si sigue entre ellos. Si cambia algo, vuelve a detectar con ello. (detección, lo
+    que dice el plan)."""
+    if not man.en_disco or "tls" not in man.modos:
+        return det, []
+    codigos = {getattr(b, "codigo", None) for b in det.bloqueos}
+    usadas = []
+    if opciones.direccion is None and (getattr(det, "direccion_privada", False) or "direccion" in codigos):
+        direccion = direccion_de_la_pasarela(sis, ambito)
+        if direccion:
+            opciones.direccion = direccion
+            usadas.append("la dirección del QR que ya tiene (%s)" % direccion)
+    if opciones.hermes_home is None and "varios-hermes" in codigos:
+        casa = ((man.datos.get("mantenimiento") or {}).get("casa") or "").rstrip("/")
+        if casa and casa in [c.home.rstrip("/") for c in getattr(det, "hermes_encontrados", None) or []]:
+            opciones.hermes_home = casa
+            usadas.append("el Hermes que ya tiene conectado (%s)" % casa)
+    if not usadas:
+        return det, []
+    return detectar(), ["Sigo como estaba instalado: %s" % " y ".join(usadas)]
+
+
+def opciones_para_recordar(opciones, det) -> dict:
+    """Lo que se apunta: lo dado (o recordado) y, con varios Hermes, el elegido aunque no se dijera (por chat, el que
+    lanzó el instalador): con él, `actualizar` no se para en `varios-hermes`."""
+    guardar = {}
+    if opciones.direccion:
+        guardar["direccion"] = opciones.direccion
+    casa = opciones.hermes_home
+    if not casa and det.hermes is not None and len(getattr(det, "hermes_encontrados", None) or []) > 1:
+        casa = det.hermes.home
+    if casa:
+        guardar["hermes_home"] = casa.rstrip("/") or casa
+    if opciones.cortafuegos_a_mano:
+        guardar["cortafuegos_a_mano"] = True
+    return guardar
+
+
+def _tupla(version: str) -> tuple:
+    return tuple(int(x) for x in version.split("."))
+
+
+def version_instalada(sis, man, ambito) -> str | None:
+    """La de la instalación: la que apunta el manifiesto (desde la 0.11.1, la de la última pasada que empezó a aplicar)
+    o, en una de antes, la del código que dejó en su carpeta. None sin instalación, o si no se sabe."""
+    if not man.en_disco:
+        return None
+    apuntada = man.datos.get("version")
+    if isinstance(apuntada, str) and _FORMA_VERSION.fullmatch(apuntada):
+        return apuntada
+    hallada = _VERSION_DEL_CODIGO.search(sis.leer_texto(ambito.prefijo + "/hehermes_servidor/__init__.py") or "")
+    return hallada.group(1) if hallada else None
+
+
+def comprobar_version(sis, man, ambito, plan) -> None:
+    """Un instalador más viejo que lo instalado (una frase de antes, del historial del chat, o un comando viejo) no
+    vuelve atrás sin avisar: se para, el primero (`version-antigua`, con la línea de detalle para la app), y dice cómo
+    seguir. Con `--volver-atras`, sí, y lo dice."""
+    instalada = version_instalada(sis, man, ambito)
+    if instalada is None or _tupla(instalada) <= _tupla(VERSION):
+        return
+    if plan.opciones.volver_atras:
+        plan.avisos.insert(0, "Vuelvo de la %s a la %s, que es más vieja, porque me lo pides (--volver-atras)"
+                           % (instalada, VERSION))
+        return
+    orden = "sudo hehermes-servidor" if ambito.root else ambito.orden
+    hecho = bloqueo("version-antigua", "Aquí ya está instalada la %s, más nueva que esta (%s): no vuelvo atrás, que "
+                    "una versión vieja puede tener un fallo ya arreglado (¿un comando o una frase de antes?). Para "
+                    "repararla o repetirla, usa la que está instalada: %s instalar. Para dar de alta un iPhone, copia "
+                    "otra vez el comando o la frase desde la app al día, que traen la de ahora. Si de verdad quieres "
+                    "volver a la %s: --volver-atras" % (instalada, VERSION, orden, VERSION))
+    hecho.detalle = "instalada=%s esta=%s" % (instalada, VERSION)
+    plan.bloqueos.insert(0, hecho)
+
+
+def antes_de_aplicar(man, plan, recordar=True) -> None:
+    """Lo que va al manifiesto antes de tocar nada (lo guarda el primer paso de `aplicar_tls`): esta versión, lo que va
+    a escribir esta pasada (`m.A_MEDIAS`, que se quita al acabar) y, si `recordar`, las opciones que cambian el
+    resultado. `avisos` no las recuerda: las suyas no las ha dado nadie."""
+    ficheros = {}
+    for a in plan.acciones:
+        if a.estado in m.ESCRIBEN and a.tipo == "fichero":
+            ficheros[a.objeto] = {"tipo": "fichero", "sha256": m.sha256(a.datos)}
+        elif a.estado in m.ESCRIBEN and a.tipo == "enlace":
+            ficheros[a.objeto] = {"tipo": "enlace", "destino": a.datos}
+    man.datos["version"] = VERSION
+    man.datos[m.A_MEDIAS] = {"version": VERSION, "ficheros": ficheros}
+    _apuntar_opciones(man, plan, recordar)
+
+
+def _apuntar_opciones(man, plan, recordar) -> None:
+    if not recordar:
+        return
+    guardar = opciones_para_recordar(plan.opciones, plan.deteccion)
+    if guardar:
+        man.datos["opciones"] = guardar
+    else:
+        man.datos.pop("opciones", None)
+
+
+def despues_de_aplicar(sis, man) -> None:
+    """La pasada ha acabado: todo lo que escribió está apuntado."""
+    if man.datos.pop(m.A_MEDIAS, None) is not None:
+        man.guardar(sis)
+
+
+def sin_cambios(sis, man, plan, recordar=True) -> None:
+    """No había nada que cambiar: lo instalado ya es esta versión con estas opciones (las que se acaban de tomar de
+    `pasarela.ini`, por ejemplo), y de una pasada que se cortó cuando ya lo había apuntado todo no queda nada a medias.
+    Solo se guarda si algo de eso cambia."""
+    if not man.en_disco:
+        return
+    antes = json.dumps(man.datos, sort_keys=True)
+    man.datos.pop(m.A_MEDIAS, None)
+    man.datos["version"] = VERSION
+    _apuntar_opciones(man, plan, recordar)
+    if json.dumps(man.datos, sort_keys=True) != antes:
+        man.guardar(sis)
+
+
 # MARK: Pintar
 
 
@@ -237,7 +416,7 @@ SECCIONES = (("Hermes", ("env", "exposicion", "soul")), ("Paquetes", ("paquete",
              ("Cortafuegos (firewalld)", ("firewalld",)), ("Cortafuegos (nftables e iptables)", ("propio",)),
              ("Avisos push", ()), ("iPhone", ("dispositivo",)), ("Canje por chat", ("canje",)))
 ETIQUETAS = {m.NUEVO: "nuevo", m.YA_ESTA: "ya está", m.CAMBIA: "cambia", m.AJENO: "ajeno", m.MODIFICADO: "cambiado",
-             m.AJENO_IGUAL: "ya está*", m.REEMPLAZA: "reemplaza"}
+             m.AJENO_IGUAL: "ya está*", m.REEMPLAZA: "reemplaza", m.ADOPTA: "es mío**"}
 
 
 def pintar(plan: Plan, color: bool = False) -> str:
@@ -306,6 +485,9 @@ def pintar(plan: Plan, color: bool = False) -> str:
             lineas.append("  %-10s %s" % (ETIQUETAS[a.estado], texto))
     if any(a.estado == m.AJENO_IGUAL for a in plan.acciones):
         lineas += ["", "  * ya está, pero no es mío: no lo apunto y desinstalar no lo quita."]
+    if any(a.estado == m.ADOPTA for a in plan.acciones):
+        lineas += ["", "  ** es mío: lo dejó escrito una pasada que se cortó a medias, sin apuntarlo. Lo apunto y lo "
+                       "dejo al día."]
     if plan.avisos:
         lineas += ["", "Hay que saber:"] + ["  - " + a for a in plan.avisos]
     if plan.bloqueos:
@@ -337,7 +519,7 @@ def _version_de_hermes(h) -> str:
 
 def _estado_de_grupo(acciones) -> str:
     estados = {a.estado for a in acciones}
-    for estado in (m.MODIFICADO, m.AJENO, m.REEMPLAZA, m.CAMBIA):
+    for estado in (m.MODIFICADO, m.AJENO, m.REEMPLAZA, m.CAMBIA, m.ADOPTA):
         if estado in estados:
             return estado
     if estados == {m.NUEVO}:

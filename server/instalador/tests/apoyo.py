@@ -37,16 +37,24 @@ class SistemaFalso(Sistema):
         self.responder: dict = {}
         self.respuestas_http: dict = {}
         self.ordenes: list = []
+        #: (orden, plazo) de las que llevan un plazo propio (`Sistema.ejecutar(…, plazo=…)`).
+        self.plazos: list = []
         self.peticiones_http: list = []
         #: Las de la sonda de las capacidades de Hermes (`Sistema.pedir`): (método, URL, cabeceras).
         self.peticiones_sonda: list = []
+        #: Las del servicio de metadatos de la nube (`Sistema.metadatos`): (método, URL, cabeceras). Sin
+        #: `metadatos_falso` no contesta nadie, como en un servidor que no está en ninguna nube.
+        self.peticiones_metadatos: list = []
+        self.metadatos_falso = None
         # Lo que contesta a lo que no está en `responder` (el `ServidorFalso`), y a las URL sin respuesta fija.
         self.resto = None
         self.http_falso = None
         self.pedir_falso = None
         opciones.setdefault("version_python", (3, 11, 2))
         opciones.setdefault("nucleo", "6.1.0-25-amd64")
-        super().__init__(raiz=self._carpeta, ejecutor=self._ejecutar, http=self._http, pedir=self._pedir, **opciones)
+        opciones.setdefault("sistema_operativo", "Linux")
+        super().__init__(raiz=self._carpeta, ejecutor=self._ejecutar, http=self._http, pedir=self._pedir,
+                         metadatos=self._metadatos_falsos, **opciones)
         # Ni el proceso de las pruebas ni su entorno: los pone cada prueba que los quiera.
         self.pid = None
         self.entorno = {}
@@ -54,9 +62,11 @@ class SistemaFalso(Sistema):
     def limpiar(self):
         shutil.rmtree(self._carpeta, ignore_errors=True)
 
-    def _ejecutar(self, args, entrada=None, heredar=False):
+    def _ejecutar(self, args, entrada=None, heredar=False, plazo=None):
         args = list(args)
         self.ordenes.append(args)
+        if plazo is not None:
+            self.plazos.append((args, plazo))
         mejor = None
         for prefijo in self.responder:
             partes = prefijo.split()
@@ -81,6 +91,12 @@ class SistemaFalso(Sistema):
         self.peticiones_sonda.append((metodo, url, dict(cabeceras)))
         if self.pedir_falso is not None:
             return self.pedir_falso(metodo, url, cabeceras)
+        return None, {}, b""
+
+    def _metadatos_falsos(self, metodo, url, cabeceras):
+        self.peticiones_metadatos.append((metodo, url, dict(cabeceras)))
+        if self.metadatos_falso is not None:
+            return self.metadatos_falso(metodo, url, cabeceras)
         return None, {}, b""
 
     # Ayudas para montar la raíz

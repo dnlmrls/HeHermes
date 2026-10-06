@@ -98,7 +98,7 @@ class Derivadas(Base):
 
 class SinHueco(Base):
     def test_se_para_al_empezar_diciendo_cuales_si(self):
-        for distro in (("rocky", "8.10"), ("almalinux", "8.9"), ("fedora", "41"), ("amzn", "2023"), ("arch", ""),
+        for distro in (("rocky", "8.10"), ("almalinux", "8.9"), ("fedora", "41"), ("amzn", "2"), ("arch", ""),
                        ("opensuse-leap", "15.6")):
             with self.subTest(distro=distro):
                 self.montar(distro)

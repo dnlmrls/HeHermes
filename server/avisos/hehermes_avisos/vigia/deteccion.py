@@ -30,6 +30,7 @@ respuestas, no los pasos intermedios, que pueden llevar la misma hora que la res
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from .. import texto
@@ -47,6 +48,17 @@ TEXTO_CONTINUAR_ANTIGUO = MARCA_CONTINUAR + " Ha llegado el resultado de la tare
 TEXTOS_CONTINUAR = (TEXTO_CONTINUAR, TEXTO_CONTINUAR_ANTIGUO)
 APERTURA_RETIRADA = "⟦hehermes:retira⟧ Ignora mi mensaje «"
 CIERRE_RETIRADA = "»: lo he retirado."
+# «Detener» de los subagentes (`Motor.textoDetener`, `HistorialHermes.aperturaDetener`, contrato §6, punto 10): un turno
+# que le pide a Hermes que los pare con su `delegate_task`, porque el api_server no tiene ruta para pararlos. Nombra las
+# delegaciones, separadas por `SEPARADOR_DETENER`, entre la apertura y el cierre. Su entrega llega igual, con lo que
+# hicieron hasta pararse, y ni se contesta ni se avisa (`delegaciones_detenidas`).
+APERTURA_DETENER = "⟦hehermes:detener⟧ Detén ahora los subagentes en segundo plano de esta conversación ("
+SEPARADOR_DETENER = ", "
+CIERRE_DETENER = ("): usa delegate_task con action \"list\" para ver los que siguen y action \"stop\" con el "
+                  "subagent_id de cada uno. No lances ninguno nuevo ni sigas tú con su trabajo, y contesta solo con una "
+                  "frase corta que diga cuántos has detenido.")
+_ID_DELEGACION = re.compile(r"deleg_[A-Za-z0-9_-]{1,64}")
+_CABECERA_DE_ENTREGA = re.compile(r"\[ASYNC DELEGATION BATCH COMPLETE\s*[—-]+\s*(deleg_[A-Za-z0-9_-]{1,64})\]")
 PREFIJO_INTERRUPCION = "Operation interrupted"
 TIPO_ENTREGA = "async_delegation_complete"
 TIPO_DESVIO = "steer"
@@ -96,6 +108,39 @@ def es_retirada(contenido: str) -> bool:
     limpio = contenido.strip()
     return (limpio.startswith(APERTURA_RETIRADA) and limpio.endswith(CIERRE_RETIRADA)
             and len(limpio) >= len(APERTURA_RETIRADA) + len(CIERRE_RETIRADA))
+
+
+def delegacion_entregada(fila: dict) -> str | None:
+    """El ``delegation_id`` de una fila de entrega, que abre su texto: ``[ASYNC DELEGATION BATCH COMPLETE — deleg_…]``."""
+    contenido = fila.get("content")
+    if not isinstance(contenido, str):
+        return None
+    encontrada = _CABECERA_DE_ENTREGA.match(contenido.lstrip())
+    return encontrada.group(1) if encontrada else None
+
+
+def detenidas_en(contenido: str) -> list | None:
+    """Las delegaciones que nombra el texto entero de un «Detener» de la app, o ``None`` si no lo es: la apertura, el
+    cierre y en medio solo ``delegation_id`` separados por ``SEPARADOR_DETENER`` (la regla de los marcadores de la app,
+    ``HistorialHermes``: lo que solo se parece lo escribió el usuario)."""
+    limpio = contenido.strip()
+    if not (limpio.startswith(APERTURA_DETENER) and limpio.endswith(CIERRE_DETENER)
+            and len(limpio) > len(APERTURA_DETENER) + len(CIERRE_DETENER)):
+        return None
+    ids = limpio[len(APERTURA_DETENER):-len(CIERRE_DETENER)].split(SEPARADOR_DETENER)
+    if not all(_ID_DELEGACION.fullmatch(i) for i in ids):
+        return None
+    return ids
+
+
+def delegaciones_detenidas(filas: list) -> set:
+    """Las delegaciones que el usuario detuvo desde la app: las que nombra algún «Detener» de estas filas. Su entrega
+    no es un trabajo terminado: ni se contesta (``entregas.decidir``) ni se avisa (``sucesos``)."""
+    detenidas: set = set()
+    for fila in filas:
+        if isinstance(fila, dict) and abre_turno(fila):
+            detenidas.update(detenidas_en(_texto(fila)) or [])
+    return detenidas
 
 
 def es_entrega(fila: dict) -> bool:
@@ -148,6 +193,8 @@ def sucesos(filas: list, *, ultimo_id: int | None, referencia: float, ahora: flo
     desvio_en_el_turno = False
     entregas: list[_Entrega] = []
     respuestas: list[tuple] = []
+    # La entrega de un subagente que el usuario detuvo no es un trabajo terminado: no se avisa.
+    detenidas = delegaciones_detenidas(ordenadas)
     for fila in ordenadas:
         rol = fila.get("role")
         if rol == "user":
@@ -159,7 +206,7 @@ def sucesos(filas: list, *, ultimo_id: int | None, referencia: float, ahora: flo
                         entrega.turno_siguiente = fila
             elif fila.get("display_kind") == TIPO_DESVIO:
                 desvio_en_el_turno = True
-            elif es_entrega(fila):
+            elif es_entrega(fila) and delegacion_entregada(fila) not in detenidas:
                 entregas.append(_Entrega(fila, nueva(fila)))
         elif rol == "assistant":
             contenido = _respuesta(fila)

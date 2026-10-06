@@ -214,6 +214,19 @@ SECRETO_VIGIA = "/etc/hehermes-avisos/vigia/secreto-tunel"
 VIGIA = "127.0.0.1:8790"
 
 
+#: Un usuario que se puede poner en `User=` sin que nada se cuele en la unidad: un nombre (también de más de 8 letras,
+#: como `cloud-user`, o con punto, como en `gestor._USUARIO`) o un uid. Uno sin nombre en el servidor lo para antes la
+#: detección (`usuario-hermes`): systemd no arranca una unidad con un usuario que no existe.
+_USUARIO_DE_UNIDAD = re.compile(r"[a-z_][a-z0-9_.-]{0,31}|[0-9]{1,10}")
+
+
+def usuario_de_unidad(usuario) -> bool:
+    if not isinstance(usuario, str) or not _USUARIO_DE_UNIDAD.fullmatch(usuario):
+        return False
+    # 65535 y 4294967295 son los «nadie» de 16 y 32 bits: systemd no los acepta.
+    return not usuario.isdigit() or int(usuario) not in (65535, 4294967295) and int(usuario) < 4294967295
+
+
 def _puerto_pasarela(puerto) -> int:
     if not isinstance(puerto, int) or isinstance(puerto, bool) or not PUERTO_MINIMO <= puerto <= PUERTO_MAXIMO:
         raise ValueError("puerto de la pasarela fuera de %d-%d: %r" % (PUERTO_MINIMO, PUERTO_MAXIMO, puerto))
@@ -798,7 +811,7 @@ def unidad_lector(ambito, hermes_home: str, usuario_hermes: str | None = None) -
     vistas = " ".join("-%s/%s" % (casa, permitida) for permitida in PERMITIDAS_HERMES + (PERFILES_HERMES,))
     usuario = ""
     if usuario_hermes and usuario_hermes != "root":
-        if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", usuario_hermes):
+        if not usuario_de_unidad(usuario_hermes):
             raise ValueError("usuario de Hermes no válido para una unidad: %r" % usuario_hermes)
         usuario = "User=%s\n" % usuario_hermes
     return (
@@ -916,7 +929,7 @@ def unidad_respaldo(ambito, hermes_home: str, usuario_hermes: str | None = None,
     sistema, restaurar no se puede y lo dice)."""
     casa = _ruta_segura(hermes_home.rstrip("/"))
     usuario = usuario_hermes or "root"
-    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", usuario):
+    if not usuario_de_unidad(usuario):
         raise ValueError("usuario de Hermes no válido para una unidad: %r" % usuario)
     if not re.fullmatch(r"[A-Za-z0-9:_.@-]{1,200}\.service", unidad_hermes):
         raise ValueError("unidad de Hermes no válida para una unidad: %r" % unidad_hermes)
@@ -1059,7 +1072,7 @@ def unidad_entrada(ambito, hermes_home: str, usuario_hermes: str | None = None) 
         ) % (_ruta_segura(ambito.entrada), casa, comun, _JAULA_ENTRADA_USUARIO)
     usuario = ""
     if usuario_hermes and usuario_hermes != "root":
-        if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", usuario_hermes):
+        if not usuario_de_unidad(usuario_hermes):
             raise ValueError("usuario de Hermes no válido para una unidad: %r" % usuario_hermes)
         usuario = "User=%s\n" % usuario_hermes
     return (
@@ -1279,7 +1292,7 @@ _TAPADO_AGENTES = (
 
 def _usuario_de_hermes(usuario_hermes) -> str:
     usuario = usuario_hermes or "root"
-    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", usuario):
+    if not usuario_de_unidad(usuario):
         raise ValueError("usuario de Hermes no válido para una unidad: %r" % usuario)
     return usuario
 

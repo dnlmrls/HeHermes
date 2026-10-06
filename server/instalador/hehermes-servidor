@@ -6,6 +6,7 @@ Uso (como root, o sin root en la casa del usuario de Hermes):
                              [--reemplazar <fichero>]... [--si] [--avisos [<código de avisos>]]
   hehermes-servidor avisos [<código de avisos>] [--plan] [--si]
   hehermes-servidor comprobar
+  hehermes-servidor informe
   hehermes-servidor actualizar --paquete <hehermes-servidor-X.tar.gz> --firma <hehermes-servidor-X.tar.gz.sig>
   hehermes-servidor desinstalar [--modo vpn|tls] [--si] [--quitar-paquetes]
 
@@ -17,6 +18,16 @@ quita con «desinstalar --modo vpn».
 import os
 import sys
 
+# Antes de importar nada del instalador, que no carga en un Python viejo (el 3.6 de RHEL 8 da un SyntaxError con
+# `from __future__ import annotations`, y por chat la app no ve ningún código): se dice, y por chat con el de `sistema`,
+# el mismo que da la detección con un 3.7 o un 3.8. Escrito para que lo entienda cualquier Python 3.
+if sys.version_info < (3, 9):
+    print("error: el instalador de HeHermes necesita Python 3.9 o más nuevo, y /usr/bin/python3 es el %d.%d. No he "
+          "cambiado nada." % tuple(sys.version_info[:2]))
+    if "--por-chat" in sys.argv:
+        print("\nhehermes-error:sistema")
+    sys.exit(1)
+
 # Con -I, Python no pone en sys.path ni la carpeta del script ni nada del entorno: se añade a mano, y solo esta, que es
 # la carpeta 0700 de mktemp o /opt/hehermes-servidor (de root).
 AQUI = os.path.dirname(os.path.realpath(__file__))
@@ -25,6 +36,11 @@ sys.path.insert(0, AQUI)
 sys.dont_write_bytecode = True
 # Nada de lo que corre como root puede leer nada del directorio desde el que se lanzó.
 os.chdir("/")
+# Cada línea, al momento (desde la 0.11.1). Con la salida a una tubería, como la de la terminal de Hermes, Python la
+# guarda hasta el final, y si Hermes lo corta por plazo se pierde todo: también la línea que dice hasta dónde llegó. Con
+# -I no vale PYTHONUNBUFFERED.
+if sys.stdout is not None:
+    sys.stdout.reconfigure(line_buffering=True)
 
 from hehermes_servidor import cli  # noqa: E402
 

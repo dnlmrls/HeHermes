@@ -183,6 +183,28 @@ def orden_reiniciar(gestor: Gestor, root: bool = True) -> list:
     return systemctl(gestor, root, "restart", gestor.nombre)
 
 
+def recarga_con_drenaje(sis, gestor: Gestor | None, root: bool = True) -> bool:
+    """Si su unidad sabe reiniciarlo sin cortarle el turno (desde la 0.11.1). La que escribe `hermes gateway install`
+    lleva `ExecReload=/bin/kill -USR1 $MAINPID` (hermes_cli/gateway.py, `generate_systemd_unit`), y Hermes con SIGUSR1
+    hace su reinicio con drenaje: no acepta turnos nuevos, espera a que acaben los que tiene (hasta
+    `agent.restart_after_turn_timeout`, 1800 s de serie), sale con 75 y systemd lo vuelve a arrancar
+    (`RestartForceExitStatus=75`; gateway/run.py, `_start_gateway_make_restart_signal_handler`). Lo dice su
+    documentación (website/docs/user-guide/messaging/index.md, en `main` a 2026-10-06): «The installed unit also maps
+    `systemctl reload hermes-gateway` to `SIGUSR1`… a graceful drain, process exit, and supervisor relaunch», y que un
+    `systemctl restart` a pelo lo para cuando dice systemd. Es lo mismo que su `/restart`. Una unidad hecha a mano, sin
+    ese `ExecReload` (o con otro), y un contenedor (SIGUSR1 le llegaría a su s6, no a Hermes), no."""
+    if gestor is None or gestor.tipo not in ("sistema", "usuario"):
+        return False
+    r = sis.ejecutar(systemctl(gestor, root, "show", gestor.nombre, "-p", "ExecReload", "--value"), plazo=30)
+    return r.bien and re.search(r"(?<![A-Za-z0-9])kill\b.*\s-(SIG)?USR1\b", r.salida) is not None
+
+
+def orden_recargar(gestor: Gestor, root: bool = True) -> list:
+    """`systemctl reload` de su unidad: le manda SIGUSR1 y vuelve enseguida (Hermes se reinicia cuando acabe su
+    turno)."""
+    return systemctl(gestor, root, "reload", gestor.nombre)
+
+
 def orden_reiniciar_luego(gestor: Gestor, root: bool = True) -> list:
     """El reinicio a los 90 s, en una unidad pasajera de systemd: sigue aunque el instalador (y el turno de Hermes que lo
     lanzó) ya hayan acabado. Sin root, en el systemd del usuario."""

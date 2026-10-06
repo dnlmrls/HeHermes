@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -34,17 +35,35 @@ def sha256(datos: bytes) -> str:
     return hashlib.sha256(datos).hexdigest()
 
 
-def _ejecutar_de_verdad(args, entrada=None, heredar=False):
+#: Lo más que espera una orden si quien la lanza no dice otra cosa (desde la 0.11.1): ninguna se queda colgada para
+#: siempre (un `systemctl` con D-Bus atascado, un `docker` con su demonio colgado, un `ufw` que no vuelve). Por encima de
+#: lo que tarda la más larga que va sin plazo propio: la compactación de noche, con su `timeout` de 15 minutos.
+PLAZO_DE_SERIE = 1200
+
+
+def _texto(datos) -> str:
+    if datos is None:
+        return ""
+    return datos.decode("utf-8", "replace") if isinstance(datos, bytes) else datos
+
+
+def _ejecutar_de_verdad(args, entrada=None, heredar=False, plazo=None):
     # Siempre en C: lo que se lee de `ufw status` o `ss` no puede cambiar con el idioma del servidor.
     entorno = dict(os.environ, LC_ALL="C", LANG="C")
     if heredar:
-        # El QR: la salida va directa al terminal de quien lo lanza (`qr` exige un terminal).
+        # El QR: la salida va directa al terminal de quien lo lanza (`qr` exige un terminal). Y el `instalar` de la
+        # versión nueva que lanza `actualizar`, que tarda lo que tarde: sin plazo.
         r = subprocess.run(args, input=entrada, text=True, env=entorno)
         return Resultado(r.returncode)
+    plazo = PLAZO_DE_SERIE if plazo is None else plazo
     try:
-        r = subprocess.run(args, input=entrada, capture_output=True, text=True, env=entorno)
+        r = subprocess.run(args, input=entrada, capture_output=True, text=True, env=entorno, timeout=plazo)
     except FileNotFoundError:
         return Resultado(127, "", "no existe %s" % args[0])
+    except subprocess.TimeoutExpired as error:
+        # Como `timeout`: 124. subprocess ya la ha matado.
+        return Resultado(124, _texto(error.stdout), "%s no ha acabado en %g s y la he cortado%s" % (
+            os.path.basename(args[0]), plazo, (": " + _texto(error.stderr).strip()[-300:]) if error.stderr else ""))
     return Resultado(r.returncode, r.stdout, r.stderr)
 
 
@@ -85,6 +104,17 @@ def _pedir_de_verdad(metodo, url, cabeceras, plazo=5):
         return None, {}, b""
 
 
+#: Lo que se espera al servicio de metadatos de una nube (`nube`): está en la propia máquina y contesta en milisegundos;
+#: en un servidor sin él (uno en casa) nadie contesta, y no se puede hacer esperar a quien instala.
+PLAZO_METADATOS = 2
+
+
+def _metadatos_de_verdad(metodo, url, cabeceras, plazo=PLAZO_METADATOS):
+    """Una petición al servicio de metadatos (169.254.169.254): sin proxies (Azure y Google las rechazan, y un proxy se
+    llevaría la petición a otro sitio), sin redirecciones y con el plazo corto."""
+    return _pedir_de_verdad(metodo, url, cabeceras, plazo=plazo)
+
+
 def _sondear_de_verdad(puerto, maxima=None, plazo=5, anfitrion="127.0.0.1"):
     """Lo que ve un cliente sin token en <anfitrion>:<puerto> (127.0.0.1, o la dirección pública del QR): la versión de
     TLS, la huella del certificado y los bytes de la respuesta a un GET. None si no hay apretón (o no con esa versión
@@ -116,14 +146,17 @@ def _sondear_de_verdad(puerto, maxima=None, plazo=5, anfitrion="127.0.0.1"):
 
 class Sistema:
     def __init__(self, raiz: str = "/", ejecutor=None, http=None, version_python=None, nucleo=None, sonda=None,
-                 pedir=None):
+                 pedir=None, metadatos=None, sistema_operativo=None):
         self.raiz = os.path.realpath(raiz)
         self._ejecutor = ejecutor or _ejecutar_de_verdad
         self._http = http or _http_de_verdad
         self._pedir = pedir or _pedir_de_verdad
+        self._metadatos = metadatos or _metadatos_de_verdad
         self._sonda = sonda or _sondear_de_verdad
         self.version_python = tuple(version_python or sys.version_info[:3])
         self.nucleo = nucleo or os.uname().release
+        #: «Linux», «Darwin»…: en un Mac (la app de escritorio de Hermes) no hay servidor que instalar.
+        self.sistema_operativo = sistema_operativo or os.uname().sysname
         #: Este proceso y su entorno: por chat, lo lanza Hermes, y con varios perfiles en marcha es lo que dice cuál
         #: (`deteccion._el_que_me_lanza`).
         self.pid = os.getpid()
@@ -275,8 +308,26 @@ class Sistema:
 
     # Órdenes
 
-    def ejecutar(self, args, entrada: str | None = None, heredar: bool = False) -> Resultado:
-        return self._ejecutor(list(args), entrada=entrada, heredar=heredar)
+    def ejecutar(self, args, entrada: str | None = None, heredar: bool = False, plazo: float | None = None) -> Resultado:
+        """`plazo`: lo más que espera, en segundos (sin él, `PLAZO_DE_SERIE`); si se pasa, 124."""
+        if plazo is None:
+            return self._ejecutor(list(args), entrada=entrada, heredar=heredar)
+        return self._ejecutor(list(args), entrada=entrada, heredar=heredar, plazo=plazo)
+
+    def ejecutar_con_reintentos(self, args, intentos: int = 3, pausa: float = 2.0, plazo: float | None = None,
+                                salida=None, que: str = "") -> Resultado:
+        """Para lo que va por la red y se puede repetir tal cual (pip, con sus hashes): si falla, otra vez, con una
+        espera que se dobla (2 s, 4 s…), como el `retry` del instalador de Homebrew. Una señal no se reintenta: corta."""
+        for intento in range(intentos):
+            r = self.ejecutar(args, plazo=plazo)
+            if r.bien or intento + 1 == intentos:
+                return r
+            espera = pausa * 2 ** intento
+            if salida is not None:
+                salida("    %s ha fallado (%s): lo vuelvo a intentar en %g s"
+                       % (que or os.path.basename(args[0]), (r.error or r.salida).strip()[-160:] or r.codigo, espera))
+            time.sleep(espera)
+        return r
 
     def cual(self, nombre: str) -> str | None:
         """Dónde está un programa, buscando dentro de la raíz (así las pruebas deciden qué hay instalado)."""
@@ -293,6 +344,32 @@ class Sistema:
     def pedir(self, metodo: str, url: str, cabeceras: dict | None = None):
         """(estado, cabeceras, cuerpo) de una petición sin cuerpo: la usa la sonda de las capacidades de Hermes."""
         return self._pedir(metodo, url, cabeceras or {})
+
+    def metadatos(self, metodo: str, url: str, cabeceras: dict | None = None):
+        """(estado, cabeceras, cuerpo) del servicio de metadatos de la nube (`nube`), con un plazo corto; (None, {}, b"")
+        si no contesta nadie."""
+        return self._metadatos(metodo, url, cabeceras or {})
+
+    def cuenta(self, uid):
+        """(nombre, casa) del usuario con ese uid, como `getent passwd` (también los de LDAP o sssd), o None si no tiene
+        nombre: el 10000 de Hermes en Docker no existe en el servidor. En una raíz que no es «/» (las pruebas), el
+        /etc/passwd de la raíz."""
+        try:
+            uid = int(uid)
+        except (TypeError, ValueError):
+            return None
+        if self.raiz == "/":
+            import pwd
+            try:
+                datos = pwd.getpwuid(uid)
+            except (KeyError, OverflowError, ValueError):
+                return None
+            return datos.pw_name, datos.pw_dir
+        for linea in (self.leer_texto("/etc/passwd") or "").splitlines():
+            campos = linea.split(":")
+            if len(campos) >= 6 and campos[2] == str(uid):
+                return campos[0], campos[5]
+        return None
 
     def sondear_pasarela(self, puerto, maxima=None, anfitrion=None):
         if anfitrion is None:

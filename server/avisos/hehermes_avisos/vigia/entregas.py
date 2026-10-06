@@ -26,12 +26,14 @@ alta un iPhone con una app que no conoce la de ahora (``texto_de_la_continuacion
   de ayer;
 - si la **cadena** es larga: Hermes puede volver a delegar al recibir la entrega, y eso daría otra entrega y otra
   continuación sin fin. Tras ``cadena_maxima`` continuaciones seguidas sin un mensaje de Daniel en medio, el vigía se
-  para y solo avisa de la entrega, como antes.
+  para y solo avisa de la entrega, como antes;
+- si el usuario **detuvo** ese subagente desde la app (``deteccion.delegaciones_detenidas``): Hermes lo para con su
+  ``delegate_task`` y su entrega llega igual, con lo que hizo hasta pararse. Contestarla sería contarle al usuario, y
+  avisarle, un trabajo que acaba de cancelar. Queda en el contexto de Hermes, por si pregunta.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
 from . import deteccion
@@ -44,8 +46,6 @@ RENUNCIAR = "renunciar"
 # Lo que dura como mucho un turno en el VPS (`agent.gateway_timeout: 7200`): un turno sin respuesta más viejo que esto
 # no está en marcha, se murió.
 VIDA_DE_UN_TURNO = 7200.0
-
-_DELEGACION = re.compile(r"\[ASYNC DELEGATION BATCH COMPLETE\s*[—-]+\s*(deleg_[A-Za-z0-9_-]{1,64})\]")
 
 
 @dataclass(frozen=True)
@@ -88,11 +88,7 @@ def texto_de_la_continuacion(dispositivos: list) -> str:
 
 def delegacion_de(fila: dict) -> str | None:
     """El ``delegation_id`` de una fila de entrega, que abre su texto: ``[ASYNC DELEGATION BATCH COMPLETE — deleg_…]``."""
-    contenido = fila.get("content")
-    if not isinstance(contenido, str):
-        return None
-    encontrada = _DELEGACION.match(contenido.lstrip())
-    return encontrada.group(1) if encontrada else None
+    return deteccion.delegacion_entregada(fila)
 
 
 def _instante(fila: dict) -> float | None:
@@ -116,8 +112,11 @@ def decidir(filas: list, *, ahora: float, gracia: float, antiguedad_maxima: floa
                        key=lambda f: f["id"])
     turnos = [f for f in ordenadas if deteccion.abre_turno(f)]
     ultimo_turno = turnos[-1]["id"] if turnos else None
+    # La de un subagente que el usuario detuvo llega igual, con lo que hizo hasta pararse, y no se contesta: no la espera
+    # nadie (contrato §6, punto 10).
+    detenidas = deteccion.delegaciones_detenidas(ordenadas)
     sin_atender = [f for f in ordenadas if deteccion.es_entrega(f)
-                   and (ultimo_turno is None or ultimo_turno < f["id"])]
+                   and (ultimo_turno is None or ultimo_turno < f["id"]) and delegacion_de(f) not in detenidas]
     if not sin_atender:
         return None
     entrega = sin_atender[-1]

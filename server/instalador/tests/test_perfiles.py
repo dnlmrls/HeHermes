@@ -409,10 +409,16 @@ class ReiniciaHermes(Base):
         self.assertEqual(self.orden("desinstalar", "--si"), 0, self.salida)
         self.assertEqual(self.sis.leer_texto(self.env), self.antes)
 
-    def test_sin_reiniciarlo_dice_que_no_contesta(self):
+    def test_sin_reiniciarlo_lo_vuelve_a_pedir(self):
+        """Hasta la 0.11.0, la segunda vez decía `api-hermes` («su API no contesta»), que la app no explica. Desde la
+        0.11.1 reconoce que la API que no contesta es la que encendió él, y vuelve a pedir el `/restart`, sin tocar
+        nada más."""
         self.assertEqual(self.por_chat(), 1)
+        encendido = self.sis.leer_texto(self.env)
         self.assertEqual(self.por_chat(), 1)
-        self.assertEqual(self.texto[-1].strip(), "hehermes-error:api-hermes")
+        self.assertEqual(self.texto[-1].strip(), "hehermes-error:reinicia-hermes")
+        self.assertIn("/restart", self.salida)
+        self.assertEqual(self.sis.leer_texto(self.env), encendido, "lo de la API, una sola vez")
 
     def test_por_un_terminal_lo_mismo_sin_la_linea_de_la_app(self):
         self.assertEqual(self.orden("instalar", "--si", "--activar-api", "--iphone", "mi-iphone"), 1)

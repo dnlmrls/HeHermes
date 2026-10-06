@@ -70,6 +70,27 @@ iPhone por la clave de ese perfil (`[agentes] claves` de `pasarela.ini`); la app
 vigía, que se lo pasa al ayudante `hehermes-agentes`, con su socket como los otros y un temporizador que junta cada
 minuto lo que saben de ti los que lo comparten.
 
+**La 0.11.1 es a prueba de servidores reales**, y lleva los avisos 1.6.1. Saca la IP pública del servicio de metadatos
+de la nube detrás de su NAT ([abajo](#la-dirección-detrás-de-un-nat-desde-la-0111)); reconoce a Hermes en Docker, un
+contenedor, WSL o LXC, y los usuarios de más de 8 letras; deja lo de Hermes lo último y todo fallo con su código
+(`hehermes-error:`), con su paso y sus avisos para la app; espera al cerrojo de apt y reintenta la red; «Actualizar»
+recuerda cómo se instaló y no vuelve a una versión anterior; adopta lo que deja un corte; y `hehermes-servidor informe`
+junta lo que hace falta para entender un fallo, sin secretos.
+
+**La 0.11.1 hace que actualizar no deje a nadie tirado** (la auditoría del 2026-10-06):
+- **Recuerda cómo se instaló.** `--direccion`, `--hermes-home` y `--cortafuegos-a-mano` van al manifiesto y se vuelven a
+  usar mientras no se dé otra cosa: «Actualizar» desde la app lanza `instalar --si` a secas, y detrás de un NAT (AWS,
+  Google Cloud, Oracle, Azure, un servidor en casa) se paraba siempre con `nat`
+  ([abajo](#cómo-se-instaló-desde-la-0111)).
+- **No vuelve atrás sin avisar.** La versión instalada va en el manifiesto, y un instalador más viejo (una frase de antes
+  del historial del chat) se para con `hehermes-error:version-antigua`, salvo con `--volver-atras`.
+- **Lo que deja a medias un corte es suyo.** Un SIGHUP del SSH, Ctrl-C o el plazo de Hermes a mitad de un paso dejaban
+  ficheros sin apuntar que paraban la vez siguiente (también la actualización desde la app) con `ficheros-ajenos`: ahora
+  se adoptan, y repetir el comando acaba el trabajo ([abajo](#cómo-no-pisa-nada)).
+- **El venv del canje se rehace** (`venv --clear`) si es de otro Python, tras subir de versión la distribución.
+- **La firma de las actualizaciones, también sin la orden `openssl`**: con `cryptography`, la del venv del canje; sin
+  ninguna de las dos, la app lo sabe (`sin_openssl`) y no dice que la firma sea mala.
+
 **La 0.10.5 lleva el vigía 1.5.1.** Lo que cambia está en los avisos (`server/avisos`): las marcas de un fichero se buscan en la conversación entera (también lo compactado), un fichero nuevo en `exports/` se avisa en cuanto deja de crecer y se puede descargar sin esperar a su `MEDIA:`, y un cliente que se corta a media petición deja una línea en el registro, no una traza. El instalador en sí no cambia.
 
 **La 0.10.4 mira el Hermes del probador antes de dar nada, y deja el chat abierto hasta que se use.** Tres cosas:
@@ -95,6 +116,7 @@ sudo ./hehermes-servidor instalar --iphone mi-iphone          # lo mismo, pregun
 ./hehermes-servidor instalar --iphone mi-iphone               # sin root: la pasarela, en la casa de este usuario
 sudo hehermes-servidor instalar                               # repetirlo: «Todo al día: 0 cambios», o repara
 sudo hehermes-servidor comprobar                              # lo que tiene que estar en marcha, y «Seguridad»
+hehermes-servidor informe                                     # para entender un fallo, sin secretos (abajo)
 sudo hehermes-servidor certificado rotar                      # el certificado siguiente pasa a ser el de la pasarela
 sudo hehermes-servidor desinstalar [--quitar-paquetes]        # enseña lo que quita, pregunta y lo quita
 sudo hehermes-servidor desinstalar --modo vpn                 # solo la VPN de una versión anterior
@@ -106,8 +128,30 @@ Más opciones de `instalar`: `--direccion <IP o nombre>` (la del QR, si el servi
 `--hermes-home <carpeta>` (si hay varios Hermes), `--reemplazar <fichero>` (repetible), `--si` (sin preguntar; sin un
 terminal es obligatorio), `--activar-api`, `--corregir-exposicion` (la API de Hermes, solo en 127.0.0.1:
 [abajo](#la-api-de-hermes-sin-exponer)), `--cortafuegos-a-mano` (el cortafuegos lo llevas tú:
-[abajo](#los-cortafuegos)) y, para el alta por chat, `--por-chat --llave <llave> [--qr-png <fichero>]` (abajo).
-`--modo tls` se sigue aceptando (lo llevan los comandos de antes), y no cambia nada.
+[abajo](#los-cortafuegos)), `--volver-atras` (esta versión aunque la instalada sea más nueva) y, para el alta por chat,
+`--por-chat --llave <llave> [--qr-png <fichero>]` (abajo). `--modo tls` se sigue aceptando (lo llevan los comandos de
+antes), y no cambia nada.
+
+## Cómo se instaló (desde la 0.11.1)
+
+Lo que cambia el resultado y se da al instalar se apunta en el manifiesto (`opciones`), y `instalar` sin ello (el
+`instalar --si` que lanza `actualizar`, la misma frase otra vez) lo vuelve a usar; el plan lo dice («Sigo como me
+instalaste: …»). Lo que se dé manda, y queda apuntado en su lugar.
+
+| Opción | Qué se apunta |
+|---|---|
+| `--direccion` | La dada, o la respuesta a «¿Cuál es su dirección pública?» (detrás de un NAT, en un terminal). La detectada no: si el servidor cambia de IP, se vuelve a detectar |
+| `--hermes-home` | La dada y, con varios Hermes, el elegido aunque no se dijera (por chat, el que lanza el instalador) |
+| `--cortafuegos-a-mano` | Que se dio (no se puede «quitar» con otra opción: se olvida al desinstalar) |
+
+Una instalación de antes, que no apuntaba nada, sigue como quedó: detrás de un NAT, la dirección del QR de su
+`pasarela.ini`; con varios Hermes, el que tiene conectado (`mantenimiento.casa`). `avisos` no cambia lo apuntado.
+
+**La versión** también va en el manifiesto (`version`; en una de antes, la de `hehermes_servidor/__init__.py` de lo
+instalado). Un instalador más viejo que lo instalado se para antes de tocar nada y dice cómo seguir: reparar con el
+instalado (`sudo hehermes-servidor instalar`) o copiar otra vez el comando o la frase de la app. Por chat, con
+`hehermes-detalle:instalada=<X.Y.Z> esta=<X.Y.Z>` y `hehermes-error:version-antigua`. Con `--volver-atras`, sigue y lo
+dice.
 
 ## La pasarela
 
@@ -269,7 +313,17 @@ siempre: el comando de la app o la frase para Hermes.
 
 **Una vez a mano.** Un servidor de antes de la 0.10.10 no tiene el ayudante, y uno con las claves de marcador no tiene
 con qué comprobar una firma: los dos se actualizan una vez con el comando de la app (o la frase para Hermes), y desde
-ahí, con un toque. **En el VPS de Daniel**, con los avisos de `instalar.sh`, el ayudante lo pone ese script; actualizar
+ahí, con un toque.
+
+**Lo que se dio al instalar sigue** (desde la 0.11.1): el `instalar --si` de la versión nueva usa las opciones que
+apuntó el manifiesto ([arriba](#cómo-se-instaló-desde-la-0111)); detrás de un NAT ya no acaba en `instalacion`. Y si el
+sistema subió de versión y el venv del canje es de otro Python, lo rehace (`venv --clear`) y reinicia el vigía, que
+corre con él.
+
+**Sin la orden `openssl`** (una imagen mínima), la firma se comprueba con `cryptography`, con el Python del venv del
+canje (`/opt/hehermes-canje/venv/bin/python`); y si tampoco, el motivo es `sin_openssl` («no hay con qué comprobarla»,
+que se arregla con `apt install openssl`, o actualizando una vez a mano, que rehace el venv), no `firma`. Un servidor
+con el ayudante de la 0.11.0 y sin `openssl` no lo sabe todavía: dice `firma`, y hay que actualizarlo una vez a mano. **En el VPS de Daniel**, con los avisos de `instalar.sh`, el ayudante lo pone ese script; actualizar
 desde la app pone lo del instalador (la pasarela) y los avisos siguen con su script.
 
 ### Los agentes (desde la 0.11.0)
@@ -408,7 +462,7 @@ Hay que saber:
   - /usr/local/sbin/hehermes-dispositivo no es mío: no lo toco. Para los iPhone de la pasarela usa el mío: sudo /opt/hehermes-servidor/hehermes-dispositivo alta <nombre>
   - Aquí ya hay unos avisos puestos a mano (/opt/hehermes-avisos, los de server/avisos/despliegue/instalar.sh): ni el vigía ni el lector de ficheros los pongo yo, y lo suyo no lo toco
 
-58 cambios.
+61 cambios.
 ```
 <!-- /pasarela-de-daniel -->
 
@@ -452,7 +506,9 @@ server/instalador/empaquetar --firmar hehermes-firma.pem       # y el .sig (hace
 
 `sudo hehermes-servidor actualizar --paquete <tar.gz> --firma <tar.gz.sig>` (lo que lanza el ayudante que actualiza, o
 una persona) no pasa por la app, así que no hay suma que la ancle: se fía de una firma Ed25519 de Daniel, comprobada
-con `openssl pkeyutl -verify -pubin -inkey <clave> -rawin -in <tar.gz> -sigfile <sig>`. Vale la de cualquiera de las
+con `openssl pkeyutl -verify -pubin -inkey <clave> -rawin -in <tar.gz> -sigfile <sig>` o, sin esa orden (o con una que
+no sabe Ed25519), con `cryptography` en el Python del venv del canje (desde la 0.11.1; `firma.CON_CRYPTOGRAPHY`). Si no
+hay con qué, dice eso, y no que la firma no sea buena; y no instala nada. Vale la de cualquiera de las
 **dos claves** del instalador instalado (`firma.CLAVES`): la principal (`/opt/hehermes-servidor/clave-publica.pem`) y la
 de rescate (`clave-rescate.pem`). Solo si la firma es buena desempaqueta (y solo ficheros y carpetas dentro de
 `hehermes-servidor-X.Y.Z/`) y lanza `instalar --si` de la versión nueva, que repara hasta dejarlo todo al día. Solo
@@ -545,8 +601,10 @@ llavero, 30 minutos y sin salir del iPhone). Hermes la ejecuta con su terminal:
 - **`--activar-api`** (decisión 6): si la API de Hermes está apagada o sin clave, añade al final de su `.env` solo las
   líneas que faltan (`API_SERVER_ENABLED=true`, `API_SERVER_HOST=127.0.0.1`, una `API_SERVER_KEY` nueva que no se
   imprime), con una copia antes y sin cambiarle el dueño, y reinicia Hermes **90 s después de acabar**, para no cortarle
-  el turno en el que contesta. Desinstalar quita esas líneas si siguen tal cual. Lo que se reinicia (desde la 0.10.2)
-  es lo que lleva su proceso, según su `/proc/<pid>/cgroup`:
+  el turno en el que contesta (desde la 0.11.1, el `.env` va lo último, detrás del canje, y con la unidad de `hermes
+  gateway install`, `systemctl reload` al acabar: su reinicio con drenaje, [arriba](#robustez-al-aplicar-desde-la-0111)).
+  Desinstalar quita esas líneas si siguen tal cual. Lo que se reinicia (desde la 0.10.2) es lo que lleva su proceso,
+  según su `/proc/<pid>/cgroup`:
   - **una unidad del sistema**, se llame como se llame (`hermes-gateway`, la de un perfil `hermes-gateway-trabajo`, o
     cualquiera cuyo nombre o `ExecStart` sea de Hermes: una que no lo es, como `cron.service`, no se reinicia):
     `systemctl restart <unidad>`;
@@ -594,21 +652,108 @@ salidas, en este orden:
 antes de tocar nada (la app dice «No se ha cambiado nada», y es verdad), salvo `reinicia-hermes` (0.10.2), que sale
 después de encender la API en el `.env` y que la app explica aparte. El texto de encima es para la persona; el
 código, para la app (`ErrorDelInstalador`). La frase le pide a Hermes que acabe con esa línea; el instalador no le da
-instrucciones a Hermes (la spec, «La frase», dice por qué):
+instrucciones a Hermes (la spec, «La frase», dice por qué). **Desde la 0.11.1, también lo que para después de
+empezar** (`a-medias`, `apt`, `pip`, `python`, `ocupado`, `interrumpido`: [abajo](#robustez-al-aplicar-desde-la-0111)):
 
 | Código | Qué pasa |
 |---|---|
-| `nat` | La dirección de salida es privada: hace falta `--direccion <IP o nombre>` (no se descubre con un servicio de fuera) |
+| `nat` | La dirección de salida es privada y el servicio de metadatos de la nube no da la pública (Oracle Cloud, que no la da nunca; una instancia sin IP pública; un servidor en casa): hace falta `--direccion <IP o nombre>`. Desde la 0.11.1, con la nube reconocida, justo antes va `hehermes-detalle:proveedor=<aws\|gcp\|azure\|oracle\|digitalocean\|hetzner>`, y el texto dice dónde se mira en su panel ([abajo](#la-dirección-detrás-de-un-nat-desde-la-0111)) |
 | `direccion` | No se sabe la dirección pública, o la dada no vale |
+| `contenedor` | Desde la 0.11.1: la orden corre dentro de un contenedor (el de Hermes en Docker, Podman, el sandbox de su terminal), no en el servidor; o en un LXC u OpenVZ donde systemd no puede encerrar las unidades (sin anidamiento) |
+| `no-es-servidor` | Desde la 0.11.1: un Mac o WSL (Hermes en el ordenador de casa) |
+| `usuario-hermes` | Desde la 0.11.1: Hermes corre con un uid que no tiene usuario en el servidor (el 10000 de su imagen de Docker); el texto da la orden de `useradd` |
 | `linger` | Sin root y sin linger (y no se ha podido encender): la pasarela se pararía al cerrarse la sesión. `sudo loginctl enable-linger <usuario>` |
 | `sin-hermes`, `hermes-parado`, `varios-hermes` | No hay Hermes, está parado, o hay varios (`--hermes-home`) |
 | `api-apagada`, `api-hermes`, `clave-hermes` | La API de Hermes apagada (y no se puede encender: sin `--activar-api`, o en un contenedor con su propia red), que no contesta o no en 127.0.0.1, o su `API_SERVER_KEY` que falta o no vale |
 | `hermes-antiguo` | Desde la 0.10.4: a Hermes le falta algo que la app necesita (anterior a la 0.20.1, o uno al que le falta una ruta). Justo antes de la última línea va otra para la app: `hehermes-detalle:version=<la suya, o ?> minima=0.20.1 falta=<claves>` ([abajo](#el-hermes-que-necesita-la-app-desde-la-0104)) |
-| `reinicia-hermes` | Hermes no corre bajo systemd ni en un contenedor: su API ya está encendida en el `.env`, y hay que reiniciarlo (`/restart`) y volver a lanzar lo mismo |
-| `ensurepip`, `sin-disco`, `puerto`, `sistema`, `paquete` | Sin `python3-venv`, sin sitio (150 MB), sin puerto libre, un sistema que no sabe, o un paquete incompleto |
+| `reinicia-hermes` | Hermes no corre bajo systemd ni en un contenedor: su API ya está encendida en el `.env`, y hay que reiniciarlo (`/restart`) y volver a lanzar lo mismo. Desde la 0.11.1, si se vuelve a lanzar sin reiniciarlo, sale otra vez, sin volver a tocar el `.env` (hasta la 0.11.0, `api-hermes`) |
+| `ensurepip`, `sin-disco`, `puerto`, `sistema`, `paquete` | Sin `python3-venv`, sin sitio (150 MB), sin puerto libre (o, desde la 0.11.1, el 127.0.0.1:8790 del vigía ocupado por otro programa), un sistema que no sabe, o un paquete incompleto |
 | `cortafuegos` | El cortafuegos cierra el paso y no se sabe abrir sin riesgo |
-| `por-chat`, `nombre-iphone`, `ficheros-ajenos`, `avisos-a-mano`, `avisos-credencial` | Lo de siempre de cada uno (el texto lo dice) |
+| `version-antigua` | Desde la 0.11.1: lo instalado es más nuevo que este instalador (una frase de antes, del historial del chat). Justo antes va `hehermes-detalle:instalada=<X.Y.Z> esta=<X.Y.Z>`. Lo que la app debería decir: «Esa frase es de una versión anterior: copia la de ahora» ([arriba](#cómo-se-instaló-desde-la-0111)) |
+| `por-chat`, `nombre-iphone`, `ficheros-ajenos`, `avisos-a-mano`, `avisos-credencial` | Lo de siempre de cada uno (el texto lo dice). `ficheros-ajenos` ya no sale por lo que dejó a medias una pasada que se cortó (desde la 0.11.1) |
 | `bloqueo` | Cualquier otro |
+
+### Robustez al aplicar (desde la 0.11.1)
+
+Por chat, el instalador lo lanza la terminal de Hermes: sin TTY, con la salida a una tubería y con un plazo (180 s de
+serie; al pasarse, SIGTERM a todo el grupo y, un segundo después, SIGKILL; con más de 420 s, descarta la salida). Las
+auditorías del 2026-10-06 encontraron que un fallo a mitad dejaba a Hermes tocado y a la persona sin pista. Ahora
+(`hehermes_servidor/marcha.py`, y lo prueba `tests/test_robustez.py`):
+
+- **Cada línea sale al momento.** El lanzador pone la salida con búfer de línea (con `-I`, `PYTHONUNBUFFERED` no vale):
+  hasta la 0.11.0, con la salida a una tubería, todo llegaba al final, y si Hermes lo cortaba se perdía.
+- **Cada paso dice cuál es y cuándo empieza**, también por un terminal: `hehermes-paso: 4/9 venv (12 s)` (el paso, el
+  total de esta pasada, su nombre y los segundos desde que arrancó el instalador). Los pasos, en su orden: `paquetes`
+  (solo si hace falta alguno), `ficheros`, `venv`, `certificados`, `servicios`, `cortafuegos` (con root),
+  `comprobar`, `iphone` (si se da de alta), `canje` (por chat) y `hermes` (si hay algo que tocarle). Si lo cortan, lo
+  impreso dice hasta dónde llegó.
+- **Lo de Hermes, lo último.** Su `.env` (`--activar-api`, `--corregir-exposicion`) y su `SOUL.md` van detrás de todo
+  lo que puede fallar, y por chat detrás del canje (`modo_tls.aplicar_hermes`). Hasta la 0.11.0 iban lo primero: el
+  cerrojo de dpkg de un VPS recién creado dejaba la API encendida en el `.env` sin reiniciar Hermes, y la frase
+  siguiente se paraba en `api-hermes` hasta que alguien lo reiniciara.
+- **Su reinicio no se pierde.** Antes de tocar su `.env` se apunta en el manifiesto que le falta reiniciarse
+  (`reinicio_de_hermes`), y se programa lo último, pase lo que pase después; al programarlo, se apunta cuándo. Si algo
+  lo impide (lo cortan justo entre medias), la vez siguiente se reconoce: su API no contesta, las líneas que la
+  encienden son las mías y siguen en su `.env`, y el reinicio está pendiente (sin programar, o programado hace menos de
+  35 minutos). Entonces se sigue como con `--activar-api` (su versión, por su código) y se reinicia al acabar; y si no
+  se sabe reiniciar (tmux, nohup), `reinicia-hermes` otra vez. Una API que no contesta sin nada pendiente sigue siendo
+  `api-hermes`.
+- **Con su reinicio con drenaje.** Si su unidad es la que escribe `hermes gateway install` (`ExecReload=/bin/kill -USR1
+  $MAINPID`; lo dice su documentación: «The installed unit also maps `systemctl reload hermes-gateway` to `SIGUSR1`…
+  a graceful drain, process exit, and supervisor relaunch»), `systemctl [--user] reload <su unidad>` al acabar:
+  Hermes no acepta turnos nuevos, espera a que acabe el que tiene (el que contesta con el enlace; hasta
+  `agent.restart_after_turn_timeout`, 1800 s de serie), sale con 75 y systemd lo arranca otra vez. Es lo mismo que su
+  `/restart`, y no corta nada. Si no (una unidad hecha a mano, un contenedor, al que SIGUSR1 le llegaría a su s6) o la
+  recarga falla, `restart` a los 90 s, como hasta ahora.
+- **Sin root y con una clave nueva**, el vigía (que la lee del `.env` de Hermes al arrancar) se reinicia después de
+  escribirla.
+- **apt y dnf, con aguante.** `apt-get -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3`, con
+  `NEEDRESTART_SUSPEND=1` y `NEEDRESTART_MODE=l` (que needrestart no reinicie nada a mitad: el instalador corre dentro de
+  Hermes), y antes, si hay cloud-init, `cloud-init status --wait`. Si `apt-get update` falla (un repositorio de otro,
+  roto), se instala igual con lo que ya conoce, y se dice. dnf ya reintenta solo.
+- **pip, con aguante.** `--retries 5 --timeout 20` y, si aun así falla, otra vez entera con espera creciente (2 s, 4 s;
+  tres intentos): con los hashes fijados, repetirlo da lo mismo.
+- **Ninguna orden se cuelga para siempre.** Todas las que se leen llevan plazo: 15 minutos los paquetes, 10 cada
+  intento de pip, 3 las de systemd y del cortafuegos y, las demás, 20 (por encima de la compactación de noche). Si se
+  pasa, 124, como `timeout`. Solo las que van directas al terminal (el QR, y el `instalar` de la versión nueva que lanza
+  `actualizar`) tardan lo que tarden.
+- **SIGTERM, SIGHUP y Ctrl-C** paran donde estén: el paso en marcha vuelve a como estaba (como cualquier parada), lo de
+  antes queda hecho y apuntado, y se dice. Por chat, la línea del código sale ya al recibir la señal (Hermes manda
+  SIGKILL un segundo después) y otra vez al final.
+- **Nada acaba en un traceback.** Lo que no se esperaba se dice en una línea (el tipo, el mensaje y dónde) y acaba en
+  `python`. Una salida que ya no se puede escribir (el terminal se ha ido) no tumba al instalador.
+
+**Lo que para después de empezar, por chat** (por un terminal, el mismo texto, sin las líneas para la app). Encima, el
+error, qué queda hecho y qué no («Hermes, sin tocar», o lo que ya se le ha dejado) y qué hacer; detrás, la línea del
+paso (si se paró a mitad de uno) y la del código, la última:
+
+```
+hehermes-detalle:paso=paquetes
+hehermes-error:apt
+```
+
+| Código | Qué pasa |
+|---|---|
+| `apt` | apt-get (o dnf) no ha podido instalar lo que hacía falta (`python3-venv`): el cerrojo de dpkg más de 2 minutos, la red, un repositorio. Suele ser pasajero: el mismo comando, en un rato |
+| `pip` | El entorno de Python de `cryptography` no se ha podido hacer: pip no llega a pypi.org (tres intentos), o `python3 -m venv` falla |
+| `a-medias` | Cualquier otra parada a mitad: un usuario, un `chown`, una unidad que no arranca, el cortafuegos, la comprobación, el canje… El texto dice cuál |
+| `python` | Algo que no se esperaba ha fallado dentro del instalador (una excepción); antes de empezar a aplicar, «No he cambiado nada» |
+| `ocupado` | Ya hay otro `hehermes-servidor` en marcha (dice cuál y desde cuándo): dos a la vez se pisarían el manifiesto |
+| `interrumpido` | Una señal a mitad: el plazo de la terminal de Hermes o su `/stop` (SIGTERM), un SSH que se cierra (SIGHUP) o Ctrl-C |
+
+En todos, **el mismo comando otra vez sigue donde se quedó**: lo hecho está apuntado en el manifiesto, y lo de Hermes,
+si no se llegó a tocar, sigue sin tocar.
+
+**Los avisos para la app.** Por chat, justo antes del enlace y juntas, una línea por cada cosa que la persona tiene que
+saber, con `clave=valor` detrás si hace falta:
+
+| Aviso | Qué pasa |
+|---|---|
+| `cortafuegos-proveedor tcp=<pasarela> canje=<canje>` | Siempre: si su proveedor tiene un cortafuegos propio (en su panel), tiene que dejar entrar esos dos TCP (el del canje, mientras dure). Desde dentro no se ve |
+| `cortafuegos-a-mano tcp=<pasarela> canje=<canje>` | El cortafuegos del servidor no lo he tocado (sin root, o con `--cortafuegos-a-mano`): esos dos TCP, también ahí |
+| `hermes-se-reinicia` | Hermes se reinicia al acabar (con drenaje, o a los 90 s): tardará un momento en contestar |
+| `reinicia-hermes` | No he podido programar su reinicio: hay que mandarle `/restart` para que lea su `.env` |
+| `avisos-push` | El vigía no está bien del todo: la app conecta, pero los avisos pueden no llegar |
 
 **El canje** (`hehermes_servidor/canje.py`) es una unidad temporal, `hehermes-canje`, lanzada con `systemd-run` para que
 sobreviva al comando de Hermes:
@@ -618,7 +763,7 @@ sobreviva al comando de Hermes:
 | Quién | Con root, `DynamicUser=yes`, **sin ninguna capacidad** (`CapabilityBoundingSet=` vacío: un puerto alto no la pide), `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `ProtectKernel*`, `ProtectControlGroups`, `RestrictNamespaces`, `RestrictSUIDSGID`, `SystemCallFilter=@system-service`, `UMask=0077` y `RuntimeMaxSec=780`. Sin root, una unidad de usuario |
 | Con qué | El venv de la pasarela (`/opt/hehermes-canje/venv`, o `~/.local/share/hehermes-venv` sin root), con `cryptography` fijada por hash (`requirements-canje.txt`) y el código por un `.pth` |
 | Secretos | El token, el código, la llave y la clave del certificado del canje, en `/run/hehermes-canje` (0700, en memoria), y al canje por `LoadCredential` |
-| Puerto | **Uno al azar entre el 58000 y el 65500** (los dos entran), de `secrets.randbelow`, libre en `ss -tan` (ni escuchando ni en una conexión); si está ocupado, el siguiente libre. En ufw, si está activo, `allow … port P comment hehermes-canje`; en firewalld, si está en marcha y el puerto no estaba abierto, `--add-port=P/tcp` solo en la configuración de ahora (nunca en la permanente); en nftables o iptables a pelo, en las mismas cadenas que las de siempre, con el comentario `hehermes-canje`. Solo mientras dure |
+| Puerto | **Uno al azar entre el 58000 y el 65500** (los dos entran), de `secrets.randbelow`, libre en `ss -tan` (ni escuchando ni en una conexión); si está ocupado, el siguiente libre. Desde la 0.11.1, el de la pasarela y el del canje, fuera de los efímeros de Linux (`/proc/sys/net/ipv4/ip_local_port_range`, del 32768 al 60999 de serie: del 61000 al 65500), que una conexión de salida puede quedarse tras un reinicio; si los cubren todos, como antes. En ufw, si está activo, `allow … port P comment hehermes-canje`; en firewalld, si está en marcha y el puerto no estaba abierto, `--add-port=P/tcp` solo en la configuración de ahora (nunca en la permanente); en nftables o iptables a pelo, en las mismas cadenas que las de siempre, con el comentario `hehermes-canje`. Solo mientras dure |
 | TLS | 1.3, con un certificado ECDSA P-256 autofirmado para ese canje, con un nombre al azar y sin ningún dato (ni «hehermes»). La huella del enlace es el SHA-256 de su SPKI, y la app no acepta otra |
 | Protocolo | `POST /canje/v1/reto {c}` devuelve un reto cifrado para la llave (el código no se gasta); `POST /canje/v1/canjear {c, reto}` devuelve `{h, p, f, t}` cifrado para la llave, y se cierra |
 | Límites | 12 minutos, 5 fallos (o 3 de una IP), una petición por segundo y por IP, 20 conexiones por IP (la siguiente ni llega al TLS) y 1024 IP recordadas |
@@ -657,7 +802,18 @@ también el siguiente `instalar --por-chat` y `desinstalar`). La app acepta cual
   desinstalar devuelve. Los tokens y la clave de Hermes de la pasarela son «gestionados»: suyos, pero sin comparar el
   hash, porque cambian.
 - **Cada paso deja el manifiesto al día**, y uno que falla vuelve a como estaba: tras un fallo basta con repetir el
+  comando. Desde la 0.11.1, también tras una señal (SIGTERM, SIGHUP, Ctrl-C), y **lo de Hermes va lo último**: un fallo
+  a mitad no lo deja tocado ([arriba](#robustez-al-aplicar-desde-la-0111)).
   comando.
+- **Lo que deja a medias un corte es suyo** (desde la 0.11.1). El manifiesto se guarda al acabar cada paso: un corte a
+  mitad de uno (el SIGHUP cuando iOS suspende la app de SSH, Ctrl-C, el plazo de la herramienta de terminal de Hermes)
+  deja lo de ese paso escrito y sin apuntar, y hasta la 0.11.0 paraba la vez siguiente con `ficheros-ajenos` (en cuanto
+  la versión nueva lo cambiaba, también la actualización desde la app). Ahora, antes de escribir nada, cada pasada apunta
+  lo que va a escribir (`a_medias`: cada fichero con su hash, cada enlace con su destino), y lo quita al acabar. Lo que no
+  está apuntado, o lo está con el hash de antes, se adopta («es mío**» en el plan: se apunta y se deja al día) si es lo
+  que iba a escribir esa pasada; y, si no está apuntado, también si es igual a lo de este paquete o lleva su marca (la
+  cabecera «# Lo escribe hehermes-servidor», o está dentro de `/opt/hehermes-servidor`). Solo con una instalación hecha
+  (el manifiesto en disco) y en lo suyo (`hehermes*`). Lo que alguien cambió a mano sigue parando, como siempre.
 - **El código nuevo, con el servicio reiniciado** (desde la 0.10.1). La pasarela carga `hehermes-pasarela` y
   `hehermes_servidor/`, y el vigía, `hehermes_avisos/` y `hehermes_servidor/` (la clave de Hermes): si alguno de esos
   ficheros cambia y el servicio está en marcha, se reinicia una vez (`systemctl [--user] restart`); si no hay nada que
@@ -673,14 +829,28 @@ también el siguiente `instalar --por-chat` y `desinstalar`). La app acepta cual
 
 ## Qué detecta, sin cambiar nada
 
+- **Que sea un servidor** (desde la 0.11.1), antes que nada: un Mac o WSL dan `no-es-servidor`, y un contenedor de
+  aplicación (`/.dockerenv`, `/run/.containerenv`, lo que apuntó systemd en `/run/systemd/container` o, sin systemd,
+  `systemd-detect-virt --container`) da `contenedor`: por chat, ahí corren las órdenes de un Hermes en Docker o con su
+  terminal en un sandbox, y antes salía `sistema` («no arranca con systemd»). En un LXC u OpenVZ, con root, una unidad
+  pasajera con la jaula de la pasarela que no hace nada (`systemd-run --wait … /bin/true`, la única orden de la
+  detección que no solo lee) dice si systemd puede encerrar aquí las unidades; si no, `contenedor`, con cómo encender el
+  anidamiento, en vez de saberlo al final con las unidades a medias.
 - **El sistema:** los de [la lista](#los-sistemas), en amd64 o arm64, con systemd y Python 3.9 o más (el de RHEL 9).
   En otro, se para al empezar sin haber ejecutado nada.
 - **Hermes, de verdad:** la unidad `hermes-gateway` (y si está en marcha) o su proceso, quién lo lleva (su cgroup: su
   unidad o su contenedor, arriba), su usuario y su `HERMES_HOME`, como lo decide Hermes al arrancar (el perfil de su
   orden, `-p trabajo`; un `HERMES_HOME` que ya es de un perfil; el perfil activo de `hermes profile use`, si no lo lanza un
-  supervisor; o `~/.hermes`);
-  del `.env` (con `export`, comillas y comentarios) y del entorno de la unidad, que manda sobre él, `API_SERVER_ENABLED`,
-  `API_SERVER_KEY`, `API_SERVER_HOST` y `API_SERVER_PORT`; que `GET /health` conteste 200 en `127.0.0.1` y que la clave
+  supervisor; o `~/.hermes`). Su usuario, desde la 0.11.1, por el uid de su proceso (`ps -eo pid=,uid=,args=`) y su
+  nombre por NSS: `ps -o user` recorta los de más de 8 letras (`cloud-user`, `almalinux`) y daba una casa equivocada o
+  un traceback; uno sin nombre en el servidor (el 10000 de Hermes en Docker) se para con `usuario-hermes`, porque
+  systemd no arranca nada con un usuario que no existe;
+  del `.env` (con `export`, comillas y comentarios) y del entorno de la unidad, que manda sobre él, `API_SERVER_HOST`;
+  `API_SERVER_ENABLED`, `API_SERVER_KEY` y `API_SERVER_PORT`, del `.env` y, si no están ahí (desde la 0.11.1), del
+  entorno de su unidad o de su proceso (`/proc/<pid>/environ`: lo de `docker run -e`, como lo enseña la guía de Docker
+  de Hermes), con el `.env` por encima, como los carga Hermes (`hermes_cli/env_loader.py`, `override=True`). En un
+  contenedor con su propia red, su `0.0.0.0` de dentro no la expone: lo dice `ss`, y el aviso aconseja publicar el puerto
+  solo en `127.0.0.1` (`-p 127.0.0.1:8642:8642`); que `GET /health` conteste 200 en `127.0.0.1` y que la clave
   valga en `GET /api/sessions?limit=1`. Cada fallo con su mensaje: no está, está instalado pero parado (la unidad, o
   solo su carpeta `.hermes`), su API está apagada, en su puerto contesta otra cosa, su clave no vale (o lleva algo que
   no puede ir en una cabecera). Varios Hermes se enumeran. La clave no se imprime nunca. Desde la 0.10.4, también su
@@ -794,10 +964,54 @@ la dirección IPv4 de salida.
 |---|---|---|
 | Debian y Ubuntu | Debian 12 y 13; Ubuntu 22.04, 24.04 y 26.04 | ufw; `python3-venv` con apt, si falta |
 | Sus derivadas | Por `ID_LIKE`: Linux Mint, Pop!_OS, Raspberry Pi OS, LMDE… Su base sale de `UBUNTU_CODENAME`, `DEBIAN_CODENAME` o `VERSION_CODENAME` | Como su base. Si la base no está en la lista (Mint 20, sobre Ubuntu 20.04) o no se sabe cuál es (Kali), lo avisa y sigue: lo que falte (Python, systemd) lo para igual |
-| Red Hat | Rocky Linux, AlmaLinux, RHEL y CentOS Stream 9 y 10 (por `PLATFORM_ID`, también sus derivadas, como Oracle Linux, con aviso); Fedora 42 o más nueva | firewalld. Sin paquetes: su python3 ya trae venv, y la pasarela no necesita EPEL |
+| Red Hat | Rocky Linux, AlmaLinux, RHEL y CentOS Stream 9 y 10 (por `PLATFORM_ID`, también sus derivadas, como Oracle Linux, con aviso); Fedora 42 o más nueva; desde la 0.11.1, Amazon Linux 2023 (`platform:al2023`), como un EL9 y con aviso (por lo que trae: Python 3.9, systemd 252 y dnf; sin probar aún en una máquina de verdad) | firewalld. Sin paquetes: su python3 ya trae venv, y la pasarela no necesita EPEL |
 
-Lo demás (RHEL 8, Fedora 41, Amazon Linux, Arch, openSUSE…) se para al empezar, diciendo cuáles sí, sin haber
+Lo demás (RHEL 8, Fedora 41, Amazon Linux 2, Arch, openSUSE…) se para al empezar, diciendo cuáles sí, sin haber
 ejecutado nada.
+
+### La dirección detrás de un NAT (desde la 0.11.1)
+
+En AWS (EC2 y Lightsail), Google Cloud, Azure y Oracle Cloud la tarjeta de red tiene una IP privada: la pública la pone
+un NAT 1:1 del proveedor, y la ruta de salida da la privada. Hasta la 0.11.0 eso era `nat`, y por chat no había forma de
+dar `--direccion`. Ahora, si nadie la da y la de salida es privada (`hehermes_servidor/nube.py`):
+
+- **Qué nube es**, por DMI (`/sys/class/dmi/id`, que se lee sin root), como cloud-init: `sys_vendor` «Amazon EC2» (o una
+  BIOS «…amazon», las de Xen), «Google», «DigitalOcean» o «Hetzner», y la etiqueta del chasis de Azure o la de Oracle.
+- **Su servicio de metadatos**, en `169.254.169.254`, que está en la propia máquina (de enlace local: no sale a
+  internet), sin proxies ni redirecciones y con 2 s de plazo: AWS con IMDSv2 (un token de un minuto, `PUT
+  /latest/api/token`, que no se guarda ni se pinta), Google con `Metadata-Flavor: Google`, Azure con `Metadata: true`
+  (y, para una IP de SKU estándar, que no sale en `publicIpAddress`, la de `/metadata/loadbalancer`), DigitalOcean y
+  Hetzner. Si DMI no dice qué nube es, se prueba una vez la forma de EC2, que imitan otras (OpenStack, con su IP
+  flotante); si ahí no contesta nadie, no se pregunta más.
+- **Solo vale una IPv4 pública, sola**: nunca una privada, de CGNAT, de enlace local, de bucle, de multidifusión,
+  reservada o una IPv6, ni nada que no sea una IP. Va en el QR, y el plan dice de dónde sale («me la da su servicio de
+  metadatos»), con cómo cambiarla (`--direccion`).
+- **Si no la da** (Oracle Cloud no la da nunca: su `/opc/v2/vnics/` solo trae las privadas; una instancia sin IP
+  pública; los metadatos apagados; un servidor en casa), `nat`, con dónde se mira en el panel de ese proveedor y, por
+  chat, `hehermes-detalle:proveedor=<cuál>` para la app.
+
+Sin probar aún en una nube de verdad: lo que contesta cada una sale de sus guías (a 2026-10-06), y la nube de mentira de
+las pruebas (`tests/servidor_falso.py`, `metadatos`) exige sus cabeceras.
+
+## El informe, para entender un fallo
+
+`hehermes-servidor informe` (`hehermes_servidor/informe.py`) junta en texto plano lo que hace falta para entender un
+fallo, para pegarlo en un chat: las versiones (la del instalador que se ejecuta y la instalada, la de los avisos, la de
+Hermes por su `/health`, Python y el sistema, con systemd o dentro de un contenedor), la instalación (con root o sin él,
+el puerto de la pasarela, qué lleva a Hermes, el alta por chat y si se canjeó, linger sin root), el estado de cada
+servicio de HeHermes y el de Hermes, los puertos que escuchan (la pasarela, el vigía y la API de Hermes, con la
+dirección de esta máquina), la última actualización desde la app con lo último que dijo el instalador (`registro.txt`,
+solo con root) y las últimas líneas de los registros de HeHermes.
+
+- **Sin secretos**: los registros de Hermes no se leen (llevan lo que se habla), y todo pasa por `informe.tapar`: las
+  IP que no son de esta máquina (`<ip>`), lo que va detrás de «token», «clave», «key», «llave», «Bearer» y parecidos, las
+  cadenas de 32 caracteres o más con letras y números, lo de detrás de `?` en los enlaces `hehermes-*:` (`<oculto>`), y
+  la casa y el nombre del usuario de Hermes (`~`, `<usuario>`). Lo tapado se ve tapado: que falte algo se nota.
+- **Sin root, sin pedir nada**: no se relanza con `sudo` ni toma el cerrojo. Dice lo que puede leer este usuario (la
+  instalación suya, o lo que se pueda de la de root) y que con `sudo` saldría todo. Así lo puede lanzar Hermes aunque
+  no tenga permisos.
+- La app lo pide desde Ajustes › Tu servidor con un mensaje para Hermes («Pedírselo a Hermes»), y junta en «Copiar
+  informe» lo que ya sabe ella (contrato §17).
 
 ## «Seguridad», en `comprobar`
 
@@ -881,9 +1095,10 @@ La auditoría del 2026-09-29 (§5, §7, §13, §14.5, §14.9), comprobada antes 
 - **El alcance, por la dirección del QR.** Desde dentro se distingue: otra máquina detrás de la dirección (mal), la
   dirección propia sin contestar (mal), la propia contestando (si la app no llega, es el cortafuegos del proveedor,
   que desde dentro no se ve), o un NAT (reenvía, o no se sabe y se dice qué abrir). La regla de ufw, aparte. La IP
-  pública detrás de un NAT no se descubre sola: un servicio de eco de fuera sería una dependencia (y una fuga de que
+  pública detrás de un NAT no se pregunta a un servicio de eco de fuera: sería una dependencia (y una fuga de que
   este servidor instala HeHermes) sin una forma robusta en la biblioteca estándar; por chat se para con
-  `hehermes-error:nat` y se pide `--direccion`.
+  `hehermes-error:nat` y se pide `--direccion`. Desde la 0.11.1 sí se pregunta al servicio de metadatos de la propia
+  nube, que no es de fuera ([abajo](#la-dirección-detrás-de-un-nat-desde-la-0111)).
 - **Los restos de la VPN**, en «Seguridad»: strongSwan en UDP 500/4500 y los sitios de nginx del túnel, con la orden
   exacta; nada se quita solo.
 - **El borrado de verdad** (abajo).
@@ -949,7 +1164,9 @@ La pasarela también se prueba de verdad (`tests/test_pasarela_red.py`): TLS en 
 token, el 404 idéntico y su segundo de espera, la clave que se añade, el SSE evento a evento, las bajas que cortan un
 SSE abierto, los límites y que el registro no lleva nada de la petición. Las de la lógica (tokens, límites, huella,
 configuración), sin red, en `tests/test_pasarela_logica.py`; el instalador, con root, sin root, al lado de una VPN hecha
-a mano y por chat, en `tests/test_modo_tls.py`; `hehermes-dispositivo`, en `tests/test_dispositivo_tls.py` (la
+a mano y por chat, en `tests/test_modo_tls.py`; lo que pasa cuando algo falla a mitad (el orden, el reinicio pendiente
+de Hermes, apt y pip, los códigos, las señales de verdad a este mismo proceso y los avisos), en
+`tests/test_robustez.py`; `hehermes-dispositivo`, en `tests/test_dispositivo_tls.py` (la
 pasarela) y `tests/test_dispositivo_vpn.py` (las bajas de la VPN de antes, y que ya no da altas). El canje se prueba de
 verdad: un servidor TLS en `127.0.0.1` y un cliente de Python que hace de iPhone (ancla la huella, abre el reto, canjea y
 abre `{h, p, f, t}`). **En el Mac va con TLS 1.2:** el Python de Xcode trae LibreSSL 2.8, que no sabe 1.3, así que las

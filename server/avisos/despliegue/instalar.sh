@@ -88,6 +88,10 @@
 # escuchar en ellos, esté o no en marcha el servicio. El relé se habilita siempre: sin la clave de APNs arranca igual,
 # con su puerto, y a los avisos contesta 503 hasta que se le reinicie con ella (lo hace volver a ejecutar esto).
 set -euo pipefail
+# Lo que se instala lo leen usuarios propios (hh-vigia, hh-rele): no puede depender del umask de quien lo lance. El
+# 2026-10-06, con un `umask 077` heredado, pip dejó h2, hpack y anyio en 0700 de root y el relé no mandaba ningún aviso.
+# Lo que es secreto se protege con su chmod y su install -m, no con el umask.
+umask 022
 
 fallar() { echo "error: $*" >&2; exit 1; }
 paso() { echo "==> $*"; }

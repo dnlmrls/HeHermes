@@ -12,6 +12,7 @@ import stat
 import unittest
 
 from hehermes_servidor import manifiesto as m
+from hehermes_servidor import piezas as p
 from hehermes_servidor.manifiesto import Manifiesto, clasificar, guardar_copia, restaurar_copia
 
 RUTA = "/etc/nginx/sites-available/hehermes-tunel"
@@ -123,6 +124,112 @@ class Clasificar(unittest.TestCase):
     def test_un_enlace_ajeno(self):
         self.sis.enlazar(ENLACE, "/etc/nginx/sites-available/de-daniel")
         self.assertEqual(clasificar(self.sis, self.man, ENLACE, destino_enlace="/x"), m.AJENO)
+
+
+class LoQueDejoUnaPasadaCortada(unittest.TestCase):
+    """Un corte a mitad de un paso (el SIGHUP del SSH, Ctrl-C, el plazo de Hermes) deja escrito lo de ese paso sin
+    apuntar en el manifiesto, que se guarda al acabar cada paso. Eso es suyo: se adopta en vez de parar con
+    `ficheros-ajenos`, y repetir el comando acaba el trabajo. Lo ajeno de verdad sigue parando."""
+
+    UNIDAD = "/etc/systemd/system/hehermes-pasarela.service"
+    CODIGO = "/opt/hehermes-servidor/hehermes_servidor/pasarela.py"
+    SUELTO = "/usr/local/libexec/hehermes-leer-media"
+
+    def setUp(self):
+        self.sis = apoyo.SistemaFalso()
+        self.addCleanup(self.sis.limpiar)
+        # Una instalación hecha: el manifiesto se guarda antes de escribir nada, así que está en disco.
+        Manifiesto().guardar(self.sis)
+        self.man = Manifiesto.leer(self.sis)
+
+    def cortada(self, **ficheros):
+        """La pasada que se cortó: lo que iba a escribir, apuntado antes de empezar (`m.A_MEDIAS`)."""
+        self.man.datos[m.A_MEDIAS] = {"version": "0.11.0", "ficheros": {
+            ruta: {"tipo": "fichero", "sha256": m.sha256(datos)} for ruta, datos in ficheros.items()}}
+
+    def test_lo_suyo_igual_que_el_paquete_se_adopta(self):
+        self.sis.poner(self.UNIDAD, b"[Unit]\n")
+        self.assertEqual(clasificar(self.sis, self.man, self.UNIDAD, b"[Unit]\n"), m.ADOPTA)
+        self.sis.enlazar(p.ORDEN, p.PREFIJO + "/hehermes-servidor")
+        self.assertEqual(clasificar(self.sis, self.man, p.ORDEN, destino_enlace=p.PREFIJO + "/hehermes-servidor"),
+                         m.ADOPTA)
+
+    def test_sin_instalacion_no_se_adopta_nada(self):
+        """Sin el manifiesto en disco no hubo ninguna pasada suya: lo que haya lo puso otro."""
+        sin = Manifiesto()
+        self.sis.poner(self.UNIDAD, p.CABECERA + "[Unit]\n")
+        self.assertEqual(clasificar(self.sis, sin, self.UNIDAD, (p.CABECERA + "[Unit]\n").encode()), m.AJENO_IGUAL)
+        self.assertEqual(clasificar(self.sis, sin, self.UNIDAD, b"otra\n"), m.AJENO)
+
+    def test_fuera_de_lo_suyo_no_se_adopta(self):
+        for ruta in ("/etc/systemd/system/nginx.service", "/root/.hermes/.env", "/etc/hermes/x"):
+            with self.subTest(ruta=ruta):
+                self.sis.poner(ruta, p.CABECERA + "x\n")
+                self.assertEqual(clasificar(self.sis, self.man, ruta, (p.CABECERA + "x\n").encode()), m.AJENO_IGUAL)
+                self.assertEqual(clasificar(self.sis, self.man, ruta, b"y\n"), m.AJENO)
+
+    def test_con_su_marca_se_adopta_aunque_sea_de_otra_version(self):
+        self.sis.poner(self.UNIDAD, p.CABECERA + "[Unit]\nDescription=la de antes\n")
+        self.assertEqual(clasificar(self.sis, self.man, self.UNIDAD, (p.CABECERA + "[Unit]\n").encode()), m.ADOPTA)
+
+    def test_sin_su_marca_y_distinto_sigue_siendo_ajeno(self):
+        self.sis.poner(self.UNIDAD, b"[Unit]\nDescription=de otro\n")
+        self.assertEqual(clasificar(self.sis, self.man, self.UNIDAD, (p.CABECERA + "[Unit]\n").encode()), m.AJENO)
+        # Ni con la marca en otra línea que la primera.
+        self.sis.poner(self.UNIDAD, "[Unit]\n" + p.CABECERA)
+        self.assertEqual(clasificar(self.sis, self.man, self.UNIDAD, (p.CABECERA + "[Unit]\n").encode()), m.AJENO)
+
+    def test_dentro_de_su_carpeta_es_suyo(self):
+        """/opt/hehermes-servidor (y la de un usuario) solo la escribe él: lo que hay dentro es de una pasada suya."""
+        for ruta in (self.CODIGO, "/home/hermes/.local/share/hehermes-servidor/hehermes-pasarela"):
+            with self.subTest(ruta=ruta):
+                self.sis.poner(ruta, b"# el codigo de la version de antes\n")
+                self.assertEqual(clasificar(self.sis, self.man, ruta, b"# el de ahora\n"), m.ADOPTA)
+        # El enlace del mismo nombre no es su carpeta.
+        self.sis.poner(p.ORDEN, b"un fichero donde va el enlace\n")
+        self.assertEqual(clasificar(self.sis, self.man, p.ORDEN, destino_enlace=p.PREFIJO + "/hehermes-servidor"),
+                         m.AJENO)
+        # Ni una carpeta o un enlace dentro de ella: solo ficheros.
+        self.sis.carpeta(p.PREFIJO + "/hehermes_avisos")
+        self.assertEqual(clasificar(self.sis, self.man, p.PREFIJO + "/hehermes_avisos", b"x"), m.AJENO)
+
+    def test_lo_que_iba_a_escribir_la_pasada_cortada_se_adopta(self):
+        self.cortada(**{self.SUELTO: b"#!/usr/bin/python3 -IS\n# la 0.11.0\n"})
+        self.sis.poner(self.SUELTO, b"#!/usr/bin/python3 -IS\n# la 0.11.0\n")
+        self.assertEqual(clasificar(self.sis, self.man, self.SUELTO, b"#!/usr/bin/python3 -IS\n# la 0.11.1\n"),
+                         m.ADOPTA)
+        self.sis.poner(self.SUELTO, b"#!/usr/bin/python3 -IS\n# otro\n")
+        self.assertEqual(clasificar(self.sis, self.man, self.SUELTO, b"#!/usr/bin/python3 -IS\n# la 0.11.1\n"),
+                         m.AJENO, "con otro contenido que el de la pasada, no es suyo")
+
+    def test_lo_mio_que_la_pasada_cortada_ya_habia_reescrito_se_adopta(self):
+        """Un corte al actualizar: el fichero ya es el nuevo y el manifiesto aún tiene el hash del de antes. No es que
+        alguien lo haya tocado: era lo que iba a escribir esa pasada."""
+        self.sis.poner(self.UNIDAD, p.CABECERA + "v1\n")
+        self.man.apuntar_fichero(self.UNIDAD, (p.CABECERA + "v1\n").encode())
+        self.sis.poner(self.UNIDAD, p.CABECERA + "v2\n")
+        self.assertEqual(clasificar(self.sis, self.man, self.UNIDAD, (p.CABECERA + "v2\n").encode()), m.MODIFICADO,
+                         "sin la pasada apuntada, el hash manda (como siempre)")
+        self.cortada(**{self.UNIDAD: (p.CABECERA + "v2\n").encode()})
+        self.assertEqual(clasificar(self.sis, self.man, self.UNIDAD, (p.CABECERA + "v2\n").encode()), m.ADOPTA)
+        self.assertEqual(clasificar(self.sis, self.man, self.UNIDAD, (p.CABECERA + "v3\n").encode()), m.ADOPTA)
+        self.sis.poner(self.UNIDAD, p.CABECERA + "v2\n# y una linea de Daniel\n")
+        self.assertEqual(clasificar(self.sis, self.man, self.UNIDAD, (p.CABECERA + "v3\n").encode()), m.MODIFICADO,
+                         "lo que alguien tocó después sigue parando")
+
+    def test_una_pasada_apuntada_rara_no_adopta_nada(self):
+        self.sis.poner(self.SUELTO, b"x\n")
+        for rara in (None, [], {"ficheros": []}, {"ficheros": {self.SUELTO: "x"}},
+                     {"ficheros": {self.SUELTO: {"tipo": "fichero"}}},
+                     {"ficheros": {self.SUELTO: {"tipo": "gestionado"}}}):
+            with self.subTest(rara=rara):
+                self.man.datos[m.A_MEDIAS] = rara
+                self.assertEqual(clasificar(self.sis, self.man, self.SUELTO, b"y\n"), m.AJENO)
+
+    def test_reemplazar_no_hace_falta_con_lo_suyo(self):
+        """Lo suyo no se «reemplaza»: la copia sería suya, y desinstalar la devolvería en lugar de quitarlo."""
+        self.sis.poner(self.UNIDAD, p.CABECERA + "[Unit]\n")
+        self.assertEqual(clasificar(self.sis, self.man, self.UNIDAD, b"[Unit]\n", reemplazar={self.UNIDAD}), m.ADOPTA)
 
 
 class Guardar(unittest.TestCase):

@@ -3,12 +3,17 @@
 La regla de la spec: solo se escribe en lo que está en el manifiesto y nadie ha cambiado desde que se escribió. Lo que
 no está (lo ajeno) y lo que está pero ha cambiado (lo modificado) paran el instalador, salvo `--reemplazar`, que antes
 guarda una copia para que desinstalar lo devuelva a como estaba.
+
+Salvo lo que es suyo aunque no esté apuntado (desde la 0.11.1): el manifiesto se guarda al acabar cada paso, así que un
+corte a mitad de uno (el SIGHUP del SSH, Ctrl-C, el plazo de Hermes) deja lo de ese paso escrito y sin apuntar. Eso se
+adopta (`ADOPTA`) en lugar de parar con `ficheros-ajenos`, y repetir el comando acaba el trabajo (`es_suyo`).
 """
 
 from __future__ import annotations
 
 import json
 
+from .piezas import CABECERA
 from .sistema import sha256
 
 RUTA_MANIFIESTO = "/etc/hehermes/instalacion.json"
@@ -22,11 +27,20 @@ AJENO = "ajeno"
 AJENO_IGUAL = "ya está (no es mío)"
 MODIFICADO = "modificado"
 REEMPLAZA = "reemplaza"
+#: Suyo aunque no esté apuntado, o apuntado con el hash de antes: lo dejó una pasada que se cortó a medias (`es_suyo`).
+#: Se vuelve a escribir (el mismo contenido, o el de ahora) y se apunta, sin copia: no hay nada de nadie que devolver.
+ADOPTA = "adopta"
 
 #: Lo que para el instalador si no se pide `--reemplazar`.
 BLOQUEAN = (AJENO, MODIFICADO)
 #: Lo que se escribe.
-ESCRIBEN = (NUEVO, CAMBIA, REEMPLAZA)
+ESCRIBEN = (NUEVO, CAMBIA, REEMPLAZA, ADOPTA)
+
+#: En el manifiesto, mientras se aplica una pasada (`plan.antes_de_aplicar`): su versión y lo que va a escribir, cada
+#: fichero con su hash y cada enlace con su destino, como en `ficheros`. Se quita al acabar: si sigue ahí, esa pasada se
+#: cortó, y lo que dejó escrito sin apuntar (o apuntado con el hash de antes) se reconoce por esto. De lo gestionado no
+#: se apunta nada (los tokens y las claves): solo se adopta si es igual a lo que se quiere.
+A_MEDIAS = "a_medias"
 
 
 #: Los dos modos, en el orden en que se enumeran: la VPN (la de antes de la 0.6.0, que ya solo se quita) y la pasarela.
@@ -178,12 +192,58 @@ def clasificar(sis, man: Manifiesto, ruta: str, deseado: bytes | None = None, de
         actual = sis.leer(ruta)
         igual = actual is not None and actual == deseado
     if entrada is None:
+        if es_suyo(sis, man, ruta, igual):
+            return ADOPTA
         if igual:
             return AJENO_IGUAL
         return REEMPLAZA if ruta in reemplazar else AJENO
     if _sin_tocar(sis, ruta, entrada):
         return YA_ESTA if (igual or entrada["tipo"] == "gestionado") else CAMBIA
+    if de_la_pasada_cortada(sis, man, ruta):
+        # Apuntado con el hash de antes y ya reescrito por una pasada que no llegó a apuntarlo (un corte al actualizar).
+        return ADOPTA
     return REEMPLAZA if ruta in reemplazar else MODIFICADO
+
+
+def de_hehermes(ruta: str) -> bool:
+    """Si la ruta es de lo suyo por su nombre: todo lo que escribe se llama `hehermes*` (una carpeta del camino o el
+    fichero), como lo que `borrar_arbol` se deja borrar."""
+    return any(parte.startswith("hehermes") for parte in ruta.split("/"))
+
+
+def _en_su_carpeta(ruta: str) -> bool:
+    """Dentro de la carpeta del instalador (`/opt/hehermes-servidor`, o la de un usuario en su casa), que no escribe
+    nadie más. El enlace del mismo nombre (`/usr/local/sbin/hehermes-servidor`) no es una carpeta."""
+    return "hehermes-servidor" in ruta.split("/")[:-1]
+
+
+def de_la_pasada_cortada(sis, man, ruta: str) -> bool:
+    """Si lo que hay en `ruta` es justo lo que iba a dejar una pasada que se cortó (`A_MEDIAS`): el mismo hash, o el
+    mismo destino."""
+    pasada = man.datos.get(A_MEDIAS)
+    ficheros = pasada.get("ficheros") if isinstance(pasada, dict) else None
+    entrada = ficheros.get(ruta) if isinstance(ficheros, dict) else None
+    if not isinstance(entrada, dict):
+        return False
+    if entrada.get("tipo") == "fichero" and isinstance(entrada.get("sha256"), str):
+        return _sin_tocar(sis, ruta, entrada)
+    if entrada.get("tipo") == "enlace" and isinstance(entrada.get("destino"), str):
+        return _sin_tocar(sis, ruta, entrada)
+    return False
+
+
+def es_suyo(sis, man, ruta: str, igual: bool = False) -> bool:
+    """Lo que no está en el manifiesto pero es suyo: lo dejó escrito una pasada que se cortó antes de apuntarlo. Solo
+    con una instalación hecha (el manifiesto en disco: se guarda antes de escribir nada, y sin él no hubo ninguna pasada
+    suya) y en lo suyo (`de_hehermes`), y si además es lo mismo que se quiere dejar ahora (`igual`), lo que iba a
+    escribir esa pasada (`de_la_pasada_cortada`) o lleva su marca: un fichero que empieza por `piezas.CABECERA` o que
+    está dentro de su carpeta. Lo de antes de la 0.11.1, que no apuntaba la pasada, se reconoce por lo uno o lo otro."""
+    if not man.en_disco or not de_hehermes(ruta):
+        return False
+    if igual or de_la_pasada_cortada(sis, man, ruta):
+        return True
+    datos = sis.leer(ruta)
+    return datos is not None and (datos.startswith(CABECERA.encode()) or _en_su_carpeta(ruta))
 
 
 def _sin_tocar(sis, ruta: str, entrada: dict) -> bool:

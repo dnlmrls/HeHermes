@@ -1097,6 +1097,14 @@ class Config:
         self.usuario, self.espera_flock = usuario, espera_flock
 
 
+#: Adónde va lo que el `hermes` del ayudante intente sacar a internet: un puerto cerrado de localhost, que contesta que
+#: no al momento. La jaula no deja salir (`IPAddressDeny=any`) y systemd tira esos paquetes sin contestar, así que lo
+#: que Hermes intenta de red al arrancar se quedaba esperando unos 2 minutos: el 2026-10-06, crear un agente tardó 2
+#: minutos, y `hermes profile list` en una jaula igual, 123 s; con esto, 5 s. Nada de lo que el ayudante le pide a
+#: `hermes` (crear, describir, exportar, borrar, `config set`) necesita internet.
+PROXY_CERRADO = "http://127.0.0.1:9"
+
+
 class Sistema:
     """`hermes` como el dueño de Hermes, lo de su casa como él, su API en 127.0.0.1, su socket de control y su unidad.
     Las pruebas ponen dobles (`server/avisos/tests/agentes_apoyo.py`); nunca el Hermes de verdad."""
@@ -1200,9 +1208,14 @@ class Sistema:
 
     def entorno_de_hermes(self) -> dict:
         casa = self.casa_del_dueno() or os.path.dirname(self.config.casa)
-        return {"HERMES_HOME": self.config.casa, "HOME": casa, "USER": self.config.usuario_hermes,
-                "LOGNAME": self.config.usuario_hermes, "LANG": "C.UTF-8", "NO_COLOR": "1", "TERM": "dumb",
-                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+        entorno = {"HERMES_HOME": self.config.casa, "HOME": casa, "USER": self.config.usuario_hermes,
+                   "LOGNAME": self.config.usuario_hermes, "LANG": "C.UTF-8", "NO_COLOR": "1", "TERM": "dumb",
+                   "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+        # Lo de fuera, al puerto cerrado (`PROXY_CERRADO`); lo de esta máquina, directo.
+        entorno.update({clave: PROXY_CERRADO for clave in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy",
+                                                           "http_proxy", "all_proxy")})
+        entorno.update(NO_PROXY="localhost,127.0.0.1,::1", no_proxy="localhost,127.0.0.1,::1")
+        return entorno
 
     def _systemctl(self, argumentos, plazo) -> tuple:
         orden = ["systemctl"] + (["--user"] if self.config.usuario else []) + list(argumentos)

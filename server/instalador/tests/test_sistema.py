@@ -64,5 +64,17 @@ class Sistema(unittest.TestCase):
         self.assertEqual(sha256(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
 
 
+class LaCuenta(unittest.TestCase):
+    def test_por_uid_con_nss_y_sin_nombre_none(self):
+        import pwd
+        from hehermes_servidor.sistema import Sistema as SistemaDeVerdad
+        de_verdad = SistemaDeVerdad()
+        yo = pwd.getpwuid(os.getuid())
+        self.assertEqual(de_verdad.cuenta(os.getuid()), (yo.pw_name, yo.pw_dir))
+        self.assertEqual(de_verdad.cuenta(str(os.getuid())), (yo.pw_name, yo.pw_dir))
+        for nadie in (3999999999, "abc", None, -1):
+            self.assertIsNone(de_verdad.cuenta(nadie))
+
+
 if __name__ == "__main__":
     unittest.main()

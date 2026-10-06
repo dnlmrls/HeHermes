@@ -20,7 +20,9 @@ Lo que hace que no sirva para otra cosa:
   ``version`` y ``sha256`` no se atiende.
 - **La suma y la firma**: lo descargado tiene que dar la suma que manda la app (la que lleva escrita, la misma que
   ancla la primera instalación) y estar firmado con una de las claves del instalador instalado, la principal o la de
-  rescate. Por dentro, la versión pedida. Después, ``hehermes-servidor actualizar`` vuelve a comprobar la firma.
+  rescate. Por dentro, la versión pedida. Después, ``hehermes-servidor actualizar`` vuelve a comprobar la firma. La
+  firma se comprueba con la orden ``openssl`` y, si no está (o no sabe Ed25519), con ``cryptography``, la del venv del
+  canje; sin ninguna de las dos, el motivo es ``sin_openssl``, no ``firma``.
 - **Nunca hacia atrás**: ni la versión instalada ni una anterior, al pedirla y otra vez al ejecutarla.
 - **Una a la vez** (``actualizar.lock``, que el trabajo tiene mientras dura) **y tres por hora** (``intentos.json``).
 - **La instalación, en su propia unidad** (``systemd-run --unit hehermes-actualizacion``): la versión nueva reinicia
@@ -56,6 +58,9 @@ PREFIJO = "/opt/hehermes-servidor"
 TRABAJO = "/var/lib/hehermes-actualizar"
 AYUDANTE = "/usr/local/libexec/hehermes-actualizar"
 PYTHON = "/usr/bin/python3"
+#: El Python del venv del canje, que tiene `cryptography` (`hehermes_servidor.porchat.PYTHON_VENV`; una prueba las ata):
+#: con él se comprueba la firma si no hay `openssl`.
+PYTHON_CANJE = "/opt/hehermes-canje/venv/bin/python"
 UNIDAD = "hehermes-actualizacion"
 #: La principal y la de rescate, como `hehermes_servidor.firma.CLAVES`.
 CLAVES = ("clave-publica.pem", "clave-rescate.pem")
@@ -86,8 +91,30 @@ PATRON_SHA = re.compile(r"[0-9a-f]{64}")
 PATRON_VERSION_INSTALADA = re.compile(r'^VERSION = "([0-9]+\.[0-9]+\.[0-9]+)"$', re.M)
 ESTADOS = ("libre", "descargando", "comprobando", "instalando", "hecho", "fallo")
 EN_MARCHA = ("descargando", "comprobando", "instalando")
-#: Por qué ha fallado, lo único que le llega a la app (contrato §17).
-MOTIVOS = frozenset({"descarga", "suma", "firma", "sin_firmas", "version", "instalacion", "interrumpida", "interna"})
+#: Por qué ha fallado, lo único que le llega a la app (contrato §17). `sin_openssl` (desde la 0.11.1): no hay con qué
+#: comprobar la firma (ni la orden `openssl` ni `cryptography` en el venv del canje), que no es lo mismo que una mala.
+MOTIVOS = frozenset({"descarga", "suma", "firma", "sin_firmas", "sin_openssl", "version", "instalacion", "interrumpida",
+                     "interna"})
+#: Lo que comprueba la firma con `cryptography`, lo mismo que `hehermes_servidor.firma.CON_CRYPTOGRAPHY` (una prueba
+#: las ata): «buena» y 0, «mala» y 1; otra cosa es que no se ha podido.
+CON_CRYPTOGRAPHY = (
+    "import sys\n"
+    "from cryptography.exceptions import InvalidSignature\n"
+    "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey\n"
+    "from cryptography.hazmat.primitives.serialization import load_pem_public_key\n"
+    "with open(sys.argv[1], 'rb') as f:\n"
+    "    clave = load_pem_public_key(f.read())\n"
+    "if not isinstance(clave, Ed25519PublicKey):\n"
+    "    sys.exit(3)\n"
+    "with open(sys.argv[2], 'rb') as f, open(sys.argv[3], 'rb') as g:\n"
+    "    datos, sello = f.read(), g.read()\n"
+    "try:\n"
+    "    clave.verify(sello, datos)\n"
+    "except InvalidSignature:\n"
+    "    print('mala')\n"
+    "    sys.exit(1)\n"
+    "print('buena')\n"
+)
 #: Lo que puede traer cada orden, y nada más.
 CAMPOS = {"estado": {"orden"}, "actualizar": {"orden", "version", "sha256"}}
 
@@ -152,8 +179,9 @@ class SoloHTTPS(urllib.request.HTTPRedirectHandler):
 
 
 class Config:
-    def __init__(self, prefijo=PREFIJO, trabajo=TRABAJO, ayudante=AYUDANTE):
+    def __init__(self, prefijo=PREFIJO, trabajo=TRABAJO, ayudante=AYUDANTE, python_canje=PYTHON_CANJE):
         self.prefijo, self.trabajo, self.ayudante = prefijo.rstrip("/"), trabajo.rstrip("/"), ayudante
+        self.python_canje = python_canje
         self.espera_cerrojo = ESPERA_CERROJO
 
 
@@ -191,15 +219,36 @@ class Sistema:
         except (OSError, ValueError, urllib.error.URLError):
             raise Fallo("descarga") from None
 
-    def verificar(self, paquete: str, firma: str, clave: str) -> bool:
-        """`openssl pkeyutl -verify -rawin`, como `hehermes_servidor.firma.verificar`: el código y el texto."""
+    def verificar(self, paquete: str, firma: str, clave: str) -> bool | None:
+        """Como `hehermes_servidor.firma.verificar`: True si es buena, False si es mala y None si no hay con qué
+        comprobarla. Primero `openssl pkeyutl -verify -rawin` (el código y el texto); sin él, o con uno que no sabe
+        Ed25519, `cryptography` con el Python del venv del canje."""
         try:
             r = subprocess.run(["openssl", "pkeyutl", "-verify", "-pubin", "-inkey", clave, "-rawin", "-in", paquete,
                                 "-sigfile", firma], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, timeout=60, check=False)
+                               stderr=subprocess.PIPE, timeout=60, check=False)
         except (OSError, subprocess.SubprocessError):
+            r = None
+        if r is not None and r.returncode == 0 and b"Signature Verified Successfully" in r.stdout:
+            return True
+        if r is not None and b"Signature Verification Failure" in r.stdout + r.stderr:
             return False
-        return r.returncode == 0 and b"Signature Verified Successfully" in r.stdout
+        return self.verificar_con_cryptography(paquete, firma, clave)
+
+    def verificar_con_cryptography(self, paquete: str, firma: str, clave: str) -> bool | None:
+        if not os.path.exists(self.config.python_canje):
+            return None
+        try:
+            r = subprocess.run([self.config.python_canje, "-I", "-B", "-c", CON_CRYPTOGRAPHY, clave, paquete, firma],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               timeout=120, check=False, cwd="/", env={"LANG": "C.UTF-8"})
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r.returncode == 0 and r.stdout.strip() == b"buena":
+            return True
+        if r.returncode == 1 and r.stdout.strip() == b"mala":
+            return False
+        return None
 
     def lanzar(self, orden: list) -> bool:
         try:
@@ -468,8 +517,16 @@ def ejecutar(trabajo: Trabajo, config: Config, sistema: Sistema, version, sha256
         for ruta, contenido in ((paquete, datos), (firma, sello)):
             with open(os.open(ruta, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as f:
                 f.write(contenido)
-        if len(sello) != LARGO_FIRMA or not any(sistema.verificar(paquete, firma, clave) for clave in rutas):
+        if len(sello) != LARGO_FIRMA:
             raise Fallo("firma")
+        vistas = []
+        for clave in rutas:
+            vistas.append(sistema.verificar(paquete, firma, clave))
+            if vistas[-1]:
+                break
+        if not vistas[-1]:
+            # Mala con alguna, o sin con qué mirarla con ninguna (que no es lo mismo, y la app lo dice distinto).
+            raise Fallo("sin_openssl" if all(v is None for v in vistas) else "firma")
         if _version_por_dentro(paquete) != version:
             raise Fallo("version")
         trabajo.poner("instalando", version)

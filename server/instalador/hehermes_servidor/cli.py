@@ -13,15 +13,17 @@ import shutil
 import sys
 import tarfile
 import tempfile
+import time
 
-from . import VERSION, firma, permisos
+from . import VERSION, firma, marcha, permisos
 from . import ambito as amb
 from . import piezas as p
 from .aplicar import Parada
 from .desinstalar import desinstalar, resumen
 from .deteccion import DIRECCION_VALIDA
 from .manifiesto import Manifiesto, ManifiestoRoto
-from .plan import PREFIJO_DETALLE, PREFIJO_ERROR, Opciones, pintar
+from .plan import (PREFIJO_DETALLE, PREFIJO_ERROR, Opciones, antes_de_aplicar, completar_opciones, comprobar_version,
+                   despues_de_aplicar, pintar, segun_lo_instalado, sin_cambios)
 from .sistema import Sistema
 
 SI = ("s", "si", "sí")
@@ -68,6 +70,8 @@ def _analizador():
                    help="si la API de Hermes escucha en todas las interfaces, la cierro a 127.0.0.1 (en su .env)")
     i.add_argument("--cortafuegos-a-mano", action="store_true",
                    help="el cortafuegos lo llevas tú: no lo toco aunque cierre el paso")
+    i.add_argument("--volver-atras", action="store_true",
+                   help="instala esta versión aunque la instalada sea más nueva")
     i.add_argument("--avisos", nargs="?", const="-", metavar="CÓDIGO",
                    help="los avisos push, con el código de avisos que te han dado (sin él, lo pido y se pega sin eco)")
     v = ordenes.add_parser("avisos", help="los avisos push en una instalación que ya tiene la pasarela")
@@ -88,6 +92,8 @@ def _analizador():
     ordenes.add_parser("pasarela-clave")
     # Lo que lanza hehermes-borrado.timer de noche (el borrado de verdad, `mantenimiento.py`). No es para personas.
     ordenes.add_parser("borrado-seguro")
+    # Solo lee, sin secretos, y sin root también: lo que se pueda leer (`informe.py`).
+    ordenes.add_parser("informe", help="lo que hace falta para entender un fallo, sin secretos, para pegarlo en un chat")
     u = ordenes.add_parser("actualizar")
     u.add_argument("--paquete", required=True)
     u.add_argument("--firma", required=True)
@@ -100,13 +106,46 @@ def _analizador():
 
 
 ORDENES = ("instalar", "avisos", "comprobar", "certificado", "actualizar", "desinstalar", "canje-limpiar", "cortafuegos",
-           "pasarela-clave", "borrado-seguro")
+           "pasarela-clave", "borrado-seguro", "informe")
 #: Lo que se puede hacer sin root en una instalación de la pasarela de un usuario.
 DEL_USUARIO = ("instalar", "avisos", "comprobar", "certificado", "desinstalar", "canje-limpiar", "borrado-seguro")
 
 
 def main(argv, doc, aqui, sis=None, entrada=input, salida=print, terminal=None, euid=None, relanzar=None,
          usuario=None, cuenta=None) -> int:
+    """Lo que haga cada orden está en `_main`. Aquí, desde la 0.11.1, que nada se quede a medias sin decirlo
+    (`marcha`): una salida que no se rompe si el terminal se va, SIGTERM, SIGHUP y Ctrl-C atendidos, y lo que se escape
+    (otro instalador en marcha, una señal antes de empezar, lo que no se esperaba), dicho en una línea y, por chat, con
+    su código, sin un traceback."""
+    por_chat = "--por-chat" in argv
+    salida = marcha.a_prueba(salida)
+    marcha.poner_el_reloj()
+    instalar = argv[:1] == ["instalar"]
+    try:
+        with marcha.senales(salida, por_chat=por_chat):
+            return _main(argv, doc, aqui, sis, entrada, salida, terminal, euid, relanzar, usuario, cuenta)
+    except marcha.Ocupado as error:
+        return _acabar_con(salida, por_chat, "error: %s" % error, "ocupado")
+    except (marcha.Interrupcion, KeyboardInterrupt) as error:
+        return _acabar_con(salida, por_chat, "\nerror: me han parado (%s)%s. Vuelve a lanzar el mismo comando." % (
+            getattr(error, "senal", "SIGINT"), " antes de cambiar nada" if instalar else ""),
+            getattr(error, "codigo", "interrumpido"))
+    except Exception as error:
+        return _acabar_con(salida, por_chat, "\nerror: algo que no esperaba ha fallado dentro del instalador: %s.%s "
+                           "Vuelve a lanzar el mismo comando; si vuelve a pasar, es un fallo del instalador: cuéntalo "
+                           "con esta línea." % (marcha.describir(error), " No he cambiado nada." if instalar else ""),
+                           "python")
+
+
+def _acabar_con(salida, por_chat, texto, codigo, paso=None) -> int:
+    """Un fallo, dicho: para personas y, por chat, la línea de la app (la última, con la del paso justo antes)."""
+    salida(texto)
+    if por_chat:
+        salida("\n" + (PREFIJO_DETALLE + "paso=%s\n" % paso if paso else "") + PREFIJO_ERROR + codigo)
+    return 1
+
+
+def _main(argv, doc, aqui, sis, entrada, salida, terminal, euid, relanzar, usuario, cuenta) -> int:
     try:
         op = _analizador().parse_args(argv)
     except SalirConUso as error:
@@ -115,6 +154,8 @@ def main(argv, doc, aqui, sis=None, entrada=input, salida=print, terminal=None, 
     if op.orden is None:
         salida(doc.strip())
         return 2
+    if op.orden == "informe":
+        return _informe(sis or Sistema(), os.geteuid() if euid is None else euid, salida, cuenta)
     if op.orden == "instalar" and op.modo == "vpn":
         # Antes que nada: ni se mira ni se relanza con sudo algo que ya no existe.
         salida(SIN_VPN)
@@ -144,6 +185,18 @@ def main(argv, doc, aqui, sis=None, entrada=input, salida=print, terminal=None, 
                          usuario or _usuario(), cuenta)
     os.umask(0o022)
     return _con_ambito(op, sis, amb.de_root(), aqui, entrada, salida, terminal)
+
+
+def _informe(sis, euid, salida, cuenta) -> int:
+    """`informe`: antes que nada, porque solo lee y nunca se relanza con sudo. Sin root, la instalación de este usuario
+    si la tiene; si no, la de root, con lo que se pueda leer de ella."""
+    from .informe import informe
+    if euid == 0:
+        return informe(sis, amb.de_root(), True, salida)
+    suyo = _ambito_del_usuario(cuenta)
+    ambito = suyo if suyo is not None and sis.existe(suyo.manifiesto) else amb.de_root()
+    return informe(sis, ambito, False, salida, usuario=suyo.usuario if suyo else None,
+                   casa=suyo.casa if suyo else None)
 
 
 def _con_ambito(op, sis, ambito, aqui, entrada, salida, terminal) -> int:
@@ -253,7 +306,8 @@ def _uso_por_chat(op):
 
 
 class _cerrojo:
-    """Dos instaladores a la vez se pisarían el manifiesto."""
+    """Dos instaladores a la vez se pisarían el manifiesto. Desde la 0.11.1 el cerrojo dice quién lo tiene y desde
+    cuándo, y el que lo encuentra tomado acaba con `marcha.Ocupado` (por chat, `hehermes-error:ocupado`)."""
 
     RUTA = "/run/hehermes-servidor.lock"
 
@@ -261,17 +315,38 @@ class _cerrojo:
         self.sis, self.fichero, self.RUTA = sis, None, ruta
 
     def __enter__(self):
+        import fcntl
         try:
-            import fcntl
             ruta = self.sis.ruta(self.RUTA)
             os.makedirs(os.path.dirname(ruta), exist_ok=True)
-            self.fichero = open(ruta, "w")
+            # Sin vaciarlo al abrir: lo que dice es de quien lo tiene.
+            self.fichero = open(ruta, "a+")
             fcntl.flock(self.fichero, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise SystemExit("error: ya hay otro hehermes-servidor en marcha")
+            quien = self._quien()
+            self.fichero.close()
+            self.fichero = None
+            raise marcha.Ocupado("ya hay otro hehermes-servidor en marcha%s: espera a que acabe y vuelve a lanzar el "
+                                 "mismo comando" % quien)
         except OSError:
             self.fichero = None
+            return self
+        try:
+            self.fichero.seek(0)
+            self.fichero.truncate()
+            self.fichero.write("%d %d\n" % (os.getpid(), int(time.time())))
+            self.fichero.flush()
+        except OSError:
+            pass
         return self
+
+    def _quien(self) -> str:
+        try:
+            self.fichero.seek(0)
+            pid, desde = (int(x) for x in self.fichero.read(64).split()[:2])
+        except (OSError, ValueError):
+            return ""
+        return " (el proceso %d, desde hace %d s)" % (pid, max(0, int(time.time()) - desde))
 
     def __exit__(self, *exc):
         if self.fichero:
@@ -330,7 +405,9 @@ def _avisos(op, sis, man, aqui, entrada, salida, terminal, ambito):
                              # nftables o iptables a pelo, solo si ya los llevaba el instalador: poner los avisos no
                              # es motivo para empezar a tocar un cortafuegos (el vigía solo sale hacia el relé).
                              cortafuegos_a_mano=not man.datos.get("cortafuegos_propio"), corregir_exposicion=False,
-                             avisos=op.codigo or "-")
+                             avisos=op.codigo or "-",
+                             # Lo de arriba no lo ha dado nadie: no cambia lo que se recuerda de cómo se instaló.
+                             recordar=False)
     return _instalar(ns, sis, man, aqui, entrada, salida, terminal, ambito)
 
 
@@ -347,8 +424,10 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
                         reemplazar=op.reemplazar, si=op.si or op.por_chat, solo_plan=op.plan, por_chat=op.por_chat,
                         llave=op.llave, activar_api=op.activar_api, qr_png=op.qr_png,
                         cortafuegos_a_mano=op.cortafuegos_a_mano, corregir_exposicion=op.corregir_exposicion,
-                        avisos=codigo)
+                        avisos=codigo, volver_atras=getattr(op, "volver_atras", False))
     del codigo
+    # Lo que no se da, como se instaló (`plan.completar_opciones`): `actualizar` lanza `instalar --si` a secas.
+    como_se_instalo = completar_opciones(opciones, man)
     if op.por_chat:
         # Lo lanza Hermes: no hay nadie a quien preguntar.
         terminal = False
@@ -361,6 +440,7 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
                                      solo_plan=op.plan)
 
     det = detectar_ya()
+    det, de_antes = segun_lo_instalado(sis, man, ambito, opciones, det, detectar_ya)
     if det.direccion_privada and terminal and not op.plan:
         # Detrás de un NAT: la de salida no es la que va en el QR. Solo se pregunta en un terminal.
         try:
@@ -371,10 +451,14 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
             opciones.direccion = dada.strip()
             det = detectar_ya()
     plan = modo_tls.calcular_plan_tls(sis, det, man, opciones, aqui)
+    plan.avisos[:0] = como_se_instalo + de_antes
+    comprobar_version(sis, man, ambito, plan)
     salida(pintar(plan, color=terminal).rstrip("\n"))
-    if not op.plan and plan.bloqueos and all(getattr(b, "codigo", None) == "reinicia-hermes" for b in plan.bloqueos):
+    if not op.plan and plan.bloqueos and all(getattr(b, "codigo", None) == "reinicia-hermes" for b in plan.bloqueos) \
+            and any(a.tipo == "env" for a in plan.acciones):
         # Lo único que falta es que Hermes se reinicie, y eso no lo sé hacer (no es una unidad ni un contenedor): se
-        # enciende su API en el .env y se para. La vez siguiente, con Hermes reiniciado, ya la encuentra encendida.
+        # enciende su API en el .env y se para. La vez siguiente, con Hermes reiniciado, ya la encuentra encendida. (Si
+        # ya estaba encendida por una pasada anterior y sin reiniciar, no hay nada que añadir: se para y se dice.)
         try:
             porchat.encender_para_reiniciar_a_mano(sis, det, plan, ambito, salida, por_chat=opciones.por_chat)
         except (OSError, ValueError) as error:
@@ -391,6 +475,7 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
             salida("\n" + (PREFIJO_DETALLE + detalle + "\n" if detalle else "") + PREFIJO_ERROR + plan.codigo_de_error)
         return 0 if plan.puede_seguir else 1
     if not plan.cambios:
+        sin_cambios(sis, man, plan, recordar=getattr(op, "recordar", True))
         if opciones.iphone:
             salida("«%s» ya está en la pasarela. Su QR no se puede volver a pintar; para uno nuevo (y que el de antes "
                    "deje de valer), desde tu terminal: %shehermes-dispositivo rotar %s"
@@ -399,10 +484,17 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
     if not _pregunta_si(entrada, salida, terminal, opciones.si):
         salida("No he cambiado nada.")
         return 1
+    # La versión, lo que va a escribir esta pasada y cómo se instala: si se corta, la siguiente lo reconoce.
+    antes_de_aplicar(man, plan, recordar=getattr(op, "recordar", True))
+    # Desde la 0.11.1 (`marcha`): cada paso se dice al empezar; lo que puede fallar va antes y lo de Hermes (su .env y
+    # su SOUL.md) lo último, detrás del canje; y todo fallo a mitad acaba dicho con verdad y, por chat, con su código.
+    la_marcha = marcha.Marcha(modo_tls.pasos_de(plan), salida)
+    fallo, el_enlace = None, None
     try:
-        hecho = modo_tls.aplicar_tls(sis, plan, man, aqui, salida=salida, terminal=terminal)
-        el_enlace = None
+        hecho = modo_tls.aplicar_tls(sis, plan, man, aqui, salida=salida, terminal=terminal, marcha=la_marcha,
+                                     con_hermes=False)
         if opciones.por_chat:
+            la_marcha.empezar("canje")
             token = hecho.get("token")
             if token is None:
                 # Repetido antes de que ese iPhone use la pasarela, se canjeara o no: del token solo queda el hash, así
@@ -412,19 +504,75 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
             del token
             el_enlace = porchat.lanzar(sis, man, det, opciones, salida, carga=carga, ambito=ambito)
             del carga
-    except (Parada, porchat.ParadaDelCanje) as parada:
-        salida("\nerror: %s\nLo que ya estaba hecho se queda apuntado: arréglalo y vuelve a lanzar el mismo comando."
-               % parada)
-        return 1
+        modo_tls.aplicar_hermes(sis, plan, man, salida, la_marcha)
+        la_marcha.acabar()
+    except (Exception, KeyboardInterrupt) as error:
+        fallo = error
+    # Pase lo que pase, lo último: si a Hermes le falta reiniciarse (por lo de esta pasada, o porque una anterior se
+    # paró antes de programarlo), se programa ahora. Antes de acabar le cortaría el turno en el que contesta.
+    reinicio = None
+    if _reinicio_por_programar(man):
+        try:
+            reinicio = porchat.reiniciar_hermes(sis, salida, det.hermes.gestor, ambito)
+            if reinicio:
+                man.datos[modo_tls.REINICIO_DE_HERMES]["programado"] = time.time()
+                man.guardar(sis)
+        except (Exception, KeyboardInterrupt) as error:
+            fallo = fallo or error
+    if fallo is not None:
+        return _fallo_a_medias(salida, opciones.por_chat, la_marcha, fallo)
+    despues_de_aplicar(sis, man)
     salida("\nHecho. «%s comprobar» lo repasa cuando quieras." % ("sudo hehermes-servidor" if ambito.root
                                                                        else ambito.orden))
-    if any(a.tipo in ("env", "exposicion") and a.cambia for a in plan.acciones):
-        # Lo último: reiniciar Hermes antes de acabar le cortaría el turno en el que contesta con el enlace.
-        porchat.reiniciar_hermes_luego(sis, salida, det.hermes.gestor, ambito)
+    if reinicio is not None:
+        la_marcha.avisar("hermes-se-reinicia" if reinicio else "reinicia-hermes")
     if el_enlace:
-        salida("\nEl enlace para la app (caduca en 10 minutos y no lleva ninguna clave):")
+        # Para la app, juntos y justo antes del enlace: lo que la persona tiene que saber (`hehermes-aviso:`).
+        hallado = re.search(r"&p=(\d+)&", el_enlace)
+        canje = hallado.group(1) if hallado else "?"
+        la_marcha.avisar("cortafuegos-proveedor", tcp=det.puerto_pasarela, canje=canje)
+        if not ambito.root or det.cortafuegos_a_mano:
+            la_marcha.avisar("cortafuegos-a-mano", tcp=det.puerto_pasarela, canje=canje)
+        salida("\nPara la app (el enlace caduca en 10 minutos y no lleva ninguna clave):")
+        for linea in la_marcha.lineas_de_avisos():
+            salida(linea)
         salida(el_enlace)
     return 0
+
+
+def _reinicio_por_programar(man) -> bool:
+    """Si a Hermes le falta reiniciarse y no se ha programado (`modo_tls.REINICIO_DE_HERMES`)."""
+    from .modo_tls import REINICIO_DE_HERMES
+    datos = man.datos.get(REINICIO_DE_HERMES)
+    return isinstance(datos, dict) and not datos.get("programado")
+
+
+#: Lo que se le dice a la persona tras cada fallo a mitad, según su código: siempre «el mismo comando», que sigue donde
+#: se quedó.
+QUE_HACER = {
+    "apt": "Suele ser pasajero (otro apt en marcha, la red): vuelve a lanzar el mismo comando en un rato, y sigue donde "
+           "se quedó.",
+    "pip": "Suele ser la red (pypi.org): vuelve a lanzar el mismo comando en un rato, y sigue donde se quedó.",
+    "interrumpido": "Vuelve a lanzar el mismo comando: sigue donde se quedó.",
+    "python": "Vuelve a lanzar el mismo comando; si vuelve a pasar, es un fallo del instalador: cuéntalo con esta línea.",
+}
+
+
+def _fallo_a_medias(salida, por_chat, la_marcha, fallo) -> int:
+    """Lo que para `instalar` después de empezar a cambiar cosas: qué ha pasado, qué queda hecho y qué no (Hermes, el
+    primero), qué hacer y, por chat, el paso y el código."""
+    from .porchat import ParadaDelCanje
+    if isinstance(fallo, KeyboardInterrupt):
+        # Sin los manejadores de `marcha.senales` (fuera del hilo principal), Ctrl-C llega como siempre.
+        texto, codigo = "me han parado a mitad (SIGINT)", "interrumpido"
+    elif isinstance(fallo, (Parada, ParadaDelCanje)):
+        # Una `marcha.Interrupcion` también: es una parada, con su código.
+        texto, codigo = str(fallo), getattr(fallo, "codigo", "a-medias")
+    else:
+        texto, codigo = "algo que no esperaba ha fallado dentro del instalador: %s" % marcha.describir(fallo), "python"
+    que_hacer = QUE_HACER.get(codigo, "Arréglalo y vuelve a lanzar el mismo comando: sigue donde se quedó.")
+    return _acabar_con(salida, por_chat, "\nerror: %s\n%s %s" % (texto, la_marcha.resumen(), que_hacer), codigo,
+                       paso=la_marcha.actual)
 
 
 def _comprobar(op, sis, man, aqui, entrada, salida, terminal, ambito):
@@ -532,7 +680,15 @@ def _actualizar(op, sis, man, aqui, entrada, salida, terminal, ambito):
         except OSError as error:
             salida("error: no puedo leer el paquete o su firma (%s)" % error)
             return 1
-        if not firma.verificar_con_alguna(sis, paquete, sello, claves):
+        buena = firma.verificar_con_alguna(sis, paquete, sello, claves, python=ambito.python_venv)
+        if buena is None:
+            # No es que sea mala: no hay con qué mirarla (`firma.verificar`). Se dice qué falta.
+            salida("error: no puedo comprobar la firma de %s, así que no lo instalo: aquí no está la orden openssl "
+                   "(OpenSSL 3), y el entorno de Python de cryptography (%s) tampoco me sirve. Instala openssl "
+                   "(sudo apt install openssl, o sudo dnf install openssl) y vuelve a intentarlo; o actualiza una vez "
+                   "con el comando de la app, que rehace ese entorno" % (op.paquete, ambito.venv))
+            return 1
+        if not buena:
             salida("error: la firma de %s no es buena: no lo instalo" % op.paquete)
             return 1
         version = _version_del_paquete(paquete)

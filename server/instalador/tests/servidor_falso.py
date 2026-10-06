@@ -37,6 +37,22 @@ CLAVE_SIGUIENTE = apoyo.DATOS / "pasarela-siguiente-NO-ES-DE-DANIEL.clave.pem"
 HUELLA_SIGUIENTE = "2om4uFk_P-Bmxouf9_eCcIVKLssSxHRX4HQNeUQ4hac"
 NO_ENCONTRADO = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 IP_PUBLICA = "198.51.100.23"
+#: La pública que pone el NAT 1:1 de una nube de mentira (`en_la_nube`), y la privada de su tarjeta.
+IP_DE_LA_NUBE = "203.0.113.50"
+IP_PRIVADA_DE_LA_NUBE = "172.31.20.5"
+#: El token de IMDSv2 que da el AWS de mentira.
+TOKEN_IMDS = "AQAEAKQ-token-de-imds-de-las-pruebas=="
+#: Lo que dice el firmware (DMI, /sys/class/dmi/id) de cada nube, como lo lee cloud-init.
+DMI = {"aws": {"sys_vendor": "Amazon EC2", "product_name": "t4g.nano", "bios_vendor": "Amazon EC2"},
+       "aws-xen": {"sys_vendor": "Xen", "product_name": "HVM domU", "bios_version": "4.11.amazon"},
+       "gcp": {"sys_vendor": "Google", "product_name": "Google Compute Engine", "bios_vendor": "Google"},
+       "azure": {"sys_vendor": "Microsoft Corporation", "product_name": "Virtual Machine",
+                 "chassis_asset_tag": "7783-7084-3265-9085-8269-3286-77"},
+       "oracle": {"sys_vendor": "QEMU", "product_name": "Standard PC (i440FX + PIIX, 1996)",
+                  "chassis_asset_tag": "OracleCloud.com"},
+       "digitalocean": {"sys_vendor": "DigitalOcean", "product_name": "Droplet"},
+       "hetzner": {"sys_vendor": "Hetzner", "product_name": "vServer"},
+       "openstack": {"sys_vendor": "OpenStack Foundation", "product_name": "OpenStack Nova"}}
 
 SWANCTL_CONF = "# swanctl.conf de Debian\ninclude conf.d/*.conf\n"
 NGINX_CONF = ("user www-data;\nevents {}\nhttp {\n    include /etc/nginx/conf.d/*.conf;\n"
@@ -224,7 +240,16 @@ class ServidorFalso:
         self.entornos: list = []
         self.lingers_pedidos: list = []
         self.ensurepip = True
+        #: Lo que contesta apt-get a cada orden («update», «install»), si falla: el texto de su error.
+        self.apt_falla: dict = {}
+        #: Las veces que se ha esperado a cloud-init (`cloud-init status --wait`).
+        self.esperas_a_cloud_init = 0
         self.venvs_listos: set = set()
+        #: Los venv hechos con otro Python (el sistema ha subido de versión): su Python no encuentra su pip.
+        self.venvs_rotos: set = set()
+        #: Lo que contesta el Python de un venv a la comprobación de una firma con `cryptography` (`firma.verificar`):
+        #: una función (args, entrada) -> Resultado, o None si ese venv no tiene `cryptography` (sale con 3).
+        self.firma_con_cryptography = None
         self.sondas: list = []
         #: Lo que dice el `comprobar` del vigía de los avisos, y cada vez que se le llama.
         self.vigia_comprueba = ["bien: Hermes contesta en http://127.0.0.1:8642: 0 conversaciones en la bandeja",
@@ -238,8 +263,78 @@ class ServidorFalso:
         self.rutas_quitadas: set = set()
         #: El diario de la pasarela (`journalctl -u hehermes-pasarela`): (cuándo, línea). None: no hay diario.
         self.diario_pasarela: list = []
+        #: La nube (`en_la_nube`): cuál, la pública de su NAT (None: la instancia no tiene), si AWS exige IMDSv2 y si la
+        #: IP de Azure es de SKU básica (la única que sale en `publicIpAddress`).
+        self.nube = None
+        self.ip_de_la_nube = None
+        self.imdsv2_obligatorio = True
+        self.azure_basica = False
+        #: Lo que deja una unidad pasajera con la jaula de la pasarela (`systemd-run --wait`): en un contenedor LXC sin
+        #: anidamiento, systemd no puede montar sus espacios de nombres (226/NAMESPACE).
+        self.jaula = True
+        #: Lo que dice `systemd-detect-virt --container` (si está instalado): «none», «docker», «podman», «lxc»…
+        self.virt = "none"
         sis.pedir_falso = self.pedir
         self._montar_base()
+
+    def en_la_nube(self, proveedor, publica=IP_DE_LA_NUBE, privada=IP_PRIVADA_DE_LA_NUBE):
+        """Un servidor de una nube con NAT 1:1: la tarjeta con la privada, su firmware diciendo de quién es y su servicio
+        de metadatos contestando como el de verdad, con sus cabeceras obligatorias (`metadatos`)."""
+        self.direccion_salida = privada
+        self.enlaces_ip["eth0"]["addr"] = [privada + "/20"]
+        for nombre, valor in DMI[proveedor].items():
+            self.sis.poner("/sys/class/dmi/id/" + nombre, valor + "\n", modo=0o444)
+        self.nube = proveedor.split("-")[0]
+        self.ip_de_la_nube = publica
+        self.sis.metadatos_falso = self.metadatos
+
+    def metadatos(self, metodo, url, cabeceras):
+        """169.254.169.254 como lo sirve cada nube (sus guías, a 2026-10-06). Lo que no conoce, un 404; y una nube que
+        no tiene ese servicio no contesta."""
+        base = "http://169.254.169.254"
+        ip = (self.ip_de_la_nube or "").encode()
+        if self.nube in ("aws", "openstack"):
+            if url == base + "/latest/api/token":
+                if self.nube == "openstack":
+                    return 404, {}, b""
+                if metodo != "PUT" or not cabeceras.get("X-aws-ec2-metadata-token-ttl-seconds", "").isdigit():
+                    return 400, {}, b""
+                return 200, {}, TOKEN_IMDS.encode()
+            if url == base + "/latest/meta-data/public-ipv4" and metodo == "GET":
+                if self.nube == "aws" and self.imdsv2_obligatorio and \
+                        cabeceras.get("X-aws-ec2-metadata-token") != TOKEN_IMDS:
+                    return 401, {}, b""
+                return (200, {}, ip) if ip else (404, {}, b"")
+            return 404, {}, b""
+        if self.nube == "gcp":
+            if cabeceras.get("Metadata-Flavor") != "Google":
+                return 403, {}, b""
+            if url == base + "/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip":
+                return (200, {"Metadata-Flavor": "Google"}, ip) if ip else (404, {}, b"")
+            return 404, {}, b""
+        if self.nube == "azure":
+            if cabeceras.get("Metadata") != "true":
+                return 400, {}, b'{"error": "Bad request. Required metadata header not specified"}'
+            if url.startswith(base + "/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?"):
+                return 200, {}, ip if self.azure_basica else b""
+            if url.startswith(base + "/metadata/loadbalancer?"):
+                pares = [] if not ip or self.azure_basica else [{"frontendIpAddress": self.ip_de_la_nube,
+                                                                 "privateIpAddress": self.direccion_salida}]
+                return 200, {}, json.dumps({"loadbalancer": {"publicIpAddresses": pares, "inboundRules": [],
+                                                             "outboundRules": []}}).encode()
+            return 404, {}, b""
+        if self.nube == "oracle":
+            # Sus metadatos solo traen las privadas (`/opc/v2/vnics/`).
+            if cabeceras.get("Authorization") != "Bearer Oracle":
+                return 401, {}, b""
+            return 404, {}, b""
+        if self.nube == "digitalocean" and url == base + "/metadata/v1/interfaces/public/0/ipv4/address":
+            return (200, {}, ip) if ip else (404, {}, b"")
+        if self.nube == "hetzner" and url == base + "/hetzner/v1/metadata/public-ipv4":
+            return 200, {}, ip
+        if self.nube in ("digitalocean", "hetzner"):
+            return 404, {}, b""
+        return None, {}, b""
 
     # Montaje
 
@@ -287,6 +382,8 @@ class ServidorFalso:
 
     def instalar_paquete(self, paquete):
         self.paquetes.add(paquete)
+        if paquete == "python3-venv":
+            self.ensurepip = True
         efectos = (EFECTOS_RPM if self.familia == "rhel" else EFECTOS).get(paquete, {})
         for ruta, texto in efectos.get("ficheros", {}).items():
             if not self.sis.existe(ruta):
@@ -305,12 +402,15 @@ class ServidorFalso:
         self.udp += [p for p in efectos.get("puertos_udp", []) if p not in self.udp]
 
     def con_hermes(self, usuario="root", home=None, como="unidad", puerto=8642, clave=CLAVE, habilitada=True,
-                   host=None, env_extra="", hermes_home=None, perfil=None, orden=None, entorno_extra=""):
+                   host=None, env_extra="", hermes_home=None, perfil=None, orden=None, entorno_extra="",
+                   uid_sin_nombre=None):
         """`como`: «unidad» (la de siempre, hermes-gateway), «proceso» (un proceso suelto, en tmux o nohup), o lo que
         hace `hermes gateway install` con un perfil (hermes_cli/gateway.py): «unidad-perfil» (del sistema,
         `hermes-gateway-<perfil>`, con root) o «unidad-usuario» (de usuario, sin root), con HERMES_HOME en su entorno y
         su proceso en el cgroup de la unidad; o «docker» (el contenedor de Hermes, con su casa en /opt/data montada de
-        la del servidor). `perfil`: la casa es `<raíz>/profiles/<perfil>`. Devuelve la ruta de su .env."""
+        la del servidor). `perfil`: la casa es `<raíz>/profiles/<perfil>`. `uid_sin_nombre`: su proceso corre con ese
+        uid, que no está en el /etc/passwd del servidor (el 10000 de la imagen de Docker de Hermes). Devuelve la ruta de
+        su .env."""
         home = home or ("/root" if usuario == "root" else "/home/" + usuario)
         self.usuarios[usuario] = home
         self._escribir_passwd()
@@ -338,7 +438,7 @@ class ServidorFalso:
             pid = 4000 + len(self.procesos)
             if orden is None:
                 orden = "/usr/bin/python3 -m hermes_cli.main %sgateway run" % ("--profile %s " % perfil if perfil else "")
-            self.procesos.append((pid, usuario, orden))
+            self.procesos.append((pid, str(uid_sin_nombre) if uid_sin_nombre is not None else usuario, orden))
             entorno = "PATH=/usr/bin\0HOME=%s\0" % home + ("HERMES_HOME=%s\0" % hermes_home if hermes_home else "")
             if como in ("unidad-perfil", "unidad-usuario"):
                 entorno += "HERMES_SUPERVISED_CHILD=1\0INVOCATION_ID=0123abcd\0"
@@ -360,7 +460,7 @@ class ServidorFalso:
                 self.sis.poner("/proc/%d/cgroup" % pid, "0::/system.slice/docker-%s.scope\n" % self.contenedor)
                 # Dentro, /opt/data; en el servidor, la carpeta de Hermes, montada.
                 self.sis.poner("/proc/%d/environ" % pid, "HOME=/opt/data\0HERMES_HOME=/opt/data\0"
-                               "HERMES_S6_SUPERVISED_CHILD=1\0")
+                               "HERMES_S6_SUPERVISED_CHILD=1\0" + entorno_extra)
                 self.montajes = [{"Type": "bind", "Source": home + "/.hermes", "Destination": "/opt/data"}]
             self.pid_hermes = pid
         if habilitada:
@@ -411,6 +511,13 @@ class ServidorFalso:
         self.compactados.append("hermes sessions optimize")
         return Resultado(0 if self.optimiza_bien else 1, "", "" if self.optimiza_bien else "database is locked")
 
+    def _cloud_init(self, args, entrada):
+        """`cloud-init status --wait`: en un servidor ya preparado, contesta enseguida."""
+        if args[:2] == ["status", "--wait"]:
+            self.esperas_a_cloud_init += 1
+            return Resultado(0, "status: done\n")
+        return Resultado(2, "", "cloud-init %s" % args)
+
     def _dpkg(self, args, entrada):
         if args == ["--print-architecture"]:
             return Resultado(0, self.arquitectura + "\n")
@@ -424,6 +531,12 @@ class ServidorFalso:
                                                             for p in falta))
 
     def _apt_get(self, args, entrada):
+        # Las opciones van delante (`-o DPkg::Lock::Timeout=120 -q update`): lo que cuenta es la orden.
+        while args and args[0].startswith("-"):
+            args = args[2:] if args[0] == "-o" else args[1:]
+        if args[:1] and args[0] in self.apt_falla:
+            # Lo que le pasa a apt en un VPS de verdad: el cerrojo de dpkg, un repositorio roto, sin red.
+            return Resultado(100, "", self.apt_falla[args[0]] + "\n")
         if args[:1] == ["update"]:
             return Resultado(0)
         if args[:1] == ["install"]:
@@ -454,7 +567,10 @@ class ServidorFalso:
             unidad = unidades[0]
             datos = self.unidades_hermes.get(unidad)
             if "--value" in resto:
-                return Resultado(0, ((datos or {}).get("ExecStart") or "") + "\n")
+                # La que se pida con -p (ExecStart, o ExecReload: la unidad de `hermes gateway install` lleva
+                # `ExecReload=/bin/kill -USR1 $MAINPID`, y una hecha a mano, nada).
+                propiedad = resto[resto.index("-p") + 1] if "-p" in resto else "ExecStart"
+                return Resultado(0, ((datos or {}).get(propiedad) or "") + "\n")
             if datos is None:
                 return Resultado(0, "LoadState=not-found\nUser=\nEnvironment=\n")
             activo = "active" if base(unidad) in self.activos else "inactive"
@@ -611,8 +727,21 @@ class ServidorFalso:
             return Resultado(0)
         return Resultado(1, "", "Error: No such object: %s" % args[-1])
 
+    def uid_de(self, usuario) -> int:
+        """El uid del /etc/passwd de mentira (`_escribir_passwd`), o el número tal cual si no tiene nombre."""
+        return int(usuario) if str(usuario).isdigit() else sorted(self.usuarios).index(usuario)
+
     def _ps(self, args, entrada):
-        return Resultado(0, "".join("%d %s %s\n" % p for p in self.procesos))
+        """Como el de procps: `user` en una columna de 8, con los nombres más largos recortados («cloud-u+») y el uid
+        de quien no tiene nombre; `uid`, el número siempre."""
+        formato = args[args.index("-eo") + 1] if "-eo" in args else ""
+        if formato == "pid=,uid=,args=":
+            return Resultado(0, "".join("%d %d %s\n" % (pid, self.uid_de(usuario), orden)
+                                        for pid, usuario, orden in self.procesos))
+        if formato == "pid=,user=,args=":
+            return Resultado(0, "".join("%d %s %s\n" % (pid, usuario if len(usuario) <= 8 else usuario[:7] + "+", orden)
+                                        for pid, usuario, orden in self.procesos))
+        return Resultado(1, "", "error: unknown user-defined format specifier")
 
     def _ss(self, args, entrada):
         if args == ["-H", "-tan"]:
@@ -812,7 +941,14 @@ class ServidorFalso:
             if not self.ensurepip:
                 return Resultado(1, "", "The virtual environment was not created successfully because ensurepip is "
                                         "not available.")
-            self.programa(args[3] + "/bin/python")
+            venv = args[-1]
+            if "--clear" in args:
+                # Lo vacía y lo vuelve a hacer con el Python de ahora: ni su pip roto ni lo que tenía instalado.
+                import shutil
+                shutil.rmtree(self.sis.ruta(venv), ignore_errors=True)
+                self.venvs_rotos.discard(venv)
+                self.venvs_listos.discard(venv)
+            self.programa(venv + "/bin/python")
             return Resultado(0)
         if args[:2] == ["-I", "-c"] and "ensurepip" in args[2]:
             return Resultado(0) if self.ensurepip else Resultado(1, "", "ModuleNotFoundError: No module named 'ensurepip'")
@@ -829,6 +965,17 @@ class ServidorFalso:
         """El Python de un venv de cryptography: el del canje, con root, o el de la casa del usuario."""
         if not self.sis.existe(venv + "/bin/python"):
             return Resultado(127, "", "no existe el venv")
+        if args == ["-I", "-c", "import pip"]:
+            return (Resultado(1, "", "ModuleNotFoundError: No module named 'pip'") if venv in self.venvs_rotos
+                    else Resultado(0))
+        if venv in self.venvs_rotos:
+            # Su Python es otro: lo que tenía instalado está en la carpeta del de antes, y no lo encuentra.
+            return Resultado(1, "", "ModuleNotFoundError: No module named %s" % ("'pip'" if "pip" in args else
+                                                                                "'cryptography'"))
+        if args[:3] == ["-I", "-B", "-c"] and "Ed25519PublicKey" in args[3]:
+            if self.firma_con_cryptography is None:
+                return Resultado(3, "", "ModuleNotFoundError: No module named 'cryptography'")
+            return self.firma_con_cryptography(args, entrada)
         if args[:4] == ["-I", "-m", "pip", "install"]:
             self.pip.append(args)
             self.venvs_listos.add(venv)
@@ -859,8 +1006,20 @@ class ServidorFalso:
             return Resultado(0, json.dumps({"huella": HUELLA}) + "\n")
         return Resultado(127, "", "python %s" % args)
 
+    def _systemd_detect_virt(self, args, entrada):
+        if args != ["--container"]:
+            return Resultado(127, "", "systemd-detect-virt %s" % args)
+        return Resultado(1 if self.virt == "none" else 0, self.virt + "\n")
+
     def _systemd_run(self, args, entrada):
         self.lanzados.append(args)
+        if "--wait" in args:
+            # Una unidad pasajera que espera a acabar: la de la jaula (`deteccion._jaula`).
+            if self.jaula:
+                return Resultado(0)
+            return Resultado(1, "", "Job for run-u12.service failed because the control process exited with error "
+                                    "code.\nFinished with result: exit-code\nMain processes terminated with: "
+                                    "code=exited/status=226\n")
         if "--unit=hehermes-canje" in args and ("--scope" in args or any(
                 a.split("=", 1)[0] in ("PartOf", "BindsTo", "Requisite") and "hermes-gateway" in a for a in args)):
             self.atados_a_hermes.add("hehermes-canje")

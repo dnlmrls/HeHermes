@@ -504,7 +504,7 @@ class ElCanje(Base):
 
     def test_sin_puerto_libre_se_para(self):
         self.assertEqual(self.orden("instalar", "--si"), 0, self.salida)
-        with mock.patch.object(porchat, "elegir_puerto", lambda ocupados: None):
+        with mock.patch.object(porchat, "elegir_puerto", lambda ocupados, **_: None):
             self.assertEqual(self.por_chat(), 1)
         self.assertIn("no hay ningún puerto libre", self.salida)
         self.assertFalse(self.falso.lanzados and "--unit=hehermes-canje" in self.falso.lanzados[-1])

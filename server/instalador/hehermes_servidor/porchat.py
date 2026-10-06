@@ -249,19 +249,33 @@ def corregir_exposicion(sis, man, accion, salida, ambito=None) -> None:
     salida("==> la API de Hermes: %s en %s (se cierra al reiniciarse Hermes)" % (linea, ruta))
 
 
-def reiniciar_hermes_luego(sis, salida, gestor=None, ambito=None) -> None:
-    """A los 90 s, y lanzado lo último: si Hermes se reiniciara antes de acabar el comando, se cortaría el turno en el
-    que tiene que contestar con el enlace. Lo que se reinicia es lo que lleva su proceso (`gestor`): su unidad, se llame
-    como se llame y sea del sistema o de usuario, o su contenedor."""
+def reiniciar_hermes(sis, salida, gestor=None, ambito=None) -> bool:
+    """Lo último, para que lea lo nuevo de su .env (encender su API, o cerrarla a 127.0.0.1). Lo que se reinicia es lo
+    que lleva su proceso (`gestor`): su unidad, se llame como se llame y sea del sistema o de usuario, o su contenedor.
+
+    Desde la 0.11.1, con la unidad de `hermes gateway install` (`gestor.recarga_con_drenaje`), `systemctl reload` ya:
+    Hermes deja de aceptar turnos, espera a que acabe el que tiene (por chat, el que contesta con el enlace) y se
+    reinicia solo. Si no (una unidad hecha a mano, un contenedor) o la recarga falla, `restart` a los 90 s, en una unidad
+    pasajera de systemd que sigue aunque el instalador ya haya acabado: antes cortaría ese turno. Devuelve si ha quedado
+    programado (si no, lo ha dicho)."""
     from . import gestor as gestores
     gestor = gestor or gestores.Gestor("sistema", "hermes-gateway.service")
     root = ambito is None or ambito.root
-    r = sis.ejecutar(gestores.orden_reiniciar_luego(gestor, root))
+    if gestores.recarga_con_drenaje(sis, gestor, root):
+        r = sis.ejecutar(gestores.orden_recargar(gestor, root), plazo=60)
+        if r.bien:
+            salida("Hermes se reinicia en cuanto acabe lo que está haciendo (systemctl reload: su reinicio con drenaje, "
+                   "que no le corta el turno), para leer lo nuevo de su .env.")
+            return True
+        salida("    La recarga de Hermes (systemctl reload) ha fallado (%s): lo reinicio a los 90 s"
+               % ((r.error or r.salida).strip()[-160:] or r.codigo))
+    r = sis.ejecutar(gestores.orden_reiniciar_luego(gestor, root), plazo=60)
     if r.bien:
-        salida("Hermes se reinicia dentro de 90 s para encender su API.")
-    else:
-        salida("No he podido programar el reinicio de Hermes: reinícialo tú (%s) para que encienda su API."
-               % gestores.como_se_reinicia(gestor, root))
+        salida("Hermes se reinicia dentro de 90 s, para leer lo nuevo de su .env.")
+        return True
+    salida("No he podido programar el reinicio de Hermes: reinícialo tú (/restart en su chat, o %s) para que lea lo "
+           "nuevo de su .env." % gestores.como_se_reinicia(gestor, root))
+    return False
 
 
 def quitar_lineas_api(sis, man, quedan, salida) -> None:
@@ -311,8 +325,19 @@ TOPE_DE_LA_UNIDAD = DURACION_CANJE + 60
 LIMPIAR = "/usr/bin/python3 -I -B %s/hehermes-servidor canje-limpiar" % p.PREFIJO
 
 
+#: pip: sus propios reintentos y su plazo por conexión (de serie, 5 y 15 s), y lo más que espera cada intento entero.
+PIP_RED = ["--retries", "5", "--timeout", "20"]
+PLAZO_PIP = 600
+PLAZO_VENV = 300
+
+
 class ParadaDelCanje(Exception):
-    """El canje no se ha podido lanzar. Lo que se había preparado ya está borrado."""
+    """El canje no se ha podido lanzar (lo que se había preparado ya está borrado), o su entorno de Python no se ha
+    podido hacer. `codigo`, el que dice por chat (`marcha`)."""
+
+    def __init__(self, mensaje="", codigo="a-medias"):
+        super().__init__(mensaje)
+        self.codigo = codigo
 
 
 def enlace(direccion: str, puerto: int, codigo: str, huella: str) -> str:
@@ -497,17 +522,36 @@ def _systemd_run_usuario(ambito) -> list:
                     ambito.run_canje]
 
 
-def elegir_puerto(ocupados, azar=None) -> int | None:
+def elegir_puerto(ocupados, azar=None, evitar=None) -> int | None:
     """Uno libre del rango, empezando por uno al azar y dando la vuelta: si el primero está ocupado, el siguiente libre.
-    `None` si no queda ninguno."""
+    `None` si no queda ninguno. `evitar`: los efímeros de Linux (`puertos_efimeros`), que se dejan fuera del sorteo
+    salvo que lo cubran todo."""
     azar = azar or _azar
-    total = PUERTO_MAXIMO - PUERTO_MINIMO + 1
+    candidatos = range(PUERTO_MINIMO, PUERTO_MAXIMO + 1)
+    if evitar:
+        fuera = [puerto for puerto in candidatos if puerto not in evitar]
+        candidatos = fuera or candidatos
+    total = len(candidatos)
     inicio = azar(total)
     for paso in range(total):
-        puerto = PUERTO_MINIMO + (inicio + paso) % total
+        puerto = candidatos[(inicio + paso) % total]
         if puerto not in ocupados:
             return puerto
     return None
+
+
+#: Los puertos que el núcleo da a las conexiones de salida (del 32768 al 60999, de serie).
+RANGO_EFIMERO = "/proc/sys/net/ipv4/ip_local_port_range"
+
+
+def puertos_efimeros(sis) -> range | None:
+    """Los efímeros de este servidor, o None si no se saben. Uno de la pasarela entre ellos lo puede coger una conexión
+    de salida antes de que arranque (tras un reinicio), y su unidad se rendiría con EADDRINUSE."""
+    try:
+        minimo, maximo = (int(x) for x in (sis.leer_texto(RANGO_EFIMERO) or "").split())
+    except ValueError:
+        return None
+    return range(minimo, maximo + 1) if 0 < minimo <= maximo <= 65535 else None
 
 
 def _puertos_tcp_ocupados(sis) -> set:
@@ -521,7 +565,7 @@ def _puertos_tcp_ocupados(sis) -> set:
 
 
 def _puerto_libre(sis) -> int:
-    puerto = elegir_puerto(_puertos_tcp_ocupados(sis))
+    puerto = elegir_puerto(_puertos_tcp_ocupados(sis), evitar=puertos_efimeros(sis))
     if puerto is None:
         raise ParadaDelCanje("no hay ningún puerto libre para el canje entre el %d y el %d"
                              % (PUERTO_MINIMO, PUERTO_MAXIMO))
@@ -533,6 +577,15 @@ def venv_listo(sis, ambito=None) -> bool:
     ambito = ambito or amb.de_root()
     return sis.existe(ambito.python_venv) and sis.ejecutar(
         [ambito.python_venv, "-I", "-B", "-c", "import cryptography, hehermes_servidor.canje"]).bien
+
+
+def venv_roto(sis, ambito=None) -> bool:
+    """El venv está, pero su Python no encuentra ni su pip: lo hizo otro Python. Pasa al subir de versión la
+    distribución (Debian 12 → 13, Ubuntu 24.04 → 26.04): su `bin/python` lleva al `python3` nuevo, que busca lo suyo en
+    otra carpeta (o a uno que ya no está). Instalar encima con pip no lo arregla: hay que rehacerlo (`--clear`)."""
+    from . import ambito as amb
+    ambito = ambito or amb.de_root()
+    return sis.existe(ambito.python_venv) and not sis.ejecutar([ambito.python_venv, "-I", "-c", "import pip"]).bien
 
 
 def _venv(sis, man, salida, ambito=None):
@@ -547,18 +600,34 @@ def _venv(sis, man, salida, ambito=None):
     salida("==> el entorno de Python de cryptography (%s)" % venv)
     man.datos["venv_canje"] = venv
     man.guardar(sis)
-    pasos = ([] if sis.existe(python) else [["python3", "-I", "-m", "venv", venv]]) + [
-        [python, "-I", "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--quiet",
-         "--only-binary=:all:", "--require-hashes", "-r", ambito.prefijo + "/requirements-canje.txt"]]
-    for paso in pasos:
-        r = sis.ejecutar(paso)
+    rehecho = venv_roto(sis, ambito)
+    if rehecho:
+        salida("    el de antes es de otro Python (¿se ha actualizado el sistema?) y ya no funciona: lo rehago")
+        r = sis.ejecutar(["python3", "-I", "-m", "venv", "--clear", venv], plazo=PLAZO_VENV)
         if not r.bien:
-            raise ParadaDelCanje("el entorno de Python ha fallado (%s): %s" % (paso[2 if paso[0] == "python3" else 3],
-                                                                             (r.error or r.salida).strip()[-400:]))
+            raise ParadaDelCanje("el entorno de Python ha fallado (venv --clear): %s"
+                                 % (r.error or r.salida).strip()[-400:], codigo="pip")
+    if not sis.existe(python):
+        r = sis.ejecutar(["python3", "-I", "-m", "venv", venv], plazo=PLAZO_VENV)
+        if not r.bien:
+            raise ParadaDelCanje("no he podido crear el entorno de Python (python3 -m venv %s): %s"
+                                 % (venv, (r.error or r.salida).strip()[-400:]), codigo="pip")
+    # Lo único de esto que va por la red: con sus reintentos y, si aun así falla (PyPI que no contesta un momento), otra
+    # vez entera con espera creciente. Con los hashes fijados, repetirlo da siempre lo mismo.
+    r = sis.ejecutar_con_reintentos(
+        [python, "-I", "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--quiet"] + PIP_RED +
+        ["--only-binary=:all:", "--require-hashes", "-r", ambito.prefijo + "/requirements-canje.txt"],
+        intentos=3, plazo=PLAZO_PIP, salida=salida, que="pip")
+    if not r.bien:
+        raise ParadaDelCanje("pip no ha podido instalar cryptography (¿llega este servidor a pypi.org?): %s"
+                             % (r.error or r.salida).strip()[-400:], codigo="pip")
     r = sis.ejecutar([python, "-I", "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"])
     sis.escribir(r.salida.strip() + "/hehermes-servidor.pth", (ambito.prefijo + "\n").encode())
     if not sis.ejecutar(comprobar).bien:
-        raise ParadaDelCanje("el entorno de Python no importa cryptography")
+        raise ParadaDelCanje("el entorno de Python no importa cryptography", codigo="pip")
+    if rehecho and man.datos.get("vigia"):
+        # El vigía corre con este venv: si sigue en marcha con el de antes (lo que tenía cargado), con el nuevo.
+        sis.ejecutar(ambito.systemctl + ["try-restart", p.UNIDAD_VIGIA])
 
 
 def _systemctl(ambito):

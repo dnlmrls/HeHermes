@@ -67,4 +67,10 @@ máquina se lleva este paquete entero y arranca solo su mitad.
 #        con drenaje y en un rato tranquilo (el trabajo dice su `paso`). La lista no lanza `hermes`: lee `profiles/` y
 #        mira cada agente con su clave, a la vez. La personalidad la escribe el principal. El lector y la entrada atienden
 #        lo de cada perfil (`?exports <perfil>`, `perfil=`).
-VERSION = "1.6.0"
+# 1.6.1: «Detener» de la app (contrato §6, punto 10): la entrega de un subagente que el usuario detuvo llega igual, con
+#        lo que hizo hasta pararse, y ni se contesta ni se avisa (`deteccion.delegaciones_detenidas`). El `hermes` del
+#        ayudante de los agentes manda lo de internet a un puerto cerrado de localhost: su jaula tira esos paquetes y
+#        crear un agente esperaba 2 minutos. `instalar.sh` fija su umask (pip dejaba lo nuevo sin leer para el relé).
+#        `hehermes-actualizar` comprueba la firma también sin la orden openssl, y si no puede, `sin_openssl`. Las
+#        dependencias del relé, sin fallos conocidos (anyio, h2 y hpack).
+VERSION = "1.6.1"

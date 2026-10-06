@@ -19,6 +19,7 @@ import shlex
 
 from . import capacidades
 from . import gestor as gestores
+from . import nube
 from .entorno import leer_env
 
 SOPORTADAS = {("debian", "12"), ("debian", "13"), ("ubuntu", "22.04"), ("ubuntu", "24.04"), ("ubuntu", "26.04")}
@@ -30,6 +31,8 @@ CODIGOS = {"bookworm": ("debian", "12"), "trixie": ("debian", "13"), "jammy": ("
 #: La familia Red Hat: RHEL y sus reconstrucciones (Rocky Linux, AlmaLinux, CentOS Stream) 9 y 10, y Fedora desde la
 #: 42. RHEL 8 no: su python3 es un 3.6.
 EL_SOPORTADAS = ("9", "10")
+#: Cada Amazon Linux, con el EL en el que se basa.
+AMAZON_LINUX = {"2023": "9"}
 FEDORA_MINIMA = 42
 LISTA = ("Debian 12 y 13, Ubuntu 22.04, 24.04 y 26.04 y sus derivadas; Rocky Linux, AlmaLinux, RHEL y CentOS Stream 9 "
          "y 10, y Fedora %d o más nueva" % FEDORA_MINIMA)
@@ -43,10 +46,6 @@ CABECERA_DISPOSITIVO = "# Generado por hehermes-dispositivo."
 ROJO = "\033[31m"
 NORMAL = "\033[0m"
 DIRECCION_VALIDA = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:-]{0,252}$")
-_CGNAT = ipaddress.ip_network("100.64.0.0/10")
-# Las de documentación (RFC 5737) no son de nadie y ningún servidor de verdad sale por una: cuentan como públicas, para
-# que las pruebas y los ejemplos las usen en vez de la dirección de un servidor que exista.
-_DOCUMENTACION = tuple(ipaddress.ip_network(r) for r in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"))
 
 
 class Bloqueo(str):
@@ -144,7 +143,10 @@ class Deteccion:
         self.hermes = None
         self.hermes_encontrados = []
         self.direccion = None
+        #: Detrás de un NAT sin saber la pública: la pregunta `instalar` en un terminal.
         self.direccion_privada = False
+        #: La nube, si se ha mirado (`nube.proveedor`: «aws», «gcp», «azure», «oracle»…; None si no se sabe).
+        self.proveedor = None
         self.ufw = None
         self.reglas_ufw = []
         #: nftables e iptables a pelo: las cadenas que cierran y donde van las reglas (`cortafuegos.Lugar`).
@@ -177,9 +179,13 @@ def _base(datos):
             if base:
                 return "debian", base, nombre
         return "debian", None, nombre
-    plataforma = re.match(r"^platform:(el|f)(\d+)$", datos.get("PLATFORM_ID", ""))
+    plataforma = re.match(r"^platform:(el|f|al)(\d+)$", datos.get("PLATFORM_ID", ""))
     if ident in ("rhel", "rocky", "almalinux", "centos", "fedora") or {"rhel", "fedora", "centos"} & set(parecidas):
-        if plataforma:
+        if plataforma and plataforma.group(1) == "al":
+            # Amazon Linux 2023 (`platform:al2023`, la imagen de serie de AWS) es casi un EL9: su Python 3.9, systemd
+            # 252 y dnf. El 2, no (su python3 es un 3.7).
+            familia, numero = "el", AMAZON_LINUX.get(plataforma.group(2), "?")
+        elif plataforma:
             familia, numero = ("fedora" if plataforma.group(1) == "f" else "el"), plataforma.group(2)
         else:
             familia, numero = ("fedora" if ident == "fedora" else "el"), version.split(".")[0]
@@ -196,7 +202,76 @@ def _nombre_de(base):
     return {"debian": "Debian", "ubuntu": "Ubuntu", "el": "RHEL", "fedora": "Fedora"}[familia] + " " + version
 
 
+#: Los contenedores de sistema (con su systemd dentro) en los que la jaula de las unidades puede no montarse: en un LXC
+#: sin anidamiento o en OpenVZ, `ProtectSystem`, `PrivateTmp`… fallan con 226/NAMESPACE.
+CONTENEDORES_DE_SISTEMA = {"lxc": "LXC (como los de Proxmox o Incus)", "lxc-libvirt": "LXC (de libvirt)",
+                           "openvz": "OpenVZ (Virtuozzo)"}
+#: La jaula de la pasarela y los suyos, en una unidad pasajera que no hace nada (`_jaula`).
+JAULA = ("ProtectSystem=strict", "ProtectHome=yes", "PrivateTmp=yes", "PrivateDevices=yes", "ProtectKernelTunables=yes",
+         "ProtectControlGroups=yes", "RestrictNamespaces=yes", "NoNewPrivileges=yes")
+NO_ES_SERVIDOR = ("%s, no el servidor donde vive tu Hermes: desde internet no se llega aquí, y la app de iPhone no "
+                  "podría conectar. HeHermes se instala en ese servidor (un VPS con Hermes): entra en él por SSH y "
+                  "lánzame allí. No he tocado nada")
+EN_UN_CONTENEDOR = ("Me estás lanzando dentro de un contenedor (%s), no en el servidor: aquí no hay systemd ni se ve el "
+                    "resto de la máquina. Si tu Hermes corre en Docker o con un terminal en un sandbox, lo que me lanza "
+                    "por chat corre ahí dentro: entra en el servidor por SSH y lánzame allí, fuera del contenedor (con "
+                    "sudo). No he tocado nada")
+
+
+def _contenedor(sis) -> str | None:
+    """En qué contenedor corre el instalador, por lo que deja cada uno (sin ejecutar nada): Docker, Podman, o lo que
+    apuntó el systemd de dentro al arrancar (`/run/systemd/container`: «lxc», «openvz», «wsl»…). None si en ninguno."""
+    apuntado = (sis.leer_texto("/run/systemd/container") or "").strip()
+    if apuntado:
+        return apuntado
+    if sis.existe("/.dockerenv"):
+        return "docker"
+    if sis.existe("/run/.containerenv"):
+        return "podman"
+    return None
+
+
+def _donde(sis, det) -> bool:
+    """Que esto sea un servidor, antes de nada: un Mac (la app de escritorio de Hermes), WSL o un contenedor de
+    aplicación (el de Hermes en Docker, o el sandbox de su terminal) no lo son, y por chat la orden corre ahí. Antes salía
+    `sistema` («no arranca con systemd»), que no le decía nada a nadie."""
+    if sis.sistema_operativo != "Linux":
+        det.bloqueos.append(bloqueo("no-es-servidor", NO_ES_SERVIDOR % (
+            "Esto es un Mac" if sis.sistema_operativo == "Darwin" else "Esto es %s" % sis.sistema_operativo)))
+        return False
+    contenedor = _contenedor(sis)
+    if "microsoft" in sis.nucleo.lower() or contenedor == "wsl":
+        det.bloqueos.append(bloqueo("no-es-servidor", NO_ES_SERVIDOR % "Esto es WSL, un Linux dentro de Windows"))
+        return False
+    if contenedor and contenedor not in CONTENEDORES_DE_SISTEMA and contenedor != "systemd-nspawn":
+        det.bloqueos.append(bloqueo("contenedor", EN_UN_CONTENEDOR % contenedor))
+        return False
+    return True
+
+
+def _jaula(sis, det) -> None:
+    """En un contenedor LXC u OpenVZ, si systemd puede encerrar las unidades: una unidad pasajera con su jaula que no
+    hace nada (`/bin/true`, y no deja nada). Es la única orden de la detección que no solo lee: sin ella, se sabría al
+    final, con las unidades a medias. Sin root no hace falta: las unidades de usuario no llevan jaula."""
+    contenedor = _contenedor(sis)
+    ambito = getattr(det, "ambito", None)
+    if contenedor not in CONTENEDORES_DE_SISTEMA or not (ambito is None or ambito.root) or det.bloqueos:
+        return
+    orden = ["systemd-run", "--wait", "--quiet", "--collect"]
+    for propiedad in JAULA:
+        orden += ["-p", propiedad]
+    if sis.ejecutar(orden + ["/bin/true"]).bien:
+        return
+    det.bloqueos.append(bloqueo("contenedor", (
+        "Este servidor es un contenedor %s, y systemd no puede encerrar aquí lo de HeHermes (lo he probado con una unidad "
+        "que no hace nada, con ProtectSystem y PrivateTmp, y no arranca). En Proxmox, enciende el anidamiento (nesting: "
+        "Opciones › Características) y reinicia el contenedor; en Incus o LXD, security.nesting=true. O instálame en "
+        "una máquina virtual. No he tocado nada") % CONTENEDORES_DE_SISTEMA[contenedor]))
+
+
 def _distro(sis, det) -> bool:
+    if not _donde(sis, det):
+        return False
     # En Ubuntu y en Debian /etc/os-release es un enlace a /usr/lib/os-release, y `leer` no sigue enlaces: se lee el de
     # /usr/lib, que es el sitio de verdad (os-release(5)), y /etc solo si no está.
     datos = leer_env(sis.leer_texto("/usr/lib/os-release") or sis.leer_texto("/etc/os-release") or "")
@@ -233,7 +308,15 @@ def _distro(sis, det) -> bool:
         etiquetar(det.bloqueos, "sistema")
     # El núcleo, cualquiera con systemd: la pasarela es un proceso de Python que escucha en un TCP.
     if not sis.es_carpeta("/run/systemd/system"):
-        det.bloqueos.append(bloqueo("sistema", "este sistema no arranca con systemd"))
+        # Sin systemd y sin las marcas de `_donde`, un contenedor de otro motor (containerd…) aún se puede reconocer.
+        virt = sis.ejecutar(["systemd-detect-virt", "--container"]) if sis.cual("systemd-detect-virt") else None
+        tipo = virt.salida.strip() if virt is not None and virt.bien else ""
+        if tipo and tipo != "none":
+            det.bloqueos.append(bloqueo("contenedor", EN_UN_CONTENEDOR % tipo))
+        else:
+            det.bloqueos.append(bloqueo("sistema", "este sistema no arranca con systemd"))
+    else:
+        _jaula(sis, det)
     det.distro["nucleo"] = sis.nucleo
     det.distro["python"] = ".".join(map(str, sis.version_python[:2]))
     return True
@@ -275,14 +358,14 @@ def _perfil_de(argv) -> str | None:
     return None
 
 
-def casa_del_proceso(sis, usuario, argv, entorno) -> str:
+def casa_del_proceso(sis, usuario, argv, entorno, casa_usuario=None) -> str:
     """La casa de Hermes (su HERMES_HOME) de un proceso, como la decide Hermes al arrancar (`hermes_cli/main.py`,
     `_apply_profile_override`): el perfil de su orden (`-p trabajo`) manda; si no, un HERMES_HOME que ya es la carpeta de un
     perfil; si no, y no lo lanzó un supervisor, el perfil activo (`<raíz>/active_profile`, el de `hermes profile use`);
     y si no, su HERMES_HOME o `~/.hermes`. `/proc/<pid>/environ` solo tiene el entorno con el que arrancó, no el que se
-    pone Hermes después: por eso hay que repetir su cuenta."""
+    pone Hermes después: por eso hay que repetir su cuenta. `casa_usuario`: la de su usuario, si ya se sabe."""
     propio = (entorno.get("HERMES_HOME") or "").rstrip("/")
-    raiz = propio or _home(sis, usuario) + "/.hermes"
+    raiz = propio or (casa_usuario or _home(sis, usuario)).rstrip("/") + "/.hermes"
     arriba = raiz.rsplit("/", 2)
     if len(arriba) == 3 and arriba[1] == "profiles":
         raiz = arriba[0]
@@ -306,6 +389,9 @@ def _candidatos(sis, root=True, usuario_actual=None):
     props = _propiedades(r.salida)
     if props.get("LoadState") == "loaded":
         usuario = props.get("User") or "root"
+        if usuario.isdigit():
+            # `User=1001` en su unidad: el nombre de ese uid, si lo tiene.
+            usuario = (sis.cuenta(usuario) or (usuario,))[0]
         entorno = dict(x.split("=", 1) for x in props.get("Environment", "").split() if "=" in x)
         hermes = Hermes(usuario, entorno.get("HERMES_HOME") or _home(sis, usuario) + "/.hermes",
                         "la unidad hermes-gateway")
@@ -313,7 +399,9 @@ def _candidatos(sis, root=True, usuario_actual=None):
         hermes.en_marcha = props.get("ActiveState") in ("active", "reloading", "activating")
         hermes.gestor = gestores.Gestor("sistema", "hermes-gateway.service")
         candidatos.append(hermes)
-    r = sis.ejecutar(["ps", "-eo", "pid=,user=,args="])
+    # Por su uid, y su nombre por NSS: `ps -o user` recorta a 8 letras los nombres más largos («cloud-u+», el usuario de
+    # RHEL en la nube) y da el uid de quien no tiene nombre (el 10000 de Hermes en Docker).
+    r = sis.ejecutar(["ps", "-eo", "pid=,uid=,args="])
     for linea in r.salida.splitlines():
         partes = linea.split(None, 2)
         # `hermes gateway run`, su lanzador (`…/.hermes/bin/hermes`) o `python -m hermes_cli.main` (hermes_cli/
@@ -324,15 +412,17 @@ def _candidatos(sis, root=True, usuario_actual=None):
         # también lleva «hermes» y «gateway», y contaría como otro Hermes (`varios-hermes`).
         if not re.fullmatch(r"(python[0-9.]*|hermes[A-Za-z0-9._-]*)", partes[2].split()[0].rsplit("/", 1)[-1]):
             continue
-        pid, usuario = partes[0], partes[1]
+        pid, uid = partes[0], partes[1]
         entorno = {}
         for par in (sis.leer("/proc/%s/environ" % pid) or b"").split(b"\0"):
             if b"=" in par:
                 clave, _, valor = par.decode("utf-8", "replace").partition("=")
                 entorno[clave] = valor
+        # Sin nombre, su usuario es el uid (`usuario-hermes` lo para con root) y su casa, el HOME de su proceso.
+        usuario, casa_usuario = sis.cuenta(uid) or (uid, entorno.get("HOME") or None)
         gestor = gestores.detectar(sis, pid, root=root, usuario_actual=usuario_actual)
         red = None
-        casa = casa_de_hermes = casa_del_proceso(sis, usuario, partes[2].split(), entorno)
+        casa = casa_de_hermes = casa_del_proceso(sis, usuario, partes[2].split(), entorno, casa_usuario)
         if gestor is not None and gestor.tipo in gestores.CONTENEDORES:
             # Su casa es la de dentro del contenedor (`/opt/data`): la del servidor es la del montaje que la lleva.
             datos = gestores.contenedor(sis, gestor)
@@ -428,17 +518,32 @@ def _hermes(sis, det, hermes_home, activar_api=False, corregir_exposicion=False,
                             "hermes-gateway) y vuelve a lanzarme")
         etiquetar(det.bloqueos, "hermes-parado")
         return
+    if root and elegido.usuario.isdigit():
+        det.bloqueos.append(bloqueo("usuario-hermes", (
+            "Hermes corre con el uid %s, que no tiene usuario en este servidor (es el de su contenedor: la imagen de "
+            "Docker de Hermes usa el 10000). Lo de HeHermes que lee y escribe en su casa tiene que correr como él, y "
+            "systemd no arranca nada con un usuario que no existe. Créalo, sin casa ni shell (sudo useradd --system "
+            "--uid %s --no-create-home --shell /usr/sbin/nologin hermes-contenedor), y vuelve a lanzarme. No he "
+            "tocado nada") % (elegido.usuario, elegido.usuario)))
+        # Para la app (`hehermes-detalle:`): con el uid, el mensaje para quien administra lleva la orden exacta.
+        det.bloqueos[-1].detalle = "uid=%s" % elegido.usuario
     texto = sis.leer_texto(elegido.env)
     if texto is None:
         det.bloqueos.append(bloqueo("clave-hermes", "no puedo leer %s, el .env de Hermes" % elegido.env))
         return
     env = leer_env(texto)
-    elegido.habilitada = env.get("API_SERVER_ENABLED", "").lower() in ("1", "true", "yes", "on")
-    elegido._clave = env.get("API_SERVER_KEY") or None
+
+    def de_hermes(nombre):
+        # Lo que no está en su .env lo pone su entorno: el de su unidad o el de su proceso (en Docker, lo de `docker run
+        # -e`, como lo enseña su guía). Hermes carga el .env por encima (`hermes_cli/env_loader.py`, override=True).
+        return env[nombre] if nombre in env else elegido.entorno.get(nombre)
+
+    elegido.habilitada = (de_hermes("API_SERVER_ENABLED") or "").lower() in ("1", "true", "yes", "on")
+    elegido._clave = de_hermes("API_SERVER_KEY") or None
     # Lo que fija su entorno manda sobre el .env (python-dotenv no pisa lo que ya está en el entorno).
     elegido.host = elegido.entorno.get("API_SERVER_HOST") or env.get("API_SERVER_HOST") or "127.0.0.1"
     try:
-        elegido.puerto = int(env.get("API_SERVER_PORT") or 8642)
+        elegido.puerto = int(de_hermes("API_SERVER_PORT") or 8642)
         if not 0 < elegido.puerto < 65536:
             raise ValueError
     except ValueError:
@@ -541,7 +646,10 @@ def _exposicion(sis, det, elegido, env, corregir, ambito=None):
     """La API de Hermes escuchando en todas las interfaces: se mira lo que dice su configuración y lo que de verdad
     escucha (`ss`). Se avisa muy claro; solo con --corregir-exposicion se cambia, y solo en el .env."""
     donde = None
-    if elegido.host in TODAS:
+    # En un contenedor con su propia red, el 0.0.0.0 de dentro es el suyo (y lo necesita para que se llegue desde
+    # fuera): lo que la abre o no es en qué direcciones del servidor se publica su puerto, y eso lo dice `ss`.
+    red_propia = elegido.gestor is not None and elegido.gestor.tipo in gestores.CONTENEDORES and elegido.red != "host"
+    if elegido.host in TODAS and not red_propia:
         donde = "%s:%d" % (elegido.host, elegido.puerto)
     for host, puerto, _ in _escuchan(sis, "tcp"):
         if puerto == str(elegido.puerto) and host in TODAS:
@@ -552,6 +660,16 @@ def _exposicion(sis, det, elegido, env, corregir, ambito=None):
     riesgo = ("La API de Hermes escucha en %s, en todas las interfaces: cualquiera que llegue a este servidor puede "
               "hablar con ella sin pasar por la pasarela, y solo la protege su clave. No lo cambio sin que me lo pidas, "
               "porque puede que otra cosa tuya la use así" % donde)
+    if red_propia:
+        # Cambiar su API_SERVER_HOST a 127.0.0.1 la dejaría sin que nadie llegase a ella, ni la pasarela.
+        det.avisos.append(ROJO + "%s. Corre en %s, que publica su puerto en todas las direcciones del servidor (y Docker "
+                          "se salta ufw): vuelve a crearlo publicándolo solo en 127.0.0.1 (-p 127.0.0.1:%d:%d)"
+                          % (riesgo, elegido.gestor.describir(), elegido.puerto, elegido.puerto) + NORMAL)
+        if corregir:
+            det.bloqueos.append(bloqueo("api-hermes", "Con --corregir-exposicion no puedo cerrarla: Hermes corre en %s, "
+                                        "y lo que la abre es cómo se publica su puerto (-p 127.0.0.1:%d:%d)"
+                                        % (elegido.gestor.describir(), elegido.puerto, elegido.puerto)))
+        return
     if "API_SERVER_HOST" in elegido.entorno:
         como = ("Lo fija el entorno de %s (Environment=API_SERVER_HOST=%s): cámbialo ahí a 127.0.0.1 y reinícialo"
                 % (elegido.origen, elegido.entorno["API_SERVER_HOST"]))
@@ -627,13 +745,12 @@ def _activar_api(det, elegido, env, ambito=None):
 # MARK: La dirección
 
 
-def _es_privada(ip):
-    if any(ip in red for red in _DOCUMENTACION):
-        return False
-    return ip.is_private or ip.is_loopback or ip.is_link_local or (ip.version == 4 and ip in _CGNAT)
+_es_privada = nube.es_privada
 
 
 def _direccion(sis, det, direccion):
+    """La del QR: la de `--direccion`; si no, la de salida; y si esa es privada (un NAT), la que da el servicio de
+    metadatos de la nube (`nube`), diciendo de dónde sale. Si tampoco, `nat`, con lo que hay que hacer."""
     if direccion is not None:
         if not DIRECCION_VALIDA.fullmatch(direccion):
             det.bloqueos.append(bloqueo("direccion", "--direccion tiene que ser una IP o un nombre de host"))
@@ -645,15 +762,36 @@ def _direccion(sis, det, direccion):
         salida = json.loads(r.salida)[0]["prefsrc"]
         ip = ipaddress.ip_address(salida)
     except (ValueError, KeyError, IndexError, TypeError):
-        det.bloqueos.append(bloqueo("direccion", "no sé la dirección pública de este servidor: dímela con --direccion"))
+        det.bloqueos.append(bloqueo("direccion", "no sé la dirección pública de este servidor (no tiene ruta IPv4 a "
+                                    "internet: ¿solo tiene IPv6?): dímela con --direccion"))
         return
-    if _es_privada(ip):
-        det.direccion_privada = True
-        det.bloqueos.append("la dirección de salida de este servidor es privada (%s): parece que está detrás de un NAT. "
-                            "Dime la pública con --direccion <IP o nombre>" % ip)
-        etiquetar(det.bloqueos, "nat")
+    if not _es_privada(ip):
+        det.direccion = str(ip)
         return
-    det.direccion = str(ip)
+    det.proveedor = nube.proveedor(sis)
+    publica = nube.ip_publica(sis, det.proveedor, privada=str(ip))
+    if publica is not None:
+        det.direccion = publica
+        det.avisos.append("La dirección de salida de este servidor es privada (%s): está detrás del NAT de %s. La "
+                          "pública, %s, me la da su servicio de metadatos (169.254.169.254, dentro de esta máquina), y "
+                          "es la que irá en el QR. Si no es la buena, vuelve a lanzarme con --direccion <IP o nombre>"
+                          % (ip, nube.nombre(det.proveedor), publica))
+        return
+    det.direccion_privada = True
+    if det.proveedor in nube.DONDE_MIRARLA:
+        texto = ("la dirección de salida de este servidor es privada (%s): está detrás del NAT de %s, y su servicio de "
+                 "metadatos no me da la pública%s. Mírala %s, y dímela con --direccion <IP o nombre>"
+                 % (ip, nube.nombre(det.proveedor), "" if det.proveedor == "oracle" else
+                    " (¿no tiene IP pública, o los metadatos están apagados?)", nube.DONDE_MIRARLA[det.proveedor]))
+    else:
+        texto = ("la dirección de salida de este servidor es privada (%s): parece que está detrás de un NAT (el de tu "
+                 "proveedor, o el router de tu casa), y no sé la pública. Dime la pública con --direccion <IP o "
+                 "nombre>: la que da el panel de tu proveedor o, en casa, la de tu router, que tendrá que llevar a "
+                 "este servidor el TCP de la pasarela" % ip)
+    det.bloqueos.append(bloqueo("nat", texto))
+    if det.proveedor:
+        # Para la app (`hehermes-detalle:`): con el proveedor, puede decir dónde se mira la pública.
+        det.bloqueos[-1].detalle = "proveedor=%s" % det.proveedor
 
 
 # MARK: Lo que escucha
@@ -661,6 +799,17 @@ def _direccion(sis, det, direccion):
 
 def _activo(sis, unidad):
     return sis.ejecutar(["systemctl", "is-active", unidad]).bien
+
+
+def quien_usa_el_vigia(sis) -> str | None:
+    """Quién escucha ya donde va el vigía (127.0.0.1:8790, fijo: la pasarela le pasa ahí /avisos/), o None. Un programa
+    en 0.0.0.0 o en [::] también lo ocupa; en otra dirección, no."""
+    from .piezas import VIGIA
+    anfitrion, puerto = VIGIA.rsplit(":", 1)
+    for host, suyo, dueno in _escuchan(sis, "tcp"):
+        if suyo == puerto and (host in TODAS or host.strip("[]") in (anfitrion, "::ffff:" + anfitrion)):
+            return dueno
+    return None
 
 
 def _escuchan(sis, protocolo):

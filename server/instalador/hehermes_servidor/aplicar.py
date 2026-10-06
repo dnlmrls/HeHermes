@@ -15,8 +15,28 @@ from . import manifiesto as m
 REINICIOS_PENDIENTES = "reinicios_pendientes"
 
 
+#: apt-get: esperar al cerrojo de dpkg (unattended-upgrades y apt-daily lo tienen a menudo en un VPS recién creado, y sin
+#: esto apt falla al momento con «Could not get lock»), reintentar las descargas, y sin preguntar. `DPkg::Lock::Timeout`
+#: es de apt 2.0 (Ubuntu 20.04, Debian 11): lo tiene todo lo que se instala.
+APT = ["apt-get", "-o", "DPkg::Lock::Timeout=120", "-o", "Acquire::Retries=3", "-q"]
+#: Su entorno: sin preguntas, y que needrestart no reinicie nada al acabar (el instalador corre dentro de Hermes, y una
+#: biblioteca actualizada no puede reiniciarle la unidad a mitad del comando que lo instala).
+ENTORNO_APT = ["env", "DEBIAN_FRONTEND=noninteractive", "NEEDRESTART_SUSPEND=1", "NEEDRESTART_MODE=l"]
+#: Lo más que espera cada orden de paquetes (con el cerrojo, las descargas y dpkg). `cloud-init status --wait`, lo que
+#: tarde un servidor recién creado en acabar de prepararse.
+PLAZO_PAQUETES = 900
+PLAZO_CLOUD_INIT = 150
+#: Lo más que espera una orden de systemd o del cortafuegos: más que el arranque de una unidad (90 s de serie).
+PLAZO_ORDEN = 180
+
+
 class Parada(Exception):
-    """El instalador se para aquí: lo de este paso ya ha vuelto a como estaba."""
+    """El instalador se para aquí: lo de este paso ya ha vuelto a como estaba. `codigo`, el que dice por chat
+    (`hehermes-error:<código>`, `marcha`): `apt` y `pip` de lo suyo, y `a-medias` de lo demás."""
+
+    def __init__(self, mensaje="", codigo="a-medias"):
+        super().__init__(mensaje)
+        self.codigo = codigo
 
 
 class Transaccion:
@@ -74,10 +94,14 @@ def _escribir(sis, man, tx, accion):
     return True
 
 
-def _orden(sis, args, que, entrada=None):
-    r = sis.ejecutar(args, entrada=entrada)
+def _fallo(r) -> str:
+    return (r.error or r.salida).strip()[-400:] or "código %d" % r.codigo
+
+
+def _orden(sis, args, que, entrada=None, codigo="a-medias", plazo=PLAZO_ORDEN):
+    r = sis.ejecutar(args, entrada=entrada, plazo=plazo)
     if not r.bien:
-        raise Parada("%s ha fallado: %s" % (que, (r.error or r.salida).strip() or "código %d" % r.codigo))
+        raise Parada("%s ha fallado: %s" % (que, _fallo(r)), codigo=codigo)
     return r
 
 
@@ -87,12 +111,24 @@ def _paquetes(sis, man, acciones, salida, familia="debian"):
         return
     salida("==> paquetes: " + " ".join(faltan))
     if familia == "rhel":
-        # Sin las dependencias débiles: lo mismo que --no-install-recommends.
-        _orden(sis, ["dnf", "install", "-y", "-q", "--setopt=install_weak_deps=False"] + faltan, "dnf install")
+        # Sin las dependencias débiles: lo mismo que --no-install-recommends. dnf ya reintenta las descargas (10 veces).
+        _orden(sis, ["dnf", "install", "-y", "-q", "--setopt=install_weak_deps=False"] + faltan, "dnf install",
+               codigo="apt", plazo=PLAZO_PAQUETES)
     else:
-        apt = ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get"]
-        _orden(sis, apt + ["update", "-q"], "apt-get update")
-        _orden(sis, apt + ["install", "-y", "-q", "--no-install-recommends"] + faltan, "apt-get install")
+        if sis.cual("cloud-init"):
+            # Un servidor recién creado: hasta que cloud-init acaba, apt y dpkg pueden estar ocupados. Da igual cómo
+            # acabó (1 y 2 son sus avisos y sus errores): solo importa que haya acabado.
+            sis.ejecutar(["cloud-init", "status", "--wait"], plazo=PLAZO_CLOUD_INIT)
+        r = sis.ejecutar(ENTORNO_APT + APT + ["update"], plazo=PLAZO_PAQUETES)
+        actualizado = None if r.bien else _fallo(r)
+        if actualizado:
+            # Un repositorio de otro, roto, no impide instalar lo que ya se conoce: se intenta igual, y se dice.
+            salida("    apt-get update ha fallado (%s): lo intento igual con lo que ya conoce" % actualizado)
+        r = sis.ejecutar(ENTORNO_APT + APT + ["install", "-y", "--no-install-recommends"] + faltan,
+                         plazo=PLAZO_PAQUETES)
+        if not r.bien:
+            raise Parada("apt-get install ha fallado: %s%s" % (
+                _fallo(r), "" if not actualizado else " (y antes, apt-get update: %s)" % actualizado), codigo="apt")
     man.paquetes.extend(x for x in faltan if x not in man.paquetes)
     man.guardar(sis)
 

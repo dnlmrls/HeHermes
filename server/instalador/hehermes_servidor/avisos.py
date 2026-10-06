@@ -44,6 +44,7 @@ import urllib.parse
 
 from . import manifiesto as m
 from . import piezas as p
+from .deteccion import quien_usa_el_vigia
 from .plan import Accion, _unidad, bloqueo, buscar_en_origen, codigo_de, etiquetar, fuente_del_lector
 
 ESQUEMA = "hehermes-avisos:1"
@@ -139,6 +140,9 @@ def _gestionado(sis, man, ruta, deseado, reemplazar) -> str:
     if not sis.existe(ruta):
         return m.NUEVO
     if ruta not in man.ficheros:
+        # El que dejó escrito una pasada que se cortó antes de apuntarlo (al darle su dueño) es suyo (`m.es_suyo`).
+        if m.es_suyo(sis, man, ruta, igual=deseado is None or sis.leer(ruta) == deseado):
+            return m.ADOPTA
         return m.REEMPLAZA if ruta in reemplazar else m.AJENO
     if deseado is None or sis.leer(ruta) == deseado:
         return m.YA_ESTA
@@ -209,6 +213,12 @@ def planear(sis, det, man, op, origen, acciones, bloqueos, fichero, avisos=None)
     if ambito.root:
         propias.append(_secreto(sis, man, acciones, ambito.clave_hermes_vigia, (det.hermes.clave + "\n").encode(),
                                 reemplazar, "la clave de Hermes del vigía, 0600 (no se imprime)"))
+        ocupado = None if sis.existe(ambito.socket_vigia) else quien_usa_el_vigia(sis)
+        if ocupado is not None:
+            # Lo abre systemd al habilitar su socket: con otro ahí, fallaría a mitad, con lo demás ya puesto.
+            bloqueos.append(bloqueo("puerto", "El TCP %s, el del vigía de los avisos, ya lo usa otro programa (%s). Es "
+                                    "fijo: la pasarela le pasa ahí lo de los avisos. Mira qué es (ss -ltnp | grep 8790), "
+                                    "libéralo y vuelve a lanzarme. No he tocado nada" % (p.VIGIA, ocupado)))
         socket_ = [fichero(ambito.socket_vigia, p.unidad_vigia_socket())]
         _unidad(sis, acciones, p.SOCKET_VIGIA, socket_, "el puerto del vigía, 127.0.0.1:8790", "restart")
     servicio = fichero(ambito.unidad_vigia, p.unidad_vigia(ambito, vigia["direccion"]))

@@ -25,7 +25,8 @@ from . import manifiesto as m
 from . import piezas as p
 from .aplicar import (Parada, Transaccion, _con_unidad, _escribir, _ficheros, _firewalld, _orden, _paquetes, _propio,
                       _ufw, apuntar_reinicios)
-from .deteccion import Deteccion, bloqueo, etiquetar, _cortafuegos, _direccion, _distro, _escuchan, _hermes, regla_ufw_canonica
+from .deteccion import (Deteccion, bloqueo, etiquetar, _cortafuegos, _direccion, _distro, _escuchan, _hermes,
+                        _version_sin_api, regla_ufw_canonica)
 from .entorno import leer_env
 from .plan import Accion, Plan, _unidad, buscar_en_origen, codigo_de, ficheros_propios
 
@@ -54,6 +55,7 @@ def detectar_tls(sis, man, ambito, direccion=None, hermes_home=None, activar_api
     if not _distro(sis, det):
         return det
     _hermes(sis, det, hermes_home, activar_api, corregir_exposicion, ambito=ambito)
+    _reinicio_pendiente(sis, det, man, ambito)
     if not ambito.root and det.hermes is not None and (det.hermes.api_pendiente or det.hermes.exposicion_pendiente) \
             and not gestores.puede_reiniciar(det.hermes.gestor, ambito):
         det.bloqueos.append("Para encender la API de Hermes o cerrarla a 127.0.0.1 hay que reiniciarlo, y sin root no "
@@ -83,13 +85,85 @@ def detectar_tls(sis, man, ambito, direccion=None, hermes_home=None, activar_api
     return det
 
 
+#: En el manifiesto (desde la 0.11.1): a Hermes le falta reiniciarse para leer lo que se le ha puesto en su .env. Se
+#: apunta antes de tocarlo y, al programar su reinicio, cuándo («programado»): si algo se para o lo cortan entre medias,
+#: la vez siguiente se sabe y se acaba.
+REINICIO_DE_HERMES = "reinicio_de_hermes"
+#: Lo que puede tardar en reiniciarse uno ya programado: los 90 s del temporizador, o lo que tarde en acabar su turno con
+#: la recarga (`agent.restart_after_turn_timeout`, 1800 s de serie), y un margen. Pasado eso, si no contesta es otra
+#: cosa, y se dice (`api-hermes`).
+TARDA_EN_REINICIARSE = 1800 + 300
+
+
+def _lineas_mias(sis, man, ambito, env) -> list:
+    """Las líneas que encienden la API de Hermes y que puse yo en `env`: las de `--activar-api` en el manifiesto, o las
+    de un `reinicia-hermes` que aún no ha pasado a él (`porchat.API_PENDIENTE`)."""
+    from .porchat import API_PENDIENTE
+    datos = man.datos.get("activar_api")
+    if not isinstance(datos, dict):
+        try:
+            datos = json.loads(sis.leer_texto(ambito.carpeta_config + "/" + API_PENDIENTE) or "null")
+        except ValueError:
+            datos = None
+    if not isinstance(datos, dict) or datos.get("env") != env or not isinstance(datos.get("lineas"), list):
+        return []
+    return [str(linea) for linea in datos["lineas"]]
+
+
+def _reinicio_pendiente(sis, det, man, ambito):
+    """Hasta la 0.11.0, si algo se paraba entre encender la API en el .env de Hermes y reiniciarlo (el cerrojo de apt, el
+    plazo de su terminal, un `/stop`), la vez siguiente su API estaba «encendida» y no contestaba, y se paraba con
+    `api-hermes` hasta que alguien lo reiniciara (y la app decía «No se ha cambiado nada»). Ahora, si su API no contesta,
+    las líneas que la encienden son mías y siguen en su .env, y su reinicio está pendiente (apuntado y sin programar, o
+    programado hace poco; o un `reinicia-hermes` sin hacer): si se sabe reiniciar, se sigue como con `--activar-api` (la
+    versión, por su código) y se reinicia al acabar; si no, `reinicia-hermes` otra vez, que la app explica (`/restart`)."""
+    hermes = det.hermes
+    if hermes is None or not (hermes.habilitada and hermes.clave) or not det.bloqueos:
+        return
+    ultimo = det.bloqueos[-1]
+    # El de «su API no contesta» es lo último que dice `_hermes` (y entonces no ha llegado a saber ni su versión ni si su
+    # clave vale).
+    if getattr(ultimo, "codigo", None) != "api-hermes" or hermes.version is not None or hermes.clave_vale is not None:
+        return
+    lineas = _lineas_mias(sis, man, ambito, hermes.env)
+    texto = (sis.leer_texto(hermes.env) or "").splitlines()
+    if not lineas or not all(linea in texto for linea in lineas):
+        return
+    from .porchat import API_PENDIENTE
+    apuntado = man.datos.get(REINICIO_DE_HERMES)
+    programado = apuntado.get("programado") if isinstance(apuntado, dict) else None
+    sin_programar = isinstance(apuntado, dict) and not isinstance(programado, (int, float))
+    ya_programado = isinstance(programado, (int, float)) and time.time() - programado < TARDA_EN_REINICIARSE
+    pendiente = sin_programar or ya_programado or sis.existe(ambito.carpeta_config + "/" + API_PENDIENTE)
+    if not pendiente or sis.http_get("http://127.0.0.1:%d/health" % hermes.puerto)[0] is not None:
+        return
+    nombres = ", ".join(linea.split("=", 1)[0] for linea in lineas)
+    if gestores.puede_reiniciar(hermes.gestor, ambito):
+        det.bloqueos.pop()
+        _version_sin_api(sis, det, hermes)
+        if ya_programado and not sin_programar:
+            # La frase otra vez antes de que llegue: se sigue, y no se programa otro (dos reinicios seguidos podrían
+            # cortar el turno de esta pasada).
+            hermes.reinicio_pendiente = "programado"
+            det.avisos.append("Hermes tiene programado su reinicio (hace %d s) para leer lo que le puse en %s (%s): su "
+                              "API contesta en cuanto se reinicie" % (time.time() - programado, hermes.env, nombres))
+            return
+        hermes.reinicio_pendiente = True
+        det.avisos.append("A Hermes le falta reiniciarse para leer lo que le puse en %s (%s): una pasada anterior se "
+                          "paró antes. Lo reinicio al acabar" % (hermes.env, nombres))
+        return
+    det.bloqueos[-1] = bloqueo("reinicia-hermes", "La API de Hermes ya está encendida en %s (le puse %s), pero Hermes no "
+                               "se ha reiniciado, y no sé reiniciarlo (lo encuentro por %s). Reinícialo tú (/restart en "
+                               "su chat) y vuelve a lanzar el mismo comando" % (hermes.env, nombres, hermes.origen))
+
+
 def _puerto(sis, man) -> int:
     """El de la instalación, si ya lo hay: fijo desde que se eligió. Si no, uno libre al azar del rango."""
-    from .porchat import _puertos_tcp_ocupados, elegir_puerto
+    from .porchat import _puertos_tcp_ocupados, elegir_puerto, puertos_efimeros
     dado = (man.datos.get("pasarela") or {}).get("puerto")
     if isinstance(dado, int) and p.PUERTO_MINIMO <= dado <= p.PUERTO_MAXIMO:
         return dado
-    return elegir_puerto(_puertos_tcp_ocupados(sis))
+    return elegir_puerto(_puertos_tcp_ocupados(sis), evitar=puertos_efimeros(sis))
 
 
 def _espacio(sis, det, ambito):
@@ -210,15 +284,24 @@ def calcular_plan_tls(sis, det, man, op, origen) -> Plan:
     if getattr(det, "falta_venv", False):
         acciones.append(Accion("paquete", PAQUETE_VENV, m.NUEVO, "para el venv de cryptography"))
 
-    # La API de Hermes
+    # La API de Hermes. Lo último que se aplica (`aplicar_hermes`), y su reinicio, al acabar.
+    reinicio = ""
+    if det.hermes.api_pendiente or det.hermes.exposicion_pendiente:
+        reinicio = ("reinicia Hermes al acabar, cuando acabe su turno (systemctl reload)"
+                    if gestores.recarga_con_drenaje(sis, det.hermes.gestor, ambito.root) else
+                    "reinicia Hermes 90 s después de acabar")
     if det.hermes.api_pendiente:
         nombres = ", ".join(linea.split("=", 1)[0] for linea in det.hermes.api_pendiente)
-        acciones.append(Accion("env", det.hermes.env, m.NUEVO, "añade %s (con una copia antes); reinicia Hermes 90 s "
-                                                               "después de acabar" % nombres, det.hermes.api_pendiente))
+        acciones.append(Accion("env", det.hermes.env, m.NUEVO, "añade %s (con una copia antes); %s" % (nombres, reinicio),
+                               det.hermes.api_pendiente))
     if det.hermes.exposicion_pendiente:
         acciones.append(Accion("exposicion", det.hermes.env, m.NUEVO, "añade %s (con una copia antes), para que la API "
-                               "de Hermes solo escuche en 127.0.0.1; reinicia Hermes 90 s después de acabar"
-                               % det.hermes.exposicion_pendiente, [det.hermes.exposicion_pendiente]))
+                               "de Hermes solo escuche en 127.0.0.1; %s" % (det.hermes.exposicion_pendiente, reinicio),
+                               [det.hermes.exposicion_pendiente]))
+    if getattr(det.hermes, "reinicio_pendiente", False) is True:
+        # Lo dice el aviso de `_reinicio_pendiente`; aquí, que es un cambio (y se aplica aunque no haya otro). Uno ya
+        # programado no: llegará solo.
+        acciones.append(Accion("reinicio", det.hermes.env, m.NUEVO, "reiniciar Hermes, que lo tenía pendiente"))
     # Cómo mandarle ficheros al iPhone, en su SOUL.md (desde la 0.10.4).
     from . import alma
     alma.planear(sis, det, man, acciones, avisos)
@@ -378,9 +461,38 @@ def nombres_de_la_pasarela(sis, ambito) -> list:
 # MARK: Aplicar
 
 
-def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
+def pasos_de(plan) -> list:
+    """Los pasos de esta pasada, en su orden (`marcha.Marcha`): los de `aplicar_tls`, el canje por chat y, lo último, lo
+    de Hermes (`aplicar_hermes`)."""
+    det, acciones = plan.deteccion, plan.acciones
+
+    def cambia(*tipos):
+        return any(a.tipo in tipos and a.cambia for a in acciones)
+
+    claves = (["paquetes"] if cambia("paquete") else []) + ["ficheros", "venv", "certificados", "servicios"]
+    if det.ambito.root:
+        claves.append("cortafuegos")
+    claves.append("comprobar")
+    if cambia("dispositivo"):
+        claves.append("iphone")
+    if plan.opciones.por_chat:
+        claves.append("canje")
+    if cambia("env", "exposicion", "soul", "reinicio"):
+        claves.append("hermes")
+    return claves
+
+
+def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False, marcha=None, con_hermes=True) -> dict:
     """Aplica el plan en orden, con el manifiesto al día tras cada paso. Devuelve {"token": …} del primer iPhone si se
-    ha dado de alta por chat (lo necesita el canje), o {}."""
+    ha dado de alta por chat (lo necesita el canje), o {}.
+
+    Desde la 0.11.1, primero lo que puede fallar (los paquetes, el venv y pip, los certificados, las unidades, el
+    cortafuegos y la comprobación) y lo de Hermes lo último (`aplicar_hermes`): hasta la 0.11.0 su .env iba lo primero, y
+    un fallo a mitad (el cerrojo de dpkg de un VPS recién creado) dejaba su API encendida en el .env sin reiniciarlo.
+    Con `con_hermes=False`, lo de Hermes no va aquí: por chat va detrás del canje (`cli._instalar`). `marcha` dice cada
+    paso y junta los avisos para la app (`marcha.Marcha`)."""
+    from .marcha import Marcha
+    marcha = marcha or Marcha()
     if not plan.puede_seguir:
         raise Parada("el plan tiene bloqueos")
     det, acciones, ambito = plan.deteccion, plan.acciones, plan.deteccion.ambito
@@ -408,20 +520,18 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
         man.datos["vigia"] = vigias.para_el_manifiesto(vigia)
     if det.familia != "debian":
         man.datos["familia"] = det.familia
+    hermes_pendiente = any(a.tipo in ("env", "exposicion", "reinicio") and a.cambia for a in acciones) or \
+        bool(getattr(det.hermes, "reinicio_pendiente", False))
+    if not hermes_pendiente:
+        # Hermes contesta con lo de su .env: un reinicio apuntado por una pasada anterior ya se ha hecho.
+        man.datos.pop(REINICIO_DE_HERMES, None)
     man.guardar(sis)
     de = lambda *tipos: [a for a in acciones if a.tipo in tipos]  # noqa: E731
 
-    for a in de("env"):
-        from .porchat import activar_api
-        activar_api(sis, man, a, salida, ambito)
-    for a in de("exposicion"):
-        from .porchat import corregir_exposicion
-        corregir_exposicion(sis, man, a, salida, ambito)
-    for a in de("soul"):
-        if a.cambia:
-            from . import alma
-            alma.anadir(sis, man, a, salida, ambito)
-    _paquetes(sis, man, de("paquete"), salida, det.familia)
+    if any(a.cambia for a in de("paquete")):
+        marcha.empezar("paquetes")
+        _paquetes(sis, man, de("paquete"), salida, det.familia)
+    marcha.empezar("ficheros")
     for a in de("usuario"):
         if a.cambia:
             _orden(sis, ["useradd", "--system", "--no-create-home", "--home-dir", "/nonexistent", "--shell",
@@ -453,10 +563,12 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
     man.guardar(sis)
 
     from .porchat import ParadaDelCanje, _venv
+    marcha.empezar("venv")
     try:
         _venv(sis, man, salida, ambito)
     except ParadaDelCanje as error:
-        raise Parada(str(error))
+        raise Parada(str(error), codigo=error.codigo)
+    marcha.empezar("certificados")
     for a in de("certificado"):
         if a.cambia:
             salida("==> el certificado de la pasarela")
@@ -472,6 +584,8 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
     for a in de("certificado_siguiente"):
         if a.cambia:
             _certificado_siguiente(sis, man, ambito, salida)
+
+    marcha.empezar("servicios")
 
     def permisos(escritos):
         if not ambito.root:
@@ -504,15 +618,16 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
                                                                     p.UNIDAD_PASARELA_CLAVE_SERVICE,
                                                                     "hehermes-pasarela-clave.path")],
                     "hehermes-pasarela-clave.path", salida)
+        marcha.empezar("cortafuegos")
         _ufw(sis, man, de("regla"), salida)
         _firewalld(sis, man, det, de("firewalld"), salida)
         _propio(sis, man, det, de("propio"), salida)
         _con_unidad(sis, man, [a for a in acciones if a.objeto in (p.UNIDAD_CORTAFUEGOS, "hehermes-cortafuegos.service")],
                     "hehermes-cortafuegos.service", salida)
 
+    marcha.empezar("comprobar")
     _esperar_a_la_pasarela(sis, det.puerto_pasarela)
-    pendiente = any(a.tipo in ("env", "exposicion") and a.cambia for a in acciones)
-    comprobado = comprobar_tls(sis, man, ambito, hermes_pendiente=pendiente, con_vigia=False)
+    comprobado = comprobar_tls(sis, man, ambito, hermes_pendiente=hermes_pendiente, con_vigia=False)
     fallos = [texto for bien, texto in comprobado if not bien]
     if fallos:
         raise Parada("la comprobación no pasa:\n  - " + "\n  - ".join(fallos))
@@ -521,12 +636,17 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
             # Lo que se sabe (y lo que no) de si la app llegará por la dirección del QR: también por chat, antes del
             # enlace, para que Hermes se lo cuente a quien lo pidió.
             salida("==> " + texto)
-    if vigia:
+    if vigia and _clave_nueva_sin_root(plan):
+        # Sin root, el vigía lee la clave de Hermes de su .env al arrancar, y la nueva va lo último (`aplicar_hermes`):
+        # hasta entonces no puede arrancar, y no hay nada que comprobar.
+        salida("==> los avisos\n    El vigía arranca con la clave nueva de Hermes, que va lo último (lo reinicio "
+               "entonces); \"%s comprobar\" lo mira cuando quieras." % ambito.orden)
+    elif vigia:
         # Lo del vigía y el lector se dice, pero no para: la pasarela ya funciona, y el relé es de otra máquina (su
         # cortafuegos, su credencial) y no se arregla repitiendo esto. `comprobar` lo vuelve a mirar cuando se quiera.
         resultados = []
         vigias.comprobar(sis, man, ambito, lambda bien, si, no: resultados.append((bool(bien), si if bien else no)),
-                         hermes_pendiente=pendiente)
+                         hermes_pendiente=hermes_pendiente)
         salida("==> los avisos")
         for bien, texto in resultados:
             salida("    %-4s %s" % ("bien" if bien else "MAL", texto))
@@ -534,8 +654,11 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
             salida("    El vigía no está bien del todo (arriba). La pasarela sí: la app ya puede conectar, y los avisos "
                    "llegarán cuando se arregle lo de arriba (\"%s comprobar\" lo vuelve a mirar)."
                    % ("sudo hehermes-servidor" if ambito.root else ambito.orden))
+            marcha.avisar("avisos-push")
 
     resultado = {}
+    if any(a.cambia for a in de("dispositivo")):
+        marcha.empezar("iphone")
     for a in de("dispositivo"):
         if not a.cambia:
             continue
@@ -568,7 +691,53 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False) -> dict:
                    "captura. No se puede volver a pintar: si hace falta otro, hehermes-dispositivo rotar %s."
                    % (a.objeto, a.objeto))
         del token
+    if con_hermes:
+        aplicar_hermes(sis, plan, man, salida, marcha)
     return resultado
+
+
+def _clave_nueva_sin_root(plan) -> bool:
+    """Sin root y con una API_SERVER_KEY nueva para Hermes: el vigía, que la lee de su .env, tiene que esperar a ella."""
+    return not plan.deteccion.ambito.root and any(
+        str(linea).startswith("API_SERVER_KEY=") for a in plan.acciones if a.tipo == "env" and a.cambia
+        for linea in a.datos or ())
+
+
+def aplicar_hermes(sis, plan, man, salida=print, marcha=None) -> bool:
+    """Lo último de todo (desde la 0.11.1): lo que se escribe en Hermes, su .env (`--activar-api`,
+    `--corregir-exposicion`) y su SOUL.md. Antes de tocar su .env se apunta que le falta reiniciarse
+    (`REINICIO_DE_HERMES`): si algo se para o lo cortan antes de programar su reinicio, la vez siguiente se sabe
+    (`_reinicio_pendiente`). Devuelve si hay que reiniciarlo: lo programa `cli._instalar`, lo último que hace, pase lo
+    que pase. Sin root y con una clave nueva, el vigía (que la lee del .env al arrancar) se reinicia aquí."""
+    from . import alma
+    from .marcha import Marcha
+    from .porchat import activar_api, corregir_exposicion
+    marcha = marcha or Marcha()
+    ambito = plan.deteccion.ambito
+    de = lambda *tipos: [a for a in plan.acciones if a.tipo in tipos and a.cambia]  # noqa: E731
+    if not de("env", "exposicion", "soul", "reinicio"):
+        return False
+    marcha.empezar("hermes")
+    reiniciar = bool(de("env", "exposicion", "reinicio"))
+    if reiniciar:
+        man.datos[REINICIO_DE_HERMES] = {"desde": time.time()}
+        man.guardar(sis)
+    for a in de("env"):
+        activar_api(sis, man, a, salida, ambito)
+        marcha.en_hermes.append("su API encendida en %s" % a.objeto)
+    for a in de("exposicion"):
+        corregir_exposicion(sis, man, a, salida, ambito)
+        marcha.en_hermes.append("%s en %s" % (a.datos[0], a.objeto))
+    for a in de("soul"):
+        alma.anadir(sis, man, a, salida, ambito)
+        marcha.en_hermes.append("cómo mandarte ficheros en %s" % a.objeto)
+    if _clave_nueva_sin_root(plan) and p.UNIDAD_VIGIA in man.unidades:
+        sis.ejecutar(ambito.systemctl + ["reset-failed", p.UNIDAD_VIGIA], plazo=60)
+        r = sis.ejecutar(ambito.systemctl + ["restart", p.UNIDAD_VIGIA], plazo=180)
+        salida("==> el vigía, reiniciado para leer la clave nueva de Hermes%s" % (
+            "" if r.bien else " (no ha podido: %s; systemctl --user restart %s)"
+            % ((r.error or r.salida).strip()[-160:] or r.codigo, p.UNIDAD_VIGIA)))
+    return reiniciar
 
 
 def _certificado_siguiente(sis, man, ambito, salida) -> str:
@@ -707,7 +876,7 @@ def comprobar_tls(sis, man, ambito, hermes_pendiente=False, con_vigia=True) -> l
     env = ini.get("env")
     clave = leer_clave_hermes(sis.leer_texto(env) or "") if env else None
     if hermes_pendiente:
-        mira(True, "Hermes: su API se enciende al reiniciarse, 90 s después de acabar", "")
+        mira(True, "Hermes: lo nuevo de su .env vale cuando se reinicie, al acabar", "")
     elif clave:
         estado, _ = sis.http_get("http://127.0.0.1:%s/api/sessions?limit=1" % ini.get("puerto", 8642),
                                  {"Authorization": "Bearer " + clave})
