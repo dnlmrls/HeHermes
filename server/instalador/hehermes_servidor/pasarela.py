@@ -30,6 +30,8 @@ import stat
 import time
 
 from .entorno import leer_env
+from . import recuperacion as rec
+from . import dispositivos as dis
 
 # MARK: Los números (los de server/API-CONTRACT.md, §12.6)
 
@@ -119,6 +121,9 @@ class Tokens:
         self.ruta = ruta
         self._firma = None
         self._entradas = []
+        #: Los hashes quitados desde la app (`dispositivos.Quitados`): aunque sigan en tokens.json, no valen. Con su
+        #: registro ilegible (`None`), no pasa nadie: un token quitado no puede volver a valer por un fichero roto.
+        self.quitados = set()
         self.recargar_si_cambia()
 
     def recargar_si_cambia(self) -> bool:
@@ -126,8 +131,29 @@ class Tokens:
         if firma == self._firma and firma is not None:
             return False
         self._firma = firma
-        self._entradas = _leer_tokens(self.ruta)
+        self._entradas = self._sin_quitados(_leer_tokens(self.ruta))
         return True
+
+    def _sin_quitados(self, entradas):
+        if self.quitados is None:
+            return []
+        return [(nombre, guardado) for nombre, guardado in entradas if guardado.decode("ascii") not in self.quitados]
+
+    def quitar(self, hash_hex: str) -> None:
+        """Ese token deja de valer ya (lo que quita la app, `dispositivos`), sin esperar a que cambie tokens.json."""
+        if self.quitados is not None:
+            self.quitados.add(hash_hex)
+        self._entradas = self._sin_quitados(self._entradas)
+
+    def validos(self) -> list:
+        """`[(nombre, hash)]` de los tokens que valen ahora."""
+        return [(nombre, guardado.decode("ascii")) for nombre, guardado in self._entradas]
+
+    def poner_quitados(self, hashes) -> None:
+        """Los quitados de su registro, al arrancar: un conjunto, o None si no se entiende (y entonces nadie pasa)."""
+        self.quitados = None if hashes is None else set(hashes)
+        self._firma = None
+        self.recargar_si_cambia()
 
     def quien(self, token) -> str | None:
         """El nombre del iPhone de ese token, o None. Contra todas las entradas y sin salir en la que coincide, con
@@ -684,6 +710,12 @@ import ssl  # noqa: E402
 #: Lo que contesta la pasarela misma (no va a Hermes) a quien trae un token: la huella de su certificado y la del que
 #: viene después, para rotarlo sin volver a emparejar (server/API-CONTRACT.md, §12.7).
 RUTA_HUELLAS = "/hehermes/v1/huellas"
+#: El código de recuperación (spec 2026-10-06): `GET` lo que hay (sin secretos: la clave es la pública) y `PUT
+#: {"clave"}` para ponerlo, solo si no hay ninguno o si es el iPhone que acaba de volver a conectar con él
+#: (`recuperacion.puede_poner`). La contesta la pasarela misma, como las huellas.
+RUTA_RECUPERACION = "/hehermes/v1/recuperacion"
+#: Lo más que se lee del cuerpo de un `PUT` de la recuperación: `{"clave": "<43>"}` y aire.
+MAX_CUERPO_RECUPERACION = 1024
 #: Lo que recibe todo lo que no trae un token válido: siempre estos bytes, ni más ni menos.
 NO_ENCONTRADO = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 _METODOS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
@@ -694,17 +726,22 @@ _NOMBRE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 #: Lo que no pasa de un salto al siguiente, lo que pone la pasarela y los secretos que pone ella.
 _QUITAR_DE_LA_APP = {"connection", "keep-alive", "proxy-connection", "proxy-authorization", "te", "trailer",
                      "transfer-encoding", "upgrade", "expect", "host", "authorization", "x-hehermes-vigia",
-                     "x-forwarded-for", "content-length"}
+                     "x-forwarded-for", "content-length", "x-hehermes-iphone", "x-hehermes-firma"}
 _QUITAR_DE_HERMES = {"server", "connection", "keep-alive", "proxy-connection", "upgrade", "trailer"}
-_TEXTOS = {400: "Bad Request", 404: "Not Found", 413: "Payload Too Large", 502: "Bad Gateway",
+_TEXTOS = {400: "Bad Request", 404: "Not Found", 409: "Conflict", 413: "Payload Too Large", 502: "Bad Gateway",
            503: "Service Unavailable"}
 _MENSAJES = {"peticion_invalida": "La petición no tiene una forma que la pasarela acepte",
+             "ya_hay_codigo": "Este servidor ya tiene un código de recuperación, y no es este iPhone quien lo cambia",
+             "recuperacion_no_disponible": "Esta pasarela no puede guardar un código de recuperación",
              "agente_desconocido": "Este servidor no tiene ese agente",
              "cuerpo_demasiado_grande": "El cuerpo es más grande de lo que la pasarela acepta",
              "hermes_no_contesta": "Hermes no contesta en este servidor",
              "avisos_no_instalados": "Los avisos no están instalados en este servidor",
              "vigia_no_contesta": "El vigía de avisos no contesta en este servidor",
              "rele_no_contesta": "El relé de avisos no contesta"}
+#: Los iPhone conectados (`dispositivos`, contrato §12.10): sus errores, aparte de los de arriba.
+_MENSAJES.update(dis.MENSAJES)
+_TEXTOS.update({405: "Method Not Allowed"})
 PLAZO_CONECTAR = 5
 #: Lo que espera la respuesta de Hermes entre dos trozos: lo mismo que el `proxy_read_timeout 1h` del túnel.
 PLAZO_HERMES = 3600
@@ -851,6 +888,9 @@ class Pasarela:
                 self.usos = Usos(carpeta)
             except OSError as error:
                 self.diario("no puedo llevar el registro de usos (%s)" % type(error).__name__)
+        #: El código de recuperación (`RUTA_RECUPERACION`), en la misma carpeta. Sin ella, no hay.
+        self.recuperacion = rec.Registro(carpeta) if carpeta else None
+        self._preparar_dispositivos(carpeta)
         #: Las peticiones que están ahora con Hermes (un SSE cuenta mientras dura) y cuándo llegó la última con token.
         self._reenviando = 0
         self._ultima = None
@@ -877,6 +917,8 @@ class Pasarela:
         tareas = [asyncio.ensure_future(self._aceptar(escucha)), asyncio.ensure_future(self._vigilar_tokens())]
         if self.mantenimiento is not None:
             tareas.append(asyncio.ensure_future(self._apuntar_actividad()))
+        if self.quitados is not None:
+            tareas.append(asyncio.ensure_future(self._barrer_lo_pendiente()))
         try:
             await self._parado
         finally:
@@ -948,6 +990,7 @@ class Pasarela:
                     antes, vez = ahora, 0
                 except OSError as error:
                     self.diario("no puedo apuntar la actividad (%s)" % type(error).__name__)
+            self._guardar_vistos()
             vez += 1
             await asyncio.sleep(cada or APUNTAR_ACTIVIDAD)
 
@@ -1082,11 +1125,17 @@ class Pasarela:
             # Una autorización que no es un token (`""`) no se sigue: no hay baja que la corte a media conexión.
             conexion.huella = huella or None
         self._ultima = int(time.time())
+        if huella and self.vistos is not None:
+            self.vistos.apuntar(huella, self._ultima)
         if peticion.ruta == RUTA_HUELLAS and peticion.metodo in ("GET", "HEAD"):
             return await self._contestar_huellas(peticion, escritor, ip)
         if peticion.ruta == RUTA_MANTENIMIENTO and peticion.metodo in ("GET", "HEAD"):
             return await self._contestar_mantenimiento(peticion, escritor, ip)
         try:
+            if peticion.ruta == RUTA_RECUPERACION and peticion.metodo in ("GET", "HEAD", "PUT"):
+                return await self._contestar_recuperacion(peticion, lector, escritor, ip)
+            if self._de_los_dispositivos(peticion):
+                return await self._contestar_dispositivos(peticion, escritor, ip)
             return await self._reenviar(peticion, lector, escritor, ip)
         except _Error as error:
             escritor.write(respuesta_de_error(error.estado, error.codigo))
@@ -1103,6 +1152,64 @@ class Pasarela:
                        + (b"" if peticion.metodo == "HEAD" else cuerpo))
         await escritor.drain()
         self.diario("%s %s 200 %d" % (ip, peticion.metodo, len(cuerpo)))
+        return peticion.version != "HTTP/1.0" and "close" not in ",".join(peticion.valores("connection")).lower()
+
+    async def _contestar_recuperacion(self, peticion, lector, escritor, ip) -> bool:
+        """`GET` y `PUT` de `RUTA_RECUPERACION` (spec 2026-10-06). El nombre de quien pregunta es el de su token: es lo
+        que decide si puede poner un código (`recuperacion.puede_poner`), y se le dice (`yo`) para que la app sepa si la
+        recuperación en curso es la suya. Nunca pasa a Hermes."""
+        conexion = self._esta()
+        nombre_de = getattr(self.tokens, "nombre_de", None)
+        yo = nombre_de(conexion.huella) if conexion is not None and conexion.huella and nombre_de else None
+        if self.recuperacion is None:
+            if peticion.metodo == "PUT":
+                raise _Error(503, "recuperacion_no_disponible")
+            return await self._contestar_json(peticion, escritor, ip, 200, {"disponible": False})
+        if peticion.metodo != "PUT":
+            estado = self.recuperacion.leer()
+            return await self._contestar_json(peticion, escritor, ip, 200, rec.publico(estado, yo))
+        if peticion.valores("transfer-encoding"):
+            raise _Error(400, "peticion_invalida")
+        largos = peticion.valores("content-length")
+        if len(largos) != 1 or not re.fullmatch(r"[0-9]{1,12}", largos[0]):
+            raise _Error(400, "peticion_invalida")
+        if int(largos[0]) > MAX_CUERPO_RECUPERACION:
+            raise _Error(413, "cuerpo_demasiado_grande")
+        try:
+            cuerpo = await asyncio.wait_for(lector.readexactly(int(largos[0])), PLAZO_TROZO)
+            clave = json.loads(cuerpo.decode("utf-8")).get("clave")
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError, ValueError, UnicodeDecodeError, AttributeError):
+            raise _Error(400, "peticion_invalida")
+        if rec.de_b64url(clave, 32) is None:
+            raise _Error(400, "peticion_invalida")
+        puesta = []
+
+        def poner(estado):
+            if estado is None or not rec.puede_poner(estado, yo):
+                return None
+            puesta.append(True)
+            return rec.con_clave(estado, clave, yo, time.time())
+
+        try:
+            estado = self.recuperacion.cambiar(poner)
+        except OSError as error:
+            self.diario("%s no puedo guardar el código de recuperación (%s)" % (ip, type(error).__name__))
+            raise _Error(503, "recuperacion_no_disponible")
+        if not puesta:
+            raise _Error(409, "ya_hay_codigo")
+        self.diario("%s código de recuperación puesto" % ip)
+        return await self._contestar_json(peticion, escritor, ip, 200, rec.publico(estado, yo))
+
+    async def _contestar_json(self, peticion, escritor, ip, estado, datos) -> bool:
+        cuerpo = json.dumps(datos, separators=(",", ":")).encode("ascii")
+        if 200 <= estado < 300:
+            self._apuntar_uso()
+        escritor.write(("HTTP/1.1 %d OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n"
+                        "Cache-Control: no-store\r\nConnection: %s\r\n\r\n"
+                        % (estado, len(cuerpo), "close" if peticion.version == "HTTP/1.0" else "keep-alive")
+                        ).encode("ascii") + (b"" if peticion.metodo == "HEAD" else cuerpo))
+        await escritor.drain()
+        self.diario("%s %s %d %d" % (ip, peticion.metodo, estado, len(cuerpo)))
         return peticion.version != "HTTP/1.0" and "close" not in ",".join(peticion.valores("connection")).lower()
 
     async def atender_aparte(self, peticion, lector, escritor, ip):
@@ -1165,7 +1272,8 @@ class Pasarela:
             secreto = self.secreto_vigia.valor()
             if secreto is None:
                 raise _Error(503, "avisos_no_instalados")
-            return self.config.vigia, [("X-HeHermes-Vigia", secreto)], "vigia_no_contesta"
+            return self.config.vigia, [("X-HeHermes-Vigia", secreto)] + self._iphone_para_el_vigia(secreto), \
+                "vigia_no_contesta"
         base = peticion.ruta.split("?", 1)[0]
         if base == "/p" or base.startswith("/p/"):
             # Un agente (contrato §18.1): la ruta tal cual, con la clave de su perfil y nunca la del principal. Sin ella
@@ -1266,6 +1374,176 @@ class Pasarela:
                     quedan -= len(trozo)
         self.diario("%s %s %d %d" % (ip, peticion.metodo, estado, enviados))
         return seguir
+
+    # MARK: Los iPhone conectados (contrato §12.10)
+
+    def _preparar_dispositivos(self, carpeta):
+        """Los quitados desde la app y la última vez que se usó cada token, en la carpeta de estado. Solo con los tokens
+        de los iPhone (`Tokens`): la entrada pública del relé, con sus credenciales, no tiene ni esto ni la ruta."""
+        self.quitados = self.vistos = None
+        if not carpeta or not isinstance(self.tokens, Tokens):
+            return
+        self.quitados = dis.Quitados(carpeta)
+        datos = self.quitados.leer()
+        if datos is None:
+            self.diario("no entiendo %s: no dejo pasar a nadie hasta que se arregle" % dis.QUITADOS)
+        self.tokens.poner_quitados(None if datos is None else datos["tokens"])
+        try:
+            self.vistos = dis.Vistos(carpeta)
+        except OSError as error:
+            self.diario("no puedo leer cuándo se usó cada iPhone (%s)" % type(error).__name__)
+
+    def _guardar_vistos(self, siempre=False):
+        if self.vistos is None:
+            return
+        try:
+            self.vistos.guardar_si_toca(time.time(), siempre=siempre)
+        except OSError as error:
+            self.diario("no puedo apuntar cuándo se usó cada iPhone (%s)" % type(error).__name__)
+
+    def _iphone_para_el_vigia(self, secreto) -> list:
+        """El iPhone de esta petición —su nombre y la marca de su token—, firmado, para que el vigía sepa de quién es
+        cada alta de avisos: para borrarlas al quitarlo y para no avisarle de que ha entrado él mismo con el código de
+        recuperación (contrato §12.9 y §12.10). Es lo único que le dice al vigía de qué iPhone es algo: la cabecera que
+        mande la app se quita (`_QUITAR_DE_LA_APP`). Sin token que seguir, nada."""
+        conexion = self._esta()
+        nombre_de = getattr(self.tokens, "nombre_de", None)
+        nombre = nombre_de(conexion.huella) if conexion is not None and conexion.huella and nombre_de else None
+        # Los nombres los pone el instalador con su forma; aun así, en una cabecera no entra nada que no la tenga.
+        if not nombre or not dis.NOMBRE.fullmatch(nombre):
+            return []
+        return [(dis.CABECERA_IPHONE, dis.cabecera_del_iphone(secreto, nombre, dis.marca_del_token(conexion.huella)))]
+
+    def _de_los_dispositivos(self, peticion) -> bool:
+        if not isinstance(self.tokens, Tokens):
+            return False
+        base = peticion.ruta.split("?", 1)[0]
+        return base == dis.RUTA or base.startswith(dis.PREFIJO)
+
+    async def _contestar_dispositivos(self, peticion, escritor, ip) -> bool:
+        """`GET` la lista y `DELETE …/<nombre>` quitar uno. Nunca pasa a Hermes. Quien pregunta es el de su token: es
+        el que sale como `este`."""
+        base, _, consulta = peticion.ruta.partition("?")
+        conexion = self._esta()
+        yo = conexion.huella if conexion is not None else None
+        if peticion.metodo not in (("GET", "HEAD") if base == dis.RUTA else ("DELETE",)):
+            raise _Error(405, "metodo_no_permitido")
+        largos = peticion.valores("content-length")
+        if peticion.valores("transfer-encoding") or any(largo.strip() != "0" for largo in largos):
+            # Ninguna lleva cuerpo: uno que no se lee se colaría como la petición siguiente.
+            raise _Error(400, "peticion_invalida")
+        if base == dis.RUTA:
+            if self.quitados is None:
+                return await self._contestar_json(peticion, escritor, ip, 200, {"disponible": False})
+            return await self._contestar_json(peticion, escritor, ip, 200, self._lista_de_dispositivos(yo))
+        if self.quitados is None:
+            raise _Error(503, "dispositivos_no_disponible")
+        return await self._quitar_dispositivo(peticion, escritor, ip, base[len(dis.PREFIJO):], consulta, yo)
+
+    def _lista_de_dispositivos(self, yo) -> dict:
+        self.tokens.recargar_si_cambia()
+        validos = {hash_hex for _, hash_hex in self.tokens.validos()}
+        entradas = dis.entradas_de(self.tokens.ruta) or []
+        iphones = dis.lista(entradas, validos, self.usos.datos if self.usos is not None else None,
+                            self.vistos.vistos if self.vistos is not None else {}, yo)
+        estado = self.recuperacion.leer() if self.recuperacion is not None else None
+        return {"iphones": iphones, "recuperacion": bool(estado and estado.get("clave"))}
+
+    async def _quitar_dispositivo(self, peticion, escritor, ip, nombre, consulta, yo) -> bool:
+        """Ese iPhone deja de valer al momento: queda escrito antes de contestar (si no se puede escribir, no se quita:
+        volvería a valer al reiniciarse), lo que tenga abierto se corta y sus altas de avisos se borran del vigía. El
+        último solo con `?ultimo=si`: la app avisa antes de cómo volver. Si es el de quien pregunta, se contesta y se
+        cierra su conexión."""
+        self.tokens.recargar_si_cambia()
+        validos = self.tokens.validos()
+        hallado = next((h for n, h in validos if n == nombre), None) if dis.NOMBRE.fullmatch(nombre) else None
+        if hallado is None:
+            raise _Error(404, "dispositivo_desconocido")
+        if len(validos) == 1 and dis.CONFIRMA_EL_ULTIMO not in consulta.split("&"):
+            raise _Error(409, "es_el_ultimo")
+        try:
+            self.quitados.quitar(hallado, nombre, time.time())
+        except (OSError, ValueError) as error:
+            self.diario("%s no puedo quitar un iPhone (%s)" % (ip, type(error).__name__))
+            raise _Error(503, "dispositivos_no_disponible")
+        self.tokens.quitar(hallado)
+        if self.vistos is not None:
+            self.vistos.olvidar(hallado)
+            self._guardar_vistos(siempre=True)
+        actual = asyncio.current_task()
+        for tarea, otra in list(self._conexiones.items()):
+            if otra.huella == hallado and tarea is not actual:
+                tarea.cancel()
+        este = hallado == yo
+        avisos = await self.borrar_en_el_vigia([dis.marca_del_token(h) for _, h in validos if h != hallado])
+        # Ni el nombre: puede ser el de una persona (el que se le dio por SSH).
+        self.diario("%s un iPhone quitado desde la app%s" % (ip, " (el suyo)" if este else ""))
+        cuerpo = json.dumps({"quitado": nombre, "este": este, "avisos": avisos}, separators=(",", ":")).encode("ascii")
+        cerrar = este or peticion.version == "HTTP/1.0" or "close" in ",".join(peticion.valores("connection")).lower()
+        self._apuntar_uso()
+        escritor.write(("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n"
+                        "Cache-Control: no-store\r\nConnection: %s\r\n\r\n"
+                        % (len(cuerpo), "close" if cerrar else "keep-alive")).encode("ascii") + cuerpo)
+        await escritor.drain()
+        self.diario("%s %s 200 %d" % (ip, peticion.metodo, len(cuerpo)))
+        # El suyo: contestado, su conexión se cierra (el token ya no vale para la siguiente).
+        return not cerrar
+
+    async def borrar_en_el_vigia(self, quedan=None) -> str:
+        """Le pide al vigía que borre las altas de avisos que no son de ningún token de `quedan` (sus marcas; por
+        defecto, las de los que valen ahora): las del quitado, las de un token de antes con un nombre que sigue (rotado,
+        o recuperado con el código: es otro token aunque se llame igual) y las que no dicen de quién son (de antes de
+        esta versión, o de un iPhone que no ha vuelto a abrir la app; cada uno las vuelve a hacer al abrirla).
+        «borradas», «sin_avisos» (no hay vigía) o «pendiente»: no contesta, es uno de antes o aún tiene por mandar un
+        aviso del código de recuperación (el `409` de §12.10), y se le vuelve a pedir cada `dis.REINTENTO`."""
+        if self.config.vigia is None:
+            resultado = "sin_avisos"
+        else:
+            if quedan is None:
+                if dis.entradas_de(self.tokens.ruta) is None:
+                    return "pendiente"
+                self.tokens.recargar_si_cambia()
+                quedan = [dis.marca_del_token(h) for _, h in self.tokens.validos()]
+            secreto = self.secreto_vigia.valor()
+            estado = await self._pedir_al_vigia(secreto, sorted(set(quedan))) if secreto else None
+            resultado = "borradas" if estado is not None and 200 <= estado < 300 else "pendiente"
+            if resultado == "pendiente":
+                self.diario("el vigía no ha borrado las altas de avisos de un iPhone quitado (%s): lo vuelvo a probar"
+                            % (estado or "no contesta"))
+        try:
+            self.quitados.barrido(resultado == "pendiente")
+        except (OSError, ValueError) as error:
+            self.diario("no puedo apuntar el barrido del vigía (%s)" % type(error).__name__)
+        return resultado
+
+    async def _pedir_al_vigia(self, secreto, quedan) -> int | None:
+        cuerpo = json.dumps({"quedan": quedan}, separators=(",", ":")).encode("ascii")
+        cabeza = ("POST %s HTTP/1.1\r\nHost: %s:%d\r\nContent-Type: application/json\r\nContent-Length: %d\r\n"
+                  "X-HeHermes-Vigia: %s\r\n%s: %s\r\nConnection: close\r\n\r\n"
+                  % (dis.RUTA_DEL_VIGIA, self.config.vigia[0], self.config.vigia[1], len(cuerpo), secreto,
+                     dis.CABECERA_FIRMA, dis.firma_del_barrido(secreto, cuerpo)))
+        escritor = None
+        try:
+            lector, escritor = await asyncio.wait_for(asyncio.open_connection(*self.config.vigia), dis.PLAZO_VIGIA)
+            escritor.write(cabeza.encode("latin-1") + cuerpo)
+            await escritor.drain()
+            linea = await asyncio.wait_for(lector.readline(), dis.PLAZO_VIGIA)
+        except (OSError, asyncio.TimeoutError, ValueError):
+            return None
+        finally:
+            if escritor is not None:
+                escritor.close()
+        partes = linea.split()
+        return int(partes[1]) if len(partes) >= 2 and partes[1].isdigit() else None
+
+    async def _barrer_lo_pendiente(self, cada=None):
+        """Si el vigía no contestó al quitar un iPhone (o se quitó con la pasarela parada a medias), se le vuelve a
+        pedir hasta que lo haga: las altas de avisos de un iPhone quitado no se quedan."""
+        while True:
+            datos = self.quitados.leer()
+            if datos is not None and datos["barrer"]:
+                await self.borrar_en_el_vigia()
+            await asyncio.sleep(cada or dis.REINTENTO)
 
 
 def _huella_de_pem(ruta):

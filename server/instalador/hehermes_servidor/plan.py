@@ -26,7 +26,7 @@ EJECUTABLES_PROPIOS = ("hehermes-servidor", "hehermes-pasarela")
 class Opciones:
     def __init__(self, iphone=None, direccion=None, hermes_home=None, reemplazar=(), si=False, solo_plan=False,
                  por_chat=False, llave=None, activar_api=False, qr_png=None, cortafuegos_a_mano=False,
-                 corregir_exposicion=False, avisos=None, volver_atras=False):
+                 corregir_exposicion=False, avisos=None, volver_atras=False, recuperacion=None):
         #: Si hay alguien delante de un terminal (el QR de la pasarela solo se pinta ahí).
         self.terminal = True
         self.iphone = iphone
@@ -48,6 +48,10 @@ class Opciones:
         self.avisos = avisos
         #: Instalar esta versión aunque la instalada sea más nueva (`comprobar_version`).
         self.volver_atras = volver_atras
+        #: Por chat, la prueba del código de recuperación de la frase (`--recuperacion`, spec 2026-10-06), y si vale y
+        #: hace falta (el chat estaba cerrado): `recuperando`, que lo decide `porchat.comprobar_recuperacion`.
+        self.recuperacion = recuperacion
+        self.recuperando = False
 
 
 class Accion:

@@ -12,7 +12,9 @@ conexión (``Accept=yes``) con su jaula. Las órdenes:
   de las carpetas de ``profiles/`` con la regla con la que Hermes elige los que sirve (``profiles_to_serve``), y si
   cada uno se sirve, preguntándoselo con su clave, todos a la vez y con un plazo corto. Los perfiles que ya estaban se
   adoptan: si su ``.env`` tiene clave, se copia para la pasarela y el vigía. No toca el cerrojo de los trabajos.
-- ``ver``, ``cambiar``: un agente, con su personalidad; cambiar su nombre, su cara, su descripción o su personalidad.
+- ``ver``, ``cambiar``: un agente, con su personalidad; cambiar su nombre, su cara, su descripción o su personalidad. Y
+  su **modelo** (§18.11), que es un trabajo, como crear: el ``model:`` de su ``config.yaml``, con ``hermes -p <perfil>
+  config set|unset`` y solo con uno de los que ofrece Hermes (``/api/model/options`` del principal).
 - ``crear`` y ``borrar``: un **trabajo**, que contesta al momento (``202``) y sigue en este mismo proceso con la
   conexión ya cerrada; su estado va en ``<trabajo>/trabajos/<id>.json`` (``trabajo``). Uno a la vez (``trabajo.lock``),
   con su latido aunque espere minutos a ``hermes``. Un Hermes que ya sirve otros perfiles sirve en caliente los nuevos
@@ -49,8 +51,9 @@ Lo que hace que no sirva para otra cosa:
 agente ``hermes config set gateway.multiplex_profiles true`` (``hermes_cli/config.py``), solo en los trabajos y al
 cambiar la descripción, que lo esperan: arrancar ``hermes`` tarda segundos, y la copia y el borrado de un perfil,
 minutos. Todos con ``-p default`` delante (``_hermes_principal``): sin él, la CLI corre con el perfil que dejara pegado
-``hermes profile use`` y ``--clone`` copiaría ese, no el principal. Su socket de control (``<casa>/gateway.sock``,
-``gateway/control_socket.py``), una línea JSON y otra de vuelta.
+``hermes profile use`` y ``--clone`` copiaría ese, no el principal. Lo del modelo de un agente, con ``-p <perfil>``
+(``_hermes_del_perfil``): ``config set model.<clave> <valor>`` y ``config unset model.<clave>``. Su socket de control
+(``<casa>/gateway.sock``, ``gateway/control_socket.py``), una línea JSON y otra de vuelta.
 Y su unidad, con ``systemctl``: ``show`` y, con el primer agente, un ``restart``.
 
 El protocolo, el del ayudante que actualiza: una línea JSON (``{"orden": …}``) y otra de vuelta (``{"ok": true, …}`` o
@@ -170,15 +173,16 @@ PLAZO_HERMES_LARGO = 600
 PLAZO_CONFIG = 120
 USUARIO_VIGIA = "hh-vigia"
 SO_PEERCRED = getattr(socket, "SO_PEERCRED", 17)
-ESTADOS = ("en_cola", "creando", "borrando", "hecho", "fallo")
-EN_MARCHA = ("en_cola", "creando", "borrando")
-MOTIVOS = frozenset({"hermes", "memoria", "clave", "no_se_sirve", "copia", "interrumpido", "interna"})
+ESTADOS = ("en_cola", "creando", "borrando", "cambiando", "hecho", "fallo")
+EN_MARCHA = ("en_cola", "creando", "borrando", "cambiando")
+TIPOS = ("crear", "borrar", "modelo")
+MOTIVOS = frozenset({"hermes", "memoria", "clave", "no_se_sirve", "copia", "modelo", "interrumpido", "interna"})
 #: Lo que puede traer cada orden, y nada más.
 CAMPOS = {
     "listar": {"orden"},
     "ver": {"orden", "perfil"},
     "crear": {"orden", "nombre", "color", "expresion", "descripcion", "personalidad", "memoria", "modelo"},
-    "cambiar": {"orden", "perfil", "nombre", "color", "expresion", "descripcion", "personalidad"},
+    "cambiar": {"orden", "perfil", "nombre", "color", "expresion", "descripcion", "personalidad", "modelo"},
     "borrar": {"orden", "perfil"},
     "trabajo": {"orden", "id"},
     "sincronizar-memoria": {"orden"},
@@ -189,6 +193,35 @@ PATRON_CLAVE_ENV = re.compile(r"^\s*(?:export\s+)?API_SERVER_KEY\s*=")
 PATRON_CLAVE = re.compile(r"[\x21-\x7e]{1,512}")
 #: Un sí de `gateway.standalone` (lo que Hermes toma por verdadero de su YAML: true, yes, on o un número que no sea 0).
 SI_EN_YAML = re.compile(r"(?i)(true|yes|on|[+-]?0*[1-9][0-9]*(\.[0-9]*)?|[+-]?0*\.0*[1-9][0-9]*)")
+#: **El modelo de un agente** (contrato §18.11) vive en el `model:` de su config.yaml, como el del principal en el suyo:
+#: `model.default` (el id), `model.provider` (el proveedor) y la ruta del proveedor (`base_url`, `api_mode`, el
+#: puntero a su clave y, en uno propio, su clave). `--clone` copia el del principal. Se cambia con la orden de Hermes
+#: (`hermes -p <perfil> config set|unset model.<clave>`, `hermes_cli/config.py` de la 0.21.5 y de main), y solo a uno
+#: de los que ofrece Hermes: el proveedor y el id, de una fila de `/api/model/options` (la regla de `/model`). Su
+#: forma, para que ninguno pase por una opción de la orden ni por otra cosa que un texto en el YAML (`hermes config
+#: set` convierte `true`, `null` o `4.5` a lo suyo).
+PATRON_PROVEEDOR = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}")
+PATRON_MODELO = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+=-]{0,255}")
+OTRO_TIPO_EN_YAML = re.compile(r"(?i)(true|false|yes|no|on|off|y|n|null|none|~|[+-]?(\.[0-9]+|[0-9][0-9_]*(\.[0-9_]*)?)"
+                               r"([eE][+-]?[0-9]+)?|0x[0-9a-f]+|0o[0-7]+|\.(inf|nan))")
+#: La ruta del modelo en el `model:` (lo que `model_selection_config_updates` de Hermes sincroniza con el proveedor): se
+#: queda si el proveedor no cambia; si cambia, se va (la del nuevo la resuelve Hermes: de su registro, o de su entrada
+#: en `providers:`/`custom_providers:`), salvo si vuelve al del principal, que se copia del suyo. Ninguna de estas
+#: cuatro es secreta; las de `SECRETOS_DEL_MODELO` (la clave de un proveedor propio), sí: nunca se copian, ni pasan por
+#: un argumento.
+RUTA_DEL_MODELO = ("base_url", "api_mode", "key_env", "api_key_env")
+SECRETOS_DEL_MODELO = ("api_key", "api")
+#: Lo que se fija para un modelo (su ventana de contexto): con otro modelo, se va.
+FIJADO_AL_MODELO = ("context_length",)
+#: Los proveedores que se configuran con su `base_url` (`custom` y `local` a secas): sin ella no van, así que no se pasa
+#: a uno de ellos desde otro.
+PROVEEDORES_POR_DIRECCION = ("custom", "local")
+#: Lo que se copia de la ruta del principal (`base_url`, sin usuario ni contraseña: va en un argumento de `hermes`).
+PATRON_RUTA = {"base_url": re.compile(r"https?://[\x21-\x3f\x41-\x7e]{1,500}"),
+               "api_mode": re.compile(r"[a-z][a-z0-9_]{0,63}"),
+               "key_env": re.compile(r"[A-Z_][A-Z0-9_]{0,127}"), "api_key_env": re.compile(r"[A-Z_][A-Z0-9_]{0,127}")}
+#: Lo que se espera a `/api/model/options` del principal (la app espera 20 s a todo `cambiar`).
+PLAZO_OPCIONES = 8.0
 
 _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _CARPETA = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | _CLOEXEC
@@ -281,19 +314,45 @@ def validar_id(valor) -> str:
     return valor
 
 
+def es_un_modelo(valor) -> bool:
+    """Si un id de modelo tiene su forma y en el YAML sería un texto."""
+    return isinstance(valor, str) and PATRON_MODELO.fullmatch(valor) is not None and \
+        OTRO_TIPO_EN_YAML.fullmatch(valor) is None
+
+
+def es_un_proveedor(valor) -> bool:
+    return isinstance(valor, str) and PATRON_PROVEEDOR.fullmatch(valor) is not None and \
+        OTRO_TIPO_EN_YAML.fullmatch(valor) is None
+
+
+def validar_modelo(valor) -> dict | None:
+    """`null` (el del principal) o `{"proveedor", "modelo"}`, cada uno con su forma. Si Hermes lo ofrece se mira
+    después (`Ayudante._comprobar_modelo`)."""
+    if valor is None:
+        return None
+    if not isinstance(valor, dict) or set(valor) != {"proveedor", "modelo"}:
+        raise _invalido("«modelo» es null o {\"proveedor\", \"modelo\"}")
+    if not es_un_proveedor(valor["proveedor"]) or not es_un_modelo(valor["modelo"]):
+        raise _invalido("«modelo» no tiene la forma de un modelo de Hermes")
+    return {"proveedor": valor["proveedor"], "modelo": valor["modelo"]}
+
+
 def validar_creacion(peticion: dict) -> dict:
-    if peticion.get("modelo") is not None:
-        raise _invalido("«modelo», por ahora, solo null: el del principal")
     return {"nombre": validar_nombre(peticion.get("nombre")),
             "color": validar_de_la_lista(peticion.get("color"), COLORES, "color"),
             "expresion": validar_de_la_lista(peticion.get("expresion"), EXPRESIONES, "expresion"),
             "descripcion": validar_descripcion(peticion.get("descripcion")),
             "personalidad": validar_personalidad(peticion.get("personalidad")),
-            "memoria": validar_de_la_lista(peticion.get("memoria"), MEMORIAS, "memoria")}
+            "memoria": validar_de_la_lista(peticion.get("memoria"), MEMORIAS, "memoria"),
+            "modelo": validar_modelo(peticion.get("modelo"))}
 
 
 def validar_cambios(peticion: dict) -> dict:
-    """Lo que cambia, con su forma: al menos una cosa."""
+    """Lo que cambia, con su forma: al menos una cosa. El modelo va solo (es un trabajo, §18.11)."""
+    if "modelo" in peticion:
+        if set(peticion) - {"orden", "perfil", "modelo"}:
+            raise _invalido("«modelo» se cambia solo")
+        return {"modelo": validar_modelo(peticion["modelo"])}
     validar = {"nombre": validar_nombre, "descripcion": validar_descripcion, "personalidad": validar_personalidad,
                "color": lambda v: validar_de_la_lista(v, COLORES, "color"),
                "expresion": lambda v: validar_de_la_lista(v, EXPRESIONES, "expresion")}
@@ -577,6 +636,148 @@ def config_multiplexa(texto: str) -> bool:
     return _es_un_si(arriba if arriba is not None else en_gateway)
 
 
+def bloque_del_modelo(texto: str) -> dict:
+    """Las claves de primer nivel del `model:` de arriba de un config.yaml (el último, como YAML), con sus valores de
+    una línea, sin comillas: `{"default", "provider", "base_url"…}`. `model: <id>` a secas es `{"default": <id>}` (la
+    forma corta, que Hermes también lee), y `model: {…}` en una línea, lo justo. Vacío si no hay. Hermes lo lee con
+    YAML; aquí, sin dependencias, lo que escribe su `config set` (un bloque con sangría). Lo que va más hondo, o es
+    nulo, no está."""
+    bloque, dentro, nivel = {}, False, None
+    for linea in texto.splitlines():
+        limpia = re.sub(r"\s+#.*$", "", linea).rstrip()
+        if not limpia.strip() or limpia.lstrip().startswith("#"):
+            continue
+        sangria = len(limpia) - len(limpia.lstrip())
+        if sangria == 0:
+            suya = re.fullmatch(r"model\s*:(.*)", limpia)
+            dentro = False
+            if suya is None:
+                continue
+            valor = suya.group(1).strip()
+            bloque, nivel, dentro = {}, None, not valor
+            if valor.startswith("{") and valor.endswith("}"):
+                for trozo in valor[1:-1].split(","):
+                    clave, dos, resto = trozo.partition(":")
+                    if dos and re.fullmatch(r"\s*[A-Za-z_][A-Za-z0-9_]*\s*", clave):
+                        bloque[clave.strip()] = _valor_yaml(resto)
+            elif valor:
+                bloque = {"default": _valor_yaml(valor)}
+            continue
+        if not dentro:
+            continue
+        nivel = sangria if nivel is None else nivel
+        suya = re.fullmatch(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*:(.*)", limpia)
+        if sangria == nivel and suya:
+            bloque[suya.group(1)] = _valor_yaml(suya.group(2))
+    return {clave: valor for clave, valor in bloque.items() if valor is not None}
+
+
+def modelo_de(bloque: dict) -> dict | None:
+    """El modelo de un perfil para la app (§18.2): su id y su proveedor, si tienen su forma. Nunca su ruta ni su
+    clave."""
+    modelo = bloque.get("default") or bloque.get("model")
+    if not es_un_modelo(modelo):
+        return None
+    proveedor = bloque.get("provider")
+    return {"proveedor": proveedor if es_un_proveedor(proveedor) else None, "modelo": modelo}
+
+
+def leer_config(casa: str, perfil: str) -> str | None:
+    """El config.yaml de un perfil tal cual, en base64 (pasa por la tubería de `como_hermes`); None si no tiene."""
+    carpeta = abrir_casa(casa, perfil)
+    try:
+        datos = _leer(carpeta, CONFIG)
+    finally:
+        os.close(carpeta)
+    return None if datos is None else base64.b64encode(datos).decode("ascii")
+
+
+def devolver_config(casa: str, perfil: str, guardado: str) -> None:
+    """El config.yaml de antes, byte a byte y 0600 (como lo deja Hermes): lo que deshace un cambio de modelo a
+    medias."""
+    carpeta = abrir_casa(casa, perfil)
+    try:
+        _escribir(carpeta, CONFIG, base64.b64decode(guardado))
+    finally:
+        os.close(carpeta)
+
+
+def texto_de(guardado: str | None) -> str:
+    return "" if guardado is None else base64.b64decode(guardado).decode("utf-8", "replace")
+
+
+def opciones_de_hermes(datos: bytes) -> dict | None:
+    """`/api/model/options` con la regla de `/model` (la misma de la app, `OpcionesServidor`): de cada proveedor
+    autenticado, no virtual y con algún modelo que se pueda usar, sus nombres (su `slug` y sus `aliases`) y esos
+    modelos. None si no es eso."""
+    try:
+        raiz = json.loads(datos.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(raiz, dict) or not isinstance(raiz.get("providers"), list):
+        return None
+    proveedores = []
+    for fila in raiz["providers"]:
+        if not isinstance(fila, dict) or fila.get("authenticated") is not True or fila.get("source") == "virtual" \
+                or not es_un_proveedor(fila.get("slug")):
+            continue
+        fuera = set()
+        for dato in fila.get("unavailable_models") if isinstance(fila.get("unavailable_models"), list) else ():
+            # Su id suelto, o un objeto con él en `id`, `model` o `name`.
+            ids = [dato] if isinstance(dato, str) else [dato.get(k) for k in ("id", "model", "name")] \
+                if isinstance(dato, dict) else []
+            fuera.update([i for i in ids if isinstance(i, str)][:1])
+        modelos = {m for m in fila.get("models") if isinstance(m, str) and m and m not in fuera} \
+            if isinstance(fila.get("models"), list) else set()
+        if not modelos:
+            continue
+        alias = [n for n in fila.get("aliases") if isinstance(n, str)] if isinstance(fila.get("aliases"), list) else []
+        proveedores.append({"slug": fila["slug"], "nombres": [fila["slug"]] + alias, "modelos": modelos})
+    return {"proveedores": proveedores}
+
+
+def pasos_del_modelo(actual: dict, principal: dict, proveedor: str | None, modelo: str) -> tuple:
+    """`(pasos, objetivo)`: lo que hay que hacer en el `model:` de un perfil (`actual`) para que quede con `proveedor` y
+    `modelo`, y cómo tiene que quedar. Los pasos son `("unset", clave)` y `("set", clave, valor)`, en este orden: lo que
+    se va, antes de cambiar el proveedor (así el `config set model.provider` de Hermes no encuentra ruta vieja que
+    dejar); luego el proveedor, el id y la ruta que haya que copiar. Lo que hace un `/model` persistido
+    (`model_selection_config_updates`): con el mismo proveedor, su ruta se queda; con otro, se va —la del nuevo la
+    resuelve Hermes—, salvo si vuelve al del principal, que se copia del suyo (nunca su clave). `Fallo("modelo")` si así
+    no se puede: uno que se configura por su dirección, o el del principal con su clave en su config.yaml."""
+    mismo = actual.get("provider") == proveedor
+    if mismo:
+        ruta = {k: actual[k] for k in RUTA_DEL_MODELO + SECRETOS_DEL_MODELO if k in actual}
+    elif proveedor is not None and proveedor == principal.get("provider"):
+        if any(k in principal for k in SECRETOS_DEL_MODELO):
+            raise Fallo("modelo")
+        ruta = {k: principal[k] for k in RUTA_DEL_MODELO if k in principal}
+        if not all(PATRON_RUTA[k].fullmatch(v) for k, v in ruta.items()):
+            raise Fallo("modelo")
+    elif proveedor is not None and proveedor.lower() in PROVEEDORES_POR_DIRECCION:
+        raise Fallo("modelo")
+    else:
+        ruta = {}
+    objetivo = dict(ruta, default=modelo)
+    if proveedor is not None:
+        objetivo["provider"] = proveedor
+    if mismo and (actual.get("default") or actual.get("model")) == modelo:
+        objetivo.update({k: actual[k] for k in FIJADO_AL_MODELO if k in actual})
+    pasos = [("unset", k) for k in ("model", "provider") + RUTA_DEL_MODELO + SECRETOS_DEL_MODELO + FIJADO_AL_MODELO
+             if k in actual and k not in objetivo]
+    if proveedor is not None and actual.get("provider") != proveedor:
+        pasos.append(("set", "provider", proveedor))
+    if actual.get("default") != modelo:
+        pasos.append(("set", "default", modelo))
+    pasos += [("set", k, v) for k, v in ruta.items() if k in RUTA_DEL_MODELO and actual.get(k) != v]
+    return pasos, objetivo
+
+
+def queda_como(bloque: dict, objetivo: dict) -> bool:
+    """Si el `model:` ha quedado como se quería: lo de `objetivo`, y nada más de lo que mueve un cambio de modelo."""
+    claves = ("default", "model", "provider") + RUTA_DEL_MODELO + SECRETOS_DEL_MODELO + FIJADO_AL_MODELO
+    return all(bloque.get(k) == objetivo.get(k) for k in claves)
+
+
 def perfiles_de_hermes(casa: str) -> list:
     """Los perfiles de `<casa>/profiles` que Hermes serviría (`profiles_to_serve` de la 0.21.5), sin lanzar `hermes`:
     carpetas de verdad (no enlaces) con nombre de perfil (el de §18, que cabe en el suyo) y sin `default`, con alguna de
@@ -639,8 +840,8 @@ def clave_del_env(texto: bytes | None) -> str | None:
 
 
 def leer_perfiles(casa: str, perfiles: list, alma: bool = False, preparar: bool = False) -> dict:
-    """De cada perfil (y del principal): su ficha y la clave de su .env; con `alma`, su SOUL.md; con `preparar`, le
-    crea las carpetas para el iPhone que le falten (las de un perfil que ya estaba)."""
+    """De cada perfil (y del principal): su ficha, la clave de su .env y su modelo (`modelo_de`); con `alma`, su
+    SOUL.md; con `preparar`, le crea las carpetas para el iPhone que le falten (las de un perfil que ya estaba)."""
     leidos = {}
     for perfil in [PRINCIPAL] + [p for p in perfiles if p != PRINCIPAL]:
         try:
@@ -648,9 +849,14 @@ def leer_perfiles(casa: str, perfiles: list, alma: bool = False, preparar: bool 
         except OSError:
             continue
         try:
-            datos = {"ficha": leer_ficha(carpeta), "clave": None, "alma": None}
+            datos = {"ficha": leer_ficha(carpeta), "clave": None, "alma": None, "modelo": None}
             try:
                 datos["clave"] = clave_del_env(_leer(carpeta, ENV))
+            except OSError:
+                pass
+            try:
+                datos["modelo"] = modelo_de(bloque_del_modelo((_leer(carpeta, CONFIG, 256 * 1024) or b"")
+                                                              .decode("utf-8", "replace")))
             except OSError:
                 pass
             if alma:
@@ -1451,7 +1657,7 @@ class Trabajos:
 
     def leer(self, id_: str) -> dict | None:
         datos = _leer_json(self.ruta("trabajos", id_ + ".json"))
-        if not (isinstance(datos, dict) and datos.get("estado") in ESTADOS and datos.get("tipo") in ("crear", "borrar")
+        if not (isinstance(datos, dict) and datos.get("estado") in ESTADOS and datos.get("tipo") in TIPOS
                 and isinstance(datos.get("perfil"), str) and PATRON_PERFIL.fullmatch(datos["perfil"])):
             return None
         latido = datos.get("latido") if isinstance(datos.get("latido"), int) else 0
@@ -1536,6 +1742,15 @@ class Ayudante:
         return self.sistema.ejecutar([hermes, "-p", PRINCIPAL] + argumentos, self.sistema.entorno_de_hermes(),
                                      plazo=plazo, carpeta=carpeta)
 
+    def _hermes_del_perfil(self, perfil: str, argumentos: list, plazo: float = PLAZO_CONFIG) -> tuple:
+        """`hermes -p <perfil> …`: lo de un agente en su casa (su `config.yaml`), nunca en la del activo."""
+        hermes = self.sistema.hermes()
+        if not hermes:
+            _decir("no encuentro hermes")
+            return 127, ""
+        return self.sistema.ejecutar([hermes, "-p", validar_perfil(perfil)] + argumentos,
+                                     self.sistema.entorno_de_hermes(), plazo=plazo)
+
     def _mientras(self, id_: str, funcion):
         """Lo que devuelve `funcion()`, que corre en otro hilo mientras este le da latido al trabajo cada `LATIDO`
         segundos: un `hermes` de minutos (la copia y el borrado) o un reinicio con drenaje no lo dejan sin latido, y la
@@ -1596,10 +1811,11 @@ class Ayudante:
         if perfil == PRINCIPAL:
             return {"perfil": PRINCIPAL, "nombre": ficha.get("nombre", "Hermes"), "color": ficha.get("color", "indigo"),
                     "expresion": ficha.get("expresion", "serena"), "descripcion": ficha.get("descripcion", ""),
-                    "memoria": "propia", "principal": True, "servido": True}
+                    "memoria": "propia", "principal": True, "servido": True, "modelo": leido.get("modelo")}
         return {"perfil": perfil, "nombre": ficha.get("nombre", perfil), "color": ficha.get("color", "grafito"),
                 "expresion": ficha.get("expresion", "serena"), "descripcion": ficha.get("descripcion", ""),
-                "memoria": ficha.get("memoria", "propia"), "principal": False, "servido": servido}
+                "memoria": ficha.get("memoria", "propia"), "principal": False, "servido": servido,
+                "modelo": leido.get("modelo")}
 
     def _leer(self, perfiles: list, alma: bool = False, preparar: bool = False) -> dict:
         return self.sistema.como_hermes(lambda: leer_perfiles(self.config.casa, perfiles, alma, preparar))
@@ -1667,6 +1883,8 @@ class Ayudante:
         datos = validar_creacion(peticion)
         if self._casa_es_un_perfil():
             raise Rechazo(409, "tope_de_agentes", "Este Hermes es un perfil de otro: aquí no caben agentes")
+        # Antes del cerrojo y del 202: que Hermes lo ofrece (o el 409 o el 502 de §18.10, sin crear nada).
+        datos["elegido"] = None if datos["modelo"] is None else self._comprobar_modelo(datos["modelo"])
         if not self.trabajos.tomar():
             raise Rechazo(409, "en_curso", "Ya hay un trabajo de los agentes en marcha")
         try:
@@ -1681,7 +1899,9 @@ class Ayudante:
         except BaseException:
             self.trabajos.soltar()
             raise
-        _decir("crear %s (trabajo %s): pedido, memoria %s" % (perfil, id_[:8], datos["memoria"]))
+        _decir("crear %s (trabajo %s): pedido, memoria %s, %s" % (perfil, id_[:8], datos["memoria"],
+                                                                   "otro modelo" if datos["elegido"] else
+                                                                   "el modelo del principal"))
 
         def continuar():
             try:
@@ -1713,6 +1933,11 @@ class Ayudante:
             self.sistema.como_hermes(lambda: preparar_perfil(self.config.casa, perfil, datos, exportaciones,
                                                              self.config.espera_flock, creado_en))
             self.trabajos.poner(id_)
+            # El modelo elegido, antes de que Hermes lo sirva: su primer turno ya es con él. Sin elegir, el del
+            # principal, que ha copiado `--clone`.
+            if datos["elegido"] is not None:
+                self._poner_modelo(id_, perfil, datos["elegido"])
+                self.trabajos.poner(id_)
             try:
                 for carpeta in (self.config.claves_pasarela, self.config.claves_vigia):
                     escribir_clave(carpeta, perfil, clave, self._modo_de_las_claves())
@@ -1889,9 +2114,12 @@ class Ayudante:
 
     def cambiar(self, peticion: dict) -> tuple:
         """Lo de la casa del perfil, al momento. La descripción va también a Hermes (`hermes profile describe`, que
-        tarda): después de contestar, con la conexión ya cerrada y el cerrojo tomado hasta acabar."""
+        tarda): después de contestar, con la conexión ya cerrada y el cerrojo tomado hasta acabar. El modelo es un
+        trabajo (`_cambiar_modelo`)."""
         perfil = validar_perfil(peticion.get("perfil"))
         cambios = validar_cambios(peticion)
+        if "modelo" in cambios:
+            return self._cambiar_modelo(perfil, cambios["modelo"])
         if perfil == PRINCIPAL and "personalidad" in cambios:
             raise Rechazo(409, "no_se_cambia_el_principal", "Del principal solo se cambian el nombre, la cara y la "
                                                             "descripción")
@@ -1925,6 +2153,127 @@ class Ayudante:
                 self.trabajos.soltar()
 
         return respuesta, continuar
+
+    # -- El modelo (§18.11)
+
+    def _opciones_de_hermes(self) -> dict:
+        """Lo que ofrece Hermes: `/api/model/options` del principal, en 127.0.0.1 con su clave (la de su .env). Es lo
+        que tiene configurado y autenticado, y lo que hereda un clon (su config.yaml y su .env). Sin respuesta que se
+        entienda, `502 sin_modelos`."""
+        try:
+            clave = self.sistema.como_hermes(lambda: clave_del_env(_leer_env_principal(self.config.casa)))
+        except (OSError, Fallo):
+            clave = None
+        estado, cuerpo = self.sistema.http("/api/model/options", clave, plazo=PLAZO_OPCIONES)
+        opciones = opciones_de_hermes(cuerpo) if estado == 200 else None
+        if opciones is None:
+            _decir("modelo: Hermes no ha dicho qué modelos tiene (%s)" % (estado or "sin respuesta"))
+            raise Rechazo(502, "sin_modelos", "Hermes no ha dicho qué modelos tiene")
+        return opciones
+
+    def _comprobar_modelo(self, modelo: dict) -> dict:
+        """El modelo pedido, si Hermes lo ofrece ahora: con los nombres de su proveedor (su `slug` y sus alias, como el
+        `custom:<nombre>` de uno propio), para escribir el que ya tenga el perfil. Si no, `409 modelo_desconocido`.
+        Nunca un texto de la app a ciegas: lo que se escribe sale de esta lista."""
+        for fila in self._opciones_de_hermes()["proveedores"]:
+            if modelo["proveedor"] in fila["nombres"] and modelo["modelo"] in fila["modelos"]:
+                return {"proveedor": fila["slug"], "nombres": fila["nombres"], "modelo": modelo["modelo"]}
+        raise Rechazo(409, "modelo_desconocido", "Hermes no ofrece ese modelo")
+
+    def _poner_modelo(self, id_: str, perfil: str, elegido: dict | None) -> None:
+        """El modelo de un perfil: lee su `model:` y el del principal, hace lo que falte con `hermes -p <perfil> config
+        set|unset` (`pasos_del_modelo`) y mira que ha quedado así. `elegido` None es «como Hermes»: el que tiene el
+        principal ahora. Del proveedor se escribe el nombre que ya tenga el perfil, o el principal, si es uno de los
+        suyos. Si algo no sale, su config.yaml vuelve a ser el de antes, byte a byte, y `Fallo("modelo")`."""
+        casa = self.config.casa
+        try:
+            antes = self.sistema.como_hermes(lambda: leer_config(casa, perfil))
+            del_principal = self.sistema.como_hermes(lambda: leer_config(casa, PRINCIPAL))
+        except (OSError, Fallo):
+            antes = None
+        if antes is None:
+            _decir("modelo %s: no puedo leer su config.yaml" % perfil)
+            raise Fallo("modelo")
+        actual, principal = bloque_del_modelo(texto_de(antes)), bloque_del_modelo(texto_de(del_principal))
+        if elegido is None:
+            proveedor, modelo = principal.get("provider"), principal.get("default") or principal.get("model")
+            if not es_un_modelo(modelo) or not (proveedor is None or es_un_proveedor(proveedor)):
+                _decir("modelo %s: no entiendo el modelo del principal" % perfil)
+                raise Fallo("modelo")
+        else:
+            modelo = elegido["modelo"]
+            proveedor = next((p for p in (actual.get("provider"), principal.get("provider"))
+                              if p in elegido["nombres"]), elegido["proveedor"])
+        try:
+            pasos, objetivo = pasos_del_modelo(actual, principal, proveedor, modelo)
+        except Fallo:
+            _decir("modelo %s: ese proveedor no se puede poner desde aquí (se configura con su dirección o su clave)"
+                   % perfil)
+            raise
+        hecho = True
+        for paso in pasos:
+            orden = ["config", "unset", "model." + paso[1]] if paso[0] == "unset" else \
+                ["config", "set", "model." + paso[1], paso[2]]
+            codigo, _ = self._mientras(id_, lambda orden=orden: self._hermes_del_perfil(perfil, orden))
+            if codigo != 0:
+                _decir("modelo %s: hermes config %s model.%s ha salido con %d" % (perfil, paso[0], paso[1], codigo))
+                hecho = False
+                break
+        if hecho:
+            try:
+                despues = self.sistema.como_hermes(lambda: leer_config(casa, perfil))
+            except (OSError, Fallo):
+                despues = None
+            hecho = queda_como(bloque_del_modelo(texto_de(despues)), objetivo)
+            if not hecho:
+                _decir("modelo %s: su config.yaml no ha quedado como debía" % perfil)
+        if not hecho:
+            try:
+                self.sistema.como_hermes(lambda: devolver_config(casa, perfil, antes))
+                _decir("modelo %s: su config.yaml, como estaba" % perfil)
+            except (OSError, Fallo) as error:
+                _decir("modelo %s: no he podido devolver su config.yaml (%s)" % (perfil, type(error).__name__))
+            raise Fallo("modelo")
+        _decir("modelo %s: puesto (%s)" % (perfil, ", ".join("%s %s" % (p[0], p[1]) for p in pasos) or "ya estaba"))
+
+    def _cambiar_modelo(self, perfil: str, modelo: dict | None) -> tuple:
+        """`PATCH` con `modelo`: un trabajo (`modelo`, en `cambiando` mientras dura), porque cada `hermes` tarda unos
+        segundos y un cambio de proveedor son varios. Lo que se puede saber antes, antes del 202: que Hermes lo ofrece y
+        que el agente existe. El del principal no se cambia desde aquí (es el de Hermes)."""
+        if perfil == PRINCIPAL:
+            raise Rechazo(409, "no_se_cambia_el_principal", "El modelo de Hermes se cambia en Hermes")
+        elegido = None if modelo is None else self._comprobar_modelo(modelo)
+        if not self.trabajos.tomar():
+            raise Rechazo(409, "en_curso", "Ya hay un trabajo de los agentes en marcha")
+        try:
+            if perfil not in self.perfiles():
+                raise Rechazo(404, "agente_desconocido", "Ese agente no existe")
+            id_ = self.trabajos.nuevo("modelo", perfil)
+        except BaseException:
+            self.trabajos.soltar()
+            raise
+        _decir("modelo %s (trabajo %s): pedido, %s" % (perfil, id_[:8], "como el del principal" if elegido is None
+                                                        else "otro"))
+
+        def continuar():
+            try:
+                self.trabajos.poner(id_, estado="cambiando")
+                try:
+                    self._poner_modelo(id_, perfil, elegido)
+                except Fallo as fallo:
+                    self.trabajos.poner(id_, estado="fallo", motivo=fallo.motivo)
+                    _decir("modelo %s (trabajo %s): fallo (%s)" % (perfil, id_[:8], fallo.motivo))
+                    return
+                except Exception as error:  # noqa: BLE001
+                    self.trabajos.poner(id_, estado="fallo", motivo="interna")
+                    _decir("modelo %s (trabajo %s): fallo (interna: %s)" % (perfil, id_[:8], type(error).__name__))
+                    return
+                self.trabajos.poner(id_, estado="hecho")
+                _decir("modelo %s (trabajo %s): hecho" % (perfil, id_[:8]))
+            finally:
+                self.trabajos.soltar()
+
+        return {"ok": True, "http": 202, "trabajo": id_, "perfil": perfil}, continuar
 
     # -- Borrar
 

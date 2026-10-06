@@ -111,8 +111,26 @@ def rotar(ruta: str, nombre: str, ahora: str | None = None) -> str:
     return token
 
 
-def lista(ruta: str) -> list:
-    return [{k: v for k, v in t.items() if k != "sha256"} for t in leer(ruta)["tokens"]]
+def lista(ruta: str, quitados=()) -> list:
+    """Los iPhone de la pasarela, sin su hash; sin los que la app ha quitado (`quitados`, sus hashes)."""
+    return [{k: v for k, v in t.items() if k != "sha256"} for t in leer(ruta)["tokens"]
+            if t.get("sha256") not in quitados]
+
+
+def purgar(ruta: str, quitados) -> list:
+    """Saca de `tokens.json` los tokens que la app ha quitado (contrato §12.10): la pasarela no puede escribir aquí, así
+    que los apunta en su carpeta de estado (`dispositivos.QUITADOS`) y ya no los deja pasar. Lo hace quien sí puede
+    escribirlo (el instalador, `hehermes-dispositivo`) antes de tocarlo: así su nombre queda libre para otra alta. Solo
+    escribe si hay algo que sacar. Devuelve sus nombres."""
+    if not quitados:
+        return []
+    datos = leer(ruta)
+    fuera = [t for t in datos["tokens"] if t.get("sha256") in quitados]
+    if not fuera:
+        return []
+    datos["tokens"] = [t for t in datos["tokens"] if t.get("sha256") not in quitados]
+    guardar(ruta, datos)
+    return [t.get("nombre") for t in fuera]
 
 
 def texto_qr(direccion: str, puerto: int, huella: str, token: str) -> str:

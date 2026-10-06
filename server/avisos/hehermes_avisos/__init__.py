@@ -73,4 +73,11 @@ máquina se lleva este paquete entero y arranca solo su mitad.
 #        crear un agente esperaba 2 minutos. `instalar.sh` fija su umask (pip dejaba lo nuevo sin leer para el relé).
 #        `hehermes-actualizar` comprueba la firma también sin la orden openssl, y si no puede, `sin_openssl`. Las
 #        dependencias del relé, sin fallos conocidos (anyio, h2 y hpack).
-VERSION = "1.6.1"
+# 1.6.2: el modelo de cada agente (contrato §18.11): el ayudante lo pone al crear y al cambiar, solo uno de los que
+#        ofrece el principal, con `hermes config set|unset` y devolviendo el `config.yaml` como estaba si algo falla; el
+#        vigía lo deja pasar y lo dice en la lista. Cada alta de avisos sabe de qué iPhone es (esquema 6): la pasarela
+#        se lo dice con su nombre y una marca de su token, firmados con el secreto que comparten (contrato §12.10), y al
+#        quitar un iPhone desde la app se barren sus altas (`/avisos/v1/iphones/barrer`, firmado). Y el aviso del código
+#        de recuperación (§12.9): un buzón que deja el instalador, y el aviso a los demás iPhone, nunca al que entra; no
+#        se barre mientras quede uno por mandar.
+VERSION = "1.6.2"

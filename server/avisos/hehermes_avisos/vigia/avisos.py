@@ -28,7 +28,7 @@ from .almacen import Dispositivo
 
 TITULO_DE_RESERVA = "Hermes"
 CUERPO_DE_RESERVA = "Tienes una respuesta nueva"
-TIPOS = ("respuesta", "aprobacion", "segundo-plano", "error", "prueba")
+TIPOS = ("respuesta", "aprobacion", "segundo-plano", "error", "prueba", "recuperacion")
 
 # Prioridad de APNs: 10 es «ahora». Existe la 5 («cuando le venga bien al iPhone»), pero Apple avisa de que esos pueden
 # agruparse, retrasarse o no entregarse, y aquí todo lo que se avisa es algo que Daniel está esperando. El relé acepta
@@ -88,6 +88,12 @@ class Aviso:
     aprobacion: PeticionDePermiso | None = None
     # El perfil de Hermes del que es (un agente, contrato §18; `default`, el principal).
     perfil: str = "default"
+    # En el del código de recuperación (`recuperacion.py`, contrato §12.9), lo que la app necesita para escribirlo:
+    # `{"que": "entrada", "iphone": …}` o `{"que": "intentos"}`.
+    recuperacion: dict | None = None
+    # La marca del token del iPhone que acaba de entrar con el código (contrato §12.9): a las altas que la pasarela firmó
+    # como suyas no se les manda. Solo la marca: el nombre lo puede poner cualquiera que tenga el código.
+    excepto: str | None = None
 
     @property
     def identidad(self) -> str:
@@ -118,7 +124,15 @@ def decidir_con_motivo(aviso: Aviso, dispositivo: Dispositivo, ahora: float) -> 
     """Lo mismo que ``decidir``, con el porqué de un ``DESCARTAR`` para el registro (``None`` en lo demás).
 
     El 2026-09-28 una continuación contestó a Daniel y el aviso no salió: sus ajustes tenían ``segundo_plano`` apagado.
-    El registro no decía nada —se descartaba en silencio— y hubo que sacarlo de la base de datos."""
+    El registro no decía nada —se descartaba en silencio— y hubo que sacarlo de la base de datos.
+
+    El del código de recuperación va siempre, como el de prueba (ni interruptor ni app delante: la app no lo avisa
+    sola), salvo a las altas del token con el que acaba de entrar un iPhone (``excepto``), que no tiene que enterarse de
+    sí mismo. Lo dice la firma de la pasarela (``Dispositivo.iphone``): un alta sin dueño firmado lo recibe."""
+    if aviso.tipo == "recuperacion":
+        if aviso.excepto is not None and dispositivo.iphone is not None and dispositivo.iphone.marca == aviso.excepto:
+            return DESCARTAR, "es el iPhone que acaba de entrar con el código de recuperación"
+        return ENVIAR, None
     if aviso.tipo == "prueba":
         return ENVIAR, None
     if not dispositivo.ajustes.avisa_de(aviso.tipo):
@@ -155,6 +169,11 @@ def contenido(aviso: Aviso, vista_previa: str) -> bytes:
     ve— y solo si cabe entera en el sobre (`TOPE_CLARO`): si no, sale como las demás, recortada y sin botones, porque
     tampoco se aprueba lo que no se ve entero.
     """
+    if aviso.recuperacion is not None:
+        # No es de ninguna conversación: lo que dice no es contenido de nadie, y va entero con cualquier vista previa.
+        return _escrito({"tipo": aviso.tipo, "sesion": "", "titulo": texto.recortar(aviso.titulo, texto.TOPE_TITULO),
+                         "texto": texto.recortar(aviso.texto, texto.TOPE_TEXTO), "perfil": aviso.perfil,
+                         "recuperacion": dict(aviso.recuperacion)})
     titulo = aviso.titulo if vista_previa in ("siempre", "nombre") else ""
     cuerpo = aviso.texto if vista_previa == "siempre" else ""
     # Desde la 1.6.0, el perfil (contrato §18.9): la app abre el chat de ese agente y pone su cara.

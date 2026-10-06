@@ -39,6 +39,8 @@ class Falso(http.server.ThreadingHTTPServer):
 
     def __init__(self):
         self.peticiones = []
+        #: Lo que contesta a todo, si se le dice (el `409` del vigía con un aviso por mandar).
+        self.estado_fijo = None
         self.sse_siguiente = threading.Event()
         self.sse_fin = threading.Event()
         super().__init__(("127.0.0.1", 0), Manejador)
@@ -79,7 +81,7 @@ class Manejador(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"0\r\n\r\n")
             return
         respuesta = json.dumps({"ruta": self.path, "largo": len(cuerpo)}).encode()
-        self.send_response(404 if "no-existe" in self.path else 200)
+        self.send_response(self.server.estado_fijo or (404 if "no-existe" in self.path else 200))
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(respuesta)))
         self.end_headers()
@@ -457,6 +459,22 @@ class LoQueSePasaAlVigia(ConPasarela):
         self.assertEqual([v for k, v in vista["lista"] if k.lower() == "x-hehermes-vigia"], [SECRETO_VIGIA])
         self.assertFalse([k for k, _ in vista["lista"] if k.lower() == "authorization"])
         self.assertEqual(vista["cuerpo"], b'{"a": 1}')
+
+    def test_el_vigia_sabe_que_iphone_es_por_su_token_y_no_por_lo_que_diga_la_app(self):
+        """El iPhone del token va firmado en `X-HeHermes-Iphone` (contrato §12.10): su nombre y la marca de su token.
+        Con él el vigía no le avisa al iPhone que entra con el código de recuperación (§12.9). El que mande la app no
+        llega, ni firmado como lo haría la pasarela: sería hacerse pasar por otro."""
+        from hehermes_servidor import dispositivos as dis
+        falsa = dis.cabecera_del_iphone(SECRETO_VIGIA, "iphone-0000", "0" * 16)
+        for token, nombre in ((TOKEN, "mi-iphone"), (OTRO, "otro")):
+            with self.subTest(nombre=nombre):
+                tls = self.peticion("POST", "/avisos/v1/dispositivos", token=token, cuerpo=b"{}",
+                                    extra="X-HeHermes-Iphone: %s\r\nX-HeHermes-Firma: x\r\n" % falsa)
+                self.assertEqual(self.leer_respuesta(tls)[0], 200)
+                vista = self.vigia.peticiones[-1]
+                buena = dis.cabecera_del_iphone(SECRETO_VIGIA, nombre, dis.marca_del_token(pa.hash_token(token)))
+                self.assertEqual([v for k, v in vista["lista"] if k.lower() == "x-hehermes-iphone"], [buena])
+                self.assertFalse([k for k, _ in vista["lista"] if k.lower() == "x-hehermes-firma"])
 
     def test_un_trozo_de_la_copia_en_icloud_llega_entero_al_vigia(self):
         trozo = bytes(range(256)) * (4 * 1024 * 4)  # 4 MiB

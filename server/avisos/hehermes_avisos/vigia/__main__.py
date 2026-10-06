@@ -24,6 +24,7 @@ import urllib.request
 from .. import VERSION, comun
 from ..comun import ErrorDeSecreto, ErrorHTTP, ServidorHTTP, cola, configurar_registro, leer_secreto
 from . import agentes as agentes_
+from . import recuperacion
 from .almacen import Almacen
 from .api import AppVigia, ManejadorVigia
 from .configuracion import ConfigVigia
@@ -89,6 +90,15 @@ def servir(config: ConfigVigia) -> int:
     claves = agentes_.ClavesDeLosAgentes(config.agentes_claves) if config.agentes_claves else None
     clientes = (agentes_.ClientesDeLosAgentes(claves, config.hermes_base, config.hermes_plazo) if claves is not None
                 else None)
+    # Lo que el instalador deja para avisar del código de recuperación (contrato §12.9): el buzón junto a la base de
+    # datos, que se crea aquí (es lo que le dice al instalador que este vigía lo entiende). Si no se puede, sin él.
+    buzon = recuperacion.Buzon(os.path.join(os.path.dirname(os.path.abspath(config.base_de_datos)),
+                                            recuperacion.BUZON))
+    try:
+        buzon.preparar()
+    except OSError as error:
+        registro.warning("sin el buzón del código de recuperación (%s): no se avisará de él", error)
+        buzon = None
     vigilante = None
     de_cada_perfil = (ExportacionesDeLosAgentes(almacen, exportaciones, config.ficheros_lector,
                                                 lambda: vigilante.despertar(),
@@ -98,7 +108,8 @@ def servir(config: ConfigVigia) -> int:
     vigilante = Vigilante(almacen, hermes, mensajero, intervalo=config.intervalo,
                           intervalo_en_calma=config.intervalo_en_calma, antiguedad_maxima=config.antiguedad_maxima,
                           filas_por_lectura=config.filas_por_lectura, caducidad_aprobacion=config.caducidad_aprobacion,
-                          reglas_entrega=config.reglas_de_entrega(), exportaciones=de_cada_perfil, agentes=clientes)
+                          reglas_entrega=config.reglas_de_entrega(), exportaciones=de_cada_perfil, agentes=clientes,
+                          buzon=buzon)
     ficheros = Ficheros(hermes, ClienteLector(config.ficheros_lector),
                         Limites(config.ficheros_por_minuto, config.ficheros_simultaneos), casa=config.ficheros_casa,
                         exportaciones=de_cada_perfil, agentes=clientes)
@@ -120,7 +131,7 @@ def servir(config: ConfigVigia) -> int:
                         servicios=config.servidor_servicios, hermes_unidad=config.servidor_hermes)
     app = AppVigia(almacen, mensajero, secreto_tunel=secreto_tunel, caducidad_prueba=config.caducidad_prueba,
                    al_moverse=vigilante.despertar, ficheros=ficheros, respaldos=respaldos, exportaciones=de_cada_perfil,
-                   entradas=entradas, servidor=servidor, agentes=de_los_agentes)
+                   entradas=entradas, servidor=servidor, agentes=de_los_agentes, buzon=buzon)
     servidor = ServidorHTTP(config.escucha, ManejadorVigia, app, heredado=heredado)
     _avisar_si_no_coincide(heredado, config.escucha)
     threading.Thread(target=servidor.serve_forever, name="api", daemon=True).start()

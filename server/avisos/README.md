@@ -485,6 +485,26 @@ del sobre y nunca en claro, el contenido lleva además `aprobacion`, y su `texto
 
 Una app de antes no lee `aprobacion` y enseña el texto; uno largo, recortado.
 
+### El código de recuperación (con los avisos posteriores a la 1.6.2)
+
+Contrato §12.9, «El aviso a los demás iPhone» (`vigia/recuperacion.py`). Cuando un iPhone entra con el código de
+recuperación, el instalador deja un fichero en el **buzón** del vigía (`buzon/`, junto a `vigia.db`; lo crea el vigía al
+arrancar, suyo y 0700), y el vigía, al empezar cada vuelta y sin esperar a Hermes, avisa a **todos los iPhone dados de
+alta menos a ese** («Se ha conectado otro iPhone con tu código de recuperación: iphone-9f3e») y lo borra. Lo mismo con
+el primer fallo de firma de cada racha («Alguien ha intentado…»), a todos. Ningún interruptor ni la app delante lo
+callan, como el de prueba; con los reintentos de siempre, y lo de hace más de un día se borra sin avisar.
+
+De qué iPhone es cada alta lo dice solo la pasarela, firmado con el secreto del túnel (`X-HeHermes-Iphone`: el nombre
+del token y la marca de ese token, contrato §12.10; la que mande la app no llega, y sin una firma que valga el alta no
+es de nadie), y el vigía lo guarda con el alta (esquema 6). El suceso trae la marca del token nuevo del que entra: a las
+altas de esa marca no se les avisa. **El nombre no basta**, porque lo pone quien firma la frase: las altas del token de
+antes con el mismo nombre (`marca_anterior`) sí lo reciben —pueden ser de otro aparato al que alguien le ha quitado el
+nombre con el código— y, avisadas, se borran. Un alta sin dueño (de una pasarela de antes) también lo recibe. Y mientras
+quede un aviso por mandar, el barrido de un iPhone quitado desde la app espera (`409 aviso_pendiente`): quien entra no
+puede quitar a los demás antes de que se enteren. En el registro sale `aviso del código de recuperación (entrada)
+resuelto`, el `no se avisa a … de recuperacion: es el iPhone que acaba de entrar…` del que entra y cuántas altas del
+token de antes se han borrado.
+
 ### Las entregas de los subagentes: el vigía lanza el turno que falta
 
 Cuando un subagente en segundo plano acaba, Hermes escribe su entrega en el historial y **no lanza ningún turno**: en

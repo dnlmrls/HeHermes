@@ -128,7 +128,7 @@ class SoloElPrimero(Base):
         self.alta_por_ssh("mi-iphone")
         texto = "\n".join(self.plan().bloqueos)
         self.assertIn("no se dio de alta por chat", texto)
-        self.assertIn("Por SSH: hehermes-dispositivo rotar mi-iphone", texto)
+        self.assertIn("o por SSH: hehermes-dispositivo rotar mi-iphone", texto)
 
     def test_ya_canjeado_y_sin_usar_otro_nombre_entra_en_su_lugar(self):
         """La app cambia de nombre si se reinstala (y la de la 0.10.2 se llamaba «mi-iphone»): mientras el de chat no ha

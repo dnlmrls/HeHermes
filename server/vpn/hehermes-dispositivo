@@ -290,7 +290,8 @@ def pasarela():
         ini.read(ruta)
         codigo = ini.get("instalador", "codigo")
         datos = {"ini": ruta, "tokens": ini.get("pasarela", "tokens"), "cert": ini.get("pasarela", "certificado"),
-                 "puerto": ini.getint("pasarela", "puerto"), "direccion": ini.get("qr", "direccion")}
+                 "puerto": ini.getint("pasarela", "puerto"), "direccion": ini.get("qr", "direccion"),
+                 "estado": ini.get("mantenimiento", "carpeta", fallback="").strip() or None}
     except (configparser.Error, ValueError) as error:
         fallar("%s no se puede leer: %s" % (ruta, error))
     for camino in (codigo, os.path.join(codigo, "hehermes_servidor")):
@@ -303,12 +304,33 @@ def pasarela():
     return datos
 
 
+def quitados(p):
+    """Los tokens que la app ha quitado (Ajustes › Tu servidor): ya no valen, aunque sigan en tokens.json. Los apunta la
+    pasarela en su carpeta de estado, que es lo único que puede escribir."""
+    if not p.get("estado"):
+        return set()
+    from hehermes_servidor import dispositivos
+    hashes = dispositivos.hashes_quitados(p["estado"])
+    if hashes is None:
+        fallar("no entiendo %s/%s, el registro de los iPhone quitados desde la app: no toco nada (con él roto, la "
+               "pasarela no deja pasar a nadie)" % (p["estado"], dispositivos.QUITADOS))
+    return hashes
+
+
+def purgar(p):
+    """Antes de escribir tokens.json, fuera lo que la app ha quitado: su nombre queda libre para otra alta."""
+    try:
+        return p["modulo_tokens"].purgar(p["tokens"], quitados(p))
+    except (ValueError, OSError) as error:
+        fallar(str(error))
+
+
 def en_la_pasarela(nombre):
     p = pasarela()
     if p is None:
         return False
     try:
-        return any(t["nombre"] == nombre for t in p["modulo_tokens"].lista(p["tokens"]))
+        return any(t["nombre"] == nombre for t in p["modulo_tokens"].lista(p["tokens"], quitados(p)))
     except ValueError as error:
         fallar(str(error))
 
@@ -348,6 +370,7 @@ def alta_tls(nombre):
                "sudo hehermes-servidor instalar" % ruta_pasarela_ini())
     exigir_terminal("El alta de la pasarela")
     huella = huella_de_la_pasarela(p)
+    purgar(p)
     try:
         token = p["modulo_tokens"].alta(p["tokens"], nombre)
     except ValueError as error:
@@ -358,6 +381,9 @@ def alta_tls(nombre):
 
 def baja_tls(nombre):
     p = pasarela()
+    if nombre in purgar(p):
+        print("«%s» ya se había quitado desde la app: su token no valía, y ya no está en la pasarela." % nombre)
+        return
     try:
         quitado = p["modulo_tokens"].baja(p["tokens"], nombre)
     except ValueError as error:
@@ -372,6 +398,8 @@ def rotar_tls(nombre):
     p = pasarela()
     exigir_terminal("Rotar en la pasarela")
     huella = huella_de_la_pasarela(p)
+    if nombre in purgar(p):
+        fallar("«%s» se quitó desde la app: dale un alta nueva (hehermes-dispositivo alta %s)" % (nombre, nombre))
     try:
         token = p["modulo_tokens"].rotar(p["tokens"], nombre)
     except ValueError as error:
@@ -433,7 +461,7 @@ def cmd_lista(_args):
     de_la_pasarela = []
     if p is not None:
         try:
-            de_la_pasarela = p["modulo_tokens"].lista(p["tokens"])
+            de_la_pasarela = p["modulo_tokens"].lista(p["tokens"], quitados(p))
         except ValueError as error:
             fallar(str(error))
         for t in de_la_pasarela:

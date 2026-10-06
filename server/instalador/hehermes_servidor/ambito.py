@@ -28,6 +28,9 @@ class Ambito:
             self.venv = self.carpeta_venv + "/venv"
             self.run_canje = "/run/hehermes-canje"
             self.cerrojo = "/run/hehermes-servidor.lock"
+            # La instalación por chat en segundo plano (`fondo`, desde la 0.11.2): lo que imprime, con el enlace, solo
+            # de root y en memoria.
+            self.run_instalar = "/run/hehermes-instalar"
             self.systemctl = ["systemctl"]
         else:
             if not casa or not _CASA.fullmatch(casa) or casa.rstrip("/") == "" or "//" in casa:
@@ -45,6 +48,7 @@ class Ambito:
             self.run_canje = "/run/user/%d/hehermes-canje" % uid
             # En /run/user, que es suyo y en memoria: dentro de ~/.config, desinstalar no podría quitar su carpeta.
             self.cerrojo = "/run/user/%d/hehermes-servidor.lock" % uid
+            self.run_instalar = "/run/user/%d/hehermes-instalar" % uid
             self.systemctl = ["systemctl", "--user"]
         # Los avisos (el vigía, `avisos`): con root, donde los deja también `server/avisos/despliegue/instalar.sh` en el
         # VPS de Daniel; sin root, en su casa, como la pasarela.

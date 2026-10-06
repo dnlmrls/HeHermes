@@ -111,13 +111,24 @@ def bloqueos(sis, man, op, activos=None, ambito=None) -> list:
     no la ha usado (se canjeara o no), la misma frase vuelve a dar un enlace: al mismo iPhone, con otra clave (la de antes
     deja de valer, `reemitir`); y a otro nombre, en su lugar (`a_sustituir`): la app cambia de nombre si se reinstala, y
     la de la 0.10.2 se llamaba «mi-iphone». Un iPhone dado de alta por SSH sigue cerrando el chat, como siempre.
-    `activos`, los iPhone del servidor (`activos_del_servidor`)."""
+    Con el chat cerrado, una frase con la prueba del código de recuperación (`--recuperacion`, spec 2026-10-06) deja
+    entrar a su iPhone, y solo a él (`comprobar_recuperacion`). `activos`, los iPhone del servidor
+    (`activos_del_servidor`)."""
     from . import ambito as amb
     ambito = ambito or amb.de_root()
+    salida = _decision_7(sis, man, op, list(activos or []), ambito)
+    if salida and getattr(op, "recuperacion", None):
+        # El chat está cerrado, pero la frase trae la prueba del código de recuperación: con ella entra este iPhone, y
+        # solo él. Si no vale, su propio bloqueo (`hehermes-error:recuperacion`), no el de la decisión 7. Con el chat
+        # abierto, la prueba ni se mira: la frase es la de siempre.
+        return comprobar_recuperacion(sis, man, op, ambito)
+    return salida
+
+
+def _decision_7(sis, man, op, activos, ambito) -> list:
     salida = []
     por_chat = man.datos.get("por_chat") or {}
     de_chat = por_chat.get("iphone")
-    activos = list(activos or [])
     estado, cuando = uso_del_iphone_por_chat(sis, man, ambito)
     alta = "hehermes-dispositivo alta <nombre>"
     if estado != "sin-usar":
@@ -127,29 +138,165 @@ def bloqueos(sis, man, op, activos=None, ambito=None) -> list:
         else:
             texto = "«%s» se dio de alta por chat y no sé si ha llegado a usar la pasarela (%s)" % (de_chat, cuando)
         salida.append("%s: por chat ya no doy de alta nada más, para que nada que lea Hermes le pueda pedir un alta "
-                      "nueva. Este iPhone (o uno nuevo), desde la app o por SSH: %s, o hehermes-dispositivo rotar %s"
-                      % (texto, alta, de_chat))
+                      "nueva. Este iPhone (o uno nuevo), con el código de recuperación de la app, o por SSH: %s, o "
+                      "hehermes-dispositivo rotar %s" % (texto, alta, de_chat))
         etiquetar(salida, "por-chat")
         return salida
     otros = sorted(d["nombre"] for d in activos if d.get("nombre") not in (op.iphone, de_chat))
     if otros:
-        salida.append("Por chat solo se conecta el primer iPhone, y aquí ya hay: %s. El siguiente, desde la app o "
-                      "por SSH (%s)" % (", ".join(otros), alta))
+        salida.append("Por chat solo se conecta el primer iPhone, y aquí ya hay: %s. El siguiente, con el código de "
+                      "recuperación de la app, o por SSH (%s)" % (", ".join(otros), alta))
         etiquetar(salida, "por-chat")
     elif any(d.get("nombre") == op.iphone for d in activos) and de_chat != op.iphone:
         salida.append("«%s» ya está dado de alta y no se dio de alta por chat: por chat solo se conecta el primer "
-                      "iPhone. Por SSH: hehermes-dispositivo rotar %s" % (op.iphone, op.iphone))
+                      "iPhone. Con el código de recuperación de la app, o por SSH: hehermes-dispositivo rotar %s"
+                      % (op.iphone, op.iphone))
         etiquetar(salida, "por-chat")
     return salida
 
 
 def a_sustituir(man, op, activos) -> str | None:
     """El iPhone que se dio de alta por chat y no ha usado la pasarela, si la frase es de otro nombre: el que sale para
-    que entre este (`bloqueos` ya ha mirado que no la ha usado)."""
+    que entre este (`bloqueos` ya ha mirado que no la ha usado). Una recuperación no saca a nadie: el chat estaba
+    cerrado, y el de chat puede ser otro iPhone de la persona."""
     de_chat = (man.datos.get("por_chat") or {}).get("iphone")
-    if op.por_chat and de_chat and de_chat != op.iphone and any(d.get("nombre") == de_chat for d in activos):
+    if op.por_chat and not getattr(op, "recuperando", False) and de_chat and de_chat != op.iphone \
+            and any(d.get("nombre") == de_chat for d in activos):
         return de_chat
     return None
+
+
+# MARK: El código de recuperación
+
+
+def _no_vale(motivo, texto, hasta=None) -> list:
+    """Lo que para una recuperación, con su código y lo que lo concreta para la app (`hehermes-detalle:`)."""
+    from .deteccion import bloqueo
+    hecho = bloqueo("recuperacion", texto)
+    hecho.detalle = "motivo=%s" % motivo + ("" if hasta is None else " hasta=%d" % hasta)
+    return [hecho]
+
+
+def comprobar_recuperacion(sis, man, op, ambito, ahora=None) -> list:
+    """La prueba de `--recuperacion` con el chat cerrado (decisión 7): [] si vale, y entonces `op.recuperando`; si no,
+    el bloqueo. Antes de tocar nada, en este orden: la espera tras los fallos (unos minutos; lo que llega mientras ni se
+    mira ni cuenta), la firma con la clave pública del servidor (si no vale, cuenta un fallo, y el primero de una racha
+    se avisa a los iPhone), la hora y que el código no esté ya gastado. Lo que se apunta al entrar (`recuperar`) va al
+    aplicar, con el token ya dado."""
+    from . import recuperacion as rec
+    ahora = time.time() if ahora is None else ahora
+    hora, firma = rec.leer_prueba(op.recuperacion) or (None, None)
+    if firma is None:
+        return _no_vale("firma", "La prueba de --recuperacion no es la de una frase de la app.")
+    registro = rec.Registro(sis.ruta(ambito.carpeta_estado_pasarela))
+    estado = registro.leer()
+    ssh = "por SSH: hehermes-dispositivo alta %s (o rotar, si ya está)" % op.iphone
+    if estado is None:
+        return _no_vale("sin-codigo", "No entiendo el registro del código de recuperación (%s): no lo toco. Por SSH, "
+                                      "hehermes-servidor recuperacion quitar, y la app pondrá otro" % registro.ruta)
+    if estado["clave"] is None:
+        return _no_vale("sin-codigo", "Este servidor no tiene ningún código de recuperación (la app lo pone al conectar "
+                                      "con un servidor de esta versión). Este iPhone, %s" % ssh)
+    hasta = rec.espera_hasta(estado, ahora)
+    if hasta is not None:
+        return _no_vale("espera", "Hace poco ha llegado un código de recuperación que no vale, y tras cada uno espero unos "
+                                  "minutos antes de mirar otro: hasta las %s UTC. Vuelve a mandármela entonces."
+                        % time.strftime("%H:%M", time.gmtime(hasta)), hasta)
+    try:
+        llave = base64.urlsafe_b64decode(op.llave + "=")
+        datos = rec.mensaje(op.iphone, llave, hora)
+    except (ValueError, binascii.Error):
+        return _no_vale("firma", "La prueba de --recuperacion no es la de una frase de la app.")
+    buena = verificar_prueba(sis, ambito, estado["clave"], datos, firma)
+    if buena is None:
+        return _no_vale("sin-comprobar", "No he podido comprobar el código de recuperación (falta el entorno de Python "
+                                         "de cryptography): repara con hehermes-servidor instalar, o este iPhone, %s"
+                        % ssh)
+    if not buena:
+        primero = []
+
+        def fallo(actual):
+            if actual is None:
+                return None
+            primero.append(rec.empieza_racha(actual, ahora))
+            return rec.con_fallo(actual, ahora)
+
+        registro.cambiar(fallo)
+        if primero == [True]:
+            # El primero de una racha se avisa a los iPhone del servidor; los siguientes, no (esperan su turno igual).
+            avisar(sis, ambito, rec.suceso("intentos", ahora), lambda texto: None)
+        return _no_vale("firma", "El código de recuperación de esta frase no es el de este servidor. Lo apunto, y espero "
+                                 "unos minutos antes de mirar otro. Este iPhone, %s" % ssh)
+    if not rec.a_tiempo(hora, ahora):
+        return _no_vale("caducada", "Esta frase de recuperación es de hace demasiado (o de un reloj que no va bien): "
+                                    "copia otra en la app y vuelve a mandármela.")
+    if rec.gastado(estado, leer_usos(sis, ambito)):
+        return _no_vale("gastada", "Ese código de recuperación ya se usó para conectar «%s», que ya ha usado la "
+                                   "pasarela: su app ha tenido que poner otro, y es el que vale. Este iPhone, %s"
+                        % (estado["en_curso"]["iphone"], ssh))
+    op.recuperando = True
+    return []
+
+
+def verificar_prueba(sis, ambito, clave, datos, firma) -> bool | None:
+    """La firma, con `cryptography` en el Python del venv del canje (el instalador corre con el del sistema). None si no
+    se ha podido comprobar."""
+    import json
+    if not sis.existe(ambito.python_venv):
+        return None
+    entrada = json.dumps({"clave": clave, "mensaje": base64.b64encode(datos).decode("ascii"),
+                          "firma": base64.b64encode(firma).decode("ascii")})
+    r = sis.ejecutar([ambito.python_venv, "-I", "-B", "-m", "hehermes_servidor.recuperacion", "verificar"],
+                     entrada=entrada)
+    if r.codigo == 0 and r.salida.strip() == "buena":
+        return True
+    if r.codigo == 1 and r.salida.strip() == "mala":
+        return False
+    return None
+
+
+def recuperar(sis, man, iphone, ruta_tokens, ambito, salida, token=None) -> str:
+    """Entra el iPhone de una recuperación que vale (`comprobar_recuperacion`): con alta nueva (`token`, el que acaba de
+    dar `aplicar_tls`) o, si ya estaba con ese nombre (una copia restaurada en otro iPhone, o la conexión quitada en la
+    app), con otro token, y el de antes deja de valer. Lo demás no se toca: ni los otros iPhone ni el `por_chat` del
+    manifiesto, que sigue cerrando el chat normal. Se apunta en el registro del código (`en_curso`, `ultima`), que es lo
+    que dice a los demás iPhone que alguien ha entrado con él. Devuelve el token.
+
+    El aviso lleva la marca del token nuevo (a sus altas de avisos no se les avisa: solo las puede haber hecho el que
+    entra) y, si ya estaba con ese nombre, la del de antes: sus altas sí lo reciben, porque el nombre lo puede poner
+    cualquiera que tenga el código y pueden ser de otro aparato, y después el vigía las borra (contrato §12.9)."""
+    from . import dispositivos as dis
+    from . import recuperacion as rec
+    from . import tokens
+    from .pasarela import hash_token
+    anterior = None
+    if token is None:
+        antes = next((e["sha256"] for e in dis.entradas_de(ruta_tokens) or [] if e["nombre"] == iphone), None)
+        token = tokens.rotar(ruta_tokens, iphone)
+        anterior = dis.marca_del_token(antes) if antes else None
+        salida("==> «%s» vuelve a conectar con el código de recuperación: le doy una clave nueva, y la de antes deja de "
+               "valer" % iphone)
+    else:
+        salida("==> «%s» entra con el código de recuperación" % iphone)
+    ahora = time.time()
+    rec.Registro(sis.ruta(ambito.carpeta_estado_pasarela)).cambiar(
+        lambda estado: None if estado is None else rec.con_exito(estado, iphone, ahora))
+    suceso = rec.suceso("entrada", ahora, iphone, dis.marca_del_token(hash_token(token)), anterior)
+    if avisar(sis, ambito, suceso, salida):
+        salida("==> Se lo aviso a los demás iPhone de este servidor")
+    return token
+
+
+def avisar(sis, ambito, suceso, salida) -> bool:
+    """Deja `suceso` en el buzón del vigía (`recuperacion.dejar_en_el_buzon`), que lo avisa a los iPhone dados de alta
+    (contrato §12.9). Sin buzón no se avisa (un vigía de antes, o sin avisos), y un fallo al dejarlo se dice y no para
+    nada: la recuperación ya está hecha, y la app de los demás iPhone lo enseña igual en Ajustes › Tu servidor."""
+    from . import recuperacion as rec
+    try:
+        return rec.dejar_en_el_buzon(sis.ruta(ambito.carpeta_estado_vigia + "/" + rec.BUZON), suceso)
+    except OSError as error:
+        salida("aviso: no he podido dejarle el aviso al vigía (%s)" % type(error).__name__)
+        return False
 
 
 def reemitir(sis, man, iphone, ruta_tokens, salida) -> str:

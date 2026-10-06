@@ -1,0 +1,13 @@
+{
+  "descripcion": "El vector del código de recuperación (spec 2026-10-06), de PRUEBA: no es el código de nadie. Lo comparten server/instalador/tests/datos/recuperacion.json y HeHermesMensajesTests/Fixtures/recuperacion.json. `codigo` es como se enseña (siete grupos de cuatro, los dos últimos símbolos de control); `semilla`, el HKDF-SHA256 de los 28 símbolos (sal «hehermes-recuperacion/v1», info «ed25519»); `clave`, su pública Ed25519 (base64url); `mensaje`, lo que se firma para ese iPhone, esa llave (base64url) y esa hora (base64); `firma`, la de Python (Ed25519 es determinista), y `prueba`, lo que va en --recuperacion.",
+  "codigo": "PRVE-BAN0-ESDE-VERD-AD00-0000-00RH",
+  "canonico": "PRVEBAN0ESDEVERDAD00000000RH",
+  "semilla": "0b6ed7da0d6fd074fb2d6e4553f6c91fdcb53371bcaa906c5c70ffa020340674",
+  "clave": "L7_BuftJXrub-2uv8ub9l8guIwFy1fq5V9ABABrEsuI",
+  "iphone": "iphone-0abc",
+  "llave": "KCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEFCQ0RFRkc",
+  "momento": 1791234567,
+  "mensaje": "aGVoZXJtZXMtcmVjdXBlcmFjaW9uL3YxAGlwaG9uZS0wYWJjACgpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHAAAAAGrEEgc=",
+  "firma": "3O4hhpM7SiHWfkBAUB-J1ex_X5YrD1gboFKZ0tnMTufGdcJSqPvpA9txSek8i2bdtsjTDpIVSJzYMQQmDF5nDg",
+  "prueba": "1.1791234567.3O4hhpM7SiHWfkBAUB-J1ex_X5YrD1gboFKZ0tnMTufGdcJSqPvpA9txSek8i2bdtsjTDpIVSJzYMQQmDF5nDg"
+}

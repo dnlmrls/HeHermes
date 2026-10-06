@@ -77,6 +77,12 @@ contenedor, WSL o LXC, y los usuarios de más de 8 letras; deja lo de Hermes lo 
 recuerda cómo se instaló y no vuelve a una versión anterior; adopta lo que deja un corte; y `hehermes-servidor informe`
 junta lo que hace falta para entender un fallo, sin secretos.
 
+**La 0.11.2 instala en segundo plano y deja volver a conectar**, y lleva los avisos 1.6.2. Por chat, la instalación
+corre en su propia unidad (`systemd-run`) y el comando la sigue sin pasarse del plazo de la terminal de Hermes: si no
+acaba, dice `hehermes-sigue:` y el mismo comando se engancha a ella. Con el código de recuperación de la app (spec
+2026-10-06), un iPhone vuelve a conectar por chat tras reinstalarla o cambiar de iPhone, con una firma que no revela el
+código. Y el modelo de cada agente se elige al crearlo y se cambia luego.
+
 **La 0.11.1 hace que actualizar no deje a nadie tirado** (la auditoría del 2026-10-06):
 - **Recuerda cómo se instaló.** `--direccion`, `--hermes-home` y `--cortafuegos-a-mano` van al manifiesto y se vuelven a
   usar mientras no se dé otra cosa: «Actualizar» desde la app lanza `instalar --si` a secas, y detrás de un NAT (AWS,
@@ -90,6 +96,11 @@ junta lo que hace falta para entender un fallo, sin secretos.
 - **El venv del canje se rehace** (`venv --clear`) si es de otro Python, tras subir de versión la distribución.
 - **La firma de las actualizaciones, también sin la orden `openssl`**: con `cryptography`, la del venv del canje; sin
   ninguna de las dos, la app lo sabe (`sin_openssl`) y no dice que la firma sea mala.
+
+**La 0.11.2 instala por chat en segundo plano** ([abajo](#en-segundo-plano-por-chat-desde-la-0112)): la instalación va en
+su propia unidad (`hehermes-instalar`), que ni el plazo de la terminal de Hermes ni su reinicio cortan, y el comando la
+sigue hasta un poco antes de ese plazo. Si no ha acabado, la última línea es `hehermes-sigue:`, y el mismo comando otra
+vez se engancha a ella, sin lanzar otra, y da su enlace.
 
 **La 0.10.5 lleva el vigía 1.5.1.** Lo que cambia está en los avisos (`server/avisos`): las marcas de un fichero se buscan en la conversación entera (también lo compactado), un fichero nuevo en `exports/` se avisa en cuanto deja de crecer y se puede descargar sin esperar a su `MEDIA:`, y un cliente que se corta a media petición deja una línea en el registro, no una traza. El instalador en sí no cambia.
 
@@ -122,6 +133,7 @@ sudo hehermes-servidor desinstalar [--quitar-paquetes]        # enseña lo que q
 sudo hehermes-servidor desinstalar --modo vpn                 # solo la VPN de una versión anterior
 sudo hehermes-dispositivo alta otro-iphone                    # otro iPhone, con el instalador ya puesto
 sudo hehermes-servidor avisos                                 # los avisos con un código de avisos (se pega), si te lo dan
+sudo hehermes-servidor recuperacion quitar                    # el código de recuperación deja de valer (la app pone otro)
 ```
 
 Más opciones de `instalar`: `--direccion <IP o nombre>` (la del QR, si el servidor está detrás de un NAT),
@@ -129,8 +141,8 @@ Más opciones de `instalar`: `--direccion <IP o nombre>` (la del QR, si el servi
 terminal es obligatorio), `--activar-api`, `--corregir-exposicion` (la API de Hermes, solo en 127.0.0.1:
 [abajo](#la-api-de-hermes-sin-exponer)), `--cortafuegos-a-mano` (el cortafuegos lo llevas tú:
 [abajo](#los-cortafuegos)), `--volver-atras` (esta versión aunque la instalada sea más nueva) y, para el alta por chat,
-`--por-chat --llave <llave> [--qr-png <fichero>]` (abajo). `--modo tls` se sigue aceptando (lo llevan los comandos de
-antes), y no cambia nada.
+`--por-chat --llave <llave> [--qr-png <fichero>] [--recuperacion <prueba>]` (abajo). `--modo tls` se sigue aceptando
+(lo llevan los comandos de antes), y no cambia nada.
 
 ## Cómo se instaló (desde la 0.11.1)
 
@@ -223,6 +235,14 @@ Sin root, lo mismo sin `sudo` (`~/.local/bin/hehermes-dispositivo`). El QR lleva
 <nombre>` dice que se use `rotar`. Si ya había un `/usr/local/sbin/hehermes-dispositivo` ajeno (el de una VPN hecha a
 mano), no se toca: el de la pasarela es `/opt/hehermes-servidor/hehermes-dispositivo`. El QR no depende de `qrencode`:
 lo dibuja `hehermes_servidor/qr.py` (modo byte, versiones 1 a 40), que las pruebas comparan módulo a módulo con `segno`.
+
+**Desde la app** (Ajustes › Tu servidor › iPhone conectados, contrato §12.10) se ven y se quitan, con el token de un
+iPhone dado de alta (`hehermes_servidor/dispositivos.py`). La pasarela no puede escribir `tokens.json`, y está bien que
+no pueda (si pudiera, una pasarela tomada podría darse tokens): lo quitado lo apunta en su carpeta de estado
+(`quitados.json`, 0600), y desde ese momento ese token no vale aunque siga en `tokens.json`; lo que tenía abierto se
+corta, y sus altas de avisos se borran del vigía. `hehermes-dispositivo` y el instalador lo sacan de `tokens.json` antes
+de escribirlo (`tokens.purgar`): su nombre queda libre, y vuelve con `alta` (no con `rotar`) o con el código de
+recuperación. `lista` ya no lo enseña. El último iPhone solo se quita confirmándolo: la app dice antes cómo volver.
 
 ### «Seguridad», en la pasarela
 
@@ -462,7 +482,7 @@ Hay que saber:
   - /usr/local/sbin/hehermes-dispositivo no es mío: no lo toco. Para los iPhone de la pasarela usa el mío: sudo /opt/hehermes-servidor/hehermes-dispositivo alta <nombre>
   - Aquí ya hay unos avisos puestos a mano (/opt/hehermes-avisos, los de server/avisos/despliegue/instalar.sh): ni el vigía ni el lector de ficheros los pongo yo, y lo suyo no lo toco
 
-61 cambios.
+64 cambios.
 ```
 <!-- /pasarela-de-daniel -->
 
@@ -573,6 +593,9 @@ llavero, 30 minutos y sin salir del iPhone). Hermes la ejecuta con su terminal:
 - **No pregunta nada y no pinta el QR** (lo leería el modelo). Da el alta en la pasarela, lanza el canje y acaba con una
   sola línea, el enlace: `hehermes-canje:1?h={dirección}&p={puerto}&c={código}&f={huella}`. **No lleva ningún
   secreto:** sin la privada del iPhone no sirve de nada.
+- **En segundo plano** (desde la 0.11.2): la instalación va en su propia unidad, y el comando la sigue; si no acaba antes
+  del plazo de la terminal de Hermes, la última línea es `hehermes-sigue:`, y el mismo comando otra vez se engancha a
+  ella ([abajo](#en-segundo-plano-por-chat-desde-la-0112)).
 - **Lo que entrega el canje** es `{"h", "p", "f", "t"}` (la dirección, el puerto de la pasarela como número, su huella y
   el token), en ese orden, y nada más: el canje se niega a arrancar con otra cosa. Lo fija `tests/datos/canje-tls.json`,
   que comparte la app.
@@ -623,6 +646,39 @@ llavero, 30 minutos y sin salir del iPhone). Hermes la ejecuta con su terminal:
 - **`--qr-png <fichero>`** deja además el enlace en un PNG con su QR, por si Hermes puede mandar imágenes (con
   `qrencode`, si está).
 
+### Volver a conectar: el código de recuperación
+
+Spec `docs/superpowers/specs/2026-10-06-codigo-de-recuperacion-design.md`, contrato `server/API-CONTRACT.md` §12.9.
+Quien reinstala la app, cambia de iPhone o quita la conexión se encuentra el chat cerrado (decisión 7). La app tiene,
+en el llavero de iCloud de la persona, un **código de recuperación** del servidor que **no sale del iPhone**: el
+servidor guarda solo su clave pública Ed25519 (`recuperacion.json`, en la carpeta de estado de la pasarela, que la pone
+con el token del iPhone por `PUT /hehermes/v1/recuperacion`), y la frase lleva `--recuperacion 1.<hora>.<firma>`, una
+firma de ese código sobre el nombre del iPhone, la llave de la frase y la hora (`hehermes_servidor/recuperacion.py`).
+
+- **Solo con el chat cerrado.** Con él abierto (el primer iPhone), la prueba ni se mira: la misma frase vale para un
+  servidor nuevo con un código viejo en el llavero.
+- **Antes de tocar nada**, en este orden: la espera tras los fallos (1, 2, 4 y 8 minutos, y a partir del quinto, 8;
+  sin cierre: el código no se puede adivinar; lo que llega mientras ni se mira ni cuenta), la firma (con el `cryptography` del venv del canje: `python -m
+  hehermes_servidor.recuperacion verificar`; si no vale, cuenta un fallo), la hora (40 minutos hacia atrás, 10 hacia
+  delante) y que el código no esté gastado (el iPhone de la recuperación anterior ya usó la pasarela, `usos.json`). Lo
+  que no vale, `hehermes-detalle:motivo=…` y `hehermes-error:recuperacion` (contrato §12.2).
+- **Entra ese iPhone, y solo él**: con el mismo nombre, otro token (el de antes deja de valer); con otro, alta nueva.
+  Los demás iPhone no se tocan, y **el chat normal sigue cerrado** (el `por_chat` del manifiesto no cambia). Se apunta
+  quién y cuándo (`en_curso`, `ultima`): la app de los demás iPhone lo enseña, y la del que entró pone otro código.
+- **Y se avisa por push** a los demás iPhone (contrato §12.9, «El aviso a los demás iPhone»): lo que entra, y el primer
+  fallo de firma de cada racha. El instalador deja un fichero en el buzón del vigía (`buzon/`, en su carpeta de estado,
+  que crea el vigía al arrancar); sin buzón (un vigía de antes), no hay aviso. Lleva la marca del token nuevo (la que
+  la pasarela firma en cada alta de avisos, §12.10: a esas no se les avisa) y, si el nombre ya estaba, la del token de
+  antes: esas altas sí lo reciben, porque el nombre lo pone quien tiene el código, y después el vigía las borra.
+- **Quien lea el chat** se lleva una firma que solo vale para esa llave (cifra el canje para el iPhone de la frase),
+  ese nombre y esa hora; **quien lea el servidor**, una clave pública con la que no se firma nada.
+- **Sin código** (otra cuenta de iCloud, uno perdido), por SSH como siempre: `hehermes-dispositivo alta <nombre>` (o
+  `rotar`), y `hehermes-servidor recuperacion quitar` (solo desde un terminal) para que la app del iPhone nuevo pueda
+  poner otro.
+
+Lo prueban `tests/test_recuperacion.py` (con el servidor falso, y la firma de verdad) y
+`tests/test_recuperacion_pasarela.py` (la ruta, con la pasarela en 127.0.0.1).
+
 ### Los permisos
 
 Antes de nada (`hehermes_servidor/permisos.py`), y sin pedir nunca una contraseña (`sudo -n`):
@@ -671,6 +727,7 @@ empezar** (`a-medias`, `apt`, `pip`, `python`, `ocupado`, `interrumpido`: [abajo
 | `cortafuegos` | El cortafuegos cierra el paso y no se sabe abrir sin riesgo |
 | `version-antigua` | Desde la 0.11.1: lo instalado es más nuevo que este instalador (una frase de antes, del historial del chat). Justo antes va `hehermes-detalle:instalada=<X.Y.Z> esta=<X.Y.Z>`. Lo que la app debería decir: «Esa frase es de una versión anterior: copia la de ahora» ([arriba](#cómo-se-instaló-desde-la-0111)) |
 | `por-chat`, `nombre-iphone`, `ficheros-ajenos`, `avisos-a-mano`, `avisos-credencial` | Lo de siempre de cada uno (el texto lo dice). `ficheros-ajenos` ya no sale por lo que dejó a medias una pasada que se cortó (desde la 0.11.1) |
+| `recuperacion` | La frase traía la firma del código de recuperación y no ha valido: justo antes, `hehermes-detalle:motivo=<firma\|caducada\|gastada\|espera\|sin-codigo\|sin-comprobar>` (con `espera`, `hasta=<segundos>`). [Arriba](#volver-a-conectar-el-código-de-recuperación) |
 | `bloqueo` | Cualquier otro |
 
 ### Robustez al aplicar (desde la 0.11.1)
@@ -739,7 +796,7 @@ hehermes-error:apt
 | `a-medias` | Cualquier otra parada a mitad: un usuario, un `chown`, una unidad que no arranca, el cortafuegos, la comprobación, el canje… El texto dice cuál |
 | `python` | Algo que no se esperaba ha fallado dentro del instalador (una excepción); antes de empezar a aplicar, «No he cambiado nada» |
 | `ocupado` | Ya hay otro `hehermes-servidor` en marcha (dice cuál y desde cuándo): dos a la vez se pisarían el manifiesto |
-| `interrumpido` | Una señal a mitad: el plazo de la terminal de Hermes o su `/stop` (SIGTERM), un SSH que se cierra (SIGHUP) o Ctrl-C |
+| `interrumpido` | Una señal a mitad: el plazo de la terminal de Hermes o su `/stop` (SIGTERM), un SSH que se cierra (SIGHUP) o Ctrl-C. Desde la 0.11.2, por chat, lo de Hermes ya no la corta (va en segundo plano, [abajo](#en-segundo-plano-por-chat-desde-la-0112)): sale si paran su unidad, o si se para sin dejarle decir nada (sin memoria) |
 
 En todos, **el mismo comando otra vez sigue donde se quedó**: lo hecho está apuntado en el manifiesto, y lo de Hermes,
 si no se llegó a tocar, sigue sin tocar.
@@ -780,6 +837,53 @@ HKDF, y la app lo usa igual. Los vectores que lo fijan los comparten el servidor
 nftables o iptables se van con él, pero ufw guarda las suyas: la quita `hehermes-cortafuegos.service` al arrancar (y
 también el siguiente `instalar --por-chat` y `desinstalar`). La app acepta cualquier puerto del enlace, del 1 al 65535
 (`EnlaceDelCanje.leer`).
+
+### En segundo plano, por chat (desde la 0.11.2)
+
+La terminal de Hermes corta lo que ejecuta: a los 180 s de serie (`terminal.timeout`; el modelo lo puede subir hasta
+600, y por encima lo pasa él a segundo plano) y, pase lo que pase, a los 420 s de su agente, que entonces se queda sin la
+salida (`agent/tool_executor.py`, `_DEFAULT_CONCURRENT_TOOL_TIMEOUT_S`). Al cortarlo manda SIGTERM a todo el grupo de
+procesos, SIGKILL un segundo después, y lo mismo a lo que se escapó con `setsid`, que busca en el árbol de procesos
+(`tools/environments/local.py`, `_kill_process_group_posix`; su `main` del 2026-10-06). Con apt y pip en un VPS de una
+CPU, la instalación puede pasar de 180 s: la 0.11.1 decía hasta dónde llegó, pero se cortaba. Desde la 0.11.2, por chat
+(`hehermes_servidor/fondo.py`, y lo prueba `tests/test_fondo.py`):
+
+- **La instalación va en su propia unidad pasajera**, `hehermes-instalar`, como el canje: `systemd-run
+  --unit=hehermes-instalar --collect` (con `--user` sin root), ni `--scope` ni atada a la unidad de Hermes. Es hija de
+  PID 1: no está en el árbol de procesos de Hermes ni en su cgroup, así que ni su plazo, ni su `/stop`, ni su reinicio
+  la cortan. Corre de una copia del paquete en su carpeta (la de `mktemp` es del usuario de Hermes, y con `PrivateTmp`
+  en su unidad PID 1 ni la vería), con la orden de siempre y `--en-segundo-plano`, y `RuntimeMaxSec=3600` por si algo se
+  cuelga.
+- **El comando la sigue**, y enseña lo que imprime al momento y desde el principio, durante 140 s como mucho (los 180 s
+  de Hermes, menos la descarga y un margen):
+  - si acaba antes, lo de siempre: el enlace (`hehermes-canje:`) o el fallo (`hehermes-error:`), la última, y su código
+    de salida;
+  - si no, la última línea es `hehermes-sigue: <paso>/<total> <nombre> (<segundos> s)` (o `preparando`, sin pasos
+    todavía), y sale con 0: no ha fallado nada;
+  - si cortan al que la sigue (un plazo de Hermes más corto, su `/stop`), dice lo mismo, `hehermes-sigue:`, y la
+    instalación sigue.
+- **El mismo comando otra vez** (la misma orden, letra a letra: la versión, la llave y el iPhone):
+  - con la instalación en marcha, se engancha a ella sin lanzar otra («Esta misma instalación ya está en marcha…»),
+    enseña lo que lleva dicho y la sigue otro rato;
+  - si ya acabó mientras nadie la seguía, da su final: el enlace, mientras su canje siga abierto (otra instalación le
+    daría otra clave al iPhone); un fallo, una vez (la siguiente lo vuelve a intentar, y sigue donde se quedó); y si la
+    pararon sin dejarle decir cómo acabó (`systemctl stop`, sin memoria), `hehermes-error:interrumpido`.
+- **Otra frase** (otra llave u otro iPhone) con una en marcha espera a que acabe, sin enseñar lo suyo (su enlace sería el
+  de otra llave), y lanza la suya.
+- **Lo guardado**, en `/run/hehermes-instalar` (0700, de root; sin root, `/run/user/<uid>/hehermes-instalar`): `salida`
+  (lo que imprime, con el enlace, 0600), `estado.json` (de qué orden es, desde cuándo y si su final ya se dio, 0600) y la
+  copia del paquete. Al cerrarse el canje (canjeado, caducado o parado) su limpieza lo borra todo, salvo con otra
+  instalación en marcha (es la que lo ha parado); y un reinicio vacía /run.
+- **Con varios Hermes, el que la lanzó**: en su unidad la instalación es hija de PID 1, así que quien la lanza le pasa sus
+  antepasados (`HEHERMES_LANZADO_POR`) y su `HERMES_HOME`, y con sudo, `SUDO_UID` y `SUDO_GID` (el PNG de `--qr-png`).
+- **Sin systemd que la lance** (sin `systemd-run` o sin el gestor de usuario, en silencio; o si no arranca, y lo dice) va
+  aquí mismo, como hasta la 0.11.1. Sin systemd, la detección se para enseguida con su código (`sistema`, `contenedor`).
+
+La frase le pide a Hermes que, si acaba en `hehermes-sigue:` o se corta por tiempo, vuelva a ejecutar el mismo comando
+hasta el enlace o un error ([arriba](#el-alta-por-chat---por-chat)). Es lo que pide la persona: el instalador solo dice
+que sigue (la spec, «La frase»). Con el detector de comandos peligrosos de Hermes (`tools/approval_detection.py`, su
+`main` del 2026-10-06), ni el comando de la frase ni el lanzador solo piden aprobación. La app, si se le pega un
+`hehermes-sigue:` (o solo pasos), dice «Todavía se está instalando: dile a tu Hermes que siga», con un mensaje para él.
 
 ### Cifrado, de punta a punta
 

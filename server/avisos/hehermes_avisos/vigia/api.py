@@ -17,6 +17,14 @@
 - ``/avisos/v1/agentes…``                                 los agentes (``agentes.py``, contrato §18, desde la 1.6.0):
   listarlos, crearlos, verlos, cambiarlos y borrarlos con su ayudante, y escribir la personalidad de uno nuevo. Y las
   rutas que llevan ``sesion`` (el fichero, los ficheros dejados) y las de la entrada aceptan ``perfil=``
+- ``POST   /avisos/v1/iphones/barrer``                    no es de la app sino de la pasarela, al quitar un iPhone desde
+  la app (contrato §12.10): borra las altas que no son de ningún token que siga. Va firmada con el secreto del túnel
+  (``X-HeHermes-Firma``): una pasarela de antes deja pasar las cabeceras de la app, pero la app no tiene el secreto
+
+Cada alta y cada primer plano llevan, desde la pasarela que quita iPhone desde la app, de qué iPhone son
+(``X-HeHermes-Iphone``: su nombre, la marca de su token y una firma con el mismo secreto); sin una firma que valga, el
+alta no es de nadie. Es lo único que le dice al vigía de quién es un alta: lo usan el barrido y el aviso del código de
+recuperación (§12.9), que no se manda a las altas del token del iPhone que entra.
 
 Todo contesta 204 si va bien, y los errores con el envoltorio del api_server de Hermes, que es el que entiende la app.
 Menos dos (spec 2026-09-28, «Avisos sin comandos», Contrato C): el alta contesta ``200 {"envio": …}``, con qué va a
@@ -38,8 +46,11 @@ cosas, y ninguna basta sola:
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import hmac
 import ipaddress
+import json
 import logging
 import re
 import time
@@ -50,7 +61,7 @@ from . import avisos
 from .agentes import PREFIJO as PREFIJO_AGENTES
 from .agentes import Agentes
 from .ajustes import MAX_ID_SESION, Ajustes
-from .almacen import PRINCIPAL, Almacen, Permiso
+from .almacen import PRINCIPAL, Almacen, Iphone, Permiso
 from .entrada import PREFIJO as PREFIJO_ENTRADA
 from .entrada import TOPE_CUERPO as TOPE_ENTRADA
 from .entrada import Entradas
@@ -81,6 +92,17 @@ REPETIR_SIN_TUNEL = 600.0
 PATRON_PERMISO = re.compile(r"hhp1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
 MAX_PERMISO = 1024
 PATRON_HUELLA = re.compile(r"[A-Za-z0-9_-]{43}")
+# Quitar un iPhone desde la app (contrato §12.10): la ruta de la pasarela, sus cabeceras y lo que va delante de lo que se
+# firma (lo mismo que `hehermes_servidor.dispositivos`, en el instalador: el vector de las pruebas es el mismo).
+RUTA_BARRIDO = "/avisos/v1/iphones/barrer"
+CABECERA_IPHONE = "X-HeHermes-Iphone"
+CABECERA_FIRMA = "X-HeHermes-Firma"
+_FIRMA_IPHONE = b"hehermes-iphone/v1\x00"
+_FIRMA_BARRIDO = b"hehermes-barrido/v1\x00"
+PATRON_IPHONE = re.compile(r"[a-z0-9][a-z0-9-]{0,30}")
+PATRON_MARCA = re.compile(r"[0-9a-f]{16}")
+# Los tokens de una pasarela que caben en un barrido: muchos más de los que tendrá nadie.
+MAX_QUEDAN = 256
 
 
 def _es_entero(valor: object) -> bool:
@@ -131,7 +153,7 @@ class AppVigia:
     def __init__(self, almacen: Almacen, mensajero: Mensajero, *, secreto_tunel: str, caducidad_prueba: int = 300,
                  reloj=time.time, al_moverse=None, ficheros: Ficheros | None = None,
                  respaldos: Respaldos | None = None, exportaciones=None, entradas: Entradas | None = None,
-                 servidor: Servidor | None = None, agentes: Agentes | None = None):
+                 servidor: Servidor | None = None, agentes: Agentes | None = None, buzon=None):
         if not secreto_tunel:
             raise ValueError("sin el secreto del túnel, la API del vigía quedaría abierta a cualquier proceso local")
         self.almacen = almacen
@@ -154,6 +176,55 @@ class AppVigia:
         self.servidor = servidor
         # Los agentes (`agentes.py`, contrato §18). Sin ellos, como un vigía de antes: 404 `ruta_desconocida`.
         self.agentes = agentes
+        # Lo que el instalador deja para avisar del código de recuperación (`recuperacion.Buzon`): mientras quede algo
+        # por mandar, el barrido espera (`barrer`). Sin él, nada que esperar.
+        self.buzon = buzon
+
+    def _mac(self, prefijo: bytes, datos: bytes) -> str:
+        resumen = hmac.new(self._secreto, prefijo + datos, hashlib.sha256).digest()
+        return base64.urlsafe_b64encode(resumen).rstrip(b"=").decode("ascii")
+
+    def iphone_de(self, valor: str | None) -> Iphone | None:
+        """El iPhone de la pasarela que manda la petición (``X-HeHermes-Iphone``: su nombre, la marca de su token y su
+        firma), o None si no viene o su firma no vale: entonces no se sabe de quién es. Ni el nombre solo ni una firma
+        que no es la de este nombre con esta marca valen para nada."""
+        if not isinstance(valor, str):
+            return None
+        partes = valor.strip().split(" ")
+        if len(partes) != 3 or not PATRON_IPHONE.fullmatch(partes[0]) or not PATRON_MARCA.fullmatch(partes[1]):
+            return None
+        nombre, marca, firma = partes
+        buena = self._mac(_FIRMA_IPHONE, ("%s\x00%s" % (nombre, marca)).encode("ascii"))
+        if not hmac.compare_digest(firma.encode("utf-8", "surrogateescape"), buena.encode("ascii")):
+            return None
+        return Iphone(nombre, marca)
+
+    def barrer(self, cuerpo: bytes, firma: str | None) -> dict:
+        """``POST /avisos/v1/iphones/barrer`` ``{"quedan": [<marcas>]}``, de la pasarela al quitar un iPhone desde la
+        app: borra las altas que no son de ninguno de los tokens de ``quedan``. Solo con la firma del cuerpo
+        (``X-HeHermes-Firma``). **Nunca antes de un aviso del código de recuperación por mandar** (``409``): quien
+        acaba de entrar con el código no puede quitar a los demás iPhone antes de que se enteren. La pasarela lo vuelve
+        a pedir cada minuto, y el bucle se despierta para mandarlo ya."""
+        buena = self._mac(_FIRMA_BARRIDO, cuerpo)
+        if not isinstance(firma, str) or not hmac.compare_digest(firma.encode("utf-8", "surrogateescape"),
+                                                                 buena.encode("ascii")):
+            raise ErrorHTTP(403, "sin_firma", "Esto solo lo pide la pasarela")
+        try:
+            quedan = json.loads(cuerpo.decode("utf-8")).get("quedan")
+        except (UnicodeDecodeError, ValueError, AttributeError):
+            quedan = None
+        if not isinstance(quedan, list) or len(quedan) > MAX_QUEDAN or not all(
+                isinstance(m, str) and PATRON_MARCA.fullmatch(m) for m in quedan):
+            raise ErrorHTTP(400, "parametro_invalido", "«quedan» tiene que ser una lista de marcas de token")
+        if self.buzon is not None and self.buzon.hay_por_avisar():
+            self.al_moverse()
+            registro.info("un iPhone quitado desde la app: sus altas de avisos esperan a que salga el aviso del código "
+                          "de recuperación")
+            raise ErrorHTTP(409, "aviso_pendiente", "Antes hay que mandar el aviso del código de recuperación")
+        borradas = self.almacen.borrar_las_ajenas(quedan)
+        registro.info("un iPhone quitado desde la app: %d altas de avisos borradas, quedan %d tokens", borradas,
+                      len(quedan))
+        return {"borradas": borradas}
 
     def viene_del_tunel(self, valor: str | None) -> bool:
         """Si la petición trae el secreto que pone nginx. Comparado en tiempo constante."""
@@ -168,9 +239,10 @@ class AppVigia:
             registro.warning("petición a la API del vigía sin la cabecera del túnel: 403 (no llegó por nginx)")
         raise ErrorHTTP(403, "fuera_del_tunel", "El vigía solo atiende lo que llega por el túnel")
 
-    def alta(self, cuerpo: dict) -> dict:
+    def alta(self, cuerpo: dict, iphone: Iphone | None = None) -> dict:
         """Guarda el iPhone y contesta con qué se mandarán sus avisos: ``{"envio": "credencial" | "permiso" |
-        "ninguno"}``. Un alta sin ``permiso`` no borra el que había."""
+        "ninguno"}``. Un alta sin ``permiso`` no borra el que había. ``iphone``: el de la pasarela que la hace, si su
+        firma vale (``iphone_de``)."""
         token = token_valido(cuerpo.get("token"))
         entorno = cuerpo.get("entorno")
         if entorno not in ENTORNOS:
@@ -183,7 +255,7 @@ class AppVigia:
         ajustes = Ajustes.desde_json(cuerpo.get("ajustes"))
         antes = self.almacen.dispositivo(token)
         ahora = self.reloj()
-        nuevo = self.almacen.guardar_dispositivo(token, entorno, clave, ajustes, ahora, permiso=permiso)
+        nuevo = self.almacen.guardar_dispositivo(token, entorno, clave, ajustes, ahora, permiso=permiso, iphone=iphone)
         envio = self.mensajero.como_envia(self.almacen.dispositivo(token), ahora)
         registro.info("%s de %s (%s); ajustes: %s; avisos: %s%s", "alta" if nuevo else "alta renovada", cola(token),
                       entorno, ajustes.cambios(antes.ajustes if antes else None), envio,
@@ -200,7 +272,7 @@ class AppVigia:
         registro.info("ajustes de %s al día: %s", cola(token), ajustes.cambios(antes.ajustes))
         _si_no_avisa_de_nada(token, ajustes)
 
-    def primer_plano(self, token: str, cuerpo: dict) -> dict | None:
+    def primer_plano(self, token: str, cuerpo: dict, iphone: Iphone | None = None) -> dict | None:
         """``{"permiso": "renovar"}`` si la app tiene que pedir otro permiso al relé y repetir el alta (sin credencial,
         y el suyo falta, caduca en menos de 7 días o el relé lo ha rechazado); si no, None (204)."""
         activa = cuerpo.get("activa") is True
@@ -214,6 +286,8 @@ class AppVigia:
         if not self.almacen.cambiar_primer_plano(token, activa, conversacion, min(float(caduca), CADUCA_MAXIMA),
                                                  ahora):
             raise ErrorHTTP(404, "dispositivo_desconocido", "Este dispositivo no está dado de alta")
+        if iphone is not None:
+            self.almacen.vincular(token, iphone)
         turnos = _turnos(cuerpo.get("turnos"))
         self.almacen.vigilar_turnos(turnos, ahora)
         if not activa or turnos:
@@ -316,7 +390,10 @@ class ManejadorVigia(ManejadorJSON):
         ruta, metodo = self.ruta, self.command
         if ruta == "/avisos/v1/dispositivos":
             self._exigir(metodo, "POST")
-            return self.enviar_json(200, app.alta(self.leer_json()))
+            return self.enviar_json(200, app.alta(self.leer_json(), app.iphone_de(self.headers.get(CABECERA_IPHONE))))
+        elif ruta == RUTA_BARRIDO:
+            self._exigir(metodo, "POST")
+            return self.enviar_json(200, app.barrer(self.leer_cuerpo(), self.headers.get(CABECERA_FIRMA)))
         elif ruta == "/avisos/v1/prueba":
             self._exigir(metodo, "POST")
             app.prueba(self.leer_json())
@@ -355,7 +432,7 @@ class ManejadorVigia(ManejadorJSON):
                 app.ajustes(token, self.leer_json())
             else:
                 self._exigir(metodo, "PUT")
-                renovar = app.primer_plano(token, self.leer_json())
+                renovar = app.primer_plano(token, self.leer_json(), app.iphone_de(self.headers.get(CABECERA_IPHONE)))
                 if renovar is not None:
                     return self.enviar_json(200, renovar)
         self.enviar_json(204)

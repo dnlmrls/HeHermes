@@ -15,7 +15,7 @@ import tarfile
 import tempfile
 import time
 
-from . import VERSION, firma, marcha, permisos
+from . import VERSION, firma, fondo, marcha, permisos
 from . import ambito as amb
 from . import piezas as p
 from .aplicar import Parada
@@ -66,6 +66,8 @@ def _analizador():
     i.add_argument("--activar-api", action="store_true",
                    help="enciende la API de Hermes si está apagada (solo las líneas que faltan en su .env)")
     i.add_argument("--qr-png", metavar="FICHERO", help="con --por-chat: deja además el enlace en un PNG con su QR")
+    i.add_argument("--recuperacion", metavar="PRUEBA",
+                   help="con --por-chat: la firma del código de recuperación que pone la app, para volver a conectar")
     i.add_argument("--corregir-exposicion", action="store_true",
                    help="si la API de Hermes escucha en todas las interfaces, la cierro a 127.0.0.1 (en su .env)")
     i.add_argument("--cortafuegos-a-mano", action="store_true",
@@ -74,6 +76,8 @@ def _analizador():
                    help="instala esta versión aunque la instalada sea más nueva")
     i.add_argument("--avisos", nargs="?", const="-", metavar="CÓDIGO",
                    help="los avisos push, con el código de avisos que te han dado (sin él, lo pido y se pega sin eco)")
+    # La de dentro de la instalación por chat en segundo plano (`fondo`): instala, no lanza otra. No es para personas.
+    i.add_argument(fondo.BANDERA, action="store_true", help=argparse.SUPPRESS)
     v = ordenes.add_parser("avisos", help="los avisos push en una instalación que ya tiene la pasarela")
     v.add_argument("codigo", nargs="?", metavar="CÓDIGO", help="el código de avisos (sin él, lo pido y se pega sin eco)")
     v.add_argument("--plan", action="store_true", help="enseña lo que haría, sin cambiar nada")
@@ -92,6 +96,8 @@ def _analizador():
     ordenes.add_parser("pasarela-clave")
     # Lo que lanza hehermes-borrado.timer de noche (el borrado de verdad, `mantenimiento.py`). No es para personas.
     ordenes.add_parser("borrado-seguro")
+    q = ordenes.add_parser("recuperacion", help="el código de recuperación: quitar (la app de tu iPhone pone otro)")
+    q.add_argument("accion", choices=("quitar",))
     # Solo lee, sin secretos, y sin root también: lo que se pueda leer (`informe.py`).
     ordenes.add_parser("informe", help="lo que hace falta para entender un fallo, sin secretos, para pegarlo en un chat")
     u = ordenes.add_parser("actualizar")
@@ -106,9 +112,10 @@ def _analizador():
 
 
 ORDENES = ("instalar", "avisos", "comprobar", "certificado", "actualizar", "desinstalar", "canje-limpiar", "cortafuegos",
-           "pasarela-clave", "borrado-seguro", "informe")
+           "pasarela-clave", "borrado-seguro", "informe", "recuperacion")
 #: Lo que se puede hacer sin root en una instalación de la pasarela de un usuario.
-DEL_USUARIO = ("instalar", "avisos", "comprobar", "certificado", "desinstalar", "canje-limpiar", "borrado-seguro")
+DEL_USUARIO = ("instalar", "avisos", "comprobar", "certificado", "desinstalar", "canje-limpiar", "borrado-seguro",
+               "recuperacion")
 
 
 def main(argv, doc, aqui, sis=None, entrada=input, salida=print, terminal=None, euid=None, relanzar=None,
@@ -154,6 +161,8 @@ def _main(argv, doc, aqui, sis, entrada, salida, terminal, euid, relanzar, usuar
     if op.orden is None:
         salida(doc.strip())
         return 2
+    # La orden tal cual: por chat, «el mismo comando otra vez» se engancha a la instalación en marcha (`fondo`).
+    op.argv = list(argv)
     if op.orden == "informe":
         return _informe(sis or Sistema(), os.geteuid() if euid is None else euid, salida, cuenta)
     if op.orden == "instalar" and op.modo == "vpn":
@@ -200,6 +209,14 @@ def _informe(sis, euid, salida, cuenta) -> int:
 
 
 def _con_ambito(op, sis, ambito, aqui, entrada, salida, terminal) -> int:
+    if fondo.toca(op):
+        # Por chat, desde la 0.11.2: la instalación va en su propia unidad, que ni el plazo de la terminal de Hermes ni
+        # su reinicio cortan, y esto la lanza (o se engancha a la que ya está en marcha) y la sigue (`fondo`). Si no se
+        # puede lanzar, aquí mismo, como hasta la 0.11.1.
+        def aqui_mismo():
+            op.en_primer_plano = True
+            return _con_ambito(op, sis, ambito, aqui, entrada, salida, terminal)
+        return fondo.por_chat(sis, ambito, op.argv, aqui, salida, aqui_mismo)
     try:
         man = Manifiesto.leer(sis, ambito.manifiesto)
     except ManifiestoRoto as error:
@@ -208,7 +225,8 @@ def _con_ambito(op, sis, ambito, aqui, entrada, salida, terminal) -> int:
     orden = {"instalar": _instalar, "avisos": _avisos, "comprobar": _comprobar, "certificado": _certificado,
              "actualizar": _actualizar,
              "desinstalar": _desinstalar, "canje-limpiar": _canje_limpiar, "cortafuegos": _cortafuegos,
-             "pasarela-clave": _pasarela_clave, "borrado-seguro": _borrado_seguro}[op.orden]
+             "pasarela-clave": _pasarela_clave, "borrado-seguro": _borrado_seguro,
+             "recuperacion": _recuperacion}[op.orden]
     if op.orden in ("comprobar", "canje-limpiar", "cortafuegos", "pasarela-clave", "borrado-seguro", "actualizar") or \
             getattr(op, "plan", False):
         # canje-limpiar tampoco: corre dentro del `systemctl stop` de un instalar que ya tiene el cerrojo.
@@ -292,9 +310,10 @@ def _usuario() -> str:
 
 def _uso_por_chat(op):
     from .porchat import llave_valida
+    from .recuperacion import leer_prueba
     if not op.por_chat:
-        if op.llave or op.qr_png:
-            return "--llave y --qr-png solo van con --por-chat"
+        if op.llave or op.qr_png or op.recuperacion:
+            return "--llave, --qr-png y --recuperacion solo van con --por-chat"
         return None
     if not op.iphone:
         return "--por-chat necesita --iphone <nombre>"
@@ -302,6 +321,12 @@ def _uso_por_chat(op):
         return "--por-chat necesita --llave (la de la frase que copió la app)"
     if not llave_valida(op.llave):
         return "la llave de --llave no es la de una frase de la app (43 caracteres en base64url)"
+    if op.recuperacion is not None:
+        if op.plan:
+            # Comprobarla apunta los fallos: un --plan que la mirara sin contarlos dejaría probar sin límite.
+            return "--recuperacion no va con --plan: la prueba se comprueba al instalar"
+        if leer_prueba(op.recuperacion) is None:
+            return "la prueba de --recuperacion no es la de una frase de la app"
     return None
 
 
@@ -424,7 +449,8 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
                         reemplazar=op.reemplazar, si=op.si or op.por_chat, solo_plan=op.plan, por_chat=op.por_chat,
                         llave=op.llave, activar_api=op.activar_api, qr_png=op.qr_png,
                         cortafuegos_a_mano=op.cortafuegos_a_mano, corregir_exposicion=op.corregir_exposicion,
-                        avisos=codigo, volver_atras=getattr(op, "volver_atras", False))
+                        avisos=codigo, volver_atras=getattr(op, "volver_atras", False),
+                        recuperacion=getattr(op, "recuperacion", None))
     del codigo
     # Lo que no se da, como se instaló (`plan.completar_opciones`): `actualizar` lanza `instalar --si` a secas.
     como_se_instalo = completar_opciones(opciones, man)
@@ -496,7 +522,10 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
         if opciones.por_chat:
             la_marcha.empezar("canje")
             token = hecho.get("token")
-            if token is None:
+            if opciones.recuperando:
+                # Con el código de recuperación: entra este iPhone, y el chat normal sigue cerrado.
+                token = porchat.recuperar(sis, man, opciones.iphone, sis.ruta(ambito.tokens), ambito, salida, token)
+            elif token is None:
                 # Repetido antes de que ese iPhone use la pasarela, se canjeara o no: del token solo queda el hash, así
                 # que va uno nuevo.
                 token = porchat.reemitir(sis, man, opciones.iphone, sis.ruta(ambito.tokens), salida)
@@ -611,6 +640,8 @@ def _certificado(op, sis, man, aqui, entrada, salida, terminal, ambito):
 def _canje_limpiar(op, sis, man, aqui, entrada, salida, terminal, ambito):
     from .porchat import limpiar
     limpiar(sis, os.environ, ambito)
+    # El enlace que guardó la instalación por chat ya no vale: fuera (`fondo`, desde la 0.11.2).
+    fondo.al_cerrar_el_canje(sis, ambito)
     return 0
 
 
@@ -619,6 +650,33 @@ def _borrado_seguro(op, sis, man, aqui, entrada, salida, terminal, ambito):
     if "tls" not in man.modos:
         return 0
     return mantenimiento.borrado_seguro(sis, man, ambito, salida)
+
+
+def _recuperacion(op, sis, man, aqui, entrada, salida, terminal, ambito):
+    """`recuperacion quitar`: el código de recuperación de este servidor deja de valer, y el primer iPhone que mire Tu
+    servidor pone otro (spec 2026-10-06, «Sin código»). Para quien lo ha perdido y ha vuelto por SSH. Solo desde un
+    terminal: por chat (sin él) sería una forma de dejar a la persona sin su código."""
+    from . import recuperacion as rec
+    if "tls" not in man.modos:
+        salida("error: aquí no hay pasarela, así que tampoco código de recuperación")
+        return 1
+    if not terminal:
+        salida("error: el código de recuperación solo se quita desde un terminal (por SSH)")
+        return 1
+    registro = rec.Registro(sis.ruta(ambito.carpeta_estado_pasarela))
+    estado = registro.leer()
+    if estado is not None and estado["clave"] is None:
+        salida("Este servidor no tiene código de recuperación: la app pondrá uno al abrir Ajustes › Tu servidor.")
+        return 0
+    quien = (estado or {}).get("por")
+    salida("Voy a quitar el código de recuperación de este servidor%s: el de antes deja de valer, y la app de tu "
+           "iPhone pondrá otro al abrir Ajustes › Tu servidor." % (" (lo puso «%s»)" % quien if quien else ""))
+    if not _pregunta_si(entrada, salida, terminal, False):
+        salida("No he cambiado nada.")
+        return 1
+    registro.quitar()
+    salida("Hecho.")
+    return 0
 
 
 def _pasarela_clave(op, sis, man, aqui, entrada, salida, terminal, ambito):

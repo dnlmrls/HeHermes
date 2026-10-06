@@ -464,6 +464,12 @@ def _el_que_me_lanza(sis, candidatos):
         estado = sis.leer_texto("/proc/%s/status" % pid) or ""
         padre = re.search(r"^PPid:\s*(\d+)\s*$", estado, re.M)
         pid = padre.group(1) if padre else None
+    # En segundo plano (`fondo`, desde la 0.11.2) la instalación es hija de PID 1: los antepasados que cuentan son los de
+    # quien la lanzó desde la terminal de Hermes, que los deja en su entorno.
+    from .fondo import ANTEPASADOS
+    for pid in ((getattr(sis, "entorno", None) or {}).get(ANTEPASADOS) or "").split():
+        if pid in por_pid:
+            return por_pid[pid]
     propia = ((getattr(sis, "entorno", None) or {}).get("HERMES_HOME") or "").rstrip("/")
     if propia:
         iguales = [c for c in candidatos if c.home.rstrip("/") == propia]

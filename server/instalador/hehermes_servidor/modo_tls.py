@@ -379,6 +379,8 @@ def calcular_plan_tls(sis, det, man, op, origen) -> Plan:
     # El primer iPhone
     from . import porchat
     activos = porchat.activos_del_servidor(sis, man, ambito) if op.por_chat else []
+    # Antes que el iPhone: con el código de recuperación (`op.recuperando`), entra sin sacar a nadie.
+    por_chat = porchat.bloqueos(sis, man, op, activos=activos, ambito=ambito) if op.por_chat else []
     if op.iphone is not None:
         from .plan import NOMBRE_VALIDO
         if not NOMBRE_VALIDO.fullmatch(op.iphone):
@@ -388,7 +390,10 @@ def calcular_plan_tls(sis, det, man, op, origen) -> Plan:
         else:
             ya = op.iphone in nombres_de_la_pasarela(sis, ambito)
             sustituye = porchat.a_sustituir(man, op, activos)
-            if op.por_chat:
+            if getattr(op, "recuperando", False):
+                detalle = ("ya dado de alta: con el código de recuperación, otro token (el de antes deja de valer)" if ya
+                           else "con el código de recuperación: su token, sin QR (se entrega por el canje)")
+            elif op.por_chat:
                 detalle = "ya dado de alta" if ya else "su token, sin QR (se entrega por el canje)"
                 if sustituye:
                     detalle += ("; en lugar de «%s», que se dio de alta por chat y no ha usado la pasarela: su token deja "
@@ -401,7 +406,7 @@ def calcular_plan_tls(sis, det, man, op, origen) -> Plan:
                                    {"sustituye": sustituye} if sustituye else None))
 
     if op.por_chat:
-        bloqueos.extend(porchat.bloqueos(sis, man, op, activos=activos, ambito=ambito))
+        bloqueos.extend(por_chat)
         acciones.append(Accion("canje", "hehermes-canje", m.NUEVO,
                                "10 minutos en un TCP al azar del 58000 al 65500, %sde un solo uso; al acabar, la línea "
                                "del enlace" % ("abierto solo mientras dura y " if ambito.root else "")))
@@ -451,11 +456,22 @@ def _plan_cortafuegos(sis, det, man, acciones, fichero):
 
 
 def nombres_de_la_pasarela(sis, ambito) -> list:
+    """Los iPhone de la pasarela, sin los que la app ha quitado (contrato §12.10): esos ya no valen, aunque sigan en
+    tokens.json, y su nombre está libre para otra alta."""
     try:
         datos = json.loads(sis.leer(ambito.tokens) or b"{}")
     except ValueError:
         return []
-    return [t.get("nombre") for t in datos.get("tokens", []) if isinstance(t, dict)]
+    quitados = quitados_de_la_pasarela(sis, ambito)
+    return [t.get("nombre") for t in datos.get("tokens", []) if isinstance(t, dict) and t.get("sha256") not in quitados]
+
+
+def quitados_de_la_pasarela(sis, ambito) -> set:
+    """Los hashes de los tokens que la app ha quitado (`dispositivos.QUITADOS`, en la carpeta de estado de la pasarela).
+    Un registro que no se entiende no quita nada aquí: la pasarela, con él, no deja pasar a nadie."""
+    from . import dispositivos
+    datos = dispositivos.leer_quitados(sis.leer(ambito.carpeta_estado_pasarela + "/" + dispositivos.QUITADOS))
+    return set(datos["tokens"]) if datos else set()
 
 
 # MARK: Aplicar
@@ -659,6 +675,9 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False, marcha=Non
     resultado = {}
     if any(a.cambia for a in de("dispositivo")):
         marcha.empezar("iphone")
+        # Lo que la app ha quitado sale antes de tokens.json (contrato §12.10): su nombre queda libre para esta alta.
+        from . import tokens
+        tokens.purgar(sis.ruta(ambito.tokens), quitados_de_la_pasarela(sis, ambito))
     for a in de("dispositivo"):
         if not a.cambia:
             continue
@@ -680,7 +699,9 @@ def aplicar_tls(sis, plan, man, origen, salida=print, terminal=False, marcha=Non
         if a.objeto not in man.dispositivos:
             man.dispositivos.append(a.objeto)
         if plan.opciones.por_chat:
-            man.datos["por_chat"] = {"iphone": a.objeto, "alta": time.time()}
+            if not getattr(plan.opciones, "recuperando", False):
+                # Una recuperación no es el alta del primer iPhone: el chat normal sigue cerrado (`porchat.recuperar`).
+                man.datos["por_chat"] = {"iphone": a.objeto, "alta": time.time()}
             resultado["token"] = token
         man.guardar(sis)
         if not plan.opciones.por_chat:

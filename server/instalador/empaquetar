@@ -140,10 +140,17 @@ def frase(base, version, suma, iphone, llave):
              ' && ./hehermes-servidor-%s/hehermes-servidor instalar --por-chat --activar-api --iphone %s --llave %s'
              % (url_del_paquete(base, version), suma, fichero, fichero, version, iphone, llave))
     return ("Hermes, quiero conectar la app HeHermes de mi iPhone contigo. Ejecuta en tu servidor este comando "
-            "tal cual, sin cambiar nada (comprueba él solo lo que descarga):\n\n`%s`\n\nTarda unos minutos. Al acabar "
-            "imprime una línea que empieza por «hehermes-canje:». Contéstame solo con esa línea, exacta y en un bloque de "
-            "código. No lleva ninguna clave y caduca en diez minutos. Si el comando falla, no lo arregles por tu cuenta: "
-            "dime el error tal cual y acaba con su última línea, exacta." % orden)
+            "tal cual, sin cambiar nada (comprueba él solo lo que descarga):\n\n`%s`\n\n%s" % (orden, CIERRE_DE_LA_FRASE))
+
+
+#: Lo de detrás del comando (desde la 0.11.2): la instalación va en segundo plano y, si no acaba antes del plazo de la
+#: terminal de Hermes, la última línea es «hehermes-sigue:» (`hehermes_servidor/fondo.py`); el mismo comando otra vez la
+#: vuelve a seguir. La app lo escribe igual (`Bienvenida.fraseParaElChat`).
+CIERRE_DE_LA_FRASE = (
+    "Tarda unos minutos. Si acaba en «hehermes-sigue:» o se corta por tiempo, sigue instalándose: vuelve a ejecutar el "
+    "mismo comando, tal cual, hasta que acabe en «hehermes-canje:» o en «hehermes-error:». Con «hehermes-canje:», "
+    "contéstame solo con esa línea, exacta y en un bloque de código: no lleva ninguna clave y caduca en diez minutos. "
+    "Con un error, no lo arregles por tu cuenta: dime el error tal cual y acaba con su última línea, exacta.")
 
 
 def firmar(ruta, clave):

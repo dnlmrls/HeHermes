@@ -198,6 +198,12 @@ class ServidorFalso:
         self.reinicios: list = []
         self.usuarios: dict = {"root": "/root"}
         self.lanzados: list = []  # las órdenes de systemd-run
+        #: Lo que hace la unidad de la instalación por chat en segundo plano al lanzarla (`fondo`): una función que recibe
+        #: la orden de systemd-run. Sin `systemd-run` en el servidor (`programa`), el instalador ni la lanza: va en primer
+        #: plano, como hasta la 0.11.1, que es lo que prueban las pruebas de antes.
+        self.al_instalar_en_segundo_plano = None
+        #: Lo que se le ha dado a comprobar a `hehermes_servidor.recuperacion verificar` (el venv del canje).
+        self.verificaciones: list = []
         #: Lo que un `systemd-run` dejó dentro del cgroup de Hermes (`--scope`, que se queda en el de quien lo lanza, y
         #: por chat quien lo lanza es Hermes) o atado a su unidad (`PartOf=`, `BindsTo=`, `Requisite=`): reiniciar Hermes
         #: se lo lleva por delante. Lo que se lanza como su propia unidad, no.
@@ -1000,6 +1006,13 @@ class ServidorFalso:
             self.comprobaciones_del_vigia.append(args)
             return Resultado(1 if any(l.startswith("mal") for l in self.vigia_comprueba) else 0,
                              "".join(l + "\n" for l in self.vigia_comprueba))
+        if args == ["-I", "-B", "-m", "hehermes_servidor.recuperacion", "verificar"]:
+            # La firma del código de recuperación se comprueba de verdad, con el cryptography de las pruebas.
+            from hehermes_servidor import recuperacion
+            dicho = []
+            codigo = recuperacion.main(["verificar"], entrada=entrada or "", salida=dicho.append)
+            self.verificaciones.append(entrada)
+            return Resultado(codigo, "".join(linea + "\n" for linea in dicho))
         if args[:5] == ["-I", "-B", "-m", "hehermes_servidor.canje", "preparar"]:
             self.sis.poner(args[5] + "/cert.pem", "-----BEGIN CERTIFICATE-----\nfalso\n", modo=0o600)
             self.sis.poner(args[5] + "/clave.pem", "-----BEGIN PRIVATE KEY-----\nfalsa\n", modo=0o600)
@@ -1020,6 +1033,21 @@ class ServidorFalso:
             return Resultado(1, "", "Job for run-u12.service failed because the control process exited with error "
                                     "code.\nFinished with result: exit-code\nMain processes terminated with: "
                                     "code=exited/status=226\n")
+        if "--unit=hehermes-instalar" in args:
+            # La instalación por chat en segundo plano (`fondo`): una unidad aparte, como la del canje. Lo que hace dentro
+            # lo decide cada prueba (`al_instalar_en_segundo_plano`); sin eso, se queda en marcha sin decir nada.
+            if "--scope" in args or any(a.split("=", 1)[0] in ("PartOf", "BindsTo", "Requisite") and "hermes-gateway"
+                                        in a for a in args):
+                self.atados_a_hermes.add("hehermes-instalar")
+            activos = self.activos_usuario if "--user" in args else self.activos
+            if "--user" in args and not self.gestor_usuario:
+                return Resultado(1, "", "Failed to connect to bus: No medium found")
+            if "hehermes-instalar" in activos:
+                return Resultado(1, "", "Unit hehermes-instalar.service already exists.")
+            activos.add("hehermes-instalar")
+            if self.al_instalar_en_segundo_plano is not None:
+                self.al_instalar_en_segundo_plano(args)
+            return Resultado(0)
         if "--unit=hehermes-canje" in args and ("--scope" in args or any(
                 a.split("=", 1)[0] in ("PartOf", "BindsTo", "Requisite") and "hermes-gateway" in a for a in args)):
             self.atados_a_hermes.add("hehermes-canje")

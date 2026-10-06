@@ -28,8 +28,12 @@ registro = logging.getLogger("vigia.almacen")
 # `delante_caduca`); la 3, el permiso de cada iPhone para el relé (`permiso*`); la 4, la hora de la última respuesta vista
 # de cada conversación (`sesiones.ultima_respuesta`), para no avisar otra vez de las copias que deja una compactación; la
 # 5, el perfil de Hermes de cada conversación y de cada turno (los agentes, contrato §18): cada perfil tiene su propio
-# state.db, así que la clave de una conversación es `(perfil, id)`. Lo de antes es del principal (`default`).
-ESQUEMA = 5
+# state.db, así que la clave de una conversación es `(perfil, id)`. Lo de antes es del principal (`default`); la 6, de
+# qué iPhone de la pasarela es cada alta, firmado por ella (`dispositivos.iphone` e `iphone_marca`: su nombre y la marca
+# de su token, contrato §12.10): al quitar uno desde la app se borran las suyas, y al que entra con el código de
+# recuperación no se le avisa de sí mismo (§12.9). Las de antes no lo dicen (NULL) hasta que su iPhone vuelve a darse de
+# alta o a decir que está delante.
+ESQUEMA = 6
 #: El perfil del principal, el de todo lo de antes de los agentes.
 PRINCIPAL = "default"
 
@@ -66,6 +70,16 @@ class Permiso:
 
 
 @dataclass(frozen=True)
+class Iphone:
+    """De qué iPhone de la pasarela es un alta: el nombre de su token y la marca de ese token (contrato §12.10). Solo lo
+    sabe la pasarela, que lo firma (`api.AppVigia.iphone_de`): sin una firma que valga, el alta no es de nadie. La marca
+    cambia con cada token, aunque el nombre siga: un iPhone que vuelve con el código de recuperación, o con un token
+    rotado, es otro dueño."""
+    nombre: str
+    marca: str
+
+
+@dataclass(frozen=True)
 class Dispositivo:
     token: str
     entorno: str
@@ -81,6 +95,8 @@ class Dispositivo:
     delante_hasta: float | None = None
     conversacion: str | None = None
     permiso: Permiso | None = None
+    #: El iPhone de la pasarela que hizo el alta (firmado por ella), si se sabe.
+    iphone: Iphone | None = None
 
     def delante(self, ahora: float) -> bool:
         """Si la app está en pantalla ahora, por lo que ha dicho: entonces no se manda nada, que ya avisa ella (spec).
@@ -162,7 +178,9 @@ _CREAR = f"""
         permiso_direccion TEXT,
         permiso_puerto INTEGER,
         permiso_huella TEXT,
-        permiso_rechazado REAL
+        permiso_rechazado REAL,
+        iphone TEXT,
+        iphone_marca TEXT
     );
     CREATE TABLE IF NOT EXISTS sesiones (
         perfil TEXT NOT NULL DEFAULT 'default',
@@ -282,6 +300,19 @@ class Almacen:
                     PRAGMA user_version = 5;
                     COMMIT;
                 """)
+            if version < 6:
+                registro.info("base de datos de la versión %d: se pone al día (de qué iPhone es cada alta)",
+                              max(version, 5))
+                # `iphones` en `estado` era de qué iPhone era cada alta según una cabecera sin firmar (el aviso del
+                # código de recuperación antes de juntarse con los iPhone conectados): no vale nada, y se va.
+                self._con.executescript("""
+                    BEGIN;
+                    ALTER TABLE dispositivos ADD COLUMN iphone TEXT;
+                    ALTER TABLE dispositivos ADD COLUMN iphone_marca TEXT;
+                    DELETE FROM estado WHERE clave = 'iphones';
+                    PRAGMA user_version = 6;
+                    COMMIT;
+                """)
 
     # -- Dispositivos
 
@@ -294,14 +325,15 @@ class Almacen:
         return Dispositivo(token=fila[0], entorno=fila[1], clave=bytes(fila[2]),
                            ajustes=Ajustes.desde_json(json.loads(fila[3])), alta=fila[4], actualizado=fila[5],
                            delante_desde=fila[6], delante_latido=fila[7], delante_caduca=fila[8],
-                           delante_hasta=fila[9], conversacion=fila[10], permiso=permiso)
+                           delante_hasta=fila[9], conversacion=fila[10], permiso=permiso,
+                           iphone=Iphone(fila[17], fila[18]) if fila[17] is not None and fila[18] is not None else None)
 
     _COLUMNAS = ("token, entorno, clave, ajustes, alta, actualizado, delante_desde, delante_latido, delante_caduca, "
                  "delante_hasta, conversacion, permiso, permiso_caduca, permiso_direccion, permiso_puerto, "
-                 "permiso_huella, permiso_rechazado")
+                 "permiso_huella, permiso_rechazado, iphone, iphone_marca")
 
     def guardar_dispositivo(self, token: str, entorno: str, clave: bytes, ajustes: Ajustes, ahora: float,
-                            permiso: Permiso | None = None) -> bool:
+                            permiso: Permiso | None = None, iphone: Iphone | None = None) -> bool:
         """Da de alta el dispositivo o, si el token ya estaba, lo actualiza (el alta es idempotente por token).
 
         Devuelve si es nuevo. Por encima de ``max_dispositivos`` se olvida el que lleva más tiempo sin darse de alta:
@@ -311,19 +343,26 @@ class Almacen:
         ``permiso``, si lo trae el alta, sustituye al que hubiera (y olvida que el relé rechazó el de antes). Sin él,
         el que había se queda: un alta sin permiso es la de una app que no ha podido pedir otro (App Attest falla, o
         es el Simulador), y el de antes puede seguir valiendo (Contrato C).
+
+        ``iphone``, el de la pasarela que la hace (firmado por ella): el alta dice de quién es, siempre, también si no
+        se sabe (una pasarela de antes, o una cabecera sin una firma que valga). Es lo que borra sus altas al quitarlo
+        desde la app (``borrar_las_ajenas``) y lo que deja fuera del aviso del código de recuperación al que entra.
         """
+        nombre, marca = (iphone.nombre, iphone.marca) if iphone is not None else (None, None)
         with self._cerrojo:
             existia = self._con.execute("SELECT 1 FROM dispositivos WHERE token = ?", (token,)).fetchone() is not None
             self._con.execute("BEGIN")
             try:
                 if existia:
                     self._con.execute(
-                        "UPDATE dispositivos SET entorno = ?, clave = ?, ajustes = ?, actualizado = ? WHERE token = ?",
-                        (entorno, clave, json.dumps(ajustes.a_json()), ahora, token))
+                        "UPDATE dispositivos SET entorno = ?, clave = ?, ajustes = ?, actualizado = ?, iphone = ?, "
+                        "iphone_marca = ? WHERE token = ?",
+                        (entorno, clave, json.dumps(ajustes.a_json()), ahora, nombre, marca, token))
                 else:
                     self._con.execute(
-                        "INSERT INTO dispositivos (token, entorno, clave, ajustes, alta, actualizado) "
-                        "VALUES (?, ?, ?, ?, ?, ?)", (token, entorno, clave, json.dumps(ajustes.a_json()), ahora, ahora))
+                        "INSERT INTO dispositivos (token, entorno, clave, ajustes, alta, actualizado, iphone, "
+                        "iphone_marca) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (token, entorno, clave, json.dumps(ajustes.a_json()), ahora, ahora, nombre, marca))
                 if permiso is not None:
                     self._con.execute(
                         "UPDATE dispositivos SET permiso = ?, permiso_caduca = ?, permiso_direccion = ?, "
@@ -399,6 +438,32 @@ class Almacen:
         with self._cerrojo:
             cursor = self._con.execute("DELETE FROM dispositivos WHERE token = ?", (token,))
         return cursor.rowcount > 0
+
+    def vincular(self, token: str, iphone: Iphone) -> bool:
+        """De qué iPhone es un alta que aún no lo dice (una de antes de la versión 6), por lo que trae su primer plano.
+        Una que ya lo dice no cambia de dueño sin un alta."""
+        with self._cerrojo:
+            cursor = self._con.execute("UPDATE dispositivos SET iphone = ?, iphone_marca = ? "
+                                       "WHERE token = ? AND (iphone IS NULL OR iphone_marca IS NULL)",
+                                       (iphone.nombre, iphone.marca, token))
+        return cursor.rowcount > 0
+
+    def borrar_las_ajenas(self, quedan: list) -> int:
+        """Borra las altas que no son de ningún token de ``quedan`` (las marcas de los que siguen en la pasarela): las
+        de uno que se acaba de quitar, las de un token de antes de un nombre que sigue y las que no dicen de quién son.
+        Devuelve cuántas."""
+        with self._cerrojo:
+            marcas = ", ".join("?" for _ in quedan)
+            condicion = "iphone_marca IS NULL" + (f" OR iphone_marca NOT IN ({marcas})" if quedan else " OR 1")
+            cursor = self._con.execute(f"DELETE FROM dispositivos WHERE {condicion}", list(quedan))
+        return cursor.rowcount
+
+    def borrar_las_de_la_marca(self, marca: str) -> int:
+        """Borra las altas de un token que ya no vale (el de antes de un iPhone que ha vuelto con el código de
+        recuperación con su mismo nombre). Devuelve cuántas."""
+        with self._cerrojo:
+            cursor = self._con.execute("DELETE FROM dispositivos WHERE iphone_marca = ?", (marca,))
+        return cursor.rowcount
 
     # -- Sesiones
 

@@ -474,8 +474,8 @@ class PorChatConRoot(Base):
         self.assertEqual(self.orden("instalar", "--iphone", "otro"), 0, self.salida)
         codigo = self.orden("instalar", "--por-chat", "--iphone", "mi-iphone", "--llave", LLAVE, terminal=False)
         self.assertEqual(codigo, 1)
-        self.assertIn("Por chat solo se conecta el primer iPhone, y aquí ya hay: otro. El siguiente, desde la app o "
-                      "por SSH (hehermes-dispositivo alta <nombre>)", self.salida)
+        self.assertIn("Por chat solo se conecta el primer iPhone, y aquí ya hay: otro. El siguiente, con el código de "
+                      "recuperación de la app, o por SSH (hehermes-dispositivo alta <nombre>)", self.salida)
 
 
 class SinRoot(Base):

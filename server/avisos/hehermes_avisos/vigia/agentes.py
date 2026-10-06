@@ -48,8 +48,10 @@ COLORES = ("indigo", "azul", "violeta", "rosa", "coral", "menta", "grafito", "or
 EXPRESIONES = ("serena", "curiosa", "alegre", "concentrada", "traviesa", "seria")
 MEMORIAS_AL_CREAR = ("comparte", "copia", "cero")
 MEMORIAS = ("propia",) + MEMORIAS_AL_CREAR
-ESTADOS = ("en_cola", "creando", "borrando", "hecho", "fallo")
-MOTIVOS = frozenset({"hermes", "memoria", "clave", "no_se_sirve", "copia", "interrumpido", "interna"})
+ESTADOS = ("en_cola", "creando", "borrando", "cambiando", "hecho", "fallo")
+#: Crear, borrar y cambiar el modelo (§18.11) son trabajos.
+TIPOS = ("crear", "borrar", "modelo")
+MOTIVOS = frozenset({"hermes", "memoria", "clave", "no_se_sirve", "copia", "modelo", "interrumpido", "interna"})
 #: En qué está un trabajo que crea el primer agente (opcional, §18.4): esperando a que Hermes esté tranquilo, o
 #: reiniciándolo (una vez) para que lo sirva.
 PASOS = ("esperando_a_hermes", "reiniciando_hermes")
@@ -58,6 +60,10 @@ MAX_NOMBRE = 40
 TOPE_AGENTES = 12
 CAMPOS_AL_CREAR = {"nombre", "color", "expresion", "descripcion", "personalidad", "memoria", "modelo"}
 CAMBIABLES = ("nombre", "color", "expresion", "descripcion", "personalidad")
+#: El modelo de un agente (§18.11): el `slug` de un proveedor de `/api/model/options` (o uno de sus alias) y el id de
+#: uno de sus modelos. Lo mismo que mira el ayudante, que además comprueba que Hermes lo ofrece.
+PATRON_PROVEEDOR = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}")
+PATRON_MODELO = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+=-]{0,255}")
 #: El mensaje de sistema con el que el principal escribe la personalidad de un agente nuevo (contrato §18.7). Fijo: lo
 #: único que pone la app es la descripción.
 SISTEMA_PERSONALIDAD = ("Escribe en español el SOUL.md de un agente de Hermes a partir de esta descripción. Solo el "
@@ -65,8 +71,9 @@ SISTEMA_PERSONALIDAD = ("Escribe en español el SOUL.md de un agente de Hermes a
 #: Lo que se espera a que Hermes la escriba: menos que los 3 minutos de la app.
 PLAZO_PERSONALIDAD = 170.0
 #: Lo que se le da al ayudante por defecto (`comprobar`), y en cada orden: todas contestan al momento, sin lanzar
-#: `hermes` (crear y borrar siguen con la conexión cerrada; la descripción le llega a Hermes después de contestar), y la
-#: lista mira cada agente con un plazo de 1 s. Así un ayudante atascado no tiene a la app esperando.
+#: `hermes` (crear, borrar y cambiar el modelo siguen con la conexión cerrada; la descripción le llega a Hermes después
+#: de contestar), y la lista mira cada agente con un plazo de 1 s. Así un ayudante atascado no tiene a la app esperando.
+#: Elegir un modelo (al crear o al cambiarlo) le pregunta antes a Hermes qué ofrece, con 8 s de plazo (§18.11).
 PLAZO_AYUDANTE = 60.0
 PLAZOS = {"listar": 10.0, "ver": 10.0, "trabajo": 10.0, "cambiar": 20.0, "crear": 30.0, "borrar": 30.0}
 #: Una clave de un agente: lo que puede ir en una cabecera, en una línea (la de la pasarela, `leer_clave_de_agente`).
@@ -203,6 +210,27 @@ VALIDAR = {"nombre": _nombre, "descripcion": _descripcion,
            "memoria": lambda v: _de_la_lista(v, MEMORIAS_AL_CREAR, "memoria")}
 
 
+def _modelo(valor) -> dict | None:
+    """`null` (el del principal) o `{"proveedor", "modelo"}`, con su forma."""
+    if valor is None:
+        return None
+    if not isinstance(valor, dict) or set(valor) != {"proveedor", "modelo"} \
+            or not isinstance(valor["proveedor"], str) or not PATRON_PROVEEDOR.fullmatch(valor["proveedor"]) \
+            or not isinstance(valor["modelo"], str) or not PATRON_MODELO.fullmatch(valor["modelo"]):
+        raise _invalido("«modelo» es null o {\"proveedor\", \"modelo\"}, de los que ofrece Hermes")
+    return {"proveedor": valor["proveedor"], "modelo": valor["modelo"]}
+
+
+def modelo_limpio(dato) -> dict | None:
+    """El modelo de un agente como lo dice §18.2 (`{"proveedor", "modelo"}`, el proveedor puede ser null), o None."""
+    if not isinstance(dato, dict) or not isinstance(dato.get("modelo"), str) \
+            or not PATRON_MODELO.fullmatch(dato["modelo"]):
+        return None
+    proveedor = dato.get("proveedor")
+    return {"proveedor": proveedor if isinstance(proveedor, str) and PATRON_PROVEEDOR.fullmatch(proveedor) else None,
+            "modelo": dato["modelo"]}
+
+
 def perfil_valido(perfil) -> str:
     if not isinstance(perfil, str) or not PATRON_PERFIL.fullmatch(perfil):
         raise _invalido("El perfil son de 1 a 24 minúsculas y cifras")
@@ -223,15 +251,19 @@ def para_crear(cuerpo: dict) -> dict:
     """Lo de `POST /avisos/v1/agentes`, con su forma (contrato §18.3), o 400. Todos los campos, y nada más."""
     if set(cuerpo) != CAMPOS_AL_CREAR:
         raise _invalido("El cuerpo es {%s}" % ", ".join(sorted(CAMPOS_AL_CREAR)))
-    if cuerpo["modelo"] is not None:
-        raise _invalido("«modelo», por ahora, solo null: el del principal")
-    return dict({campo: VALIDAR[campo](cuerpo[campo]) for campo in CAMPOS_AL_CREAR - {"modelo"}}, modelo=None)
+    return dict({campo: VALIDAR[campo](cuerpo[campo]) for campo in CAMPOS_AL_CREAR - {"modelo"}},
+                modelo=_modelo(cuerpo["modelo"]))
 
 
 def para_cambiar(cuerpo: dict) -> dict:
-    """Lo de `PATCH /avisos/v1/agentes/{perfil}`: al menos uno de los que se cambian, y nada más."""
+    """Lo de `PATCH /avisos/v1/agentes/{perfil}`: al menos uno de los que se cambian, y nada más; o el modelo, solo
+    (§18.11: es un trabajo)."""
+    if "modelo" in cuerpo:
+        if set(cuerpo) != {"modelo"}:
+            raise _invalido("«modelo» se cambia solo")
+        return {"modelo": _modelo(cuerpo["modelo"])}
     if not cuerpo or set(cuerpo) - set(CAMBIABLES):
-        raise _invalido("Se cambia alguno de: %s" % ", ".join(CAMBIABLES))
+        raise _invalido("Se cambia alguno de: %s" % ", ".join(CAMBIABLES + ("modelo",)))
     return {campo: VALIDAR[campo](valor) for campo, valor in cuerpo.items()}
 
 
@@ -257,11 +289,12 @@ def agente_limpio(dato) -> dict | None:
             "descripcion": descripcion if isinstance(descripcion, str)
             and len(descripcion.encode("utf-8", "replace")) <= MAX_TEXTO else "",
             "memoria": dato.get("memoria") if dato.get("memoria") in MEMORIAS else "propia",
-            "principal": principal, "servido": dato.get("servido") is True or principal}
+            "principal": principal, "servido": dato.get("servido") is True or principal,
+            "modelo": modelo_limpio(dato.get("modelo"))}
 
 
 def trabajo_limpio(dato) -> dict:
-    if not isinstance(dato, dict) or dato.get("estado") not in ESTADOS or dato.get("tipo") not in ("crear", "borrar") \
+    if not isinstance(dato, dict) or dato.get("estado") not in ESTADOS or dato.get("tipo") not in TIPOS \
             or not (isinstance(dato.get("perfil"), str) and PATRON_PERFIL.fullmatch(dato["perfil"])):
         raise ErrorHTTP(502, NO_DISPONIBLE, "El ayudante de los agentes contesta algo que no entiendo")
     motivo = dato.get("motivo")
@@ -321,7 +354,8 @@ class Agentes:
         if metodo == "GET":
             return 200, self.ver(perfil), sin_cache
         if metodo == "PATCH":
-            return 200, self.cambiar(perfil, _objeto(leer_cuerpo())), sin_cache
+            estado, objeto = self.cambiar(perfil, _objeto(leer_cuerpo()))
+            return estado, objeto, sin_cache
         _exigir(metodo, "DELETE", "GET, PATCH, DELETE")
         return 202, self.borrar(perfil), sin_cache
 
@@ -355,16 +389,24 @@ class Agentes:
             agente["personalidad"] = _recortar(agente["personalidad"], MAX_TEXTO)
         return agente
 
-    def cambiar(self, perfil: str, cuerpo: dict) -> dict:
+    def cambiar(self, perfil: str, cuerpo: dict) -> tuple:
+        """`(200, el agente)`; con `modelo`, `(202, {"trabajo"})`: cambiar el modelo es un trabajo (§18.11)."""
         cambios = para_cambiar(cuerpo)
-        if perfil == PRINCIPAL and "personalidad" in cambios:
+        if perfil == PRINCIPAL and ("personalidad" in cambios or "modelo" in cambios):
             raise ErrorHTTP(409, "no_se_cambia_el_principal", "Del principal solo se cambian el nombre, la cara y la "
                                                               "descripción")
-        agente = agente_limpio(self._pedir(dict(cambios, orden="cambiar", perfil=perfil)))
+        respuesta = self._pedir(dict(cambios, orden="cambiar", perfil=perfil))
+        if "modelo" in cambios:
+            trabajo = respuesta.get("trabajo")
+            if not (isinstance(trabajo, str) and PATRON_ID.fullmatch(trabajo)):
+                raise ErrorHTTP(502, NO_DISPONIBLE, "El ayudante de los agentes contesta algo que no entiendo")
+            registro.info("agentes: modelo de %s (trabajo %s)", perfil, trabajo[:8])
+            return 202, {"trabajo": trabajo}
+        agente = agente_limpio(respuesta)
         if agente is None:
             raise ErrorHTTP(502, NO_DISPONIBLE, "El ayudante de los agentes contesta algo que no entiendo")
         registro.info("agentes: cambiar %s (%s)", perfil, ", ".join(sorted(cambios)))
-        return agente
+        return 200, agente
 
     def borrar(self, perfil: str) -> dict:
         if perfil == PRINCIPAL:

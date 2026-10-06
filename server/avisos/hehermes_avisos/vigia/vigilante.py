@@ -23,6 +23,11 @@ conversación por leída: la vuelta siguiente lo vuelve a encontrar en el histor
 creciente entre intentos (``_esperas``). Así sobrevive también a un reinicio del vigía, y se acaba solo cuando la fila
 pasa de ``antiguedad_maxima``.
 
+**Lo del código de recuperación** (``recuperacion``, contrato §12.9): al empezar cada vuelta, lo que el instalador ha
+dejado en el buzón se avisa a los iPhone dados de alta (menos a las altas del token del que entra) y se borra, y con él
+las altas del token de antes de ese iPhone, si ya estaba con su nombre; lo que no sale se queda para la siguiente. Va
+antes de leer a Hermes: no depende de que Hermes conteste.
+
 **Lo justo para Hermes.** Sin ningún iPhone dado de alta no se lee nada (antes: 17 280 lecturas de la bandeja al día
 para nadie). Con uno, cada 5 s mientras pasa algo (una conversación cambia, una app está delante o se acaba de ir,
 hay turnos vigilados o algo pendiente) y cada 25 s tras tres minutos de calma; una app que se va despierta al bucle al
@@ -40,7 +45,7 @@ from dataclasses import dataclass, replace
 
 from .. import texto
 from ..comun import cola
-from . import avisos, deteccion, entregas, exportaciones
+from . import avisos, deteccion, entregas, exportaciones, recuperacion
 from .almacen import PRINCIPAL, Almacen, EstadoSesion
 from .envio import ENVIADO, LIMITADO, REINTENTABLE, Mensajero
 from .hermes import ClienteHermes, ErrorHermes
@@ -115,8 +120,12 @@ class Vigilante:
     def __init__(self, almacen: Almacen, hermes: ClienteHermes, mensajero: Mensajero, *, intervalo: float = 5.0,
                  intervalo_en_calma: float = INTERVALO_EN_CALMA, antiguedad_maxima: float = 900.0,
                  filas_por_lectura: int = 100, caducidad_aprobacion: int = 120, reloj=time.time,
-                 reglas_entrega: ReglasDeEntrega | None = None, exportaciones=None, agentes=None):
+                 reglas_entrega: ReglasDeEntrega | None = None, exportaciones=None, agentes=None, buzon=None):
         self.almacen = almacen
+        # Lo que el instalador deja para avisar del código de recuperación (`recuperacion.Buzon`). Sin buzón, nada de
+        # esto. De qué iPhone es cada alta (para no avisarle al que entra) lo dice su dueño firmado, en el almacén.
+        self.buzon = buzon
+        self._buzon_pendiente = False
         # Los ficheros nuevos de `exports/` que hay que avisar (`exportaciones`), si se vigila la carpeta: la del
         # principal (`Exportaciones`) o la de cada perfil (`ExportacionesDeLosAgentes`, con su `de(perfil)`).
         self.exportaciones = exportaciones
@@ -188,7 +197,7 @@ class Vigilante:
     def siguiente_espera(self) -> float:
         """Cuánto esperar hasta la vuelta siguiente: poco mientras pase algo, y más en calma."""
         ahora = self.reloj()
-        if self._pendiente_en_la_vuelta or ahora - self._ultimo_movimiento < CALMA:
+        if self._pendiente_en_la_vuelta or self._buzon_pendiente or ahora - self._ultimo_movimiento < CALMA:
             return self.intervalo
         if self.almacen.turnos():
             return self.intervalo
@@ -224,6 +233,7 @@ class Vigilante:
     def vuelta(self) -> None:
         ahora = self.reloj()
         self._olvidar_lo_viejo(ahora)
+        self._avisar_lo_del_buzon(ahora)
         clientes = self._clientes()
         if not self.almacen.dispositivos():
             # Nadie a quien avisar: no se molesta a Hermes. Lo que pase mientras no es de nadie, así que al volver a
@@ -310,6 +320,48 @@ class Vigilante:
             except Exception:  # noqa: BLE001 — un fichero que rompe algo no puede dejar sin avisos al resto
                 self._apuntar_fallo("exportaciones", "fallo avisando de un fichero nuevo de exports", excepcion=True)
                 hechas.anunciado(fichero)
+
+    # -- El código de recuperación
+
+    def _avisar_lo_del_buzon(self, ahora: float) -> None:
+        """Avisa de lo que el instalador ha dejado en el buzón (``recuperacion``): a todos los iPhone dados de alta menos
+        a las altas del token del que entra, con los reintentos de siempre. Lo que ya no queda por mandar a nadie se
+        borra; sin ningún iPhone, no hay a quién, y también. Lo de hace más de un día ya no se avisa: Ajustes › Tu
+        servidor lo enseña igual."""
+        if self.buzon is None:
+            return
+        self._buzon_pendiente = False
+        try:
+            sucesos = self.buzon.pendientes()
+        except OSError as error:
+            self._apuntar_fallo("buzon", "no se pudo mirar el buzón del código de recuperación: %s", error)
+            return
+        for suceso in sucesos:
+            try:
+                if self.buzon.caducado(suceso):
+                    registro.info("un aviso del código de recuperación de hace más de un día: se borra sin mandarlo")
+                elif self._avisar(recuperacion.aviso(suceso), ahora):
+                    registro.info("aviso del código de recuperación (%s) resuelto", suceso.que)
+                else:
+                    self._buzon_pendiente = True
+                    continue
+                self._borrar_las_del_token_de_antes(suceso)
+                self.buzon.hecho(suceso)
+            except Exception:  # noqa: BLE001 — un suceso que rompe algo no puede repetirse en cada vuelta
+                self._apuntar_fallo("buzon " + suceso.fichero, "fallo avisando del código de recuperación: se deja",
+                                    excepcion=True)
+                self.buzon.hecho(suceso)
+
+    def _borrar_las_del_token_de_antes(self, suceso) -> None:
+        """Un iPhone que ha vuelto con el código con su mismo nombre tiene otro token, y el de antes ya no vale: sus altas
+        de avisos sobran. Se borran **después** de avisar, no antes: pueden ser de otro aparato al que alguien le ha
+        quitado el nombre con el código, y es el primero que tiene que enterarse."""
+        if suceso.anterior is None:
+            return
+        borradas = self.almacen.borrar_las_de_la_marca(suceso.anterior)
+        if borradas:
+            registro.info("%d altas de avisos del token de antes de un iPhone que ha vuelto con el código: borradas",
+                          borradas)
 
     # -- La bandeja
 
