@@ -31,6 +31,12 @@ from .deteccion import PREFIJO_DETALLE, PREFIJO_ERROR  # noqa: F401
 
 PREFIJO_PASO = "hehermes-paso:"
 PREFIJO_AVISO = "hehermes-aviso:"
+#: Desde la 0.12.0 (2026-10-08): por chat, en segundo plano, el instalador va a actualizar Hermes y reiniciarlo
+#: (`actualizar_hermes`), y ese reinicio corta el turno que lo sigue. Quien lo sigue (`fondo`) acaba en cuanto la ve, con
+#: ella la última, para que Hermes conteste antes de reiniciarse: `hehermes-reinicio: <su versión> (<segundos> s)`.
+PREFIJO_REINICIO = "hehermes-reinicio:"
+#: Lo que dice el instalador cuando eso ha acabado (bien o no): desde ahí, quien la sigue la sigue como siempre.
+DE_VUELTA = "==> Hermes, de vuelta:"
 
 #: Desde cuándo cuenta el reloj de los pasos: lo pone `cli.main` al empezar (el plazo de Hermes cuenta desde ahí, más
 #: lo poco de la descarga).

@@ -19,6 +19,7 @@ from . import VERSION, firma, fondo, marcha, permisos
 from . import ambito as amb
 from . import piezas as p
 from .aplicar import Parada
+from .capacidades import RECOMENDADA, texto_de
 from .desinstalar import desinstalar, resumen
 from .deteccion import DIRECCION_VALIDA
 from .manifiesto import Manifiesto, ManifiestoRoto
@@ -65,6 +66,12 @@ def _analizador():
     i.add_argument("--llave", help="con --por-chat: la clave pública de la frase que copió la app")
     i.add_argument("--activar-api", action="store_true",
                    help="enciende la API de Hermes si está apagada (solo las líneas que faltan en su .env)")
+    # Desde la 0.12.0 (Daniel, 2026-10-08): el permiso para actualizar Hermes antes de nada, si es anterior a la que la
+    # app aprovecha entera (`actualizar_hermes`). Opcional, para quien lo lance a mano: la frase de la app no lo lleva
+    # hasta probarlo con un Hermes de verdad, y sin él se instala con lo que tenga.
+    i.add_argument("--actualizar-hermes", action="store_true",
+                   help="si Hermes es anterior a la %s, lo actualizo antes de nada (hermes update) y lo reinicio"
+                        % texto_de(RECOMENDADA))
     i.add_argument("--qr-png", metavar="FICHERO", help="con --por-chat: deja además el enlace en un PNG con su QR")
     i.add_argument("--recuperacion", metavar="PRUEBA",
                    help="con --por-chat: la firma del código de recuperación que pone la app, para volver a conectar")
@@ -426,7 +433,8 @@ def _avisos(op, sis, man, aqui, entrada, salida, terminal, ambito):
     if direccion == "PENDIENTE":
         direccion = None
     ns = _argparse.Namespace(iphone=None, direccion=direccion, hermes_home=None, reemplazar=op.reemplazar, si=op.si,
-                             plan=op.plan, por_chat=False, llave=None, activar_api=False, qr_png=None,
+                             plan=op.plan, por_chat=False, llave=None, activar_api=False, actualizar_hermes=False,
+                             qr_png=None,
                              # nftables o iptables a pelo, solo si ya los llevaba el instalador: poner los avisos no
                              # es motivo para empezar a tocar un cortafuegos (el vigía solo sale hacia el relé).
                              cortafuegos_a_mano=not man.datos.get("cortafuegos_propio"), corregir_exposicion=False,
@@ -439,7 +447,7 @@ def _avisos(op, sis, man, aqui, entrada, salida, terminal, ambito):
 def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
     """La pasarela: la instala, la repara o da de alta un iPhone en ella. En un servidor con la VPN de antes, va a su
     lado sin tocarla, y el plan dice cómo quitarla (`modo_tls._convivir`). Con `--avisos`, también el vigía."""
-    from . import modo_tls, porchat
+    from . import actualizar_hermes, modo_tls, porchat
     codigo = None
     if getattr(op, "avisos", None):
         codigo = _codigo_de_avisos(op.avisos, entrada, salida, terminal)
@@ -450,7 +458,8 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
                         llave=op.llave, activar_api=op.activar_api, qr_png=op.qr_png,
                         cortafuegos_a_mano=op.cortafuegos_a_mano, corregir_exposicion=op.corregir_exposicion,
                         avisos=codigo, volver_atras=getattr(op, "volver_atras", False),
-                        recuperacion=getattr(op, "recuperacion", None))
+                        recuperacion=getattr(op, "recuperacion", None),
+                        actualizar_hermes=getattr(op, "actualizar_hermes", False))
     del codigo
     # Lo que no se da, como se instaló (`plan.completar_opciones`): `actualizar` lanza `instalar --si` a secas.
     como_se_instalo = completar_opciones(opciones, man)
@@ -479,6 +488,27 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
     plan = modo_tls.calcular_plan_tls(sis, det, man, opciones, aqui)
     plan.avisos[:0] = como_se_instalo + de_antes
     comprobar_version(sis, man, ambito, plan)
+    # Desde la 0.12.0 (Daniel, 2026-10-08), con --actualizar-hermes: un Hermes anterior a la que la app aprovecha entera
+    # se actualiza antes que nada, y con él de vuelta se vuelve a mirar todo. Si no se puede, se sigue con lo que hay desde
+    # la mínima de respaldo, y se dice por qué (`actualizar_hermes`).
+    decision = actualizar_hermes.decidir(sis, det, plan, opciones, ambito,
+                                         en_segundo_plano=getattr(op, "en_segundo_plano", False))
+    actualizacion = None
+    if decision is not None and decision.toca:
+        actualizacion = actualizar_hermes.actualizar(sis, decision, det, ambito, salida, por_chat=opciones.por_chat)
+        if actualizacion.parada is not None:
+            # Hermes no ha vuelto: de HeHermes no se ha instalado nada, y se dice como cualquier otra parada.
+            salida("\nerror: %s" % actualizacion.parada)
+            if opciones.por_chat:
+                salida("\n" + PREFIJO_DETALLE + actualizacion.parada.detalle + "\n" + PREFIJO_ERROR +
+                       actualizacion.parada.codigo)
+            return 1
+        det = detectar_ya()
+        det, de_antes = segun_lo_instalado(sis, man, ambito, opciones, det, detectar_ya)
+        plan = modo_tls.calcular_plan_tls(sis, det, man, opciones, aqui)
+        plan.avisos[:0] = como_se_instalo + de_antes
+        comprobar_version(sis, man, ambito, plan)
+    actualizar_hermes.anotar(plan, decision, actualizacion)
     salida(pintar(plan, color=terminal).rstrip("\n"))
     if not op.plan and plan.bloqueos and all(getattr(b, "codigo", None) == "reinicia-hermes" for b in plan.bloqueos) \
             and any(a.tipo == "env" for a in plan.acciones):
@@ -555,6 +585,7 @@ def _instalar(op, sis, man, aqui, entrada, salida, terminal, ambito):
                                                                        else ambito.orden))
     if reinicio is not None:
         la_marcha.avisar("hermes-se-reinicia" if reinicio else "reinicia-hermes")
+    actualizar_hermes.avisos_para_la_app(la_marcha, decision, actualizacion, det.hermes)
     if el_enlace:
         # Para la app, juntos y justo antes del enlace: lo que la persona tiene que saber (`hehermes-aviso:`).
         hallado = re.search(r"&p=(\d+)&", el_enlace)

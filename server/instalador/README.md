@@ -83,6 +83,17 @@ acaba, dice `hehermes-sigue:` y el mismo comando se engancha a ella. Con el cód
 2026-10-06), un iPhone vuelve a conectar por chat tras reinstalarla o cambiar de iPhone, con una firma que no revela el
 código. Y el modelo de cada agente se elige al crearlo y se cambia luego.
 
+**La 0.12.0 instala con el Hermes que haya, desde la 0.15.0** (decisión de Daniel del 2026-10-08). Un probador pegó la
+frase con un Hermes 0.19.0 y la 0.11.2 se paró con `hermes-antiguo`, pidiéndole que lo actualizara él. Ahora un Hermes
+antiguo se instala al momento con lo que tenga: **la mínima es la 0.15.0**, el modelo (`GET /api/model/options`) y el
+desvío (`POST /v1/runs/{id}/steer`) ya no son obligatorios, y por debajo de la 0.21.1 la salida dice claro que se
+instala igual y que «/update» trae elegir el modelo y escribirle mientras trabaja (y, para la app, el aviso
+`hermes-sin-actualizar motivo=sin-permiso`). Además, **`--actualizar-hermes`, opcional y para quien lo lance a mano**
+([abajo](#hermes-al-día-desde-la-0120)): actualiza a Hermes antes que nada (`hermes update`), lo reinicia, espera a que
+vuelva y sigue. La frase de la app no lo lleva hasta probarlo con un Hermes de verdad: ese reinicio corta el turno de
+Hermes, y el enlace solo llega por el chat. Con él, códigos nuevos: la línea `hehermes-reinicio:` (no es un error) y
+`hehermes-error:hermes-no-volvio`.
+
 **La 0.11.1 hace que actualizar no deje a nadie tirado** (la auditoría del 2026-10-06):
 - **Recuerda cómo se instaló.** `--direccion`, `--hermes-home` y `--cortafuegos-a-mano` van al manifiesto y se vuelven a
   usar mientras no se dé otra cosa: «Actualizar» desde la app lanza `instalar --si` a secas, y detrás de un NAT (AWS,
@@ -140,7 +151,9 @@ Más opciones de `instalar`: `--direccion <IP o nombre>` (la del QR, si el servi
 `--hermes-home <carpeta>` (si hay varios Hermes), `--reemplazar <fichero>` (repetible), `--si` (sin preguntar; sin un
 terminal es obligatorio), `--activar-api`, `--corregir-exposicion` (la API de Hermes, solo en 127.0.0.1:
 [abajo](#la-api-de-hermes-sin-exponer)), `--cortafuegos-a-mano` (el cortafuegos lo llevas tú:
-[abajo](#los-cortafuegos)), `--volver-atras` (esta versión aunque la instalada sea más nueva) y, para el alta por chat,
+[abajo](#los-cortafuegos)), `--volver-atras` (esta versión aunque la instalada sea más nueva), `--actualizar-hermes`
+(desde la 0.12.0, opcional, a mano: si Hermes es anterior a la 0.21.1, lo actualizo antes de nada y lo reinicio,
+[abajo](#hermes-al-día-desde-la-0120)) y, para el alta por chat,
 `--por-chat --llave <llave> [--qr-png <fichero>] [--recuperacion <prueba>]` (abajo). `--modo tls` se sigue aceptando
 (lo llevan los comandos de antes), y no cambia nada.
 
@@ -482,7 +495,7 @@ Hay que saber:
   - /usr/local/sbin/hehermes-dispositivo no es mío: no lo toco. Para los iPhone de la pasarela usa el mío: sudo /opt/hehermes-servidor/hehermes-dispositivo alta <nombre>
   - Aquí ya hay unos avisos puestos a mano (/opt/hehermes-avisos, los de server/avisos/despliegue/instalar.sh): ni el vigía ni el lector de ficheros los pongo yo, y lo suyo no lo toco
 
-64 cambios.
+65 cambios.
 ```
 <!-- /pasarela-de-daniel -->
 
@@ -721,7 +734,8 @@ empezar** (`a-medias`, `apt`, `pip`, `python`, `ocupado`, `interrumpido`: [abajo
 | `linger` | Sin root y sin linger (y no se ha podido encender): la pasarela se pararía al cerrarse la sesión. `sudo loginctl enable-linger <usuario>` |
 | `sin-hermes`, `hermes-parado`, `varios-hermes` | No hay Hermes, está parado, o hay varios (`--hermes-home`) |
 | `api-apagada`, `api-hermes`, `clave-hermes` | La API de Hermes apagada (y no se puede encender: sin `--activar-api`, o en un contenedor con su propia red), que no contesta o no en 127.0.0.1, o su `API_SERVER_KEY` que falta o no vale |
-| `hermes-antiguo` | Desde la 0.10.4: a Hermes le falta algo que la app necesita (anterior a la 0.20.1, o uno al que le falta una ruta). Justo antes de la última línea va otra para la app: `hehermes-detalle:version=<la suya, o ?> minima=0.20.1 falta=<claves>` ([abajo](#el-hermes-que-necesita-la-app-desde-la-0104)) |
+| `hermes-antiguo` | Desde la 0.10.4: a Hermes le falta algo que la app necesita (desde la 0.12.0, anterior a la 0.15.0; hasta la 0.11.2, a la 0.20.1; o uno al que le falta una ruta). Justo antes de la última línea va otra para la app: `hehermes-detalle:version=<la suya, o ?> minima=0.15.0 falta=<claves>` y, desde la 0.12.0, si con `--actualizar-hermes` no se ha podido actualizar, ` actualizar=<contenedor\|suelto\|permisos\|primer-plano\|sin-orden\|fallo\|sin-cambios\|no-volvio>` ([abajo](#el-hermes-que-necesita-la-app-desde-la-0104)) |
+| `hermes-no-volvio` | Desde la 0.12.0: con `--actualizar-hermes`, Hermes no ha vuelto tras `hermes update` y su reinicio, ni devolviendo su código a como estaba. De HeHermes no se ha instalado nada, pero Hermes sí se ha tocado. Justo antes, `hehermes-detalle:version=<la que tenía>`; el texto da las órdenes para mirarlo y reiniciarlo ([abajo](#hermes-al-día-desde-la-0120)) |
 | `reinicia-hermes` | Hermes no corre bajo systemd ni en un contenedor: su API ya está encendida en el `.env`, y hay que reiniciarlo (`/restart`) y volver a lanzar lo mismo. Desde la 0.11.1, si se vuelve a lanzar sin reiniciarlo, sale otra vez, sin volver a tocar el `.env` (hasta la 0.11.0, `api-hermes`) |
 | `ensurepip`, `sin-disco`, `puerto`, `sistema`, `paquete` | Sin `python3-venv`, sin sitio (150 MB), sin puerto libre (o, desde la 0.11.1, el 127.0.0.1:8790 del vigía ocupado por otro programa), un sistema que no sabe, o un paquete incompleto |
 | `cortafuegos` | El cortafuegos cierra el paso y no se sabe abrir sin riesgo |
@@ -811,6 +825,8 @@ saber, con `clave=valor` detrás si hace falta:
 | `hermes-se-reinicia` | Hermes se reinicia al acabar (con drenaje, o a los 90 s): tardará un momento en contestar |
 | `reinicia-hermes` | No he podido programar su reinicio: hay que mandarle `/restart` para que lea su `.env` |
 | `avisos-push` | El vigía no está bien del todo: la app conecta, pero los avisos pueden no llegar |
+| `hermes-actualizado antes=<X> version=<Y>` | Desde la 0.12.0: con `--actualizar-hermes`, Hermes se ha actualizado antes de instalar |
+| `hermes-sin-actualizar version=<X> motivo=<…>` | Desde la 0.12.0: Hermes es anterior a la 0.21.1 y se ha instalado con lo que tiene: sin `--actualizar-hermes` (la frase de la app), `motivo=sin-permiso`; con él, no se ha podido actualizar (los motivos de `actualizar=`, arriba): la app funciona desde la 0.15.0, sin lo que llegó después |
 
 **El canje** (`hehermes_servidor/canje.py`) es una unidad temporal, `hehermes-canje`, lanzada con `systemd-run` para que
 sobreviva al comando de Hermes:
@@ -880,7 +896,10 @@ CPU, la instalación puede pasar de 180 s: la 0.11.1 decía hasta dónde llegó,
   aquí mismo, como hasta la 0.11.1. Sin systemd, la detección se para enseguida con su código (`sistema`, `contenedor`).
 
 La frase le pide a Hermes que, si acaba en `hehermes-sigue:` o se corta por tiempo, vuelva a ejecutar el mismo comando
-hasta el enlace o un error ([arriba](#el-alta-por-chat---por-chat)). Es lo que pide la persona: el instalador solo dice
+hasta el enlace o un error ([arriba](#el-alta-por-chat---por-chat)). Desde la 0.12.0, quien la sigue acaba también, ya,
+en cuanto la instalación dice que va a actualizar a Hermes y reiniciarlo (`hehermes-reinicio:`, la última; `fondo.en_reinicio`),
+y el mismo comando otra vez, mientras siga en eso, acaba igual enseguida: el reinicio cortaría su turno
+([abajo](#hermes-al-día-desde-la-0120)). Es lo que pide la persona: el instalador solo dice
 que sigue (la spec, «La frase»). Con el detector de comandos peligrosos de Hermes (`tools/approval_detection.py`, su
 `main` del 2026-10-06), ni el comando de la frase ni el lanzador solo piden aprobación. La app, si se le pega un
 `hehermes-sigue:` (o solo pasos), dice «Todavía se está instalando: dile a tu Hermes que siga», con un mensaje para él.
@@ -979,10 +998,12 @@ de dar el QR o el enlace (`hehermes_servidor/capacidades.py`), y `comprobar` lo 
   su historial y fijarla, archivarla o renombrarla (`GET`/`POST /api/sessions`, `GET …/messages`, `PATCH
   /api/sessions/{id}`: 0.15.0); mandar un mensaje y ver la respuesta mientras se escribe (`POST /v1/runs`,
   `GET /v1/runs/{id}/events`: 0.8.0); recuperarla y pararla (`GET /v1/runs/{id}`, `POST …/stop`: 0.12.0); aprobar una
-  orden (`POST …/approval`: 0.14.0); el modelo (`GET /api/model/options`: 0.19.1); y escribir mientras trabaja
-  (`POST …/steer`: **0.20.1**). **La mínima es la 0.20.1.**
+  orden (`POST …/approval`: 0.14.0). **La mínima es la 0.15.0** (desde la 0.12.0, la de respaldo; hasta la 0.11.2,
+  la 0.20.1).
 - **Lo que la app puede no tener** (se avisa y sigue): el consumo de la ficha (`GET /api/sessions/{id}`), «Eliminar
-  también de Hermes» (`DELETE /api/sessions/{id}`) y las tareas programadas (`GET /api/jobs`).
+  también de Hermes» (`DELETE /api/sessions/{id}`), las tareas programadas (`GET /api/jobs`) y, desde la 0.12.0
+  (Daniel, 2026-10-08: la app funciona sin ellos), el modelo (`GET /api/model/options`: 0.19.1) y escribirle mientras
+  trabaja (`POST …/steer`: 0.20.1). Sin sonda, lo que falta se sabe por la versión.
 - **Lo que no se ve en las rutas, por la versión:** hasta la **0.21.1** Hermes no lleva a los subagentes en segundo plano
   (`delegation_id`), y antes de la 0.21.0 no reconoce un mensaje repetido (`Idempotency-Key`): la app funciona, pero se
   avisa. Lo que no se avisa, porque un `main` dice la versión publicada anterior (el de Daniel dice «0.21.3» y ya lo
@@ -995,7 +1016,60 @@ de dar el QR o el enlace (`hehermes_servidor/capacidades.py`), y `comprobar` lo 
 - **Lo que dice:** la versión en el plan (`Hermes … versión 0.21.3`) y en `comprobar`; a uno viejo, `hermes-antiguo` con
   su versión, lo que le falta (cada cosa con su ruta) y cómo actualizarlo: `hermes update` como su usuario o `/update` en
   su chat (lo actualiza y lo reinicia); en un contenedor, su imagen nueva. Por chat, antes de la última línea,
-  `hehermes-detalle:version=0.19.0 minima=0.20.1 falta=modelo,desviar`, para la app.
+  `hehermes-detalle:version=0.14.0 minima=0.15.0 falta=bandeja,nueva,historial,ficha`, para la app. Con
+  `--actualizar-hermes` no se llega a esto si se puede actualizar (abajo).
+
+### Hermes, al día (desde la 0.12.0)
+
+Decisión de Daniel del 2026-10-08, cuando un probador pegó la frase con un Hermes 0.19.0 y la 0.11.2 se paró con
+`hermes-antiguo`. **La frase de la app no lo lleva** (Daniel, 2026-10-08): con un Hermes antiguo se instala al momento
+con lo que tenga, desde la 0.15.0 (arriba), y esto queda para quien lo lance a mano hasta probarlo con un Hermes de
+verdad. Con **`--actualizar-hermes`** (el permiso) y un Hermes anterior a la
+**0.21.1**, la que la app aprovecha entera (`capacidades.RECOMENDADA`), el instalador lo actualiza **antes que nada**
+(`hehermes_servidor/actualizar_hermes.py`, y lo prueba `tests/test_actualizar_hermes.py`). A uno que ya la tiene (o que
+no dice su versión y tiene todo) no lo toca; y si la instalación se va a parar por otra cosa, tampoco.
+
+- **Con su propio actualizador, como lo hace Hermes**: `hermes update` (la orden del venv junto a su código, la que lo
+  lanza o la de su PATH), como el dueño de su código (con root, `runuser -u <dueño>`), con su casa, el PATH con el que
+  corre (y `~/.local/bin`, donde suelen estar uv y git), su `HERMES_HOME` si lo lleva, el systemd de su usuario a mano y
+  **sin nada en la entrada** (si pregunta algo, lee el final), con 20 minutos de plazo.
+- **Su reinicio**: si `hermes update` no lo ha reiniciado ya (el de verdad reinicia su unidad si la ve en marcha), con
+  `systemctl [--user] restart` de su unidad; y se espera a que vuelva, hasta **10 minutos**, preguntando a los 2, 3, 5…
+  y luego cada 30 s: con su API, que `/health` diga una versión nueva; sin ella (`--activar-api` la enciende después), que
+  su unidad esté en marcha con otro proceso, el mismo dos veces seguidas. Con él de vuelta, se vuelve a mirar todo y se
+  sigue como siempre; el plan dice «He actualizado tu Hermes antes de nada: de la X a la Y», y por chat va el aviso
+  `hermes-actualizado`.
+- **El reinicio corta el turno de Hermes que lanzó el instalador.** Por eso solo se hace por chat en segundo plano
+  ([arriba](#en-segundo-plano-por-chat-desde-la-0112): la instalación es hija de PID 1 y el reinicio no la toca) o por
+  un terminal; por chat aquí mismo (sin `systemd-run`), nunca (`primer-plano`). Y por chat, antes de tocarlo, se dice:
+  una explicación para Hermes y la línea `hehermes-reinicio: <su versión> (<s> s)`, la última. Quien la sigue acaba en
+  cuanto la ve, Hermes contesta con ella (una frase que lo lleve tiene que decirle que es normal y que no haga nada
+  más), y la instalación espera
+  a que ese turno acabe —que el que la sigue ya no esté (`HEHERMES_LANZADO_POR`) y 45 s para su respuesta— antes de
+  lanzar `hermes update`. Cuando Hermes vuelve, el mismo comando otra vez se engancha a la instalación y da el enlace.
+  **La app no puede conectarse sola**: el enlace solo llega por el chat. Si se le pega la respuesta con
+  `hehermes-reinicio:`, dice «Tu Hermes se está actualizando… cuando te conteste otra vez, mándale este mensaje» y le da
+  el de «sigue».
+- **Nada destructivo.** Ni se borra ni se reinstala Hermes. Si `hermes update` falla sin cambiar su código, Hermes sigue
+  como estaba y no se reinicia. Lo que cuenta es su código (su versión y su commit), no lo que devuelve `hermes update`:
+  uno que falla después de traerlo (al preguntar algo) se reinicia y vale.
+- **Si no vuelve**, y su código es un checkout de git que el update ha movido y está limpio, se devuelve a donde estaba
+  (`git reset --keep <commit de antes>`, como su dueño: lo nuevo sigue en su `origin`, y su próximo `hermes update` lo
+  vuelve a traer), se reinicia y se esperan otros 5 minutos: si vuelve, se sigue con la de antes (`no-volvio`). Si no, o
+  si no se puede (no es un checkout, tiene cambios sin guardar), `hehermes-error:hermes-no-volvio`, sin haber instalado
+  nada de HeHermes, con las órdenes para mirarlo (`journalctl`) y reiniciarlo.
+- **Si no se puede actualizar**, se sigue con el que hay desde la mínima de respaldo (la 0.15.0) y se dice por qué (en el
+  plan, y por chat en el aviso `hermes-sin-actualizar version=<X> motivo=<…>`); por debajo de ella, `hermes-antiguo`,
+  con ` actualizar=<motivo>` en su detalle. Los motivos: `contenedor` (en Docker o Podman: lo de dentro se pierde al
+  recrearlo, se actualiza con su imagen), `suelto` (tmux, nohup: no se sabe reiniciar), `permisos` (sin root, una unidad
+  que no es suya, o un código de otro), `primer-plano`, `sin-orden` (sin su `hermes`), `fallo`, `sin-cambios` (no ha
+  traído nada: ¿un checkout fijado?) y `no-volvio`.
+- **Sin el permiso** (la frase de la app), como hasta la 0.11.2 con la mínima nueva: por debajo de la 0.15.0,
+  `hermes-antiguo`; por debajo de la 0.21.1, se instala igual y lo dice claro, con lo que trae «/update» (y el aviso
+  `hermes-sin-actualizar motivo=sin-permiso`). Con `--plan`, dice lo que haría.
+- **Lo que no está probado de verdad**: un `hermes update` real (con su git, su uv y sus migraciones; si en alguna
+  versión pregunta algo y con la entrada vacía se para), su reinicio de la unidad desde dentro, y un Hermes de verdad
+  leyendo `hehermes-reinicio:` y contestando antes de reiniciarse.
 - **La dirección pública:** la de salida (`ip route get`); si es privada, `--direccion` o se pregunta en un terminal.
 - **Lo que ya hay:** el puerto de la pasarela (uno libre), el cortafuegos (ufw, firewalld, nftables e iptables:
   [abajo](#los-cortafuegos)), `python3-venv`, el gestor de usuario y linger (sin root), y una VPN de HeHermes, hecha a

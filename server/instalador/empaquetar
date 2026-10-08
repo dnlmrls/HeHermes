@@ -145,7 +145,10 @@ def frase(base, version, suma, iphone, llave):
 
 #: Lo de detrás del comando (desde la 0.11.2): la instalación va en segundo plano y, si no acaba antes del plazo de la
 #: terminal de Hermes, la última línea es «hehermes-sigue:» (`hehermes_servidor/fondo.py`); el mismo comando otra vez la
-#: vuelve a seguir. La app lo escribe igual (`Bienvenida.fraseParaElChat`).
+#: vuelve a seguir. La app lo escribe igual (`Bienvenida.fraseParaElChat`). No lleva `--actualizar-hermes` (Daniel,
+#: 2026-10-08): con un Hermes antiguo se instala al momento con lo que tenga, y actualizarlo antes (que lo reinicia a
+#: mitad, `hehermes_servidor/actualizar_hermes.py`) queda para quien lo lance a mano hasta probarlo con un Hermes de
+#: verdad.
 CIERRE_DE_LA_FRASE = (
     "Tarda unos minutos. Si acaba en «hehermes-sigue:» o se corta por tiempo, sigue instalándose: vuelve a ejecutar el "
     "mismo comando, tal cual, hasta que acabe en «hehermes-canje:» o en «hehermes-error:». Con «hehermes-canje:», "

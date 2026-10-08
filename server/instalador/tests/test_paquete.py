@@ -149,6 +149,9 @@ class Paquete(unittest.TestCase):
                          .replace("{versión}", "0.2.0").replace("{sha256}", "ab" * 32).replace("{nombre}", "mi-iphone")
                          .replace("{llave}", "LLAVE"))
         self.assertIn(" instalar --por-chat --activar-api --iphone mi-iphone --llave LLAVE`", frase)
+        # Sin --actualizar-hermes (Daniel, 2026-10-08): con un Hermes antiguo se instala con lo que tenga.
+        self.assertNotIn("--actualizar-hermes", frase)
+        self.assertNotIn("hehermes-reinicio", frase)
 
     def test_la_url_por_defecto_es_la_de_las_releases_de_github(self):
         # Decisión 1, por ahora: una Release `v<versión>` del repositorio público, con el paquete como asset.

@@ -53,7 +53,11 @@ class Base(unittest.TestCase):
 class LaTabla(unittest.TestCase):
     def test_la_minima_es_la_ultima_obligatoria_en_llegar(self):
         self.assertEqual(cap.MINIMA, max(cap.version(c.desde) for c in cap.CAPACIDADES if c.obligatoria))
-        self.assertEqual(cap.texto_de(cap.MINIMA), "0.20.1")
+        # Desde la 0.12.0 (Daniel, 2026-10-08): la de respaldo, las sesiones; el modelo y el desvío ya no paran.
+        self.assertEqual(cap.texto_de(cap.MINIMA), "0.15.0")
+        self.assertFalse(cap.POR_CLAVE["modelo"].obligatoria)
+        self.assertFalse(cap.POR_CLAVE["desviar"].obligatoria)
+        self.assertEqual(cap.texto_de(cap.RECOMENDADA), "0.21.1")
 
     def test_cada_capacidad_llega_cuando_dice_la_historia_de_hermes(self):
         historia = {}
@@ -104,23 +108,29 @@ class LasEdades(Base):
                 self.assertTrue(det.hermes.sondeo.calibrada)
                 self.assertEqual(det.hermes.sondeo.ausentes, set())
 
-    def test_a_uno_sin_desvio_le_falta_solo_eso(self):
+    def test_a_uno_sin_desvio_se_le_avisa_de_eso_y_sigue(self):
+        """Desde la 0.12.0 el desvío no es obligatorio (2026-10-08): se avisa, y se sigue."""
         self.montar("0.20.0")
         det = self.detectar()
-        (bloqueo,) = self.antiguo(det)
-        self.assertIn("la 0.20.0, según su /health", bloqueo)
-        self.assertIn("escribirle mientras trabaja (POST /v1/runs/{id}/steer)", bloqueo)
-        self.assertNotIn("GET /api/model/options", bloqueo)
-        self.assertIn("HeHermes necesita Hermes 0.20.1 o más nuevo", bloqueo)
-        self.assertIn("«hermes update» en el servidor, como root, o «/update» en su chat", bloqueo)
-        self.assertEqual(bloqueo.detalle, "version=0.20.0 minima=0.20.1 falta=desviar")
+        self.assertEqual(det.bloqueos, [])
+        (aviso,) = [a for a in det.avisos if a.startswith("A tu Hermes")]
+        self.assertIn("la 0.20.0, según su /health", aviso)
+        self.assertIn("escribirle mientras trabaja (POST /v1/runs/{id}/steer)", aviso)
+        self.assertNotIn("GET /api/model/options", aviso)
+        self.assertIn("«/update» en su chat, o «hermes update» en el servidor, como root", aviso)
 
-    def test_a_uno_de_julio_le_faltan_el_modelo_y_el_desvio(self):
+    def test_a_uno_de_julio_le_faltan_el_modelo_y_el_desvio_y_sigue(self):
+        """El Hermes del probador del 2026-10-08 (la 0.19.0): hasta la 0.11.2, `hermes-antiguo`; ahora, un aviso."""
         self.montar("0.19.0")
-        (bloqueo,) = self.antiguo(self.detectar())
-        self.assertIn("GET /api/model/options", bloqueo)
-        self.assertIn("POST /v1/runs/{id}/steer", bloqueo)
-        self.assertEqual(bloqueo.detalle, "version=0.19.0 minima=0.20.1 falta=modelo,desviar")
+        det = self.detectar()
+        self.assertEqual(self.antiguo(det), [])
+        (aviso,) = [a for a in det.avisos if a.startswith("A tu Hermes")]
+        # Que se lea claro que se instala igual, y qué trae «/update» (Daniel, 2026-10-08).
+        self.assertEqual(aviso, "A tu Hermes (la 0.19.0, según su /health) le falta elegir el modelo (GET "
+                                "/api/model/options); escribirle mientras trabaja (POST /v1/runs/{id}/steer). Instalo "
+                                "igual: la app funciona sin eso, y lo tendrás en cuanto lo actualices («/update» en su "
+                                "chat, o «hermes update» en el servidor, como root)")
+        self.assertTrue([a for a in det.avisos if a.startswith("Tu Hermes es la 0.19.0")])
 
     def test_uno_sin_sesiones_no_tiene_ni_la_bandeja(self):
         """Anterior a la 0.15.0: `GET /api/sessions` con su clave da 404. Antes era un «api-hermes» sin más."""
@@ -128,10 +138,8 @@ class LasEdades(Base):
         det = self.detectar()
         self.assertEqual([getattr(b, "codigo", None) for b in det.bloqueos], ["hermes-antiguo"])
         (bloqueo,) = self.antiguo(det)
-        for falta in ("bandeja", "nueva", "historial", "ficha", "modelo", "desviar"):
-            self.assertIn(falta, bloqueo.detalle)
-        for tiene in ("enviar", "eventos", "estado", "parar", "aprobar"):
-            self.assertNotIn(tiene, bloqueo.detalle)
+        self.assertEqual(bloqueo.detalle, "version=0.14.0 minima=0.15.0 falta=bandeja,nueva,historial,ficha")
+        self.assertIn("HeHermes necesita Hermes 0.15.0 o más nuevo", bloqueo)
 
     def test_hasta_la_recomendada_se_avisa_de_lo_que_no_se_ve(self):
         self.montar("0.20.1")
@@ -192,10 +200,20 @@ class SinSonda(Base):
         self.assertFalse(det.hermes.sondeo.calibrada)
         self.assertFalse([a for a in det.avisos if "No he podido comprobar" in a])
 
-    def test_con_una_vieja_se_para_por_la_version(self):
-        self.montar("0.18.0").trace_hermes = False
+    def test_con_una_vieja_se_para(self):
+        """Sin sonda, una anterior a la mínima: el 404 de su bandeja (con su clave) ya dice lo que falta."""
+        self.montar("0.14.0").trace_hermes = False
         (bloqueo,) = self.antiguo(self.detectar())
-        self.assertEqual(bloqueo.detalle, "version=0.18.0 minima=0.20.1 falta=modelo,desviar")
+        self.assertEqual(bloqueo.detalle, "version=0.14.0 minima=0.15.0 falta=bandeja")
+
+    def test_con_una_de_respaldo_avisa_por_la_version_de_lo_que_falta(self):
+        """Sin sonda, una 0.18.0 (desde la 0.12.0, de respaldo): sigue, y lo que le falta lo dice su versión."""
+        self.montar("0.18.0").trace_hermes = False
+        det = self.detectar()
+        self.assertEqual(det.bloqueos, [])
+        (aviso,) = [a for a in det.avisos if a.startswith("A tu Hermes")]
+        self.assertIn("GET /api/model/options", aviso)
+        self.assertIn("POST /v1/runs/{id}/steer", aviso)
 
     def test_sin_version_avisa_y_sigue(self):
         self.montar(None).trace_hermes = False
@@ -205,11 +223,11 @@ class SinSonda(Base):
 
     def test_un_servidor_que_contesta_trace_con_un_200_no_calibra(self):
         """Lo que dice `Allow` solo vale en un 405: un 200 a TRACE (un servidor que lo atiende) no dice qué rutas hay."""
-        self.montar("0.18.0").trace_hermes = "eco"
+        self.montar("0.14.0").trace_hermes = "eco"
         det = self.detectar()
         self.assertFalse(det.hermes.sondeo.calibrada)
         (bloqueo,) = self.antiguo(det)
-        self.assertEqual(bloqueo.detalle, "version=0.18.0 minima=0.20.1 falta=modelo,desviar")
+        self.assertEqual(bloqueo.detalle, "version=0.14.0 minima=0.15.0 falta=bandeja")
 
     def test_sin_sonda_ni_version_un_404_a_la_bandeja_es_que_no_la_tiene(self):
         """El GET de la bandeja con su clave también es una sonda: su 404 es el de una ruta que no existe."""
@@ -217,7 +235,7 @@ class SinSonda(Base):
         falso.trace_hermes = False
         falso.rutas_quitadas = {(metodo, ruta) for metodo, ruta, _ in sf.RUTAS_HERMES if ruta.startswith("/api/sessions")}
         (bloqueo,) = self.antiguo(self.detectar())
-        self.assertEqual(bloqueo.detalle, "version=? minima=0.20.1 falta=bandeja")
+        self.assertEqual(bloqueo.detalle, "version=? minima=0.15.0 falta=bandeja")
         self.assertIn("Tu Hermes (no dice su versión)", bloqueo)
 
     def test_un_405_sin_get_en_health_no_calibra(self):
@@ -237,19 +255,20 @@ class ConLaApiApagada(Base):
         return self.falso.codigo_de_hermes(version, **opciones)
 
     def test_viejo_se_para_sin_tocar_su_env(self):
-        carpeta = self.montar_apagado("0.18.2")
+        carpeta = self.montar_apagado("0.14.2")
         antes = self.sis.foto()
         self.assertEqual(self.orden("instalar", "--por-chat", "--activar-api", "--iphone", "mi-iphone", "--llave", LLAVE),
                          1)
         self.assertEqual(self.sis.foto(), antes, "ni el .env de Hermes")
-        self.assertIn("la 0.18.2, según su código, en %s" % carpeta, self.salida)
-        self.assertEqual(self.texto[-1].splitlines()[-2:], ["hehermes-detalle:version=0.18.2 minima=0.20.1 "
-                                                           "falta=modelo,desviar", "hehermes-error:hermes-antiguo"])
+        self.assertIn("la 0.14.2, según su código, en %s" % carpeta, self.salida)
+        self.assertEqual(self.texto[-1].splitlines()[-2:], ["hehermes-detalle:version=0.14.2 minima=0.15.0 "
+                                                           "falta=bandeja,nueva,historial,ficha",
+                                                           "hehermes-error:hermes-antiguo"])
 
     def test_la_version_sale_de_su_init_o_de_su_sello(self):
         for donde in ("init", "sello"):
             with self.subTest(donde=donde):
-                self.montar_apagado("0.19.0", donde=donde)
+                self.montar_apagado("0.14.0", donde=donde)
                 self.assertEqual(len(self.antiguo(self.detectar(activar_api=True))), 1)
 
     def test_una_buena_sigue_y_el_plan_lo_dice(self):
@@ -267,7 +286,7 @@ class ConLaApiApagada(Base):
 
     def test_su_codigo_se_encuentra_por_lo_que_ejecuta_su_proceso(self):
         self.montar(habilitada=False, como="proceso", orden="/opt/hermes/venv/bin/python -m hermes_cli.main gateway run")
-        self.falso.codigo_de_hermes("0.17.0", carpeta="/opt/hermes")
+        self.falso.codigo_de_hermes("0.14.1", carpeta="/opt/hermes")
         (bloqueo,) = self.antiguo(self.detectar(activar_api=True))
         self.assertIn("su código, en /opt/hermes", bloqueo)
 
@@ -275,9 +294,9 @@ class ConLaApiApagada(Base):
         self.montar(habilitada=False, como="docker", orden="/opt/hermes/.venv/bin/python /opt/hermes/.venv/bin/hermes "
                                                             "gateway run")
         pid = self.falso.pid_hermes
-        self.falso.codigo_de_hermes("0.16.0", carpeta="/proc/%d/root/opt/hermes" % pid)
+        self.falso.codigo_de_hermes("0.13.0", carpeta="/proc/%d/root/opt/hermes" % pid)
         (bloqueo,) = self.antiguo(self.detectar(activar_api=True))
-        self.assertIn("la 0.16.0", bloqueo)
+        self.assertIn("la 0.13.0", bloqueo)
         self.assertIn("va en el contenedor de Docker", bloqueo, "en un contenedor no vale hermes update")
 
 
@@ -289,7 +308,7 @@ class LoQueSeVe(Base):
         self.assertRegex(pintar(plan), r"  Hermes     /root/\.hermes/\.env .*, la clave vale, versión 0\.21\.3\n")
 
     def test_por_ssh_no_hay_lineas_para_la_app(self):
-        self.montar("0.19.0")
+        self.montar("0.14.0")
         self.assertEqual(self.orden("instalar", "--si"), 1)
         self.assertIn("No puedo seguir:", self.salida)
         self.assertNotIn("hehermes-error:", self.salida)
@@ -301,13 +320,21 @@ class LoQueSeVe(Base):
         man = Manifiesto.leer(self.sis)
         textos = [t for _, t in comprobar_tls(self.sis, man, amb.de_root())]
         self.assertIn("Hermes: versión 0.21.3, con todo lo que usa la app", textos)
-        # Hermes vuelve a una versión de antes (o a un fork sin el desvío): comprobar lo dice, con un MAL.
+        # Hermes vuelve a una versión de antes (o a un fork sin el desvío): comprobar lo dice, con un aviso desde la
+        # 0.12.0 (el desvío ya no es obligatorio); sin lo obligatorio (un fork sin `PATCH`), con un MAL.
         self.falso.version_hermes = "0.20.0"
         resultados = comprobar_tls(self.sis, man, amb.de_root())
-        malos = [t for bien, t in resultados if not bien]
+        self.assertEqual([t for bien, t in resultados if not bien], [])
+        textos = [t for _, t in resultados]
+        self.assertTrue([t for t in textos if t.startswith("Hermes (aviso): A tu Hermes") and "steer" in t], textos)
+        self.assertIn("Hermes: versión 0.20.0, con lo que la app necesita (lo que le falta, en el aviso)", textos)
+        self.falso.version_hermes = "0.21.3"
+        self.falso.rutas_quitadas = {("PATCH", "/api/sessions/{session_id}")}
+        malos = [t for bien, t in comprobar_tls(self.sis, man, amb.de_root()) if not bien]
         self.assertEqual(len(malos), 1, malos)
-        self.assertIn("POST /v1/runs/{id}/steer", malos[0])
+        self.assertIn("PATCH /api/sessions/{id}", malos[0])
         self.assertEqual(self.orden("comprobar"), 1)
+        self.falso.rutas_quitadas = set()
         self.falso.version_hermes = "0.21.0"
         textos = [t for _, t in comprobar_tls(self.sis, man, amb.de_root())]
         self.assertTrue([t for t in textos if t.startswith("Hermes (aviso): Tu Hermes es la 0.21.0")], textos)

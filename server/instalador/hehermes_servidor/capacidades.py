@@ -57,21 +57,27 @@ CAPACIDADES = (
     Capacidad("estado", "GET", "/v1/runs/{id}", True, "recuperar una respuesta si se corta la conexión", "0.12.0"),
     Capacidad("parar", "POST", "/v1/runs/{id}/stop", True, "pararlo a media respuesta", "0.12.0"),
     Capacidad("aprobar", "POST", "/v1/runs/{id}/approval", True, "aprobar o denegar una orden", "0.14.0"),
-    Capacidad("modelo", "GET", "/api/model/options", True, "decir qué modelo usa (lo primero que pregunta la app al "
-                                                           "conectar)", "0.19.1"),
-    Capacidad("desviar", "POST", "/v1/runs/{id}/steer", True, "escribirle mientras trabaja", "0.20.1"),
+    # Desde la 0.12.0 (Daniel, 2026-10-08) el modelo y el desvío ya no son obligatorios: la app funciona sin ellos (no
+    # dice ni cambia el modelo, y lo que se escribe mientras trabaja espera a que acabe). Así un Hermes de hace meses
+    # que no se puede actualizar (en Docker, sin `hermes` a mano, un `hermes update` que falla) sigue desde la 0.15.0.
+    Capacidad("modelo", "GET", "/api/model/options", False, "elegir el modelo", "0.19.1"),
+    Capacidad("desviar", "POST", "/v1/runs/{id}/steer", False, "escribirle mientras trabaja", "0.20.1"),
     Capacidad("consumo", "GET", "/api/sessions/{id}", False, "el consumo de cada conversación, en su ficha", "0.15.0"),
     Capacidad("borrar", "DELETE", "/api/sessions/{id}", False, "«Eliminar también de Hermes»", "0.15.0"),
     Capacidad("tareas", "GET", "/api/jobs", False, "las tareas programadas", "0.4.0"),
 )
 POR_CLAVE = {c.clave: c for c in CAPACIDADES}
 
-#: La mínima: la primera versión publicada con todo lo obligatorio (`POST /v1/runs/{id}/steer`, en la v0.20.1, la etiqueta
-#: v2026.8.13). La comprueba `test_capacidades` contra la tabla de arriba.
-MINIMA = (0, 20, 1)
-#: Desde aquí, lo que la app usa y no se ve en las rutas: la idempotencia duradera de `POST /v1/runs` (`Idempotency-Key`,
-#: el 409 `idempotency_key_conflict`, en la 0.21.0) y los subagentes en segundo plano (`delegation_id`, la 0.21.1). Con
-#: una anterior la app funciona, pero un reintento puede llegarle dos veces y «Usa subagentes» espera a que acaben.
+#: La mínima: la primera versión publicada con todo lo obligatorio (las sesiones, la 0.15.0). La comprueba
+#: `test_capacidades` contra la tabla de arriba. Hasta la 0.11.2 era la 0.20.1 (el desvío); desde la 0.12.0 (Daniel,
+#: 2026-10-08) es la de respaldo: la que tiene que tener Hermes si no se puede actualizar.
+MINIMA = (0, 15, 0)
+#: Desde aquí, lo que la app aprovecha entero: además del modelo y el desvío (arriba), lo que no se ve en las rutas, la
+#: idempotencia duradera de `POST /v1/runs` (`Idempotency-Key`, el 409 `idempotency_key_conflict`, en la 0.21.0) y los
+#: subagentes en segundo plano (`delegation_id`, la 0.21.1). Con una anterior la app funciona, pero un reintento puede
+#: llegarle dos veces y «Usa subagentes» espera a que acaben. Desde la 0.12.0, con `--actualizar-hermes` (opcional, para
+#: quien lo lance a mano: la frase de la app no lo lleva), un Hermes anterior a esta se actualiza antes de nada
+#: (`actualizar_hermes`); uno que ya la tiene, no.
 RECOMENDADA = (0, 21, 1)
 _IDEMPOTENCIA = (0, 21, 0)
 
@@ -177,12 +183,13 @@ def sondear(sis, puerto: int, version_texto=None) -> Sondeo:
 
 
 def como_actualizar(usuario=None, gestor=None) -> str:
-    """Cómo se actualiza Hermes: `hermes update` (o su `/update` del chat, que también lo reinicia); en un contenedor, su
-    imagen nueva (lo de dentro se pierde al recrearlo)."""
+    """Cómo se actualiza Hermes: su `/update` del chat, que lo actualiza y lo reinicia (lo primero, desde la 0.12.0: es lo
+    que puede hacer cualquiera desde su chat), o `hermes update`; en un contenedor, su imagen nueva (lo de dentro se
+    pierde al recrearlo)."""
     from .gestor import CONTENEDORES
     if gestor is not None and gestor.tipo in CONTENEDORES:
         return "va en %s: con la imagen nueva de Hermes" % gestor.describir()
-    return "«hermes update» en el servidor, como %s, o «/update» en su chat" % (usuario or "el usuario que lo corre")
+    return "«/update» en su chat, o «hermes update» en el servidor, como %s" % (usuario or "el usuario que lo corre")
 
 
 def _de_quien(sondeo) -> str:
@@ -224,9 +231,14 @@ def veredicto(sondeo, usuario=None, gestor=None) -> tuple:
                          detalle(sondeo, faltan)))
         return bloqueos, avisos
     opcionales = [c for c in CAPACIDADES if not c.obligatoria and c.clave in sondeo.ausentes]
+    if not opcionales and not sondeo.calibrada and numeros is not None:
+        # Sin sonda, por la versión: desde la 0.12.0 el modelo y el desvío son de estas (2026-10-08).
+        opcionales = [c for c in CAPACIDADES if not c.obligatoria and version(c.desde) > numeros]
     if opcionales:
-        avisos.append("A tu Hermes (%s) le falta %s: la app funciona, pero eso no lo tendrás. Se arregla "
-                      "actualizándolo (%s)" % (_de_quien(sondeo), _lista(opcionales), actualizar))
+        # Desde la 0.12.0 (Daniel, 2026-10-08) un Hermes antiguo se instala al momento con lo que tenga: que se lea claro
+        # que se instala igual y qué trae actualizarlo.
+        avisos.append("A tu Hermes (%s) le falta %s. Instalo igual: la app funciona sin eso, y lo tendrás en cuanto lo "
+                      "actualices (%s)" % (_de_quien(sondeo), _lista(opcionales), actualizar))
     if numeros is not None and numeros < RECOMENDADA:
         que = ["lleva a los subagentes en segundo plano (con «Usa subagentes», el turno espera a que acaben)"]
         if numeros < _IDEMPOTENCIA:
@@ -290,6 +302,12 @@ def _version_del_venv(sis, venv) -> str | None:
                 if datos and version(datos.group(1)) is not None:
                     return legible(datos.group(1))
     return None
+
+
+def version_en_carpeta(sis, carpeta) -> str | None:
+    """La versión del código de Hermes de `carpeta` (su checkout, o un venv con él), o None. La usa también
+    `actualizar_hermes` (desde la 0.12.0) para saber si `hermes update` ha cambiado algo."""
+    return _version_en(sis, carpeta) or _version_del_venv(sis, carpeta)
 
 
 def version_del_codigo(sis, hermes) -> tuple:

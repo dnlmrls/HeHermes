@@ -947,7 +947,11 @@ def _capacidades_de_hermes(sis, man, puerto, mira, sin_bandeja=False):
         mira(True, "Hermes (aviso): " + texto, "")
     if bloqueos:
         return
-    if sondeo.calibrada:
+    if sondeo.calibrada and any(not c.obligatoria and c.clave in sondeo.ausentes for c in capacidades.CAPACIDADES):
+        # Desde la 0.12.0 (2026-10-08), el modelo y el desvío son de estas: le pueden faltar, y lo dice el aviso.
+        mira(True, "Hermes: versión %s, con lo que la app necesita (lo que le falta, en el aviso)"
+             % (version or "desconocida"), "")
+    elif sondeo.calibrada:
         mira(True, "Hermes: versión %s, con todo lo que usa la app" % (version or "desconocida"), "")
     else:
         mira(True, "Hermes: versión %s (la app necesita la %s o más nueva)"

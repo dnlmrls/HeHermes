@@ -26,7 +26,8 @@ EJECUTABLES_PROPIOS = ("hehermes-servidor", "hehermes-pasarela")
 class Opciones:
     def __init__(self, iphone=None, direccion=None, hermes_home=None, reemplazar=(), si=False, solo_plan=False,
                  por_chat=False, llave=None, activar_api=False, qr_png=None, cortafuegos_a_mano=False,
-                 corregir_exposicion=False, avisos=None, volver_atras=False, recuperacion=None):
+                 corregir_exposicion=False, avisos=None, volver_atras=False, recuperacion=None,
+                 actualizar_hermes=False):
         #: Si hay alguien delante de un terminal (el QR de la pasarela solo se pinta ahí).
         self.terminal = True
         self.iphone = iphone
@@ -52,6 +53,9 @@ class Opciones:
         #: hace falta (el chat estaba cerrado): `recuperando`, que lo decide `porchat.comprobar_recuperacion`.
         self.recuperacion = recuperacion
         self.recuperando = False
+        #: Desde la 0.12.0 (2026-10-08): el permiso para actualizar Hermes antes de nada si es anterior a la recomendada
+        #: (`--actualizar-hermes`, opcional, a mano: la frase de la app no lo lleva; `actualizar_hermes`).
+        self.actualizar_hermes = actualizar_hermes
 
 
 class Accion:

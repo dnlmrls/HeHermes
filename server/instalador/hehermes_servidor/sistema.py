@@ -216,6 +216,19 @@ class Sistema:
         except OSError:
             return None
 
+    def dueno(self, ruta: str) -> int | None:
+        """El uid del dueño de `ruta` (siguiendo enlaces), o None si no se puede mirar. Desde la 0.12.0: `hermes update`
+        se lanza como el dueño del código de Hermes (`actualizar_hermes`, 2026-10-08)."""
+        try:
+            return os.stat(self.ruta(ruta)).st_uid
+        except OSError:
+            return None
+
+    def es_ejecutable(self, ruta: str) -> bool:
+        """Un fichero (o un enlace a uno) que se puede ejecutar."""
+        real = self.ruta(ruta)
+        return os.path.isfile(real) and os.access(real, os.X_OK)
+
     # Escritura
 
     def libre(self, ruta: str) -> int | None:
@@ -369,6 +382,23 @@ class Sistema:
             campos = linea.split(":")
             if len(campos) >= 6 and campos[2] == str(uid):
                 return campos[0], campos[5]
+        return None
+
+    def cuenta_de(self, nombre):
+        """(uid, casa) del usuario `nombre`, como `cuenta` pero al revés, o None si no existe (desde la 0.12.0)."""
+        if not isinstance(nombre, str) or not nombre:
+            return None
+        if self.raiz == "/":
+            import pwd
+            try:
+                datos = pwd.getpwnam(nombre)
+            except (KeyError, ValueError):
+                return None
+            return datos.pw_uid, datos.pw_dir
+        for linea in (self.leer_texto("/etc/passwd") or "").splitlines():
+            campos = linea.split(":")
+            if len(campos) >= 6 and campos[0] == nombre and campos[2].isdigit():
+                return int(campos[2]), campos[5]
         return None
 
     def sondear_pasarela(self, puerto, maxima=None, anfitrion=None):

@@ -16,7 +16,10 @@ cgroup: ni su plazo ni su reinicio la cortan. Y la sigue, enseñando lo que impr
 - si no, `hehermes-sigue: <paso> (<segundos> s)`, la última, y sale con 0: no ha fallado nada;
 - el mismo comando otra vez (la misma orden, letra a letra) se engancha a la que está en marcha, sin lanzar otra, y la
   sigue otro rato; si ya acabó, da su final: el enlace mientras su canje siga abierto, y un fallo, una vez;
-- con otra orden (otra frase: otra llave, otro iPhone) y una instalación en marcha, espera a que acabe y lanza la suya.
+- con otra orden (otra frase: otra llave, otro iPhone) y una instalación en marcha, espera a que acabe y lanza la suya;
+- desde la 0.12.0 (2026-10-08), si la instalación dice que va a actualizar a Hermes y reiniciarlo
+  (`marcha.PREFIJO_REINICIO`, `actualizar_hermes`), acaba ya, con esa línea la última: el reinicio cortaría su turno, y
+  así Hermes contesta antes. Mientras siga en eso, el mismo comando otra vez acaba igual enseguida (`en_reinicio`).
 
 Lo que imprime va a `salida`, en `ambito.run_instalar` (0700, en /run: con root, solo de root; sin root, del usuario), y
 el enlace se queda ahí mientras vale su canje: lo borra la limpieza del canje (`al_cerrar_el_canje`). Sin systemd que la
@@ -139,6 +142,19 @@ def resultado_de(texto: str) -> str | None:
     return final
 
 
+def en_reinicio(texto: str) -> bool:
+    """Si lo último que ha dicho la instalación es que va a actualizar Hermes y reiniciarlo (`marcha.PREFIJO_REINICIO`,
+    desde la 0.12.0): sin nada detrás que diga que ya ha vuelto, un paso, un final o que sigue."""
+    dentro = False
+    for linea in texto.splitlines():
+        linea = linea.strip()
+        if linea.startswith(marcha.PREFIJO_REINICIO):
+            dentro = True
+        elif linea.startswith((marcha.DE_VUELTA, marcha.PREFIJO_PASO, PREFIJO_SIGUE)) or _FINAL.match(linea):
+            dentro = False
+    return dentro
+
+
 def antepasados_de(sis) -> list:
     """Los pid de este proceso hacia arriba, sin PID 1: los de la terminal de Hermes y el de Hermes."""
     pid, vistos = getattr(sis, "pid", None), []
@@ -250,6 +266,10 @@ def _seguir(sis, ambito, salida, estado, limite) -> int:
                     if resto:
                         salida(resto.decode("utf-8", "replace"))
                     return _el_final(sis, ambito, salida, datos.decode("utf-8", "replace"), ya_dicho=True)
+                if en_reinicio(datos.decode("utf-8", "replace")):
+                    # Desde la 0.12.0: va a actualizar Hermes y reiniciarlo, y eso cortaría este turno. Se acaba ya, con
+                    # su línea la última, para que Hermes conteste antes; la instalación sigue (`actualizar_hermes`).
+                    return 0
                 if _reloj() >= limite:
                     return _sigue(salida, estado, paso["donde"], "\nLa instalación sigue en segundo plano")
                 _dormir(CADA)

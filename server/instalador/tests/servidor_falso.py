@@ -280,6 +280,24 @@ class ServidorFalso:
         self.jaula = True
         #: Lo que dice `systemd-detect-virt --container` (si está instalado): «none», «docker», «podman», «lxc»…
         self.virt = "none"
+        #: `hermes update` (desde la 0.12.0, `actualizar_hermes`, 2026-10-08): la versión que trae (None: nada nuevo), si
+        #: sale bien, si reinicia él mismo su unidad (como el de verdad con una de usuario en marcha) y si Hermes vuelve
+        #: tras reiniciarlo (y tras devolver su código a como estaba). Su código, su checkout de git (None: no es uno) y
+        #: si tiene cambios sin guardar; el proceso de su unidad (`MainPID`), y lo que corre tras el reinicio.
+        self.update_trae = "0.21.4"
+        self.update_sale_bien = True
+        self.update_reinicia = False
+        self.vuelve_tras_reiniciar = True
+        self.vuelve_tras_deshacer = True
+        self.updates: list = []
+        self.carpeta_hermes = None
+        self.git_head = None
+        self.git_sucio = ""
+        self.git_resets: list = []
+        self.version_en_disco = None
+        self.version_de_antes = None
+        self.pid_principal = 4321
+        self.hermes_caido = False
         sis.pedir_falso = self.pedir
         self._montar_base()
 
@@ -507,7 +525,30 @@ class ServidorFalso:
         return Resultado(127, "", "runuser %s" % args)
 
     def _hermes(self, args, entrada):
-        """El `hermes` de Hermes: `sessions optimize` si ese Hermes lo sabe (`sabe_optimizar`), con él parado."""
+        """El `hermes` de Hermes: `sessions optimize` si ese Hermes lo sabe (`sabe_optimizar`), con él parado; y, desde la
+        0.12.0, `update`: trae su versión nueva al disco (`codigo_de_hermes`), mueve su checkout y, si lo hace el de
+        verdad (`update_reinicia`), reinicia su unidad. Sin nada en la entrada: si preguntara algo, leería el final."""
+        if args == ["update"]:
+            self.updates.append(entrada)
+            if self.update_trae is None:
+                return Resultado(0 if self.update_sale_bien else 1, "Already up to date.\n",
+                                 "" if self.update_sale_bien else "error: git pull falló en https://usuario:"
+                                 "TOKEN-DE-MENTIRA@servidor-git/x.git\nAPI_KEY=secreto-de-mentira\n")
+            self.version_de_antes = self.version_de_antes or self.version_hermes
+            self.codigo_de_hermes(self.update_trae, carpeta=self.carpeta_hermes)
+            self.version_en_disco = self.update_trae
+            if self.git_head is not None:
+                self.git_head = "b" * 40
+            if self.update_reinicia:
+                for unidad in list(self.activos):
+                    if unidad.startswith("hermes-gateway"):
+                        self._systemctl(["restart", unidad], None)
+                for unidad in list(self.activos_usuario):
+                    if unidad.startswith("hermes-gateway"):
+                        self._systemctl_usuario(["restart", unidad])
+            if not self.update_sale_bien:
+                return Resultado(1, "→ Pulling updates...\n", "EOFError: EOF when reading a line\n")
+            return Resultado(0, "\x1b[32m→ Pulling updates...\x1b[0m\n✓ Update complete!\n")
         if args[:2] != ["sessions", "optimize"] or not self.sabe_optimizar:
             return Resultado(2, "", "hermes: error: invalid choice")
         if args[2:] == ["--help"]:
@@ -516,6 +557,37 @@ class ServidorFalso:
             return Resultado(1, "", "refusing: the gateway is running (use --force)")
         self.compactados.append("hermes sessions optimize")
         return Resultado(0 if self.optimiza_bien else 1, "", "" if self.optimiza_bien else "database is locked")
+
+    def _git(self, args, entrada):
+        """El checkout de Hermes (`git_head`): `rev-parse HEAD`, `status --porcelain` y `reset --keep <commit>`, que
+        devuelve su código a la versión de antes del update (y, si `vuelve_tras_deshacer`, Hermes vuelve con ella)."""
+        if args[:1] == ["-C"]:
+            args = args[2:]
+        if self.git_head is None:
+            return Resultado(128, "", "fatal: not a git repository (or any of the parent directories): .git")
+        if args == ["rev-parse", "HEAD"]:
+            return Resultado(0, self.git_head + "\n")
+        if args == ["status", "--porcelain", "--untracked-files=no"]:
+            return Resultado(0, self.git_sucio)
+        if args[:2] == ["reset", "--keep"] and len(args) == 3:
+            self.git_resets.append(args[2])
+            self.git_head = args[2]
+            if self.version_de_antes is not None:
+                self.codigo_de_hermes(self.version_de_antes, carpeta=self.carpeta_hermes)
+                self.version_en_disco = self.version_de_antes
+            self.vuelve_tras_reiniciar = self.vuelve_tras_deshacer
+            return Resultado(0)
+        return Resultado(127, "", "git %s" % args)
+
+    def con_checkout(self, version="0.19.0", usuario="root"):
+        """Hermes como lo deja su instalador: su código en `<casa>/.hermes/hermes-agent`, un checkout de git con su venv,
+        y git en el servidor."""
+        self.programa("/usr/bin/git")
+        self.git_head = "a" * 40
+        self.version_hermes = version
+        carpeta = self.codigo_de_hermes(version, usuario=usuario)
+        self.sis.carpeta(carpeta + "/.git")
+        return carpeta
 
     def _cloud_init(self, args, entrada):
         """`cloud-init status --wait`: en un servidor ya preparado, contesta enseguida."""
@@ -576,6 +648,8 @@ class ServidorFalso:
                 # La que se pida con -p (ExecStart, o ExecReload: la unidad de `hermes gateway install` lleva
                 # `ExecReload=/bin/kill -USR1 $MAINPID`, y una hecha a mano, nada).
                 propiedad = resto[resto.index("-p") + 1] if "-p" in resto else "ExecStart"
+                if propiedad == "MainPID":
+                    return Resultado(0, "%d\n" % (self.pid_principal if base(unidad) in self.activos else 0))
                 return Resultado(0, ((datos or {}).get(propiedad) or "") + "\n")
             if datos is None:
                 return Resultado(0, "LoadState=not-found\nUser=\nEnvironment=\n")
@@ -602,6 +676,7 @@ class ServidorFalso:
                     self.reinicios.append(u)
                     self._arrancar(u)
                     self._matar_lo_atado(u)
+                    self._reinicio_de_hermes(self.activos, u)
                 if orden == "reload":
                     if u not in self.activos:
                         return Resultado(1, "", "%s is not active, cannot reload." % unidad)
@@ -615,6 +690,18 @@ class ServidorFalso:
         if unidad.startswith("hermes-gateway"):
             self.activos -= self.atados_a_hermes
             self.activos_usuario -= self.atados_a_hermes
+
+    def _reinicio_de_hermes(self, activos, unidad):
+        """Hermes, reiniciado: otro proceso, que corre lo que haya en el disco (lo que trajo `hermes update`); o que no
+        vuelve (`vuelve_tras_reiniciar`): su unidad no arranca y su API no contesta."""
+        if not unidad.startswith("hermes-gateway"):
+            return
+        self.pid_principal += 1
+        if self.version_en_disco is not None:
+            self.version_hermes = self.version_en_disco
+        self.hermes_caido = not self.vuelve_tras_reiniciar
+        if self.hermes_caido:
+            activos.discard(unidad)
 
     def _systemctl_usuario(self, args):
         """El systemd de usuario: solo si hay uno en marcha (linger o una sesión)."""
@@ -631,6 +718,8 @@ class ServidorFalso:
             return Resultado(0 if all(u in self.habilitados_usuario for u in unidades) else 1)
         if orden == "daemon-reload":
             return Resultado(0)
+        if orden == "show" and args[2:5] == ["-p", "MainPID", "--value"]:
+            return Resultado(0, "%d\n" % (self.pid_principal if unidades[0] in self.activos_usuario else 0))
         for u in unidades:
             if orden == "enable":
                 self.habilitados_usuario.add(u)
@@ -645,6 +734,7 @@ class ServidorFalso:
             if orden == "restart":
                 self.reinicios.append("usuario:" + u)
                 self._matar_lo_atado(u)
+                self._reinicio_de_hermes(self.activos_usuario, u)
         return Resultado(0) if orden in ("enable", "disable", "start", "stop", "restart", "try-restart") else \
             Resultado(127, "", "systemctl --user %s" % args)
 
@@ -1221,6 +1311,8 @@ class ServidorFalso:
 
     def http(self, url, cabeceras):
         m = re.match(r"^http://127\.0\.0\.1:(\d+)(/.*)$", url)
+        if m and int(m.group(1)) in self.hermes and self.hermes_caido:
+            return None, b""
         if m and int(m.group(1)) in self.hermes:
             clave = self.hermes[int(m.group(1))]
             ruta = m.group(2).split("?", 1)[0]
@@ -1271,6 +1363,9 @@ class ServidorFalso:
         (`<casa>/hermes-agent`), con su versión en su `pyproject.toml`, en el `__version__` de `hermes_cli/__init__.py` o
         en su sello (`install-stamp.json`, el `main` de ahora)."""
         carpeta = carpeta or self.usuarios.get(usuario, "/root") + "/.hermes/hermes-agent"
+        # Su venv, con su orden `hermes`, como lo deja su instalador: la que lanza `hermes update` (desde la 0.12.0).
+        self.carpeta_hermes = carpeta
+        self.programa(carpeta + "/venv/bin/hermes")
         init = '"""Hermes CLI."""\n' + ('__version__ = "%s"\n' % version if donde == "init" else "")
         self.sis.poner(carpeta + "/hermes_cli/__init__.py", init)
         self.sis.poner(carpeta + "/pyproject.toml", '[project]\nname = "hermes-agent"\nversion = "%s"\n'
