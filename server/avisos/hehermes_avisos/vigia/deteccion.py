@@ -62,6 +62,9 @@ _CABECERA_DE_ENTREGA = re.compile(r"\[ASYNC DELEGATION BATCH COMPLETE\s*[—-]+\
 PREFIJO_INTERRUPCION = "Operation interrupted"
 TIPO_ENTREGA = "async_delegation_complete"
 TIPO_DESVIO = "steer"
+# El ``display_kind`` con el que el Hermes de mediados de octubre guarda la fila ``user`` de todo turno que entra por la
+# API: lo que escribe el usuario y los turnos de la app, la continuación del vigía incluida (2026-10-22).
+TIPO_INTERNO = "internal_notification"
 
 # El texto del aviso de una entrega. El de la fila no sirve: es un informe en inglés para el modelo, con rutas del VPS
 # («A background fan-out of 2 subagent(s) you dispatched…»). Lo que Daniel necesita saber es que ha acabado; el
@@ -148,9 +151,13 @@ def es_entrega(fila: dict) -> bool:
 
 
 def abre_turno(fila: dict) -> bool:
-    """Una fila ``user`` sin ``display_kind``: un mensaje de Daniel o un turno que lanza la app. Los desvíos van dentro
-    del turno en curso, y las entregas y las filas ocultas no abren ninguno."""
-    return fila.get("role") == "user" and fila.get("display_kind") is None
+    """Una fila ``user`` que abre un turno: un mensaje de Daniel o un turno que lanza la app. Sin ``display_kind`` en el
+    Hermes de antes, y con ``TIPO_INTERNO`` desde el de mediados de octubre, que marca así la fila de todo turno de la
+    API. Con solo la primera, el vigía no veía la continuación que él mismo había lanzado, avisaba de la entrega como si
+    nadie la hubiera contestado y daba cada respuesta por un trabajo en segundo plano (2026-10-22). Los desvíos van
+    dentro del turno en curso, y las entregas y las filas ocultas no abren ninguno. La misma regla que la app
+    (``HistorialHermes.abreTurno``)."""
+    return fila.get("role") == "user" and fila.get("display_kind") in (None, TIPO_INTERNO)
 
 
 class _Entrega:

@@ -104,6 +104,23 @@ def _es_respuesta(fila: dict) -> bool:
             and fila.get("finish_reason") != "tool_calls" and fila.get("display_kind") is None)
 
 
+def turno_en_marcha(filas: list, ahora: float) -> bool:
+    """Si el último turno de estas filas (las últimas de la conversación) aún no tiene respuesta y puede estar vivo: uno
+    que lleva más de ``VIDA_DE_UN_TURNO`` sin ella se da por muerto. Lo usan la entrega de un subagente (no se le
+    contesta a mitad de un turno) y los mensajes programados (``programados``: no se lanza uno encima de otro turno).
+    Sin ningún turno, no hay nada en marcha."""
+    ordenadas = sorted((f for f in filas if isinstance(f, dict) and isinstance(f.get("id"), int)),
+                       key=lambda f: f["id"])
+    turnos = [f for f in ordenadas if deteccion.abre_turno(f)]
+    if not turnos:
+        return False
+    turno = turnos[-1]
+    if any(_es_respuesta(f) for f in ordenadas if f["id"] > turno["id"]):
+        return False
+    empezado = _instante(turno)
+    return empezado is None or ahora - empezado < VIDA_DE_UN_TURNO
+
+
 def decidir(filas: list, *, ahora: float, gracia: float, antiguedad_maxima: float,
             cadena_maxima: int) -> Entrega | None:
     """Qué hacer con la entrega sin atender más reciente de estas filas (las últimas de la conversación), o ``None`` si
@@ -126,14 +143,10 @@ def decidir(filas: list, *, ahora: float, gracia: float, antiguedad_maxima: floa
         return None
     if ahora - instante < gracia:
         return Entrega(ESPERAR, entrega["id"], delegacion)
-    if turnos:
-        # El último turno empezó antes de la entrega. Si aún no tiene respuesta, sigue en marcha (la entrega le llegó
-        # a mitad): se espera a que acabe, salvo que lleve tanto que ya no puede estar vivo.
-        turno = turnos[-1]
-        contestado = any(_es_respuesta(f) for f in ordenadas if f["id"] > turno["id"])
-        empezado = _instante(turno)
-        if not contestado and (empezado is None or ahora - empezado < VIDA_DE_UN_TURNO):
-            return Entrega(ESPERAR, entrega["id"], delegacion)
+    # El último turno empezó antes de la entrega. Si aún no tiene respuesta, sigue en marcha (la entrega le llegó a
+    # mitad): se espera a que acabe, salvo que lleve tanto que ya no puede estar vivo.
+    if turno_en_marcha(ordenadas, ahora):
+        return Entrega(ESPERAR, entrega["id"], delegacion)
     # Las continuaciones seguidas desde el último mensaje de Daniel: cada una es una entrega que Hermes recibió y
     # volvió a delegar.
     cadena = 0

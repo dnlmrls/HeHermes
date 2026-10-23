@@ -5,6 +5,8 @@
 - ``PUT    /avisos/v1/dispositivos/{token}/primer-plano`` si la app está delante (con plazo)
 - ``POST   /avisos/v1/prueba``                           manda un aviso de prueba, y espera a lo que diga Apple
 - ``DELETE /avisos/v1/dispositivos/{token}``             baja (un 404 también le vale a la app)
+- ``POST   /avisos/v1/dispositivos/{token}/actividades``  el token de una Actividad en Vivo, para moverla con la app
+  suspendida (``actividades.py``, contrato §20); ``DELETE …/actividades/{actividad}``, que ya acabó
 - ``GET    /avisos/v1/salud``                            para ver desde Safari que nginx llega al vigía
 - ``GET    /avisos/v1/fichero?sesion=&ruta=``            un fichero que Hermes marcó con ``MEDIA:`` (``fichero.py``),
   los bytes por partes; es la única que no contesta JSON cuando va bien
@@ -14,6 +16,8 @@
   desde la 1.5.2): las subidas y sus trozos, en binario, con cuerpos de hasta 4 MiB + 64 KiB
 - ``/avisos/v1/servidor``, ``…/servidor/actualizar``       Ajustes › Tu servidor (``servidor.py``, contrato §17, desde
   la 1.5.5): el estado del servidor, sin secretos, y actualizarlo con el ayudante que actualiza
+- ``/avisos/v1/programados…``                              «Enviar más tarde» (``programados.py``, contrato §19, desde la 1.6.6):
+                                                         crear, listar, cambiar y borrar los mensajes de una conversación
 - ``/avisos/v1/agentes…``                                 los agentes (``agentes.py``, contrato §18, desde la 1.6.0):
   listarlos, crearlos, verlos, cambiarlos y borrarlos con su ayudante, y escribir la personalidad de uno nuevo. Y las
   rutas que llevan ``sesion`` (el fichero, los ficheros dejados) y las de la entrada aceptan ``perfil=``
@@ -68,6 +72,8 @@ from .entrada import Entradas
 from .envio import BAJA, ENVIADO, LIMITADO, PERMISO, REINTENTABLE, SIN_PERMISO, Mensajero
 from .fichero import (PATRON_PERFIL, PATRON_SESION, Descarga, Ficheros, disposicion, parametros, perfil_de_la_consulta,
                       perfil_valido)
+from .programados import PREFIJO as PREFIJO_PROGRAMADOS
+from .programados import TOPE_DEL_CUERPO, Programados
 from .respaldo import PREFIJO as PREFIJO_RESPALDO
 from .respaldo import TOPE_CUERPO as TOPE_RESPALDO
 from .respaldo import Respaldos
@@ -76,6 +82,7 @@ from .servidor import Servidor
 
 registro = logging.getLogger("vigia.api")
 
+RUTA_ACTIVIDADES = re.compile(r"/avisos/v1/dispositivos/([^/]+)/actividades(?:/([^/]+))?/?")
 RUTA_DISPOSITIVO = re.compile(r"/avisos/v1/dispositivos/([^/]+)(?:/(ajustes|primer-plano))?/?")
 # Lo que la app manda como plazo del primer plano (90 s) y lo que se acepta: un plazo enorme dejaría al vigía callado
 # mucho tiempo si el «ya no estoy delante» se pierde, que es justo lo que el plazo existe para evitar.
@@ -153,7 +160,8 @@ class AppVigia:
     def __init__(self, almacen: Almacen, mensajero: Mensajero, *, secreto_tunel: str, caducidad_prueba: int = 300,
                  reloj=time.time, al_moverse=None, ficheros: Ficheros | None = None,
                  respaldos: Respaldos | None = None, exportaciones=None, entradas: Entradas | None = None,
-                 servidor: Servidor | None = None, agentes: Agentes | None = None, buzon=None):
+                 servidor: Servidor | None = None, agentes: Agentes | None = None, buzon=None,
+                 programados: Programados | None = None):
         if not secreto_tunel:
             raise ValueError("sin el secreto del túnel, la API del vigía quedaría abierta a cualquier proceso local")
         self.almacen = almacen
@@ -179,6 +187,8 @@ class AppVigia:
         # Lo que el instalador deja para avisar del código de recuperación (`recuperacion.Buzon`): mientras quede algo
         # por mandar, el barrido espera (`barrer`). Sin él, nada que esperar.
         self.buzon = buzon
+        # Los mensajes programados (`programados.py`, contrato §19). Sin ellos, como un vigía de antes: 404.
+        self.programados = programados
 
     def _mac(self, prefijo: bytes, datos: bytes) -> str:
         resumen = hmac.new(self._secreto, prefijo + datos, hashlib.sha256).digest()
@@ -262,7 +272,9 @@ class AppVigia:
                       "" if permiso is None else " (con un permiso nuevo, hasta %s)" % _fecha(permiso.caduca))
         _si_no_avisa_de_nada(token, ajustes)
         self.al_moverse()
-        return {"envio": envio}
+        # «actividades»: este vigía mueve las Actividades en Vivo (1.6.7, contrato §20). Sin él, la app usa la tarjeta de
+        # la tarea continuada, que mantiene la app despierta (`DecisionDeLaActividad.sustituyeLaTarjeta`).
+        return {"envio": envio, "actividades": True}
 
     def ajustes(self, token: str, cuerpo: dict) -> None:
         ajustes = Ajustes.desde_json(cuerpo)
@@ -342,6 +354,25 @@ class AppVigia:
         return {"ficheros": [{"ruta": f.ruta, "nombre": f.nombre, "tamano": f.tamano, "instante": f.instante}
                              for f in de_ese.de_la_sesion(sesion)]}
 
+    def registrar_actividad(self, token: str, cuerpo: dict) -> None:
+        """Apunta el token de una Actividad en Vivo de este iPhone (contrato §20). 404 si el iPhone no está dado de alta:
+        sin alta no hay clave con la que cifrar ni permiso con el que mandar."""
+        actividad = token_valido(cuerpo.get("actividad"))
+        sesion = cuerpo.get("sesion")
+        if not isinstance(sesion, str) or not PATRON_ID.fullmatch(sesion) or len(sesion) > MAX_ID_SESION:
+            raise ErrorHTTP(400, "sesion_invalida", "La sesión no es válida")
+        run = cuerpo.get("run_id")
+        if run is not None and not (isinstance(run, str) and PATRON_ID.fullmatch(run)):
+            raise ErrorHTTP(400, "run_invalido", "El run no es válido")
+        perfil = perfil_valido(cuerpo["perfil"]) if cuerpo.get("perfil") is not None else PRINCIPAL
+        if not self.almacen.guardar_actividad(actividad, token, perfil, sesion, run, self.reloj()):
+            raise ErrorHTTP(404, "dispositivo_desconocido", "Este dispositivo no estaba dado de alta")
+        registro.info("actividad %s de %s registrada", cola(actividad), cola(token))
+
+    def olvidar_actividad(self, token: str, actividad: str) -> None:
+        if not self.almacen.borrar_actividad(token_valido(actividad), token):
+            raise ErrorHTTP(404, "actividad_desconocida", "Esa actividad no estaba registrada")
+
     def baja(self, token: str) -> None:
         if not self.almacen.borrar_dispositivo(token):
             raise ErrorHTTP(404, "dispositivo_desconocido", "Este dispositivo no estaba dado de alta")
@@ -408,6 +439,8 @@ class ManejadorVigia(ManejadorJSON):
             return self._servidor(app)
         elif ruta == PREFIJO_AGENTES or ruta.startswith(PREFIJO_AGENTES + "/"):
             return self._agentes(app)
+        elif ruta == PREFIJO_PROGRAMADOS or ruta.startswith(PREFIJO_PROGRAMADOS + "/"):
+            return self._programados(app)
         elif ruta == "/avisos/v1/fichero":
             self._exigir(metodo, "GET")
             consulta = self.path.partition("?")[2]
@@ -419,6 +452,15 @@ class ManejadorVigia(ManejadorJSON):
             consulta = self.path.partition("?")[2]
             sesion, _ = parametros(consulta)
             return self.enviar_json(200, app.ficheros_dejados(sesion, perfil_de_la_consulta(consulta)))
+        elif RUTA_ACTIVIDADES.fullmatch(ruta):
+            encontrada = RUTA_ACTIVIDADES.fullmatch(ruta)
+            token = token_valido(encontrada.group(1))
+            if encontrada.group(2) is None:
+                self._exigir(metodo, "POST")
+                app.registrar_actividad(token, self.leer_json())
+            else:
+                self._exigir(metodo, "DELETE")
+                app.olvidar_actividad(token, encontrada.group(2))
         else:
             encontrada = RUTA_DISPOSITIVO.fullmatch(ruta)
             if not encontrada:
@@ -474,7 +516,16 @@ class ManejadorVigia(ManejadorJSON):
         """Los agentes (contrato §18): la lista, crear, ver, cambiar y borrar con su ayudante, y la personalidad."""
         if app.agentes is None:
             raise ErrorHTTP(404, "ruta_desconocida", "Ruta desconocida")
-        estado, objeto, cabeceras = app.agentes.atender(self.command, self.ruta, self.leer_cuerpo)
+        estado, objeto, cabeceras = app.agentes.atender(self.command, self.ruta, self.leer_cuerpo, self.headers)
+        return self.enviar_json(estado, objeto, cabeceras)
+
+    def _programados(self, app: AppVigia) -> None:
+        """«Enviar más tarde» (contrato §19): crear, listar, cambiar y borrar los mensajes de una conversación."""
+        if app.programados is None:
+            raise ErrorHTTP(404, "ruta_desconocida", "Ruta desconocida")
+        self.tope_cuerpo = TOPE_DEL_CUERPO
+        estado, objeto, cabeceras = app.programados.atender(self.command, self.ruta, self.leer_cuerpo,
+                                                            self.path.partition("?")[2])
         return self.enviar_json(estado, objeto, cabeceras)
 
     def _servidor(self, app: AppVigia) -> None:

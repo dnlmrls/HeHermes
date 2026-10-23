@@ -45,7 +45,7 @@ from dataclasses import dataclass, replace
 
 from .. import texto
 from ..comun import cola
-from . import avisos, deteccion, entregas, exportaciones, recuperacion
+from . import actividades, avisos, deteccion, entregas, exportaciones, recuperacion
 from .almacen import PRINCIPAL, Almacen, EstadoSesion
 from .envio import ENVIADO, LIMITADO, REINTENTABLE, Mensajero
 from .hermes import ClienteHermes, ErrorHermes
@@ -120,8 +120,13 @@ class Vigilante:
     def __init__(self, almacen: Almacen, hermes: ClienteHermes, mensajero: Mensajero, *, intervalo: float = 5.0,
                  intervalo_en_calma: float = INTERVALO_EN_CALMA, antiguedad_maxima: float = 900.0,
                  filas_por_lectura: int = 100, caducidad_aprobacion: int = 120, reloj=time.time,
-                 reglas_entrega: ReglasDeEntrega | None = None, exportaciones=None, agentes=None, buzon=None):
+                 reglas_entrega: ReglasDeEntrega | None = None, exportaciones=None, agentes=None, buzon=None,
+                 observatorio=None, programados=None):
         self.almacen = almacen
+        # Los mensajes que el usuario dejó para una hora (`programados`, 1.6.6). Sin él, nada.
+        self.programados = programados
+        # Lo que se mira de Hermes y del servidor sin que nadie lo pida (`observatorio`, desde la 1.6.4). Sin él, nada.
+        self.observatorio = observatorio
         # Lo que el instalador deja para avisar del código de recuperación (`recuperacion.Buzon`). Sin buzón, nada de
         # esto. De qué iPhone es cada alta (para no avisarle al que entra) lo dice su dueño firmado, en el almacén.
         self.buzon = buzon
@@ -197,6 +202,15 @@ class Vigilante:
     def siguiente_espera(self) -> float:
         """Cuánto esperar hasta la vuelta siguiente: poco mientras pase algo, y más en calma."""
         ahora = self.reloj()
+        espera = self._espera_en_calma(ahora)
+        # Lo programado no espera a la calma: se mira justo a su hora (`Programados.espera`).
+        if self.programados is not None:
+            programada = self.programados.espera(ahora, self.intervalo)
+            if programada is not None:
+                return min(espera, max(programada, 0.2))
+        return espera
+
+    def _espera_en_calma(self, ahora: float) -> float:
         if self._pendiente_en_la_vuelta or self._buzon_pendiente or ahora - self._ultimo_movimiento < CALMA:
             return self.intervalo
         if self.almacen.turnos():
@@ -232,9 +246,19 @@ class Vigilante:
 
     def vuelta(self) -> None:
         ahora = self.reloj()
+        # Antes de todo y aunque no haya iPhone ni conteste Hermes: es la parte que avisa de que Hermes ha cambiado.
+        if self.observatorio is not None:
+            self.observatorio.vuelta()
         self._olvidar_lo_viejo(ahora)
         self._avisar_lo_del_buzon(ahora)
         clientes = self._clientes()
+        # Antes de leer ninguna bandeja y del «sin iPhone»: lo programado sale a su hora aunque Hermes no conteste a la
+        # bandeja, y aunque el iPhone se haya dado de baja (el mensaje es del usuario, no de un dispositivo).
+        if self.programados is not None:
+            try:
+                self.programados.vuelta(clientes, ahora)
+            except Exception:  # noqa: BLE001 — lo programado no puede parar la vigilancia de lo demás
+                self._apuntar_fallo("programados", "fallo lanzando los mensajes programados", excepcion=True)
         if not self.almacen.dispositivos():
             # Nadie a quien avisar: no se molesta a Hermes. Lo que pase mientras no es de nadie, así que al volver a
             # haber un iPhone se rehace la línea de base en vez de avisarle de lo de antes de darse de alta.
@@ -418,6 +442,9 @@ class Vigilante:
             return
         donde = sid if perfil == PRINCIPAL else f"{perfil}/{sid}"
         filas, limite = self._leer(cliente, sid)
+        if self.observatorio is not None:
+            # Solo lo posterior a lo ya visto: se vuelven a leer las 20 últimas cada vez que la conversación cambia.
+            self.observatorio.ver_filas(perfil, sid, filas, ahora, desde_id=estado.ultimo_id)
         ids = [fila["id"] for fila in filas] + ([estado.ultimo_id] if estado.ultimo_id is not None else [])
         pendiente = None
         entregas_del_vigia = None
@@ -443,6 +470,10 @@ class Vigilante:
             self._apuntar_fallo(f"avisar {donde}", "fallo avisando de %s: lo de ahora se da por leído para no "
                                 "repetirlo en cada vuelta", donde, excepcion=True)
             pendiente = None
+        try:
+            self._mover_actividades(perfil, sid, filas, ahora)
+        except Exception:  # noqa: BLE001 — una actividad que falla no puede dejar la conversación sin avisos
+            self._apuntar_fallo(f"actividad {donde}", "fallo moviendo la Actividad en Vivo de %s", donde, excepcion=True)
         if pendiente is None:
             self.almacen.guardar_sesion(EstadoSesion(sid, max(ids) if ids else None, estado.referencia, actividad,
                                                      mensajes, ahora,
@@ -457,6 +488,39 @@ class Vigilante:
                                                  estado.ultima_actividad, estado.mensajes, ahora,
                                                  deteccion.ultima_respuesta(filas, estado.ultima_respuesta,
                                                                             hasta=pendiente), perfil=perfil))
+
+    # -- Las Actividades en Vivo (contrato §20)
+
+    def _mover_actividades(self, perfil: str, sid: str, filas: list, ahora: float) -> None:
+        """Pone al día las Actividades en Vivo de esta conversación con lo que dicen sus filas: el paso y los subagentes
+        mientras trabaja, y la respuesta al acabar. Solo cuando cambia algo (``actividades.huella``), y la final, una vez:
+        después se olvida."""
+        registradas = self.almacen.actividades(perfil, sid, ahora, actividades.VIDA_DE_UN_REGISTRO)
+        if not registradas:
+            return
+        estado_turno = actividades.estado_del_turno(filas)
+        if estado_turno is None:
+            return
+        huella = actividades.huella(estado_turno)
+        for registrada in registradas:
+            if registrada.ultimo == huella:
+                continue
+            dispositivo = self.almacen.dispositivo(registrada.token)
+            if dispositivo is None:
+                self.almacen.borrar_actividad(registrada.actividad)
+                continue
+            vuelta = registrada.vuelta + 1
+            carga = actividades.carga(estado_turno, run=registrada.run_id, vuelta=vuelta, ahora=ahora,
+                                      clave=dispositivo.clave)
+            peticion = actividades.peticion_al_rele(dispositivo.token, dispositivo.entorno, registrada.actividad, carga,
+                                                    estado_turno.acabado)
+            resultado = self.mensajero.enviar_actividad(dispositivo, registrada.actividad, peticion)
+            if resultado.tipo != ENVIADO:
+                continue
+            if estado_turno.acabado:
+                self.almacen.borrar_actividad(registrada.actividad)
+            else:
+                self.almacen.anotar_actividad(registrada.actividad, vuelta, huella)
 
     # -- Las entregas de los subagentes
 

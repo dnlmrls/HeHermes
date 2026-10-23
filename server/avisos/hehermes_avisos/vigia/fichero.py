@@ -83,6 +83,9 @@ TIPOS = {
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    # Un EPUB: sin esto iba como application/octet-stream y el iPhone no lo abría en Libros. Se puso a mano en el VPS el
+    # 2026-10-08 y llega aquí con la 1.6.3 (2026-10-22), para que desplegar no lo quite.
+    "epub": "application/epub+zip",
 }
 # El código se abre como texto (la app lo colorea por la extensión).
 for _extension in ("py", "sh", "zsh", "bash", "swift", "ts", "toml", "sql", "go", "rs", "c", "h", "cpp", "java",

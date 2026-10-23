@@ -126,6 +126,13 @@ class ConfigVigia:
     # rutas de /avisos/v1/agentes contestan 503). Sin la sección (un `vigia.ini` de antes), estos.
     agentes_claves: str = "/etc/hehermes-avisos/agentes"
     agentes_ayudante: str = "/run/hehermes-agentes.sock"
+    # La vigilancia de Hermes (`observatorio`, desde la 1.6.4). `hermes_codigo`: la carpeta del código de Hermes, de la
+    # que se lee su commit; vacía, se busca en dos sitios fijos y, si no está, no hay commit (es opcional). `manifiesto`:
+    # el de lo instalado (`integridad`); vacío, `manifiesto.sha256` junto a este `vigia.ini` (lo pone `__main__`, que sabe
+    # dónde está). Ninguno hace falta en un
+    # `vigia.ini` de antes.
+    hermes_codigo: str | None = None
+    manifiesto: str = ""
 
     @classmethod
     def leer(cls, ruta: str) -> ConfigVigia:
@@ -163,7 +170,15 @@ class ConfigVigia:
         agentes_claves = (texto("agentes", "claves", base.agentes_claves) or "").strip()
         if agentes_claves and not agentes_claves.startswith("/"):
             raise ValueError("[agentes] claves tiene que ser una carpeta absoluta")
+        hermes_codigo = (texto("hermes", "codigo", "") or "").strip() or None
+        if hermes_codigo and not hermes_codigo.startswith("/"):
+            raise ValueError("[hermes] codigo tiene que ser una carpeta absoluta")
+        manifiesto = (texto("servidor", "manifiesto", "") or "").strip()
+        if manifiesto and not manifiesto.startswith("/"):
+            raise ValueError("[servidor] manifiesto tiene que ser una ruta absoluta")
         return cls(
+            hermes_codigo=hermes_codigo,
+            manifiesto=manifiesto,
             escucha=direccion(texto("vigia", "escucha", "%s:%d" % base.escucha)),
             base_de_datos=texto("vigia", "base_de_datos", base.base_de_datos),
             intervalo=max(1.0, numero("vigia", "intervalo", base.intervalo)),

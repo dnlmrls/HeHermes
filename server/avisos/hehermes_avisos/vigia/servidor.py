@@ -114,13 +114,15 @@ class Servidor:
     """
 
     def __init__(self, hermes, instalador: str, actualizador, entrada, respaldo, servicios, hermes_unidad=None,
-                 systemctl=systemctl):
+                 systemctl=systemctl, observatorio=None):
         self.hermes, self.instalador = hermes, instalador
         self.actualizador, self.entrada, self.respaldo = actualizador, entrada, respaldo
         self.servicios = [unidad_valida(u) + ("hehermes",) for u in servicios]
         if hermes_unidad:
             self.servicios.append(unidad_valida(hermes_unidad) + ("hermes",))
         self._systemctl = systemctl
+        # Lo que el vigía ha visto de Hermes y de los ficheros (`observatorio`, desde la 1.6.4); sin él, `vigilancia` es null.
+        self.observatorio = observatorio
 
     # -- Cada parte
 
@@ -185,7 +187,8 @@ class Servidor:
             hechas = {nombre: futuro.result() for nombre, futuro in futuros.items()}
         return {"formato": FORMATO, "instalador": {"version": version_del_instalador(self.instalador)},
                 "avisos": {"version": VERSION}, "hermes": hechas["hermes"], "disco": hechas["disco"],
-                "servicios": hechas["servicios"], "copia": hechas["copia"], "actualizacion": hechas["actualizacion"]}
+                "servicios": hechas["servicios"], "copia": hechas["copia"], "actualizacion": hechas["actualizacion"],
+                "vigilancia": self.observatorio.informe() if self.observatorio is not None else None}
 
     # -- La actualización
 

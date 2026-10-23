@@ -20,11 +20,12 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from dataclasses import replace
 
 from .. import VERSION, comun
 from ..comun import ErrorDeSecreto, ErrorHTTP, ServidorHTTP, cola, configurar_registro, leer_secreto
 from . import agentes as agentes_
-from . import recuperacion
+from . import integridad, recuperacion
 from .almacen import Almacen
 from .api import AppVigia, ManejadorVigia
 from .configuracion import ConfigVigia
@@ -33,7 +34,9 @@ from .entrada import ayudante as ayudante_de_la_entrada
 from .envio import ClienteRele, Mensajero
 from .exportaciones import Exportaciones, ExportacionesDeLosAgentes, VigiaDeExportaciones
 from .fichero import ClienteLector, Ficheros, Limites
-from .hermes import ClienteHermes, ErrorHermes
+from .hermes import ClienteHermes, ErrorHermes, escuchar_codigos
+from .observatorio import Observatorio
+from .programados import Programados
 from .respaldo import ClienteAyudante, Respaldos, limpiar_cada_hora
 from .servidor import NO_DISPONIBLE as ACTUALIZAR_NO_DISPONIBLE
 from .servidor import Servidor
@@ -77,6 +80,10 @@ def servir(config: ConfigVigia) -> int:
         registro.error("%s", error)
         return comun.fuera_de_servicio(heredado, "vigia")
     hermes = ClienteHermes(config.hermes_base, clave_hermes, config.hermes_plazo)
+    # Lo que se mira de Hermes y de los ficheros instalados (`observatorio`, desde la 1.6.4); cada código de error que
+    # Hermes conteste, de cualquier cliente (el principal y los de los agentes), pasa por él.
+    observatorio = Observatorio(almacen, hermes, codigo_de_hermes=config.hermes_codigo, manifiesto=config.manifiesto)
+    escuchar_codigos(observatorio.ver_codigo)
     huellas_del_rele = tuple(h for h in (config.rele_huella, config.rele_huella_siguiente) if h) or None
     rele = (ClienteRele(config.rele_url, credencial, config.rele_plazo, huella=huellas_del_rele)
             if config.con_credencial else None)
@@ -100,6 +107,8 @@ def servir(config: ConfigVigia) -> int:
         registro.warning("sin el buzón del código de recuperación (%s): no se avisará de él", error)
         buzon = None
     vigilante = None
+    # «Enviar más tarde» (1.6.6): lo que el usuario deja para una hora sale a ella aunque la app esté cerrada.
+    programados = Programados(almacen, time.time, lambda: vigilante.despertar())
     de_cada_perfil = (ExportacionesDeLosAgentes(almacen, exportaciones, config.ficheros_lector,
                                                 lambda: vigilante.despertar(),
                                                 estabilidad=config.exportaciones_estabilidad,
@@ -109,7 +118,7 @@ def servir(config: ConfigVigia) -> int:
                           intervalo_en_calma=config.intervalo_en_calma, antiguedad_maxima=config.antiguedad_maxima,
                           filas_por_lectura=config.filas_por_lectura, caducidad_aprobacion=config.caducidad_aprobacion,
                           reglas_entrega=config.reglas_de_entrega(), exportaciones=de_cada_perfil, agentes=clientes,
-                          buzon=buzon)
+                          buzon=buzon, observatorio=observatorio, programados=programados)
     ficheros = Ficheros(hermes, ClienteLector(config.ficheros_lector),
                         Limites(config.ficheros_por_minuto, config.ficheros_simultaneos), casa=config.ficheros_casa,
                         exportaciones=de_cada_perfil, agentes=clientes)
@@ -128,10 +137,11 @@ def servir(config: ConfigVigia) -> int:
                         else None,
                         respaldo=ClienteAyudante(config.respaldo_ayudante, plazo=10) if config.respaldo_ayudante
                         else None,
-                        servicios=config.servidor_servicios, hermes_unidad=config.servidor_hermes)
+                        servicios=config.servidor_servicios, hermes_unidad=config.servidor_hermes,
+                        observatorio=observatorio)
     app = AppVigia(almacen, mensajero, secreto_tunel=secreto_tunel, caducidad_prueba=config.caducidad_prueba,
                    al_moverse=vigilante.despertar, ficheros=ficheros, respaldos=respaldos, exportaciones=de_cada_perfil,
-                   entradas=entradas, servidor=servidor, agentes=de_los_agentes, buzon=buzon)
+                   entradas=entradas, servidor=servidor, agentes=de_los_agentes, buzon=buzon, programados=programados)
     servidor = ServidorHTTP(config.escucha, ManejadorVigia, app, heredado=heredado)
     _avisar_si_no_coincide(heredado, config.escucha)
     threading.Thread(target=servidor.serve_forever, name="api", daemon=True).start()
@@ -422,6 +432,10 @@ def main(argv: list | None = None) -> int:
     parser.add_argument("orden", nargs="?", default="servir", choices=("servir", "comprobar", "dispositivos"))
     argumentos = parser.parse_args(argv)
     config = ConfigVigia.leer(argumentos.config)
+    if not config.manifiesto:
+        # Junto a vigia.ini, donde lo dejan instalar.sh y el instalador: sirve para las dos disposiciones, sin configuración.
+        config = replace(config, manifiesto=os.path.join(os.path.dirname(os.path.abspath(argumentos.config)),
+                                                         integridad.NOMBRE))
     configurar_registro(config.registro)
     return {"servir": servir, "comprobar": comprobar, "dispositivos": dispositivos}[argumentos.orden](config)
 

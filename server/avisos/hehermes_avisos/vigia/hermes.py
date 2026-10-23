@@ -1,6 +1,7 @@
-"""El vigía leyendo el api_server de Hermes como lo lee la app: ``GET`` de rutas del contrato y **dos escrituras**: el
+"""El vigía leyendo el api_server de Hermes como lo lee la app: ``GET`` de rutas del contrato y **tres escrituras**: el
 turno que contesta la entrega de un subagente (``lanzar_continuacion``, con el texto fijo de la app y su misma
-``Idempotency-Key``; por qué, en ``entregas``) y, desde la 1.6.0, la personalidad de un agente nuevo, que escribe el
+``Idempotency-Key``; por qué, en ``entregas``), el mensaje que el usuario dejó para más tarde (``lanzar_programado``, con
+el cuerpo que armó la app; ``programados``) y, desde la 1.6.0, la personalidad de un agente nuevo, que escribe el
 principal por ``/v1/chat/completions`` con un mensaje de sistema fijo (``completar``, contrato §18.7). Nada más: el
 vigía no escribe lo que quiere, ni en otra ruta.
 
@@ -33,6 +34,24 @@ LIMITE_BANDEJA = 200
 #: El de un agente (contrato §18): minúsculas y cifras, hasta 24. `default` es el principal, sin prefijo.
 PATRON_PERFIL = re.compile(r"[a-z0-9]{1,24}")
 PRINCIPAL = "default"
+
+
+#: Quien quiere saber cada ``code`` de error que Hermes contesta (``observatorio.Observatorio.ver_codigo``): uno solo, el
+#: del proceso, puesto por ``__main__``. Sin él, nada. Un fallo suyo nunca cambia lo que contesta el cliente.
+_escucha_de_codigos = None
+
+
+def escuchar_codigos(funcion) -> None:
+    global _escucha_de_codigos
+    _escucha_de_codigos = funcion
+
+
+def _oir_codigo(codigo: str | None) -> None:
+    if codigo is not None and _escucha_de_codigos is not None:
+        try:
+            _escucha_de_codigos(codigo)
+        except Exception:  # noqa: BLE001
+            registro.debug("fallo anotando un código de error", exc_info=True)
 
 
 class ErrorHermes(Exception):
@@ -75,11 +94,13 @@ class ClienteHermes:
             with self._abridor.open(peticion, timeout=self.plazo if plazo is None else plazo) as respuesta:
                 return json.loads(respuesta.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
+            codigo = _codigo_de_error(error)
             error.close()
+            _oir_codigo(codigo)
             if error.code == 401:
                 raise ErrorHermes("Hermes rechaza la clave (401): el nginx del túnel no la pone o la del fichero no "
                                   "vale", 401) from None
-            raise ErrorHermes(f"Hermes contestó {error.code} a GET {ruta}", error.code) from None
+            raise ErrorHermes(f"Hermes contestó {error.code} a GET {ruta}", error.code, codigo) from None
         except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
             # `HTTPException` es la respuesta cortada a medias (IncompleteRead, RemoteDisconnected): no es un OSError.
             razon = getattr(error, "reason", None) or type(error).__name__
@@ -149,6 +170,31 @@ class ClienteHermes:
             raise ErrorHermes("Hermes aceptó el turno sin decir su run_id")
         return run_id
 
+    def lanzar_programado(self, sesion: str, clave: str, cuerpo: dict) -> str:
+        """``POST /v1/runs`` con el mensaje que el usuario programó, en ``sesion`` y con la ``Idempotency-Key`` ``clave`` (el id
+        de su mensaje en la app). Devuelve el ``run_id``.
+
+        ``cuerpo`` lo armó la app al programarlo, con lo mismo que habría mandado al enviarlo (``input``,
+        ``instructions`` ya con su encabezado, ``effort``, y ``model`` con ``provider``), porque el vigía no conoce las
+        instrucciones ni el esfuerzo de la conversación. Va con las claves ordenadas: un reintento cuyo primer intento sí
+        llegó da el mismo run (``replayed``), no otro turno, y si la app lo envía a la vez con la misma clave el servidor
+        contesta 409 y sigue habiendo uno solo."""
+        envio: dict = {"input": cuerpo["input"], "session_id": sesion}
+        if cuerpo.get("instructions"):
+            envio["instructions"] = cuerpo["instructions"]
+        if cuerpo.get("effort"):
+            envio["model_options"] = {"reasoning": {"effort": cuerpo["effort"]}}
+        # Los dos o ninguno, como la app: uno solo dejaría el turno a medias entre el elegido y el global.
+        if cuerpo.get("model") and cuerpo.get("provider"):
+            envio["model"] = cuerpo["model"]
+            envio["provider"] = cuerpo["provider"]
+        datos = self._post("/v1/runs", json.dumps(envio, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+                           {"Idempotency-Key": clave}, self.plazo)
+        run_id = datos.get("run_id") if isinstance(datos, dict) else None
+        if not isinstance(run_id, str) or not run_id:
+            raise ErrorHermes("Hermes aceptó el turno sin decir su run_id")
+        return run_id
+
     def _post(self, ruta: str, cuerpo: bytes, cabeceras: dict, plazo: float) -> object:
         peticion = urllib.request.Request(self.base + self._prefijo + ruta, data=cuerpo, method="POST",
                                           headers=dict({"Accept": "application/json",
@@ -161,6 +207,7 @@ class ClienteHermes:
         except urllib.error.HTTPError as error:
             codigo = _codigo_de_error(error)
             error.close()
+            _oir_codigo(codigo)
             raise ErrorHermes(f"Hermes contestó {error.code} ({codigo or 'sin código'}) a POST {ruta}", error.code,
                               codigo) from None
         except (urllib.error.URLError, OSError, http.client.HTTPException) as error:

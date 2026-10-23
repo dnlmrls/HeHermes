@@ -223,6 +223,31 @@ class Mensajero:
             registro.warning("aviso de %s → %s: %s (%s)", aviso.tipo, donde, resultado.tipo, resultado.motivo)
         return resultado
 
+    def enviar_actividad(self, dispositivo: Dispositivo, actividad: str, peticion: dict) -> Resultado:
+        """Manda la actualización (o el final) de una Actividad en Vivo con lo mismo que los avisos de ese iPhone: la
+        credencial del vigía o el permiso del iPhone (contrato §20). Una baja es de la actividad, que ya acabó: se olvida
+        ella, y el iPhone sigue dado de alta."""
+        donde = f"{cola(dispositivo.token)} ({dispositivo.entorno})"
+        ahora = self.reloj()
+        permiso = None
+        if self.rele is None:
+            permiso = dispositivo.permiso
+            if permiso is None or not permiso.vigente(ahora):
+                return Resultado(SIN_PERMISO, "sin credencial ni un permiso vigente de este iPhone")
+        if permiso is None:
+            resultado = self.rele.enviar(peticion)
+        else:
+            resultado = self._cliente(permiso).enviar(peticion, permiso=permiso.valor)
+        if resultado.tipo == BAJA:
+            self.almacen.borrar_actividad(actividad)
+            registro.info("actividad %s → %s: ya acabada (%s); se olvida", cola(actividad), donde, resultado.motivo)
+        elif resultado.tipo == PERMISO and permiso is not None:
+            self.almacen.rechazar_permiso(dispositivo.token, permiso.valor, ahora)
+            registro.warning("actividad → %s: el relé no acepta su permiso (%s)", donde, resultado.motivo)
+        elif resultado.tipo != ENVIADO:
+            registro.warning("actividad → %s: %s (%s)", donde, resultado.tipo, resultado.motivo)
+        return resultado
+
     def _apuntar_sin_permiso(self, aviso: avisos.Aviso, dispositivo: Dispositivo, donde: str, ahora: float) -> None:
         ultimo = self._sin_permiso_apuntado.get(dispositivo.token)
         if ultimo is not None and ahora - ultimo < REPETIR_SIN_PERMISO:

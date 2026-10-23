@@ -37,6 +37,7 @@ instalador: la de la pasarela (`modo_tls`) y la del vigía (`aplicar_secretos`).
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import secrets
@@ -105,6 +106,24 @@ def ficheros_del_codigo(origen: str, prefijo: str) -> list:
                 with open(ruta, "rb") as f:
                     salida.append((prefijo + "/hehermes_avisos/" + relativa, f.read()))
     return salida
+
+
+#: El nombre del manifiesto de lo instalado, junto a `vigia.ini` (el vigía lo busca ahí). Es el de
+#: `hehermes_avisos.vigia.integridad.NOMBRE`; este paquete no importa aquel, y una prueba cruza los dos
+#: (`test_avisos.ElManifiestoDeLoInstalado`).
+NOMBRE_DEL_MANIFIESTO = "manifiesto.sha256"
+CABECERA_DEL_MANIFIESTO = "# hehermes-manifiesto 1"
+
+
+def manifiesto_de(codigo: list, ayudantes: list, prefijo: str) -> bytes:
+    """El manifiesto de lo que esta pasada instala: la suma de cada fichero del código (nombre relativo al prefijo,
+    `hehermes_avisos/vigia/fichero.py`) y de cada ayudante (su nombre a secas), una línea por fichero con tabuladores:
+    `<sha256>\t<nombre>\t<ruta>`. El vigía lo compara (`hehermes_avisos.vigia.integridad`) y dice, solo por el nombre, los
+    ficheros que alguien ha tocado a mano. `codigo` y `ayudantes` son listas de `(ruta, contenido)`."""
+    entradas = [(hashlib.sha256(datos).hexdigest(), ruta[len(prefijo) + 1:], ruta) for ruta, datos in codigo]
+    entradas += [(hashlib.sha256(datos).hexdigest(), ruta.rsplit("/", 1)[-1], ruta) for ruta, datos in ayudantes]
+    lineas = ["%s\t%s\t%s" % e for e in sorted(entradas, key=lambda e: (e[1], e[2]))]
+    return (CABECERA_DEL_MANIFIESTO + "\n" + "".join(l + "\n" for l in lineas)).encode()
 
 
 #: El vigía sin código de avisos: sin credencial ni relé fijo (lo que va en el manifiesto, `{"modo": "permisos"}`).
@@ -183,11 +202,25 @@ def planear(sis, det, man, op, origen, acciones, bloqueos, fichero, avisos=None)
     for ruta, datos in codigo:
         fichero(ruta, datos, 0o644, grupo=ambito.prefijo + "/hehermes_avisos/")
     reemplazar = getattr(op, "reemplazar", frozenset())
-    lector = planear_lector(sis, det, origen, acciones, bloqueos, avisos, fichero)
-    respaldo = planear_respaldo(sis, det, origen, acciones, bloqueos, avisos, fichero)
-    entrada = planear_entrada(sis, det, origen, acciones, bloqueos, avisos, fichero)
-    actualizar = planear_actualizar(sis, det, origen, acciones, bloqueos, fichero)
-    agentes = planear_agentes(sis, det, origen, acciones, bloqueos, avisos, fichero)
+    # Los ayudantes de root que se escriben en esta pasada (`/usr/local/libexec`), para el manifiesto. Sin root son la
+    # copia del paquete que ya va en su casa, y no los escribe nadie aquí.
+    ayudantes = []
+    ruta_de_ayudantes = {ambito.lector, ambito.respaldo, ambito.entrada, ambito.actualizar, ambito.agentes}
+
+    def fichero_anotado(ruta, contenido, *resto, **claves):
+        if ambito.root and ruta in ruta_de_ayudantes:
+            ayudantes.append((ruta, contenido.encode() if isinstance(contenido, str) else contenido))
+        return fichero(ruta, contenido, *resto, **claves)
+
+    lector = planear_lector(sis, det, origen, acciones, bloqueos, avisos, fichero_anotado)
+    respaldo = planear_respaldo(sis, det, origen, acciones, bloqueos, avisos, fichero_anotado)
+    entrada = planear_entrada(sis, det, origen, acciones, bloqueos, avisos, fichero_anotado)
+    actualizar = planear_actualizar(sis, det, origen, acciones, bloqueos, fichero_anotado)
+    agentes = planear_agentes(sis, det, origen, acciones, bloqueos, avisos, fichero_anotado)
+    # Desde la 1.6.4: el manifiesto de lo instalado, antes que el vigía (que lo lee al arrancar su primera vuelta). Es un
+    # fichero más del plan: se reescribe si cambia, y el instalador lo cuenta entre los suyos.
+    fichero(os.path.join(ambito.carpeta_avisos, NOMBRE_DEL_MANIFIESTO), manifiesto_de(codigo, ayudantes, ambito.prefijo),
+            0o644, detalle="la suma de lo instalado, con la que el vigía dice qué se ha tocado a mano")
     credencial = (vigia["credencial"] + "\n").encode() if vigia["credencial"] else None
     secreto = sis.leer(ambito.secreto_vigia)
     propias = [

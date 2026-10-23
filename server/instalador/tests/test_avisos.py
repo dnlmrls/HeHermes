@@ -172,6 +172,50 @@ class Base(unittest.TestCase):
         return ambito.de_root() if self.euid == 0 else ambito.de_usuario(*self.cuenta)
 
 
+class ElManifiestoDeLoInstalado(Base):
+    """Desde la 1.6.4 el instalador deja la suma de lo que instala junto a `vigia.ini`, y el vigía
+    (`hehermes_avisos.vigia.integridad`) la compara: dice qué se tocó a mano, solo por el nombre."""
+
+    def setUp(self):
+        super().setUp()
+        sys.path.insert(0, str(apoyo.REPO / "server" / "avisos"))
+        self.addCleanup(sys.path.remove, str(apoyo.REPO / "server" / "avisos"))
+        from hehermes_avisos.vigia import integridad
+        self.integridad = integridad
+
+    def sumar(self, ruta):
+        import hashlib
+        if not self.sis.existe(ruta):
+            raise FileNotFoundError(ruta)
+        return hashlib.sha256(self.sis.leer(ruta)).hexdigest()
+
+    def test_el_vigia_lo_lee_y_coincide_con_lo_instalado(self):
+        self.assertEqual(self.orden("instalar", "--si", "--avisos", codigo()), 0, self.salida)
+        ruta = self.ambito().carpeta_avisos + "/" + avisos.NOMBRE_DEL_MANIFIESTO
+        self.assertEqual(avisos.NOMBRE_DEL_MANIFIESTO, self.integridad.NOMBRE)
+        self.assertEqual(avisos.CABECERA_DEL_MANIFIESTO, self.integridad.CABECERA)
+        entradas = self.integridad.leer(self.sis.leer_texto(ruta))
+        self.assertIsNotNone(entradas, "el vigía entiende lo que escribe el instalador")
+        nombres = {nombre for _, nombre, _ in entradas}
+        self.assertIn("hehermes_avisos/vigia/fichero.py", nombres)
+        self.assertTrue({"hehermes-leer-media", "hehermes-actualizar", "hehermes-agentes"} <= nombres, nombres)
+        self.assertFalse([n for n in nombres if "__pycache__" in n])
+        self.assertEqual(self.integridad.cambiados(entradas, self.sumar), [])
+        self.assertEqual(self.sis.modo(ruta), 0o644)
+
+    def test_tocar_un_fichero_a_mano_se_nota(self):
+        self.assertEqual(self.orden("instalar", "--si", "--avisos", codigo()), 0, self.salida)
+        a = self.ambito()
+        entradas = self.integridad.leer(self.sis.leer_texto(a.carpeta_avisos + "/" + avisos.NOMBRE_DEL_MANIFIESTO))
+        self.sis.escribir(a.actualizar, b"#!/bin/sh\n# parche a mano\n")
+        self.assertEqual(self.integridad.cambiados(entradas, self.sumar), ["hehermes-actualizar"])
+
+    def test_repetir_la_instalacion_no_lo_cambia(self):
+        self.assertEqual(self.orden("instalar", "--si", "--avisos", codigo()), 0, self.salida)
+        self.assertEqual(self.orden("instalar", "--plan"), 0, self.salida)
+        self.assertIn("Todo al día: 0 cambios.", self.salida)
+
+
 class ConRoot(Base):
     def test_instalar_con_avisos_deja_el_vigia_hablando_con_el_rele(self):
         self.assertEqual(self.orden("instalar", "--si", "--avisos", codigo()), 0, self.salida)

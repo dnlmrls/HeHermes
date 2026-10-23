@@ -932,6 +932,20 @@ arrancar_respaldo
 arrancar_entrada
 arrancar_actualizar
 arrancar_agentes
+# El manifiesto de lo instalado (desde la 1.6.4): la suma del código de $PREFIJO/src y de los ayudantes de
+# /usr/local/libexec. El vigía la compara y dice los ficheros que alguien ha tocado a mano (el 2026-10-08 se puso un parche
+# a mano en fichero.py y esta actualización lo habría borrado sin que nadie lo supiera). Lo escribe el propio Python del
+# vigía, el mismo código que compara, y va después de poner todos los ayudantes. Si falla, se dice y se sigue: es un
+# aviso de más, no algo de lo que dependa el servidor.
+paso "manifiesto de lo instalado"
+AYUDANTES_INSTALADOS=()
+for ayudante in "$LECTOR" "$RESPALDO" "$ENTRADA" "$ACTUALIZAR" "$AGENTES"; do
+  [[ -f "$ayudante" ]] && AYUDANTES_INSTALADOS+=("$ayudante")
+done
+"$VENV_PY" -I -B -m hehermes_avisos.vigia.integridad escribir "$CONF/manifiesto.sha256" "$PREFIJO/src" \
+  "${AYUDANTES_INSTALADOS[@]}" \
+  || echo "    no se ha podido escribir el manifiesto: el vigía no podrá decir si alguien toca estos ficheros a mano"
+
 # Con los dos puertos ya de systemd, los servicios: con el código nuevo, y el relé con la clave si Daniel ya la ha
 # puesto (sin ella, arranca igual y contesta 503).
 for unidad in hehermes-vigia hehermes-rele; do

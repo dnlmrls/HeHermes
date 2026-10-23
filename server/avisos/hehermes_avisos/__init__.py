@@ -80,4 +80,30 @@ máquina se lleva este paquete entero y arranca solo su mitad.
 #        quitar un iPhone desde la app se barren sus altas (`/avisos/v1/iphones/barrer`, firmado). Y el aviso del código
 #        de recuperación (§12.9): un buzón que deja el instalador, y el aviso a los demás iPhone, nunca al que entra; no
 #        se barre mientras quede uno por mandar.
-VERSION = "1.6.2"
+# 1.6.3: el Hermes de mediados de octubre guarda la fila `user` de todo turno de la API con `display_kind:
+#        internal_notification`, y el vigía solo veía como turno la que no llevaba ninguno: no encontraba la continuación
+#        que él mismo lanzaba, avisaba de la entrega como si nadie la hubiera contestado y daba cada respuesta por un
+#        trabajo en segundo plano. Abren turno las dos (`deteccion.abre_turno`, la misma regla que la app).
+#        Y el tipo de un EPUB (`application/epub+zip`), que se puso a mano en el VPS el 2026-10-08.
+# 1.6.4: el vigía nota que Hermes cambia (2026-10-22, contrato §17.2). Apunta la versión y el commit de Hermes (su
+#        /health y el .git de su código, sin ejecutar git) y cuándo cambian; cada `display_kind` y cada código de error
+#        que no conoce, con su primera vez y cuántas veces, registrado una sola vez; y, tras un cambio o cada seis horas,
+#        mira las últimas sesiones y comprueba que cada fila `user` se clasifica (`vigia.observatorio`). Y compara lo
+#        instalado con su manifiesto (`vigia.integridad`, que dejan `instalar.sh` y el instalador) y dice los ficheros
+#        cambiados a mano, solo sus nombres. Todo en `vigilancia` de GET /avisos/v1/servidor.
+#        Y crear un agente lleva `Idempotency-Key` (contrato §18.3): el ayudante apunta la clave en el trabajo y un POST con
+#        la misma devuelve ese trabajo en vez de crear otro agente con un número detrás (la respuesta de un POST se
+#        puede perder, y la app lo reintenta).
+# 1.6.5: lo que Hermes sabe de ti y lo que sabe hacer, solo para leer (2026-10-23, contrato §18.12):
+#        `GET /avisos/v1/agentes/<perfil>/memoria|habilidades`. Lo lee el ayudante de los agentes (`memoria` y
+#        `habilidades`), que sí entra en la casa de cada perfil; Hermes no tiene rutas para esto y no se le añaden.
+# 1.6.6: «Enviar más tarde» (2026-10-23, contrato §19): el vigía guarda los mensajes que el usuario deja para una hora (texto,
+#        conversación, hora y el cuerpo del turno que arma la app, con sus instrucciones y su esfuerzo; esquema 7 del
+#        almacén) y los lanza a su hora con `POST /v1/runs` y su `Idempotency-Key`, aunque la app esté cerrada. Una tarea
+#        de Hermes no vale: no tiene `session_id`. Rutas `/avisos/v1/programados…` (crear, listar, cambiar y borrar).
+# 1.6.7: las Actividades en Vivo de los turnos largos con la app suspendida (2026-10-23, contrato §20). La app le registra
+#        el token de cada actividad (`POST /avisos/v1/dispositivos/{token}/actividades`; esquema 8 del almacén) y el
+#        vigía, que ya lee las filas de la conversación, le manda el paso y los subagentes mientras trabaja y la respuesta
+#        al acabar, cifrados con la clave del iPhone. Van por el relé, con el token del iPhone para el permiso y el
+#        límite, y el de la actividad como destino (`tipo: "liveactivity"`). El alta dice `"actividades": true`.
+VERSION = "1.6.7"

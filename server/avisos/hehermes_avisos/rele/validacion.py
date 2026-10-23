@@ -9,6 +9,11 @@ las pocas claves que usa la app; y ``c`` con la forma de un sobre. Así, un vig�
 respuesta en ``alert`` —o en cualquier otro sitio— no llega a Apple en claro: se rechaza aquí. Tampoco pasa ``badge``,
 que es de la extensión. Y el hilo y el colapso tienen que ser lo que calcula el vigía, 32 caracteres hexadecimales de
 un HMAC: un id de sesión o un texto en su lugar se rechazan.
+
+**Las Actividades en Vivo** (``tipo: "liveactivity"``, avisos 1.6.7, contrato §20) siguen la misma regla. Se autorizan
+con el ``token`` del iPhone, como cualquier aviso —el permiso de App Attest y el límite son los suyos—, y van al token
+de la actividad (``actividad``). Su payload es solo ``aps`` con lo que pide Apple para actualizarla o acabarla, y en su
+``content-state`` solo números, la fase y el sobre: el paso y la respuesta viajan cifrados, y nada en claro pasa.
 """
 
 from __future__ import annotations
@@ -21,7 +26,15 @@ from dataclasses import dataclass
 
 from ..comun import ENTORNOS, PATRON_TOKEN, ErrorHTTP
 
-CAMPOS = frozenset({"token", "entorno", "prioridad", "payload", "colapso", "caduca"})
+CAMPOS = frozenset({"token", "entorno", "prioridad", "payload", "colapso", "caduca", "tipo", "actividad"})
+TIPOS = ("alert", "liveactivity")
+# Lo que lleva el ``aps`` de una Actividad en Vivo, y lo único que puede llevar su ``content-state``.
+CLAVES_APS_ACTIVIDAD = frozenset({"timestamp", "event", "content-state", "dismissal-date", "stale-date"})
+CLAVES_ESTADO = frozenset({"fase", "subagentes", "run", "vuelta", "fin", "c"})
+EVENTOS = ("update", "end")
+# La fase es una palabra (``FaseDeLaActividad`` de la app), y el run, el id de Hermes.
+PATRON_FASE = re.compile(r"[a-z]{1,20}")
+PATRON_RUN = re.compile(r"[A-Za-z0-9_-]{1,80}")
 PRIORIDADES = (5, 10)
 # El tope de Apple para un push normal.
 TOPE_CARGA = 4096
@@ -41,6 +54,9 @@ class AvisoValidado:
     carga: bytes
     colapso: str | None
     caduca: int | None
+    tipo: str = "alert"
+    # El token de la Actividad en Vivo a la que va; ``None`` en un aviso.
+    actividad: str | None = None
 
 
 def _rechazo(motivo: str) -> ErrorHTTP:
@@ -81,6 +97,11 @@ def validar_carga(carga, reservas: list) -> bytes:
         raise _rechazo("aps.sound solo puede ser «default»: el tono lo elige la extensión")
     if "interruption-level" in aps and aps["interruption-level"] not in NIVELES:
         raise _rechazo("aps.interruption-level no es válido")
+    _validar_sobre(sobre)
+    return _en_bytes(carga)
+
+
+def _validar_sobre(sobre) -> None:
     if not isinstance(sobre, dict) or set(sobre) != {"v", "n", "t"}:
         raise _rechazo("c tiene que ser un sobre {v, n, t}")
     if not (_es_entero(sobre["v"]) and 1 <= sobre["v"] <= 255):
@@ -89,6 +110,47 @@ def validar_carga(carga, reservas: list) -> bytes:
         raise _rechazo("c.n tiene que medir 12 bytes")
     if len(_base64(sobre["t"], "t")) < 16:
         raise _rechazo("c.t no llega ni a la etiqueta")
+
+
+def _es_instante(valor) -> bool:
+    return (_es_entero(valor) or isinstance(valor, float)) and 0 <= valor < 10 ** 11
+
+
+def validar_carga_de_actividad(carga) -> bytes:
+    """El payload de una Actividad en Vivo ya comprobado: ``aps`` y nada más; en él, lo que pide Apple; y en su
+    ``content-state``, la fase, los números, el run y el sobre. Ni una alerta ni un texto en claro."""
+    if not isinstance(carga, dict) or set(carga) != {"aps"}:
+        raise _rechazo("el payload de una actividad tiene que traer «aps», y nada más")
+    aps = carga["aps"]
+    if not isinstance(aps, dict) or not set(aps) <= CLAVES_APS_ACTIVIDAD:
+        raise _rechazo("aps trae claves que el relé no deja pasar en una actividad")
+    if aps.get("event") not in EVENTOS:
+        raise _rechazo("aps.event tiene que ser «update» o «end»")
+    if not _es_entero(aps.get("timestamp")) or not _es_instante(aps["timestamp"]):
+        raise _rechazo("aps.timestamp tiene que ser un instante en segundos")
+    for fecha in ("dismissal-date", "stale-date"):
+        if fecha in aps and not (_es_entero(aps[fecha]) and _es_instante(aps[fecha])):
+            raise _rechazo(f"aps.{fecha} tiene que ser un instante en segundos")
+    estado = aps.get("content-state")
+    if (not isinstance(estado, dict) or not set(estado) <= CLAVES_ESTADO
+            or not {"fase", "subagentes", "vuelta"} <= set(estado)):
+        raise _rechazo("aps.content-state trae claves que el relé no deja pasar, o le faltan fase, subagentes y vuelta")
+    if not (isinstance(estado["fase"], str) and PATRON_FASE.fullmatch(estado["fase"])):
+        raise _rechazo("content-state.fase tiene que ser una palabra")
+    if not (_es_entero(estado["subagentes"]) and 0 <= estado["subagentes"] <= 999):
+        raise _rechazo("content-state.subagentes tiene que ser un número")
+    if not (_es_entero(estado["vuelta"]) and 0 <= estado["vuelta"] < 2 ** 31):
+        raise _rechazo("content-state.vuelta tiene que ser un número")
+    if estado.get("run") is not None and not (isinstance(estado["run"], str) and PATRON_RUN.fullmatch(estado["run"])):
+        raise _rechazo("content-state.run no es un id de run")
+    if estado.get("fin") is not None and not _es_instante(estado["fin"]):
+        raise _rechazo("content-state.fin tiene que ser un instante en segundos")
+    if estado.get("c") is not None:
+        _validar_sobre(estado["c"])
+    return _en_bytes(carga)
+
+
+def _en_bytes(carga: dict) -> bytes:
     datos = json.dumps(carga, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(datos) > TOPE_CARGA:
         raise ErrorHTTP(413, "payload_demasiado_grande", f"el payload pasa de {TOPE_CARGA} bytes")
@@ -114,5 +176,16 @@ def validar(peticion: dict, reservas: list) -> AvisoValidado:
     caduca = peticion.get("caduca")
     if caduca is not None and not (_es_entero(caduca) and 0 <= caduca <= CADUCA_MAXIMA):
         raise _rechazo("caduca no válido (segundos, hasta 30 días)")
+    tipo = peticion.get("tipo", "alert")
+    if tipo not in TIPOS:
+        raise _rechazo("tipo no válido («alert» o «liveactivity»)")
+    if tipo == "liveactivity":
+        actividad = peticion.get("actividad")
+        if not isinstance(actividad, str) or not PATRON_TOKEN.fullmatch(actividad):
+            raise _rechazo("actividad no válida (el token de la actividad, hexadecimal en minúsculas)")
+        return AvisoValidado(token, entorno, prioridad, validar_carga_de_actividad(peticion.get("payload")), colapso,
+                             caduca, tipo, actividad)
+    if "actividad" in peticion:
+        raise _rechazo("un aviso no lleva «actividad»")
     carga = validar_carga(peticion.get("payload"), reservas)
     return AvisoValidado(token, entorno, prioridad, carga, colapso, caduca)

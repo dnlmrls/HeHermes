@@ -79,10 +79,10 @@ class ClienteAPNs:
         self._cliente.close()
 
     def enviar(self, token: str, entorno: str, carga: bytes, prioridad: int, colapso: str | None = None,
-               expiracion: int | None = None) -> RespuestaAPNs:
+               expiracion: int | None = None, tipo: str = "alert") -> RespuestaAPNs:
         limite = self.reloj() + self.plazo
         url = f"{self.bases[entorno]}/3/device/{token}"
-        cabeceras = {"apns-topic": self.tema, "apns-push-type": "alert", "apns-priority": str(prioridad),
+        cabeceras = {"apns-topic": tema_de(self.tema, tipo), "apns-push-type": tipo, "apns-priority": str(prioridad),
                      "content-type": "application/json"}
         if colapso:
             cabeceras["apns-collapse-id"] = colapso
@@ -118,6 +118,12 @@ class ClienteAPNs:
                 continue
             return ultima
         return ultima
+
+
+def tema_de(tema: str, tipo: str) -> str:
+    """El ``apns-topic``: el de la app para los avisos, y con ``.push-type.liveactivity`` para sus Actividades en Vivo,
+    que es como lo pide Apple."""
+    return f"{tema}.push-type.liveactivity" if tipo == "liveactivity" else tema
 
 
 def _motivo(respuesta: httpx.Response) -> str:

@@ -39,6 +39,16 @@ registro = logging.getLogger("vigia.agentes")
 
 PREFIJO = "/avisos/v1/agentes"
 RUTA = re.compile(r"/avisos/v1/agentes(?:/(personalidad|trabajos/([^/]*)|[^/]*))?/?")
+#: `/avisos/v1/agentes/<perfil>/memoria|habilidades` (§18.12, 1.6.5): solo lectura.
+RUTA_DE_LO_QUE_SABE = re.compile(r"/avisos/v1/agentes/([^/]*)/(memoria|habilidades)/?")
+ORIGENES_DE_MEMORIA = ("memoria", "usuario")
+ORIGENES_DE_HABILIDAD = ("suya", "hermes")
+#: Lo mismo que lee el ayudante: aquí se vuelve a recortar lo que conteste, que no es de fiar más que la forma.
+MAX_ENTRADAS = 200
+MAX_ENTRADA = 4 * 1024
+MAX_HABILIDADES = 400
+MAX_NOMBRE_HABILIDAD = 80
+MAX_DESCRIPCION_HABILIDAD = 300
 NO_DISPONIBLE = "agentes_no_disponible"
 PRINCIPAL = "default"
 PATRON_PERFIL = re.compile(r"[a-z0-9]{1,24}")
@@ -75,7 +85,7 @@ PLAZO_PERSONALIDAD = 170.0
 #: de contestar), y la lista mira cada agente con un plazo de 1 s. Así un ayudante atascado no tiene a la app esperando.
 #: Elegir un modelo (al crear o al cambiarlo) le pregunta antes a Hermes qué ofrece, con 8 s de plazo (§18.11).
 PLAZO_AYUDANTE = 60.0
-PLAZOS = {"listar": 10.0, "ver": 10.0, "trabajo": 10.0, "cambiar": 20.0, "crear": 30.0, "borrar": 30.0}
+PLAZOS = {"listar": 10.0, "ver": 10.0, "memoria": 10.0, "habilidades": 10.0, "trabajo": 10.0, "cambiar": 20.0, "crear": 30.0, "borrar": 30.0}
 #: Una clave de un agente: lo que puede ir en una cabecera, en una línea (la de la pasarela, `leer_clave_de_agente`).
 PATRON_CLAVE = re.compile(r"[\x21-\x7e]{1,512}")
 
@@ -247,6 +257,22 @@ def _objeto(datos: bytes) -> dict:
     return objeto
 
 
+#: La `Idempotency-Key` de un «crear» (§18.3, desde la 1.6.4): lo que cabe en una cabecera, de 8 a 128 caracteres. La
+#: misma forma que comprueba el ayudante.
+PATRON_CLAVE_DE_CREACION = re.compile(r"[A-Za-z0-9._~-]{8,128}")
+
+
+def clave_de_creacion(cabeceras) -> str | None:
+    """La `Idempotency-Key` de la petición, o None si no viene (una app de antes: se crea como siempre), o 400 si no
+    tiene la forma."""
+    valor = cabeceras.get("Idempotency-Key") if cabeceras is not None else None
+    if valor is None:
+        return None
+    if not PATRON_CLAVE_DE_CREACION.fullmatch(valor):
+        raise _invalido("La Idempotency-Key son de 8 a 128 letras, cifras, puntos, guiones o virgulillas")
+    return valor
+
+
 def para_crear(cuerpo: dict) -> dict:
     """Lo de `POST /avisos/v1/agentes`, con su forma (contrato §18.3), o 400. Todos los campos, y nada más."""
     if set(cuerpo) != CAMPOS_AL_CREAR:
@@ -331,8 +357,15 @@ class Agentes:
             raise _error_de(respuesta if isinstance(respuesta, dict) else {}, NO_DISPONIBLE)
         return respuesta
 
-    def atender(self, metodo: str, ruta: str, leer_cuerpo) -> tuple:
+    def atender(self, metodo: str, ruta: str, leer_cuerpo, cabeceras=None) -> tuple:
         sin_cache = {"Cache-Control": "no-store"}
+        de_lo_que_sabe = RUTA_DE_LO_QUE_SABE.fullmatch(ruta)
+        if de_lo_que_sabe:
+            _exigir(metodo, "GET")
+            perfil = perfil_valido(de_lo_que_sabe.group(1))
+            if de_lo_que_sabe.group(2) == "memoria":
+                return 200, self.memoria(perfil), sin_cache
+            return 200, self.habilidades(perfil), sin_cache
         encontrada = RUTA.fullmatch(ruta)
         if not encontrada:
             raise ErrorHTTP(404, "ruta_desconocida", "Ruta desconocida")
@@ -341,7 +374,7 @@ class Agentes:
             if metodo == "GET":
                 return 200, self.listar(), sin_cache
             _exigir(metodo, "POST", "GET, POST")
-            return 202, self.crear(_objeto(leer_cuerpo())), sin_cache
+            return 202, self.crear(_objeto(leer_cuerpo()), clave_de_creacion(cabeceras)), sin_cache
         if que == "personalidad":
             _exigir(metodo, "POST")
             return 200, self.personalidad(_objeto(leer_cuerpo())), sin_cache
@@ -367,9 +400,49 @@ class Agentes:
         agentes = [agente for agente in (agente_limpio(dato) for dato in lista) if agente is not None]
         return {"agentes": agentes, "caben": max(0, min(TOPE_AGENTES, caben)) if _entero(caben) else 0}
 
-    def crear(self, cuerpo: dict) -> dict:
+    def memoria(self, perfil: str) -> dict:
+        """Lo que Hermes sabe de ti (§18.12): sus entradas, de solo lectura. Lo lee el ayudante, que puede entrar en la
+        casa de Hermes; aquí solo se comprueba la forma. Al registro, cuántas: nunca el texto."""
+        respuesta = self._pedir({"orden": "memoria", "perfil": perfil})
+        lista = respuesta.get("entradas")
+        if not isinstance(lista, list):
+            raise ErrorHTTP(502, NO_DISPONIBLE, "El ayudante de los agentes contesta algo que no entiendo")
+        entradas = []
+        for dato in lista[:MAX_ENTRADAS]:
+            if (isinstance(dato, dict) and dato.get("origen") in ORIGENES_DE_MEMORIA
+                    and isinstance(dato.get("texto"), str) and dato["texto"].strip()):
+                entradas.append({"origen": dato["origen"], "texto": _recortar(dato["texto"], MAX_ENTRADA)})
+        registro.info("agentes: memoria de %s (%d entradas)", perfil, len(entradas))
+        return {"entradas": entradas,
+                "incompleta": respuesta.get("incompleta") is True or len(lista) > MAX_ENTRADAS}
+
+    def habilidades(self, perfil: str) -> dict:
+        """Lo que Hermes sabe hacer (§18.12): nombre, descripción y de quién es cada habilidad. De solo lectura."""
+        respuesta = self._pedir({"orden": "habilidades", "perfil": perfil})
+        lista = respuesta.get("habilidades")
+        if not isinstance(lista, list):
+            raise ErrorHTTP(502, NO_DISPONIBLE, "El ayudante de los agentes contesta algo que no entiendo")
+        habilidades = []
+        for dato in lista[:MAX_HABILIDADES]:
+            if (isinstance(dato, dict) and dato.get("origen") in ORIGENES_DE_HABILIDAD
+                    and isinstance(dato.get("nombre"), str) and dato["nombre"].strip()):
+                descripcion = dato.get("descripcion")
+                habilidades.append({
+                    "nombre": _recortar(dato["nombre"], MAX_NOMBRE_HABILIDAD),
+                    "descripcion": _recortar(descripcion, MAX_DESCRIPCION_HABILIDAD) if isinstance(descripcion, str) else "",
+                    "origen": dato["origen"]})
+        registro.info("agentes: habilidades de %s (%d)", perfil, len(habilidades))
+        return {"habilidades": habilidades,
+                "incompleta": respuesta.get("incompleta") is True or len(lista) > MAX_HABILIDADES}
+
+    def crear(self, cuerpo: dict, clave: str | None = None) -> dict:
         datos = para_crear(cuerpo)
-        respuesta = self._pedir(dict(datos, orden="crear"))
+        # Con clave (la `Idempotency-Key` de la app), el ayudante contesta el mismo trabajo si ya lo creó: la respuesta
+        # de un POST se puede perder, y sin esto el reintento hacía otro agente con un número detrás.
+        pedido = dict(datos, orden="crear")
+        if clave is not None:
+            pedido["clave"] = clave
+        respuesta = self._pedir(pedido)
         trabajo, perfil = respuesta.get("trabajo"), respuesta.get("perfil")
         if not (isinstance(trabajo, str) and PATRON_ID.fullmatch(trabajo) and isinstance(perfil, str)
                 and PATRON_PERFIL.fullmatch(perfil)):

@@ -32,8 +32,11 @@ registro = logging.getLogger("vigia.almacen")
 # qué iPhone de la pasarela es cada alta, firmado por ella (`dispositivos.iphone` e `iphone_marca`: su nombre y la marca
 # de su token, contrato §12.10): al quitar uno desde la app se borran las suyas, y al que entra con el código de
 # recuperación no se le avisa de sí mismo (§12.9). Las de antes no lo dicen (NULL) hasta que su iPhone vuelve a darse de
-# alta o a decir que está delante.
-ESQUEMA = 6
+# alta o a decir que está delante. La 7 (2026-10-23, «Enviar más tarde»), la tabla `programados`: los mensajes que el usuario deja
+# para una hora y que el vigía lanza a su hora aunque la app esté cerrada (`programados.py`, contrato §19). La 8
+# (2026-10-23, avisos 1.6.7), la tabla `actividades`: el token de cada Actividad en Vivo que la app le registra, para
+# moverla con la app suspendida (`actividades.py`, contrato §20).
+ESQUEMA = 8
 #: El perfil del principal, el de todo lo de antes de los agentes.
 PRINCIPAL = "default"
 
@@ -131,6 +134,19 @@ class Dispositivo:
 
 
 @dataclass(frozen=True)
+class Actividad:
+    """Una Actividad en Vivo que la app registró para que el vigía la mueva con ella suspendida (contrato §20)."""
+    actividad: str
+    token: str
+    perfil: str
+    sesion: str
+    run_id: str | None
+    alta: float
+    vuelta: int
+    ultimo: str | None
+
+
+@dataclass(frozen=True)
 class EstadoSesion:
     id: str
     # La última fila vista. `None` hasta la primera lectura de sus mensajes: entonces vale `referencia`.
@@ -156,6 +172,61 @@ class Turno:
     visto: float
     perfil: str = PRINCIPAL
 
+
+@dataclass(frozen=True)
+class ProgramadoGuardado:
+    """Un mensaje que el usuario dejó para una hora (``programados.py``). ``cuerpo`` es el JSON del turno tal como lo armó la
+    app (``input``, ``instructions``, ``effort``, ``model``, ``provider``): el vigía no lo interpreta, lo manda."""
+
+    clave: str
+    perfil: str
+    sesion: str
+    hora: float
+    cuerpo: dict
+    creado: float
+    # pendiente → lanzando (reclamado: ya no se cambia ni se borra) → lanzado; o fallido / caducado, que se quedan para
+    # que la app lo diga.
+    estado: str = "pendiente"
+    run_id: str | None = None
+    lanzado: float | None = None
+    fallos: int = 0
+    # No se vuelve a intentar antes de esta hora (tras un fallo pasajero).
+    hasta: float = 0.0
+    motivo: str | None = None
+
+
+# La tabla de la versión 7, la misma en una base nueva y en una puesta al día (una prueba compara las dos).
+_TABLA_PROGRAMADOS = """
+    CREATE TABLE IF NOT EXISTS programados (
+        clave TEXT PRIMARY KEY,
+        perfil TEXT NOT NULL DEFAULT 'default',
+        sesion TEXT NOT NULL,
+        hora REAL NOT NULL,
+        cuerpo TEXT NOT NULL,
+        creado REAL NOT NULL,
+        estado TEXT NOT NULL,
+        run_id TEXT,
+        lanzado REAL,
+        fallos INTEGER NOT NULL DEFAULT 0,
+        hasta REAL NOT NULL DEFAULT 0,
+        motivo TEXT
+    );
+"""
+
+# La tabla de la versión 8, la misma en una base nueva y en una puesta al día. `token` es el del iPhone, con el que el relé
+# comprueba el permiso; `ultimo`, lo último que se le mandó (`actividades.huella`), para no repetirlo.
+_TABLA_ACTIVIDADES = """
+    CREATE TABLE IF NOT EXISTS actividades (
+        actividad TEXT PRIMARY KEY,
+        token TEXT NOT NULL,
+        perfil TEXT NOT NULL DEFAULT 'default',
+        sesion TEXT NOT NULL,
+        run_id TEXT,
+        alta REAL NOT NULL,
+        vuelta INTEGER NOT NULL DEFAULT 0,
+        ultimo TEXT
+    );
+"""
 
 # Una base nueva, ya en la última versión. Lo que añade cada paso de `_migrar` tiene que estar también aquí (lo mira una
 # prueba: una base nueva y una puesta al día desde la 1 tienen las mismas columnas).
@@ -202,6 +273,8 @@ _CREAR = f"""
         perfil TEXT NOT NULL DEFAULT 'default'
     );
     CREATE TABLE IF NOT EXISTS estado (clave TEXT PRIMARY KEY, valor TEXT NOT NULL);
+    {_TABLA_PROGRAMADOS}
+    {_TABLA_ACTIVIDADES}
     PRAGMA user_version = {ESQUEMA};
     COMMIT;
 """
@@ -313,6 +386,14 @@ class Almacen:
                     PRAGMA user_version = 6;
                     COMMIT;
                 """)
+            if version < 7:
+                registro.info("base de datos de la versión %d: se pone al día (los mensajes programados)",
+                              max(version, 6))
+                self._con.executescript("BEGIN;" + _TABLA_PROGRAMADOS + "PRAGMA user_version = 7; COMMIT;")
+            if version < 8:
+                registro.info("base de datos de la versión %d: se pone al día (las Actividades en Vivo)",
+                              max(version, 7))
+                self._con.executescript("BEGIN;" + _TABLA_ACTIVIDADES + "PRAGMA user_version = 8; COMMIT;")
 
     # -- Dispositivos
 
@@ -437,6 +518,52 @@ class Almacen:
     def borrar_dispositivo(self, token: str) -> bool:
         with self._cerrojo:
             cursor = self._con.execute("DELETE FROM dispositivos WHERE token = ?", (token,))
+            # Sus actividades se van con él: sin iPhone no hay permiso con el que mandarlas.
+            self._con.execute("DELETE FROM actividades WHERE token = ?", (token,))
+        return cursor.rowcount > 0
+
+    # -- Actividades en Vivo (contrato §20)
+
+    def guardar_actividad(self, actividad: str, token: str, perfil: str, sesion: str, run_id: str | None,
+                          ahora: float, maximo: int = 8) -> bool:
+        """Apunta el token de una actividad de un iPhone dado de alta. Idempotente por actividad: el mismo token otra vez
+        cambia la conversación o el run, y se vuelve a mandar lo que toque. Con más de ``maximo`` en ese iPhone, se olvida
+        la más antigua. ``False`` si el iPhone no está dado de alta."""
+        with self._cerrojo:
+            if self._con.execute("SELECT 1 FROM dispositivos WHERE token = ?", (token,)).fetchone() is None:
+                return False
+            self._con.execute(
+                "INSERT INTO actividades (actividad, token, perfil, sesion, run_id, alta) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(actividad) DO UPDATE SET token = excluded.token, perfil = excluded.perfil, "
+                "sesion = excluded.sesion, run_id = excluded.run_id, ultimo = NULL",
+                (actividad, token, perfil, sesion, run_id, ahora))
+            self._con.execute(
+                "DELETE FROM actividades WHERE token = ? AND actividad NOT IN "
+                "(SELECT actividad FROM actividades WHERE token = ? ORDER BY alta DESC LIMIT ?)", (token, token, maximo))
+        return True
+
+    def actividades(self, perfil: str, sesion: str, ahora: float, vida: float) -> list[Actividad]:
+        """Las actividades de esa conversación. Las de más de ``vida`` se olvidan aquí: iOS ya las ha quitado."""
+        with self._cerrojo:
+            self._con.execute("DELETE FROM actividades WHERE alta < ?", (ahora - vida,))
+            filas = self._con.execute(
+                "SELECT actividad, token, perfil, sesion, run_id, alta, vuelta, ultimo FROM actividades "
+                "WHERE perfil = ? AND sesion = ? ORDER BY alta", (perfil, sesion)).fetchall()
+        return [Actividad(*fila) for fila in filas]
+
+    def anotar_actividad(self, actividad: str, vuelta: int, ultimo: str) -> None:
+        with self._cerrojo:
+            self._con.execute("UPDATE actividades SET vuelta = ?, ultimo = ? WHERE actividad = ?",
+                              (vuelta, ultimo, actividad))
+
+    def borrar_actividad(self, actividad: str, token: str | None = None) -> bool:
+        """Olvida una actividad; con ``token``, solo si es de ese iPhone (lo que pide la app desde la API)."""
+        with self._cerrojo:
+            if token is None:
+                cursor = self._con.execute("DELETE FROM actividades WHERE actividad = ?", (actividad,))
+            else:
+                cursor = self._con.execute("DELETE FROM actividades WHERE actividad = ? AND token = ?",
+                                           (actividad, token))
         return cursor.rowcount > 0
 
     def vincular(self, token: str, iphone: Iphone) -> bool:
@@ -542,4 +669,137 @@ class Almacen:
     def podar_turnos(self, antes_de: float) -> int:
         with self._cerrojo:
             cursor = self._con.execute("DELETE FROM turnos WHERE alta < ?", (antes_de,))
+        return cursor.rowcount
+
+
+    # -- Mensajes programados (`programados.py`)
+
+    _COLUMNAS_PROGRAMADOS = "clave, perfil, sesion, hora, cuerpo, creado, estado, run_id, lanzado, fallos, hasta, motivo"
+
+    @staticmethod
+    def _programado(fila) -> ProgramadoGuardado:
+        return ProgramadoGuardado(clave=fila[0], perfil=fila[1], sesion=fila[2], hora=fila[3],
+                                  cuerpo=json.loads(fila[4]), creado=fila[5], estado=fila[6], run_id=fila[7],
+                                  lanzado=fila[8], fallos=fila[9], hasta=fila[10], motivo=fila[11])
+
+    def programado(self, clave: str) -> ProgramadoGuardado | None:
+        with self._cerrojo:
+            fila = self._con.execute(f"SELECT {self._COLUMNAS_PROGRAMADOS} FROM programados WHERE clave = ?",
+                                     (clave,)).fetchone()
+        return self._programado(fila) if fila else None
+
+    def programados(self, perfil: str | None = None, sesion: str | None = None) -> list[ProgramadoGuardado]:
+        """Los de una conversación (o todos), por hora."""
+        condiciones, valores = [], []
+        if perfil is not None:
+            condiciones.append("perfil = ?")
+            valores.append(perfil)
+        if sesion is not None:
+            condiciones.append("sesion = ?")
+            valores.append(sesion)
+        donde = (" WHERE " + " AND ".join(condiciones)) if condiciones else ""
+        with self._cerrojo:
+            filas = self._con.execute(
+                f"SELECT {self._COLUMNAS_PROGRAMADOS} FROM programados{donde} ORDER BY hora, creado, clave",
+                valores).fetchall()
+        return [self._programado(fila) for fila in filas]
+
+    def contar_programados_pendientes(self) -> int:
+        with self._cerrojo:
+            return self._con.execute("SELECT COUNT(*) FROM programados WHERE estado = 'pendiente'").fetchone()[0]
+
+    def escribir_programado(self, nuevo: ProgramadoGuardado) -> str:
+        """Crea el programado o, si su clave ya estaba **y aún no se ha reclamado**, lo sustituye (la hora, la
+        conversación y el cuerpo; ``creado`` se queda). Devuelve ``creado``, ``cambiado`` o ``igual``; ``ya_lanzado`` si
+        la clave ya estaba reclamada o lanzada: lo que está en camino no se cambia."""
+        with self._cerrojo:
+            actual = self.programado(nuevo.clave)
+            if actual is None:
+                self._con.execute(
+                    f"INSERT INTO programados ({self._COLUMNAS_PROGRAMADOS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (nuevo.clave, nuevo.perfil, nuevo.sesion, nuevo.hora, json.dumps(nuevo.cuerpo, sort_keys=True),
+                     nuevo.creado, "pendiente", None, None, 0, 0.0, None))
+                return "creado"
+            if actual.estado != "pendiente":
+                return ("igual" if (actual.perfil, actual.sesion, actual.hora, actual.cuerpo)
+                        == (nuevo.perfil, nuevo.sesion, nuevo.hora, nuevo.cuerpo) else "ya_lanzado")
+            if (actual.perfil, actual.sesion, actual.hora, actual.cuerpo) == (nuevo.perfil, nuevo.sesion, nuevo.hora,
+                                                                              nuevo.cuerpo):
+                return "igual"
+            self._con.execute("UPDATE programados SET perfil = ?, sesion = ?, hora = ?, cuerpo = ?, fallos = 0, "
+                              "hasta = 0 WHERE clave = ? AND estado = 'pendiente'",
+                              (nuevo.perfil, nuevo.sesion, nuevo.hora, json.dumps(nuevo.cuerpo, sort_keys=True),
+                               nuevo.clave))
+            return "cambiado"
+
+    def cambiar_programado(self, clave: str, hora: float, cuerpo: dict) -> bool:
+        """Solo mientras esté pendiente: desde que se reclama, ya no."""
+        with self._cerrojo:
+            cursor = self._con.execute(
+                "UPDATE programados SET hora = ?, cuerpo = ?, fallos = 0, hasta = 0 WHERE clave = ? "
+                "AND estado = 'pendiente'", (hora, json.dumps(cuerpo, sort_keys=True), clave))
+        return cursor.rowcount > 0
+
+    def borrar_programado(self, clave: str) -> str:
+        """``borrado``, ``no_existe`` o ``ya_lanzado`` (reclamado o lanzado: no se borra, es historia). Uno fallido o
+        caducado sí: es quitar el aviso de la app."""
+        with self._cerrojo:
+            cursor = self._con.execute(
+                "DELETE FROM programados WHERE clave = ? AND estado IN ('pendiente', 'fallido', 'caducado')", (clave,))
+            if cursor.rowcount:
+                return "borrado"
+            return "ya_lanzado" if self.programado(clave) is not None else "no_existe"
+
+    def borrar_programados_de(self, perfil: str, sesion: str) -> int:
+        """Los pendientes de una conversación que se borra: sin esto saldrían a su hora en una sesión archivada."""
+        with self._cerrojo:
+            cursor = self._con.execute(
+                "DELETE FROM programados WHERE perfil = ? AND sesion = ? AND estado IN ('pendiente', 'fallido', "
+                "'caducado')", (perfil, sesion))
+        return cursor.rowcount
+
+    def programados_por_hacer(self, ahora: float) -> list[ProgramadoGuardado]:
+        """Los pendientes o reclamados a medias cuya hora ya ha llegado, por hora."""
+        with self._cerrojo:
+            filas = self._con.execute(
+                f"SELECT {self._COLUMNAS_PROGRAMADOS} FROM programados WHERE estado IN ('pendiente', 'lanzando') "
+                "AND hora <= ? ORDER BY hora, creado, clave", (ahora,)).fetchall()
+        return [self._programado(fila) for fila in filas]
+
+    def proxima_hora_programada(self) -> float | None:
+        with self._cerrojo:
+            fila = self._con.execute(
+                "SELECT MIN(hora) FROM programados WHERE estado IN ('pendiente', 'lanzando')").fetchone()
+        return fila[0]
+
+    def reclamar_programado(self, clave: str) -> bool:
+        """Pendiente → lanzando, de una vez y bajo el cerrojo: quien lo consigue es el único que lo lanza, y desde aquí la
+        app ya no lo puede cambiar ni borrar (un POST que llegó pero se dio por fallido, seguido de un cambio de texto,
+        dejaría el turno con el texto viejo)."""
+        with self._cerrojo:
+            cursor = self._con.execute("UPDATE programados SET estado = 'lanzando' WHERE clave = ? "
+                                       "AND estado = 'pendiente'", (clave,))
+        return cursor.rowcount > 0
+
+    def programado_lanzado(self, clave: str, run_id: str | None, ahora: float) -> None:
+        with self._cerrojo:
+            self._con.execute("UPDATE programados SET estado = 'lanzado', run_id = ?, lanzado = ?, motivo = NULL "
+                              "WHERE clave = ? AND estado = 'lanzando'", (run_id, ahora, clave))
+
+    def programado_con_fallo(self, clave: str, fallos: int, hasta: float) -> None:
+        with self._cerrojo:
+            self._con.execute("UPDATE programados SET fallos = ?, hasta = ? WHERE clave = ?", (fallos, hasta, clave))
+
+    def programado_terminado(self, clave: str, estado: str, motivo: str, ahora: float) -> None:
+        """``fallido`` (Hermes lo rechazó) o ``caducado`` (pasó el retraso máximo sin poder lanzarse)."""
+        with self._cerrojo:
+            self._con.execute("UPDATE programados SET estado = ?, motivo = ?, lanzado = ? WHERE clave = ? "
+                              "AND estado IN ('pendiente', 'lanzando')", (estado, motivo, ahora, clave))
+
+    def podar_programados(self, antes_de: float) -> int:
+        """Olvida los que ya no son del futuro y llevan mucho: lanzados, fallidos o caducados."""
+        with self._cerrojo:
+            cursor = self._con.execute(
+                "DELETE FROM programados WHERE estado IN ('lanzado', 'fallido', 'caducado') AND COALESCE(lanzado, hora) "
+                "< ?", (antes_de,))
         return cursor.rowcount

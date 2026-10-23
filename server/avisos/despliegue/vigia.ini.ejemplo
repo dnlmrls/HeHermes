@@ -32,6 +32,10 @@ secreto_tunel = /etc/hehermes-avisos/vigia/secreto-tunel
 # Directo al api_server, no por el nginx del túnel: ese pone el Bearer a cualquier conexión local, y así el vigía no
 # depende de ello.
 base = http://127.0.0.1:8642
+# Desde la 1.6.4, opcional: la carpeta del código de Hermes (un repositorio git), de la que el vigía lee el commit para
+# notar que Hermes ha cambiado (sin ejecutar git). Sin ella lo busca en /usr/local/lib/hermes-agent y /opt/hermes-agent;
+# si no está, solo mira la versión de su /health.
+# codigo = /usr/local/lib/hermes-agent
 # La API_SERVER_KEY, en un fichero 0600 de hh-vigia. La escribe `sudo hehermes-dispositivo clave`, igual que la de
 # nginx: si la clave cambia, esa orden lo arregla todo y reinicia el vigía.
 clave = /etc/hehermes-avisos/vigia/clave-hermes
@@ -113,6 +117,9 @@ dias = 30
 # Desde la 1.5.5: lo que enseña Ajustes › Tu servidor (GET /avisos/v1/servidor), sin secretos, y actualizarlo desde la
 # app (/avisos/v1/servidor/actualizar). Dónde está el instalador, para saber su versión.
 instalador = /opt/hehermes-servidor
+# Desde la 1.6.4, opcional: el manifiesto de lo instalado (la suma del código y de los ayudantes, que deja instalar.sh), con
+# el que el vigía dice qué ficheros se han tocado a mano. Sin ponerlo, `manifiesto.sha256` junto a este vigia.ini.
+# manifiesto = /etc/hehermes-avisos/manifiesto.sha256
 # El ayudante de root de /usr/local/libexec/hehermes-actualizar, que systemd lanza por cada conexión a este socket
 # (root:hh-vigia 0660) y que lanza la actualización en su propia unidad. Vacío: sin él, la app no puede actualizar el
 # servidor (503). Aquí actualiza lo del instalador; estos avisos siguen con instalar.sh.

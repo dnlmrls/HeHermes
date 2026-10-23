@@ -25,6 +25,10 @@ conexión (``Accept=yes``) con su jaula. Las órdenes:
   con el principal solo), con el **primer agente** se le reinicia **una vez**: en un rato tranquilo, tras fijar
   ``gateway.multiplex_profiles: true`` con ``hermes config set``, ``systemctl restart`` de su unidad, con drenaje
   (``CALMA``).
+- ``memoria`` y ``habilidades`` (§18.12, 2026-10-23): lo que Hermes sabe de ti y lo que sabe hacer, **solo para leer**.
+  De ``memories/MEMORY.md`` y ``USER.md`` (partidos en entradas como los escribe Hermes) y de las cabeceras de
+  ``skills/**/SKILL.md`` (nombre, descripción y si es del usuario o de las que trae Hermes), con tope de tamaño, sin
+  seguir enlaces y sin leer nunca un ``.env``. El vigía no puede entrar en ``/root``: lo lee este ayudante.
 - ``sincronizar-memoria``: lo que sabe de ti, entre el principal y los que lo comparten (§18.8). Lo lanza cada minuto
   ``hehermes-agentes-memoria.timer``.
 
@@ -113,6 +117,29 @@ TRABAJO_DE_HERMES = "MEMORY.md"
 CERROJO_DE_USER = "USER.md.lock"
 #: Las carpetas del perfil para el iPhone (contrato §11 y §16), como las del principal.
 CARPETAS_DEL_IPHONE = ("exports", "entrada")
+
+# Lo que la app lee de la memoria y las habilidades (2026-10-23, §18.12): solo estos nombres, nunca una ruta de fuera.
+#: Los dos ficheros de la memoria de Hermes, con el nombre con el que sale cada uno: sus notas y lo que sabe de ti.
+FICHEROS_DE_MEMORIA = (("MEMORY.md", "memoria"), (USER, "usuario"))
+CARPETA_DE_HABILIDADES = "skills"
+HABILIDAD = "SKILL.md"
+#: Las habilidades que trae Hermes en cada instalación (un `nombre:suma` por línea): lo que no está ahí es del usuario.
+MANIFIESTO_DE_HABILIDADES = ".bundled_manifest"
+#: Hermes limita su memoria a unos miles de caracteres: un fichero de más de esto no es suyo y no se lee.
+TOPE_DE_MEMORIA = 64 * 1024
+TOPE_DE_ENTRADA = 4 * 1024
+TOPE_DE_ENTRADAS = 200
+#: De una habilidad solo se lee la cabecera: el principio de su SKILL.md, sea cual sea su tamaño.
+TOPE_DE_CABECERA = 16 * 1024
+TOPE_DE_HABILIDADES = 400
+#: Carpetas que se miran como mucho al recorrer `skills/` (las categorías y las habilidades): que una casa enorme o
+#: con un bucle de carpetas no tenga al ayudante dando vueltas.
+TOPE_DE_CARPETAS = 2000
+#: `skills/<habilidad>` o `skills/<categoría>/<habilidad>`: Hermes las agrupa por categoría; dos niveles bastan.
+PROFUNDIDAD_DE_HABILIDADES = 2
+PATRON_NOMBRE_DE_CARPETA = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
+TOPE_DE_NOMBRE_DE_HABILIDAD = 80
+TOPE_DE_DESCRIPCION = 300
 #: Lo que se espera al flock de Hermes antes de saltarse ese perfil (o dar la memoria por fallida al crear).
 ESPERA_FLOCK = 5.0
 #: Lo que se espera a que Hermes sirva un perfil nuevo (si ya sirve otros, sin reiniciarlo: lo recoge en caliente),
@@ -181,11 +208,14 @@ MOTIVOS = frozenset({"hermes", "memoria", "clave", "no_se_sirve", "copia", "mode
 CAMPOS = {
     "listar": {"orden"},
     "ver": {"orden", "perfil"},
-    "crear": {"orden", "nombre", "color", "expresion", "descripcion", "personalidad", "memoria", "modelo"},
+    "crear": {"orden", "nombre", "color", "expresion", "descripcion", "personalidad", "memoria", "modelo", "clave"},
     "cambiar": {"orden", "perfil", "nombre", "color", "expresion", "descripcion", "personalidad", "modelo"},
     "borrar": {"orden", "perfil"},
     "trabajo": {"orden", "id"},
     "sincronizar-memoria": {"orden"},
+    # Lo que sabe de ti y lo que sabe hacer, solo para leer (2026-10-23, §18.12).
+    "memoria": {"orden", "perfil"},
+    "habilidades": {"orden", "perfil"},
 }
 CAMBIABLES = ("nombre", "color", "expresion", "descripcion", "personalidad")
 PATRON_CLAVE_ENV = re.compile(r"^\s*(?:export\s+)?API_SERVER_KEY\s*=")
@@ -337,8 +367,22 @@ def validar_modelo(valor) -> dict | None:
     return {"proveedor": valor["proveedor"], "modelo": valor["modelo"]}
 
 
+#: La `Idempotency-Key` de un «crear» (1.6.4): la que manda la app, una por creación. Lo que cabe en una cabecera, sin
+#: espacios, de 8 a 128.
+PATRON_CLAVE_DE_CREACION = re.compile(r"[A-Za-z0-9._~-]{8,128}")
+
+
+def validar_clave_de_creacion(valor) -> str | None:
+    if valor is None:
+        return None
+    if not isinstance(valor, str) or not PATRON_CLAVE_DE_CREACION.fullmatch(valor):
+        raise _invalido("La clave de idempotencia son de 8 a 128 letras, cifras, puntos, guiones o virgulillas")
+    return valor
+
+
 def validar_creacion(peticion: dict) -> dict:
-    return {"nombre": validar_nombre(peticion.get("nombre")),
+    return {"clave": validar_clave_de_creacion(peticion.get("clave")),
+            "nombre": validar_nombre(peticion.get("nombre")),
             "color": validar_de_la_lista(peticion.get("color"), COLORES, "color"),
             "expresion": validar_de_la_lista(peticion.get("expresion"), EXPRESIONES, "expresion"),
             "descripcion": validar_descripcion(peticion.get("descripcion")),
@@ -1638,13 +1682,31 @@ class Trabajos:
         self.soltar()
         return False
 
-    def nuevo(self, tipo: str, perfil: str) -> str:
+    def nuevo(self, tipo: str, perfil: str, clave: str | None = None) -> str:
         id_ = secrets.token_hex(16)
         ahora = int(self.sistema.ahora())
-        _escribir_json(self.ruta("trabajos", id_ + ".json"), {"id": id_, "tipo": tipo, "perfil": perfil,
-                                                              "estado": "en_cola", "motivo": None, "creado": ahora,
-                                                              "latido": ahora})
+        datos = {"id": id_, "tipo": tipo, "perfil": perfil, "estado": "en_cola", "motivo": None, "creado": ahora,
+                 "latido": ahora}
+        if clave is not None:
+            datos["clave"] = clave
+        _escribir_json(self.ruta("trabajos", id_ + ".json"), datos)
         return id_
+
+    def por_clave(self, clave: str) -> tuple | None:
+        """`(id, perfil)` del trabajo de crear que se pidió con esa `Idempotency-Key`, o None. Se miran todos los que
+        quedan en la carpeta (los de más de un día se olvidan, `limpiar`), también los que fallaron: reintentar una
+        creación que falló es otra creación, y la app la pide con otra clave."""
+        try:
+            nombres = os.listdir(self.ruta("trabajos"))
+        except OSError:
+            return None
+        for nombre in nombres:
+            datos = _leer_json(self.ruta("trabajos", nombre))
+            if isinstance(datos, dict) and datos.get("tipo") == "crear" and datos.get("clave") == clave \
+                    and isinstance(datos.get("id"), str) and PATRON_ID.fullmatch(datos["id"]) \
+                    and isinstance(datos.get("perfil"), str) and PATRON_PERFIL.fullmatch(datos["perfil"]):
+                return datos["id"], datos["perfil"]
+        return None
 
     def poner(self, id_: str, **cambios) -> None:
         ruta = self.ruta("trabajos", id_ + ".json")
@@ -1721,6 +1783,8 @@ class Ayudante:
             return self.cambiar(peticion)
         if orden == "borrar":
             return self.borrar(peticion.get("perfil"))
+        if orden in ("memoria", "habilidades"):
+            return self.lo_que_sabe(orden, peticion.get("perfil")), None
         if orden == "trabajo":
             datos = self.trabajos.leer(validar_id(peticion.get("id")))
             if datos is None:
@@ -1877,17 +1941,42 @@ class Ayudante:
         servido = self._servidos([perfil]).get(perfil, False)
         return dict(self._agente(perfil, leido, servido), personalidad=personalidad, ok=True)
 
+    def lo_que_sabe(self, que: str, perfil) -> dict:
+        """La memoria o las habilidades de un agente (§18.12), solo para leer. Como `ver`: el perfil con su forma y
+        que exista; lo demás lo hace una función de la casa, como el dueño de Hermes."""
+        perfil = validar_perfil(perfil)
+        if perfil != PRINCIPAL and perfil not in self.perfiles():
+            raise Rechazo(404, "agente_desconocido", "Ese agente no existe")
+        casa = self.config.casa
+        leido = self.sistema.como_hermes((lambda: leer_memoria(casa, perfil)) if que == "memoria"
+                                         else (lambda: leer_habilidades(casa, perfil)))
+        # Al registro, el perfil y cuántas: nunca lo que dicen.
+        _decir("perfil %s: %s, %d" % (perfil, que, len(leido["entradas" if que == "memoria" else "habilidades"])))
+        return dict(leido, ok=True)
+
     # -- Crear
 
     def crear(self, peticion: dict) -> tuple:
         datos = validar_creacion(peticion)
         if self._casa_es_un_perfil():
             raise Rechazo(409, "tope_de_agentes", "Este Hermes es un perfil de otro: aquí no caben agentes")
+        # El mismo «crear» otra vez (1.6.4): la respuesta se perdió y la app reintenta con su misma clave. Se contesta
+        # el mismo trabajo, antes del cerrojo (si sigue en marcha, tendría el 409 `en_curso`) y sin crear otro perfil
+        # con un número detrás.
+        repetido = self._creacion_repetida(datos["clave"])
+        if repetido is not None:
+            return repetido, None
         # Antes del cerrojo y del 202: que Hermes lo ofrece (o el 409 o el 502 de §18.10, sin crear nada).
         datos["elegido"] = None if datos["modelo"] is None else self._comprobar_modelo(datos["modelo"])
         if not self.trabajos.tomar():
             raise Rechazo(409, "en_curso", "Ya hay un trabajo de los agentes en marcha")
         try:
+            # Otra vez con el cerrojo ya nuestro: un reintento que corría a la vez pudo acabar de crearlo entre la
+            # primera mirada y aquí.
+            repetido = self._creacion_repetida(datos["clave"])
+            if repetido is not None:
+                self.trabajos.soltar()
+                return repetido, None
             perfiles = self.perfiles()
             if len(perfiles) >= TOPE_AGENTES:
                 raise Rechazo(409, "tope_de_agentes", "Ya hay %d agentes" % TOPE_AGENTES)
@@ -1895,7 +1984,7 @@ class Ayudante:
                 raise Rechazo(507, "sin_espacio", "No hay sitio en el disco para otro agente")
             ocupados = set(perfiles) | set(self.sistema.como_hermes(lambda: nombres_en_profiles(self.config.casa)))
             perfil = perfil_de(datos["nombre"], ocupados)
-            id_ = self.trabajos.nuevo("crear", perfil)
+            id_ = self.trabajos.nuevo("crear", perfil, datos["clave"])
         except BaseException:
             self.trabajos.soltar()
             raise
@@ -1910,6 +1999,15 @@ class Ayudante:
                 self.trabajos.soltar()
 
         return {"ok": True, "http": 202, "trabajo": id_, "perfil": perfil}, continuar
+
+    def _creacion_repetida(self, clave: str | None) -> dict | None:
+        if clave is None:
+            return None
+        previo = self.trabajos.por_clave(clave)
+        if previo is None:
+            return None
+        _decir("crear %s (trabajo %s): repetido, misma clave" % (previo[1], previo[0][:8]))
+        return {"ok": True, "http": 202, "trabajo": previo[0], "perfil": previo[1]}
 
     def _crear(self, id_: str, perfil: str, datos: dict) -> None:
         self.trabajos.poner(id_, estado="creando")
@@ -2376,6 +2474,176 @@ class Ayudante:
         except OSError as error:
             _decir("memoria compartida: no puedo apuntar lo visto (%s)" % type(error).__name__)
         return {"ok": True, "copiados": hecho["copiados"], "saltados": len(hecho["saltados"])}
+
+
+# MARK: Lo que sabe de ti y lo que sabe hacer (solo lectura, §18.12)
+
+
+def _recortar_bytes(texto: str, maximo: int) -> str:
+    """Hasta `maximo` bytes en UTF-8, sin partir una letra."""
+    return texto.encode("utf-8")[:maximo].decode("utf-8", "ignore")
+
+
+def _sin_control(texto: str) -> str:
+    """Sin caracteres de control (salvo el salto de línea y el tabulador): lo que sale de un fichero que escribió otro no
+    lleva nada que la app o el registro tengan que tragarse."""
+    return "".join(c for c in texto if c in "\n\t" or unicodedata.category(c) not in ("Cc", "Cs"))
+
+
+def partir_memoria(texto: str) -> list:
+    """Las entradas de un MEMORY.md o un USER.md como las escribe Hermes: separadas por una línea con solo `§`
+    (`ENTRY_DELIMITER` de `tools/memory_tool.py`). Sin ninguna, un texto escrito a mano: un párrafo por entrada."""
+    texto = _sin_control(texto.replace("\r\n", "\n").replace("\r", "\n"))
+    trozos, actual, con_marca = [], [], False
+    for linea in texto.split("\n"):
+        if linea.strip() == "\u00a7":
+            con_marca = True
+            trozos.append("\n".join(actual))
+            actual = []
+        else:
+            actual.append(linea)
+    trozos.append("\n".join(actual))
+    if not con_marca:
+        trozos = re.split(r"\n\s*\n", texto)
+    entradas = [_recortar_bytes(t.strip(), TOPE_DE_ENTRADA) for t in trozos]
+    return [e for e in entradas if e][:TOPE_DE_ENTRADAS]
+
+
+def leer_memoria(casa: str, perfil: str) -> dict:
+    """La memoria de un perfil: sus entradas, de `memories/MEMORY.md` y `memories/USER.md` y de nada más. Sin carpeta
+    o sin ficheros, una lista vacía. Un fichero que es un enlace, que no es normal o que pasa del tope no se lee: la
+    lista sale sin él y con `incompleta` (la app lo dice, no enseña un vacío como si fuera cierto)."""
+    carpeta = _carpeta_de_memoria(casa, perfil)
+    entradas, incompleta = [], False
+    if carpeta is None:
+        return {"entradas": entradas, "incompleta": incompleta}
+    try:
+        for nombre, origen in FICHEROS_DE_MEMORIA:
+            try:
+                datos = _leer(carpeta, nombre, TOPE_DE_MEMORIA)
+            except OSError:
+                incompleta = True
+                continue
+            if datos is None:
+                continue
+            for texto in partir_memoria(datos.decode("utf-8", "replace")):
+                entradas.append({"origen": origen, "texto": texto})
+    finally:
+        _cerrar(carpeta)
+    return {"entradas": entradas[:TOPE_DE_ENTRADAS], "incompleta": incompleta or len(entradas) > TOPE_DE_ENTRADAS}
+
+
+def _leer_cabecera(carpeta: int, nombre: str, tope: int) -> bytes | None:
+    """Los primeros `tope` bytes de un fichero normal, sin seguir enlaces, o None si no está. A diferencia de `_leer`,
+    un fichero enorme no es un error: de una habilidad solo importa su cabecera."""
+    try:
+        fd = os.open(nombre, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | _CLOEXEC, dir_fd=carpeta)
+    except FileNotFoundError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "no es un fichero normal")
+        return os.read(fd, tope)
+    finally:
+        os.close(fd)
+
+
+def _sin_comillas(valor: str) -> str:
+    valor = valor.strip()
+    if len(valor) >= 2 and valor[0] == valor[-1] and valor[0] in "\"'":
+        return valor[1:-1].strip()
+    return valor
+
+
+def cabecera_de_habilidad(texto: str) -> dict:
+    """`name` y `description` de la cabecera YAML (entre dos `---`) de un SKILL.md. Lo justo para esos dos: una línea
+    `clave: valor`, entre comillas o no, o un bloque (`>`, `|`) con las líneas que siguen sangradas. Sin cabecera, {}."""
+    lineas = texto.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if not lineas or lineas[0].strip() != "---":
+        return {}
+    datos, clave = {}, None
+    for linea in lineas[1:]:
+        if linea.strip() == "---":
+            break
+        encontrada = re.match(r"([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)", linea)
+        if encontrada and not linea[:1].isspace():
+            clave, valor = encontrada.group(1), encontrada.group(2).strip()
+            datos[clave] = "" if valor in (">", ">-", ">+", "|", "|-", "|+") else _sin_comillas(valor)
+        elif clave is not None and linea.strip() and linea[:1].isspace():
+            datos[clave] = (datos[clave] + " " + linea.strip()).strip()
+    return {k: v for k, v in datos.items() if k in ("name", "description")}
+
+
+def _habilidades_de_hermes(raiz: int) -> set:
+    """Los nombres del manifiesto de lo que trae Hermes; sin manifiesto (o ilegible), ninguno: todas son del usuario."""
+    try:
+        datos = _leer(raiz, MANIFIESTO_DE_HABILIDADES, 256 * 1024)
+    except OSError:
+        return set()
+    nombres = set()
+    for linea in (datos or b"").decode("utf-8", "replace").splitlines():
+        nombre = linea.partition(":")[0].strip()
+        if nombre:
+            nombres.add(nombre)
+    return nombres
+
+
+def leer_habilidades(casa: str, perfil: str) -> dict:
+    """Las habilidades de un perfil: nombre, descripción y si son suyas o de las que trae Hermes. De `skills/` y de
+    nada más, hasta dos carpetas de profundidad, sin seguir enlaces (`dir_fd` y `O_NOFOLLOW`: una carpeta o un
+    SKILL.md que sea un enlace se salta), sin lo que empieza por punto (`.hub`, `.env`…) y leyendo solo la cabecera
+    de cada SKILL.md. Sin carpeta, una lista vacía."""
+    vacia = {"habilidades": [], "incompleta": False}
+    casa_fd = skills = None
+    try:
+        try:
+            casa_fd = abrir_casa(casa, perfil)
+            skills = _abrir_carpeta(CARPETA_DE_HABILIDADES, casa_fd)
+        except OSError:
+            return vacia
+        trae_hermes = _habilidades_de_hermes(skills)
+        encontradas, visitadas, incompleta = [], [0], [False]
+
+        def recorrer(carpeta: int, nivel: int) -> None:
+            try:
+                nombres = sorted(os.listdir(carpeta))
+            except OSError:
+                return
+            for nombre in nombres:
+                if len(encontradas) >= TOPE_DE_HABILIDADES or visitadas[0] >= TOPE_DE_CARPETAS:
+                    incompleta[0] = True
+                    return
+                if not PATRON_NOMBRE_DE_CARPETA.fullmatch(nombre):
+                    continue
+                visitadas[0] += 1
+                try:
+                    hija = _abrir_carpeta(nombre, carpeta)
+                except OSError:
+                    continue
+                try:
+                    try:
+                        cabecera = _leer_cabecera(hija, HABILIDAD, TOPE_DE_CABECERA)
+                    except OSError:
+                        continue
+                    if cabecera is not None:
+                        datos = cabecera_de_habilidad(cabecera.decode("utf-8", "replace"))
+                        nombre_visto = _recortar_bytes(_sin_control(datos.get("name") or nombre).strip(),
+                                                       TOPE_DE_NOMBRE_DE_HABILIDAD) or nombre
+                        descripcion = " ".join(_sin_control(datos.get("description", "")).split())
+                        encontradas.append({
+                            "nombre": nombre_visto,
+                            "descripcion": _recortar_bytes(descripcion, TOPE_DE_DESCRIPCION),
+                            "origen": "hermes" if (nombre in trae_hermes or nombre_visto in trae_hermes) else "suya"})
+                    elif nivel + 1 < PROFUNDIDAD_DE_HABILIDADES:
+                        recorrer(hija, nivel + 1)
+                finally:
+                    os.close(hija)
+
+        recorrer(skills, 0)
+        encontradas.sort(key=lambda h: (h["nombre"].lower(), h["origen"]))
+        return {"habilidades": encontradas, "incompleta": incompleta[0]}
+    finally:
+        _cerrar(skills, casa_fd)
 
 
 # MARK: El socket

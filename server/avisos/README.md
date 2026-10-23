@@ -329,6 +329,27 @@ enseña en Ajustes › Tu servidor cómo está el servidor y, si su instalador e
 instalador (que puede llevar rutas y nombres de los iPhone), en `/var/lib/hehermes-actualizar/registro.txt`, de root, y
 no en el journal.
 
+## Que Hermes cambie no pase sin que nadie lo sepa (desde la 1.6.4)
+
+Hermes es la rama main y se actualiza solo cada noche. El 2026-10-15 empezó a guardar la fila `user` de todo turno con
+`display_kind: "internal_notification"` y el vigía dejó de reconocer los turnos durante siete días. Ahora lo nota él
+(`vigia/observatorio.py`, contrato §17.2, dentro de `vigilancia` de `GET /avisos/v1/servidor`):
+
+- **Versión y commit**: `GET /health` cada 10 minutos y el commit del `.git` del código de Hermes, leído sin ejecutar `git`
+  (`[hermes] codigo` en `vigia.ini`, o `/usr/local/lib/hermes-agent` y `/opt/hermes-agent`; sin él, solo la versión).
+  Apunta cuándo cambian.
+- **Valores que no conoce**: cada `display_kind` de las filas que ya lee y cada `code` de error de Hermes fuera de los
+  conocidos, con la primera vez y cuántas veces; al registro va una sola vez por valor. Lo que una versión nueva del
+  vigía ya conoce se quita al arrancar.
+- **Autocomprobación**: tras un cambio de versión o de commit, y si no cada 6 horas, lee las últimas sesiones y mira que cada
+  fila `user` se clasifique (abre turno, desvío, entrega con su cabecera u oculta).
+- **Ficheros tocados a mano**: `instalar.sh` (y el instalador) dejan `manifiesto.sha256` junto a `vigia.ini` con la suma del
+  código y de los ayudantes de `/usr/local/libexec`; el vigía, sin root, los vuelve a sumar cada 30 minutos y dice los
+  **nombres** de los que ya no coinciden. Sin manifiesto (una instalación de antes), no dice nada.
+
+Se queda en el registro del vigía (`journalctl -u hehermes-vigia | grep -i "ha cambiado\|a mano"`) y en Ajustes › Tu
+servidor de la app. Lo apuntado vive en la tabla `estado` de la base de datos del vigía (clave `observatorio`).
+
 ## Los agentes (desde la 1.6.0)
 
 Spec `docs/superpowers/specs/2026-10-05-agentes-design.md` («Revisión del 2026-10-05»), contrato
@@ -337,6 +358,11 @@ pasarela de Hermes 0.21 sirve en su mismo proceso bajo `/p/<perfil>/`, con su pr
 todos por la misma conexión: la pasarela de HeHermes cambia el token del iPhone por la clave de cada perfil
 (`[agentes] claves` de `pasarela.ini`, `<perfil>.clave`), y a un perfil sin clave le contesta `404 agente_desconocido`.
 
+- **Lo que sabe de ti y lo que sabe hacer** (desde la 1.6.5, contrato §18.12): `GET /avisos/v1/agentes/<perfil>/memoria` y
+  `…/habilidades`, solo lectura. Hermes no tiene rutas para esto y no se le añaden, y el vigía (`hh-vigia`) no entra en
+  `/root`: las órdenes `memoria` y `habilidades` del ayudante de los agentes leen `memories/MEMORY.md`, `memories/USER.md`
+  y las cabeceras de `skills/**/SKILL.md` de la casa del perfil, sin seguir enlaces, con tope de tamaño y sin tocar nunca
+  un `.env`. No hay unidad nueva: es el mismo ayudante, con la misma jaula.
 - **El vigía** vigila todos los perfiles: el principal como siempre y cada agente con su prefijo y su clave (la carpeta
   `[agentes] claves`, `/etc/hehermes-avisos/agentes`, de root y del grupo `hh-vigia`). Lo visto va por perfil (base de
   datos 5: la clave es `(perfil, id)`; lo de antes, del principal) y cada aviso lleva su `perfil` dentro del sobre; el
@@ -421,6 +447,27 @@ mirarlo: de ahí la clave lo primero y el `rescan-profiles`. Ese día, con su He
 crear dio `no_se_sirve` a los 7 s (`multiplex: false`) y borrar tardó 261 s: de ahí el reinicio del primer agente y
 los plazos largos de borrar. **Sin comprobar todavía:** el reinicio del primer agente en el VPS, y un Hermes que ya es
 un perfil de otro (`hermes -p <nombre>`): ahí no se crean agentes.
+
+## Enviar más tarde (desde la 1.6.6)
+
+Spec: la hoja 8 del usuario del 2026-10-22; contrato `server/API-CONTRACT.md` §19. El usuario deja un mensaje para una hora y el
+vigía lo lanza a su hora con `POST /v1/runs` **dentro de la conversación**, aunque la app esté cerrada. Una tarea
+programada de Hermes no vale (§10: no tiene `session_id`) y Hermes está congelado, así que lo hace el vigía, que ya lanza
+turnos solo con las continuaciones de los subagentes.
+
+- **Qué guarda**: en la tabla `programados` del SQLite del vigía (esquema 7), por mensaje: la clave (el id del mensaje, que
+  es también su `Idempotency-Key`), el perfil y la sesión, la hora y el cuerpo del turno **tal como lo armó la app**
+  (`input`, `instructions` con su encabezado, `effort`, `model`, `provider`). El vigía no interpreta nada de eso.
+- **Cuándo lanza** (`programados.decidir`, pura): a su hora y no antes; no encima de un turno en marcha de esa
+  conversación; no pasadas 24 h (queda `caducado` y la app lo enseña). Reclama la fila (`lanzando`) antes de llamar a
+  Hermes, y desde ahí ya no se cambia ni se borra (`409 ya_lanzado`); un reinicio a mitad repite el POST con la misma
+  clave y Hermes devuelve el mismo run.
+- **En el bucle** (`Vigilante.vuelta`): antes de leer ninguna bandeja y antes de comprobar si hay iPhone, y con su propio
+  `try`, así que sale aunque Hermes no conteste a la bandeja o no haya ningún iPhone dado de alta. `siguiente_espera` se
+  ajusta a lo próximo programado.
+- **Rutas**: `PUT`, `GET`, `PATCH` y `DELETE` de `/avisos/v1/programados…`. Sin ayudante ni unidad nueva.
+- **Lo que no hay**: aviso push de un mensaje que falló o caducó (la app lo ve en la lista) y adjuntos programados: la app de esta
+  versión solo programa texto (una foto va en línea en base64 y los ficheros suben al lanzar el turno, no antes).
 
 ## Probar de punta a punta
 

@@ -128,8 +128,14 @@ class AppRele:
             return 429, {"resultado": "limitado", "motivo": "limite_del_rele"}, {"Retry-After": str(int(espera) + 1)}
         expiracion = int(self.reloj()) + aviso.caduca if aviso.caduca is not None else None
         inicio = time.monotonic()
-        respuesta = self.apns.enviar(aviso.token, aviso.entorno, aviso.carga, aviso.prioridad, aviso.colapso,
-                                     expiracion)
+        # Una Actividad en Vivo se autoriza y se limita con el token del iPhone, como un aviso, pero va al suyo.
+        respuesta = self.apns.enviar(aviso.actividad or aviso.token, aviso.entorno, aviso.carga, aviso.prioridad,
+                                     aviso.colapso, expiracion, tipo=aviso.tipo)
+        if aviso.actividad is not None and respuesta.baja:
+            # Lo que ya no vale es la actividad, que acabó: el iPhone sigue dado de alta.
+            registro.info("actividad → %s de «%s»: ya acabada (%s)", destino, credencial.nombre, respuesta.motivo)
+            return 410, {"resultado": "baja", "motivo": respuesta.motivo or "Unregistered", "baja": True,
+                         "actividad": True}, {}
         estado, cuerpo, cabeceras = self._traducir(respuesta, clave_token)
         nivel = logging.INFO if estado == 200 else (logging.ERROR if cuerpo.get("resultado") == "configuracion"
                                                     else logging.WARNING)

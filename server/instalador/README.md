@@ -83,6 +83,18 @@ acaba, dice `hehermes-sigue:` y el mismo comando se engancha a ella. Con el cód
 2026-10-06), un iPhone vuelve a conectar por chat tras reinstalarla o cambiar de iPhone, con una firma que no revela el
 código. Y el modelo de cada agente se elige al crearlo y se cambia luego.
 
+**La 0.13.0 lleva los avisos 1.6.7** (2026-10-23):
+- **Funciones nuevas que trae la app:**
+  - «Enviar más tarde»: el vigía guarda el mensaje y lo lanza a su hora en su conversación, aunque el iPhone esté apagado.
+  - La Actividad en Vivo de un turno largo: el vigía la mueve por push y el relé acepta el tipo `liveactivity`.
+  - La memoria y las habilidades de cada agente, solo para leer.
+  - Crear un agente sin duplicarlo, con su `Idempotency-Key`.
+- **Hermes, vigilado:** el vigía apunta su versión y su commit, lo que devuelve y no reconoce (la marca
+  `internal_notification` de mediados de octubre pasó 7 días sin que nadie la viera) y los ficheros instalados que
+  alguien toca a mano, con el manifiesto que deja la instalación. Lo enseña Ajustes › Tu servidor.
+- **`certifi` 2026.10.19:** sin la raíz de emSign cuyas intermedias tenían las claves comprometidas (PYSEC-2026-4320, la
+  encontró pip-audit al publicar).
+
 **La 0.12.0 instala con el Hermes que haya, desde la 0.15.0** (decisión de Daniel del 2026-10-08). Un probador pegó la
 frase con un Hermes 0.19.0 y la 0.11.2 se paró con `hermes-antiguo`, pidiéndole que lo actualizara él. Ahora un Hermes
 antiguo se instala al momento con lo que tenga: **la mínima es la 0.15.0**, el modelo (`GET /api/model/options`) y el
