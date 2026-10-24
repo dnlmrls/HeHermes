@@ -36,6 +36,42 @@ def _preparar(texto: str) -> str:
     recortado = texto[:TOPE_ENTRADA].replace("\r\n", "\n").replace("\r", "\n")
     return "".join(c for c in recortado if c in "\n\t" or unicodedata.category(c) != "Cc")
 
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Enlaces de conexión
+
+SUSTITUTO_DE_ENLACE = "Enlace de conexión de HeHermes"
+_ENLACE_EN_MARKDOWN = re.compile(r"\[[^\]\n]*\]\(\s*<?hehermes-(?:canje|tls|vpn):[^)\s]*>?\s*\)", re.IGNORECASE)
+_ENLACE_ENTRE_ANGULOS = re.compile(r"<hehermes-(?:canje|tls|vpn):[^\s>]*>", re.IGNORECASE)
+_ENLACE_SUELTO = re.compile(r"hehermes-(?:canje|tls|vpn):[^\s`\"'<>]*", re.IGNORECASE)
+# Lo que cierra la frase o el markdown de alrededor y no es del enlace. Ni «_» ni «~», que caben en el código del canje.
+_CIERRES = ".,;:!?)]}»”’*"
+
+
+def sin_enlaces_de_conexion(texto: str) -> str:
+    """El texto con cada enlace de conexión (``hehermes-canje:``, ``hehermes-tls:``, ``hehermes-vpn:``) cambiado por
+    «Enlace de conexión de HeHermes»: llevan la IP del servidor y el código del canje, la huella o la clave, y la respuesta
+    de Hermes que da el del alta por chat sale en un aviso como cualquier otra.
+
+    La misma regla que la app (``EnlacesDeConexion.tapar``) y los mismos casos, que leen las pruebas de los dos
+    (``HeHermes/HeHermesMensajesTests/Fixtures/enlaces-de-conexion.json``). Un esquema sin nada detrás no lleva secreto
+    y se queda.
+    """
+    if "hehermes-" not in texto.lower():
+        return texto
+    salida = _ENLACE_EN_MARKDOWN.sub(SUSTITUTO_DE_ENLACE, texto)
+    salida = _ENLACE_ENTRE_ANGULOS.sub(SUSTITUTO_DE_ENLACE, salida)
+
+    def tapar(hallado: re.Match) -> str:
+        enlace = hallado.group(0)
+        cuerpo = enlace.rstrip(_CIERRES)
+        detras = enlace[len(cuerpo):]
+        if not cuerpo.partition(":")[2]:
+            return enlace
+        return SUSTITUTO_DE_ENLACE + detras
+
+    return _ENLACE_SUELTO.sub(tapar, salida)
+
 # ---------------------------------------------------------------------------------------------------------------------
 # Ficheros que anuncia Hermes
 
@@ -249,7 +285,7 @@ def de_respuesta(texto: str) -> str:
     Una respuesta que solo trae un fichero dice «Hermes ha creado informe.pdf», que es lo que pone la fila de la lista.
     """
     resto, rutas = sin_media(_preparar(texto))
-    plano = una_linea(sin_markdown(resto))
+    plano = una_linea(sin_markdown(sin_enlaces_de_conexion(resto)))
     if not plano and rutas:
         plano = f"Hermes ha creado {os.path.basename(rutas[0].rstrip('/')) or rutas[0]}"
     return recortar(plano, TOPE_TEXTO)
@@ -260,10 +296,10 @@ def titulo_de_sesion(sesion: dict) -> str:
     hay, su primera petición recortada; si tampoco, «Hermes»."""
     titulo = sesion.get("title")
     if isinstance(titulo, str) and _preparar(titulo).strip():
-        return recortar(una_linea(_preparar(titulo)), TOPE_TITULO)
+        return recortar(una_linea(sin_enlaces_de_conexion(_preparar(titulo))), TOPE_TITULO)
     vista = sesion.get("preview")
     if isinstance(vista, str) and _preparar(vista).strip():
-        primera = next((parte for parte in _preparar(vista).strip().split("\n") if parte), "")
+        primera = next((parte for parte in sin_enlaces_de_conexion(_preparar(vista)).strip().split("\n") if parte), "")
         if len(primera) > TOPE_TITULO_DESDE_PETICION:
             primera = primera[:TOPE_TITULO_DESDE_PETICION].strip() + "…"
         if primera.strip():

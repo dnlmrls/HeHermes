@@ -16,7 +16,7 @@ import json
 import posixpath
 from dataclasses import dataclass
 
-from .. import cifrado
+from .. import cifrado, texto as textos
 from . import deteccion
 
 #: Lo que se queda la respuesta en la pantalla bloqueada (``DecisionDeLaActividad.respuestaVisible`` en la app).
@@ -35,6 +35,26 @@ CADUCA_FINAL = 3600
 VIDA_DE_UN_REGISTRO = 8 * 3600
 #: Cuántas actividades se recuerdan por iPhone: una por conversación con un turno largo, y alguna de más.
 MAXIMO_POR_DISPOSITIVO = 8
+
+
+# -- El push de inicio (contrato §20.5)
+
+#: Cuántos inicios se mandan a cada iPhone por hora. Un inicio es un push de prioridad alta (cuenta para el presupuesto que
+#: Apple reparte, y no publica cifras): este tope es propio y bajo, para que una cadena de continuaciones no lo gaste.
+TOPE_DE_INICIOS_POR_HORA = 4
+#: Cuánto tiempo se espera, tras mandar un inicio, a que la app registre el token de la actividad nueva antes de dar por
+#: perdido ese inicio. Mientras tanto no se manda otro de la misma conversación.
+ESPERA_DEL_REGISTRO = 600
+#: Un inicio que llega tarde ya no dice nada: el turno habrá acabado.
+CADUCA_INICIO = 300
+#: ``attributes-type``: el nombre de ``TurnoEnVivo`` en la app. El relé solo deja pasar este.
+TIPO_DE_ATRIBUTOS = "TurnoEnVivo"
+#: El ``alert`` que Apple exige para arrancar una actividad. Fijo y sin nada de nadie; lo repite el relé
+#: (``rele.validacion.ALERTA_DE_INICIO``) y una prueba mira que coincidan.
+ALERTA_DE_INICIO = ("Hermes", "Hermes está trabajando")
+#: Cuántos agentes con cara caben en lo que dice la app, y la cara del principal por si no ha dicho ninguna.
+MAXIMO_DE_CARAS = 16
+CARA_DE_SERIE = {"nombre": "Hermes", "color": "indigo", "expresion": "serena"}
 
 
 @dataclass(frozen=True)
@@ -144,7 +164,7 @@ def estado_del_turno(filas: list) -> EstadoDelTurno | None:
         if subagentes > 0:
             # Ha contestado, pero deja trabajo en segundo plano: la respuesta de verdad llegará con la continuación.
             return EstadoDelTurno("subagentes", paso, subagentes)
-        return EstadoDelTurno("respuesta", None, 0, _recortar(texto, LARGO_RESPUESTA))
+        return EstadoDelTurno("respuesta", None, 0, _recortar(textos.sin_enlaces_de_conexion(texto), LARGO_RESPUESTA))
     if ultima.get("role") == "assistant" and isinstance(ultima.get("tool_calls"), list) and ultima["tool_calls"]:
         return EstadoDelTurno("trabajando", paso, subagentes)
     return EstadoDelTurno("pensando", paso, subagentes)
@@ -189,3 +209,79 @@ def peticion_al_rele(token: str, entorno: str, actividad: str, carga_: dict, fin
     return {"token": token, "entorno": entorno, "tipo": "liveactivity", "actividad": actividad,
             "prioridad": PRIORIDAD_FINAL if final else PRIORIDAD_PASO, "payload": carga_,
             "caduca": CADUCA_FINAL if final else CADUCA_PASO}
+
+
+def cara_de(caras: str | dict | None, perfil: str) -> dict:
+    """La cara (nombre, color y expresión) con la que la app dijo pintar a ese agente. Sin ella, la de serie: el principal
+    como se ve de fábrica y los demás con el nombre de su perfil."""
+    if isinstance(caras, str):
+        try:
+            caras = json.loads(caras)
+        except ValueError:
+            caras = None
+    cara = caras.get(perfil) if isinstance(caras, dict) else None
+    if isinstance(cara, dict) and all(isinstance(cara.get(campo), str) and cara[campo] for campo in CARA_DE_SERIE):
+        return {campo: cara[campo] for campo in CARA_DE_SERIE}
+    return dict(CARA_DE_SERIE, nombre=CARA_DE_SERIE["nombre"] if perfil == "default" else perfil,
+                color="indigo" if perfil == "default" else "grafito")
+
+
+def hilo_de_la_app(perfil: str, sesion: str) -> str:
+    """La conversación como la nombra la app (``ClaveDeConversacion``): la sesión sola en el principal, o ``perfil~sesión``."""
+    return sesion if perfil == "default" else f"{perfil}~{sesion}"
+
+
+def decidir_inicio(*, delante: bool, silenciada: bool, avisa: bool, con_actividad: bool, mandados: list,
+                   perfil: str, sesion: str, ahora: float, tope: int = TOPE_DE_INICIOS_POR_HORA) -> str | None:
+    """Si hay que arrancar la actividad de un turno que el vigía acaba de lanzar en este iPhone. ``None`` si sí, o por qué no.
+
+    - ``delante``: la app está en pantalla y ya la pide ella.
+    - ``silenciada`` y ``avisa``: el inicio lleva un ``alert`` obligatorio, así que cuenta como un aviso y respeta lo
+      mismo que ellos (la conversación silenciada y el interruptor de ese tipo).
+    - ``con_actividad``: ya tiene una registrada para esa conversación (la app la hizo suya, o una anterior sigue): nunca
+      dos para la misma.
+    - ``mandados``: ``(perfil, sesion, instante, registrado)`` de la última hora. Uno de esta conversación sin registrar
+      y reciente es un inicio que aún no se ha visto aparecer: tampoco otro encima. Y el tope por hora.
+    """
+    if delante:
+        return "la app está delante"
+    if silenciada:
+        return "la conversación está silenciada"
+    if not avisa:
+        return "ese tipo de aviso está apagado"
+    if con_actividad:
+        return "ya tiene una actividad registrada"
+    for perfil_, sesion_, instante, registrado in mandados:
+        if perfil_ == perfil and sesion_ == sesion and not registrado and ahora - instante < ESPERA_DEL_REGISTRO:
+            return "ya se mandó un inicio y la app aún no ha registrado su actividad"
+    if len([1 for _, _, instante, _ in mandados if ahora - instante < 3600]) >= tope:
+        return "tope de inicios por hora"
+    return None
+
+
+def carga_de_inicio(*, perfil: str, sesion: str, cara: dict, run: str | None, ahora: float, clave: bytes,
+                    nonce: bytes | None = None) -> dict:
+    """El push que arranca la actividad (``event: "start"``). Lo que Apple lee en claro es lo mínimo: la cara
+    (``color`` y ``expresion``, dos palabras de una lista) y la hora. La conversación, el agente y su nombre van dentro de
+    ``c`` en los atributos, cifrados con la clave del iPhone, y en claro quedan vacíos; la extensión de widgets los abre al
+    pintar (``TurnoEnVivo.abiertos``)."""
+    secreto = {"hilo": hilo_de_la_app(perfil, sesion), "perfil": perfil, "nombre": cara["nombre"]}
+    claro = json.dumps(secreto, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    atributos = {"hilo": "", "perfil": "", "nombre": "", "color": cara["color"], "expresion": cara["expresion"],
+                 "inicio": int(ahora), "c": cifrado.sellar(claro, clave, nonce)}
+    estado: dict = {"fase": "pensando", "subagentes": 0}
+    if run:
+        estado["run"] = run
+    estado["vuelta"] = 0
+    return {"aps": {"timestamp": int(ahora), "event": "start", "content-state": estado,
+                    "attributes-type": TIPO_DE_ATRIBUTOS, "attributes": atributos,
+                    "alert": {"title": ALERTA_DE_INICIO[0], "body": ALERTA_DE_INICIO[1]},
+                    # Desde iOS 18 sin esto la actividad nace sin token de actualización y nadie la podría mover.
+                    "input-push-token": 1}}
+
+
+def peticion_de_inicio(token: str, entorno: str, inicio: str, carga_: dict) -> dict:
+    """Lo que ve el relé: igual que una actividad, pero a donde va es el token de inicio del iPhone. Prioridad alta, que
+    es la que arranca la pantalla; caduca pronto."""
+    return {"token": token, "entorno": entorno, "tipo": "liveactivity", "actividad": inicio,
+            "prioridad": PRIORIDAD_FINAL, "payload": carga_, "caduca": CADUCA_INICIO}

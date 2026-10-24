@@ -7,6 +7,8 @@
 - ``DELETE /avisos/v1/dispositivos/{token}``             baja (un 404 también le vale a la app)
 - ``POST   /avisos/v1/dispositivos/{token}/actividades``  el token de una Actividad en Vivo, para moverla con la app
   suspendida (``actividades.py``, contrato §20); ``DELETE …/actividades/{actividad}``, que ya acabó
+- ``PUT/DELETE /avisos/v1/dispositivos/{token}/actividades/inicio``  el token con el que iOS deja arrancar una actividad por
+  push, y las caras de los agentes (contrato §20.5)
 - ``GET    /avisos/v1/salud``                            para ver desde Safari que nginx llega al vigía
 - ``GET    /avisos/v1/fichero?sesion=&ruta=``            un fichero que Hermes marcó con ``MEDIA:`` (``fichero.py``),
   los bytes por partes; es la única que no contesta JSON cuando va bien
@@ -61,7 +63,8 @@ import time
 
 from .. import VERSION, cifrado
 from ..comun import ENTORNOS, PATRON_TOKEN, ErrorHTTP, ManejadorJSON, cola, es_ip_publica, es_nombre_dns
-from . import avisos
+from . import actividades, avisos
+from .agentes import COLORES, EXPRESIONES, MAX_NOMBRE
 from .agentes import PREFIJO as PREFIJO_AGENTES
 from .agentes import Agentes
 from .ajustes import MAX_ID_SESION, Ajustes
@@ -274,7 +277,7 @@ class AppVigia:
         self.al_moverse()
         # «actividades»: este vigía mueve las Actividades en Vivo (1.6.7, contrato §20). Sin él, la app usa la tarjeta de
         # la tarea continuada, que mantiene la app despierta (`DecisionDeLaActividad.sustituyeLaTarjeta`).
-        return {"envio": envio, "actividades": True}
+        return {"envio": envio, "actividades": True, "inicios": True}
 
     def ajustes(self, token: str, cuerpo: dict) -> None:
         ajustes = Ajustes.desde_json(cuerpo)
@@ -369,6 +372,30 @@ class AppVigia:
             raise ErrorHTTP(404, "dispositivo_desconocido", "Este dispositivo no estaba dado de alta")
         registro.info("actividad %s de %s registrada", cola(actividad), cola(token))
 
+    def registrar_inicio(self, token: str, cuerpo: dict) -> None:
+        """``PUT …/actividades/inicio``: el token con el que iOS deja arrancar una Actividad en Vivo de este iPhone por push,
+        y las caras de sus agentes (§20.5). Cambia el anterior; 404 si el iPhone no está dado de alta."""
+        inicio = token_valido(cuerpo.get("inicio"))
+        caras = cuerpo.get("caras", {})
+        if not isinstance(caras, dict) or len(caras) > actividades.MAXIMO_DE_CARAS:
+            raise ErrorHTTP(400, "caras_invalidas", "«caras» tiene que ser un objeto de pocos agentes")
+        limpias = {}
+        for perfil, cara in caras.items():
+            perfil = perfil_valido(perfil)
+            if not (isinstance(cara, dict) and isinstance(cara.get("nombre"), str)
+                    and 0 < len(cara["nombre"].strip()) <= MAX_NOMBRE
+                    and cara.get("color") in COLORES and cara.get("expresion") in EXPRESIONES):
+                raise ErrorHTTP(400, "caras_invalidas", "Cada cara lleva nombre, color y expresión de las listas")
+            limpias[perfil] = {"nombre": cara["nombre"].strip(), "color": cara["color"], "expresion": cara["expresion"]}
+        if not self.almacen.guardar_inicio(token, inicio, json.dumps(limpias, ensure_ascii=False), self.reloj()):
+            raise ErrorHTTP(404, "dispositivo_desconocido", "Este dispositivo no estaba dado de alta")
+        registro.info("inicio de actividades de %s registrado (%d caras)", cola(token), len(limpias))
+
+    def olvidar_inicio(self, token: str) -> None:
+        """``DELETE …/actividades/inicio``: la app ya no quiere que se le arranquen actividades. No es un fallo que no
+        estuviera."""
+        self.almacen.borrar_inicio(token)
+
     def olvidar_actividad(self, token: str, actividad: str) -> None:
         if not self.almacen.borrar_actividad(token_valido(actividad), token):
             raise ErrorHTTP(404, "actividad_desconocida", "Esa actividad no estaba registrada")
@@ -455,7 +482,14 @@ class ManejadorVigia(ManejadorJSON):
         elif RUTA_ACTIVIDADES.fullmatch(ruta):
             encontrada = RUTA_ACTIVIDADES.fullmatch(ruta)
             token = token_valido(encontrada.group(1))
-            if encontrada.group(2) is None:
+            if encontrada.group(2) == "inicio":
+                # Antes que «una actividad que olvidar»: `inicio` no es el token de ninguna.
+                if metodo == "PUT":
+                    app.registrar_inicio(token, self.leer_json())
+                else:
+                    self._exigir(metodo, "DELETE")
+                    app.olvidar_inicio(token)
+            elif encontrada.group(2) is None:
                 self._exigir(metodo, "POST")
                 app.registrar_actividad(token, self.leer_json())
             else:

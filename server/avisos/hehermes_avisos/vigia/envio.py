@@ -223,10 +223,11 @@ class Mensajero:
             registro.warning("aviso de %s → %s: %s (%s)", aviso.tipo, donde, resultado.tipo, resultado.motivo)
         return resultado
 
-    def enviar_actividad(self, dispositivo: Dispositivo, actividad: str, peticion: dict) -> Resultado:
+    def enviar_actividad(self, dispositivo: Dispositivo, actividad: str, peticion: dict, inicio: bool = False) -> Resultado:
         """Manda la actualización (o el final) de una Actividad en Vivo con lo mismo que los avisos de ese iPhone: la
         credencial del vigía o el permiso del iPhone (contrato §20). Una baja es de la actividad, que ya acabó: se olvida
-        ella, y el iPhone sigue dado de alta."""
+        ella, y el iPhone sigue dado de alta. Con ``inicio``, lo que va es un push de inicio (§20.5) y ``actividad`` es el token
+        de inicio del iPhone: si Apple lo da por muerto, lo que se olvida es ese token."""
         donde = f"{cola(dispositivo.token)} ({dispositivo.entorno})"
         ahora = self.reloj()
         permiso = None
@@ -238,7 +239,11 @@ class Mensajero:
             resultado = self.rele.enviar(peticion)
         else:
             resultado = self._cliente(permiso).enviar(peticion, permiso=permiso.valor)
-        if resultado.tipo == BAJA:
+        if resultado.tipo == BAJA and inicio:
+            self.almacen.borrar_inicio(dispositivo.token)
+            registro.info("inicio %s → %s: Apple dice que ya no vale (%s); se olvida", cola(actividad), donde,
+                          resultado.motivo)
+        elif resultado.tipo == BAJA:
             self.almacen.borrar_actividad(actividad)
             registro.info("actividad %s → %s: ya acabada (%s); se olvida", cola(actividad), donde, resultado.motivo)
         elif resultado.tipo == PERMISO and permiso is not None:

@@ -106,4 +106,12 @@ máquina se lleva este paquete entero y arranca solo su mitad.
 #        vigía, que ya lee las filas de la conversación, le manda el paso y los subagentes mientras trabaja y la respuesta
 #        al acabar, cifrados con la clave del iPhone. Van por el relé, con el token del iPhone para el permiso y el
 #        límite, y el de la actividad como destino (`tipo: "liveactivity"`). El alta dice `"actividades": true`.
-VERSION = "1.6.7"
+# 1.6.8: tres cosas del 2026-10-24.
+#        - Los enlaces de conexión (`hehermes-canje:`, `hehermes-tls:`, `hehermes-vpn:`) ya no salen en claro en un aviso
+#          ni en la Actividad en Vivo (`texto.sin_enlaces_de_conexion`).
+#        - «Enviar más tarde» admite fotos (a trozos de 48 KiB, `PUT …/{clave}/imagen/{n}`, borradas al salir) y
+#          documentos subidos antes por la entrada (contrato §19).
+#        - El push de inicio de la Actividad en Vivo (contrato §20.5; esquema 9 del almacén): con un turno que lanza el
+#          propio vigía (una continuación o un mensaje programado), la actividad aparece aunque la app esté cerrada. El
+#          relé lo deja pasar con su lista cerrada. Los tokens de Apple se aceptan hasta 255 bytes.
+VERSION = "1.6.8"

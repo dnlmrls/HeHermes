@@ -13,6 +13,15 @@ ya con su encabezado, ``effort``, ``model`` y ``provider``): el vigía no conoce
 conversación, así que la app se los pasa al programarlo y el turno sale como habría salido al enviarlo. Todo en el
 SQLite del vigía (``almacen``, esquema 7): sobrevive a reiniciarse.
 
+**La foto** (2026-10-24). Una foto programada viaja **en el cuerpo del turno**, como la del envío normal (``input`` multimodal con
+``data:image/jpeg;base64,``), pero no puede llegar en el ``PUT``: la pasarela corta las rutas ``/avisos/`` a 64 KiB. La app
+la sube antes **a trozos de 48 KiB** (``PUT …/{clave}/imagen/{n}``, bytes sin más), que el vigía guarda **en memoria** hasta
+que el ``PUT`` del mensaje declare ``imagen: {trozos, tamano, sha256}``: entonces los junta, comprueba el SHA-256 y deja la foto
+en base64 dentro del cuerpo guardado (``imagen``, con ``imagen_sha256``). Sin esquema nuevo: ``cuerpo`` ya era JSON. Hay un
+tope por foto (``TOPE_DE_IMAGEN``) y otro del cuerpo guardado de todos los que esperan (``TOPE_GUARDADO``); y la foto **se
+borra del cuerpo en cuanto el mensaje sale, falla o caduca** (``almacen``): el vigía no se queda 7 días con fotos de nadie.
+Un documento no pasa por aquí: sube por ``/avisos/v1/entrada`` (§16) y el ``input`` lleva su ruta.
+
 **Cuándo lanza** (``decidir``, pura): a su hora y no antes; **no encima de un turno en marcha** de esa conversación
 (``entregas.turno_en_marcha``: espera a que acabe); no tras ``RETRASO_MAXIMO`` (24 h, lo que dura la idempotencia de
 Hermes y lo que espera la app sin conexión): pasado eso queda ``caducado`` y la app lo enseña, no se pierde en silencio;
@@ -31,10 +40,13 @@ como siempre, y si falla, el aviso de error.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import math
 import re
+import threading
 import urllib.parse
 
 from ..comun import ErrorHTTP
@@ -75,8 +87,21 @@ PAUSAS = (5.0, 20.0, 60.0, 300.0)
 FILAS_A_MIRAR = 100
 
 #: El cuerpo de la ruta: el texto que quepa en un mensaje y sus instrucciones, no un fichero (esos suben por
-#: ``/avisos/v1/entrada``, contrato §16).
+#: ``/avisos/v1/entrada``, contrato §16). **Por la pasarela llegan 64 KiB**, que es lo que corta ella en ``/avisos/``: por eso la
+#: foto va a trozos.
 TOPE_DEL_CUERPO = 256 * 1024
+#: Lo que lleva cada trozo de una foto: por debajo de los 64 KiB de la pasarela, con holgura para las cabeceras.
+TROZO_DE_IMAGEN = 48 * 1024
+#: Una foto programada: la app guarda las suyas a 2048 px (unos cientos de KB); esto deja sitio de sobra y sigue cabiendo
+#: en los 10 MB que acepta el api_server de Hermes una vez en base64.
+TOPE_DE_IMAGEN = 6 * 1024 * 1024
+#: Los trozos de una foto del tope.
+MAX_TROZOS = -(-TOPE_DE_IMAGEN // TROZO_DE_IMAGEN)
+#: Lo que pueden ocupar los cuerpos guardados de todo lo que espera (``pendiente`` y ``lanzando``), con sus fotos, más los
+#: trozos en espera: el tope total, para que un iPhone no llene el disco del servidor con fotos que saldrán dentro de un mes.
+TOPE_GUARDADO = 64 * 1024 * 1024
+#: Cuánto espera un trozo suelto a que llegue el ``PUT`` del mensaje antes de olvidarse.
+ESPERA_DE_TROZOS = 3600.0
 TOPE_DEL_TEXTO = 100_000
 TOPE_DE_INSTRUCCIONES = 16 * 1024
 ESFUERZOS = ("low", "medium", "high", "xhigh")
@@ -162,18 +187,40 @@ def hora_valida(valor: object, ahora: float) -> float:
     return float(valor)
 
 
+def _entero(valor: object, nombre: str, minimo: int, maximo: int) -> int:
+    if isinstance(valor, bool) or not isinstance(valor, int) or not minimo <= valor <= maximo:
+        raise _invalido(f"«{nombre}» tiene que ser un entero entre {minimo} y {maximo}")
+    return valor
+
+
+def imagen_declarada(valor: object) -> tuple[int, int, str]:
+    """``{"trozos", "tamano", "sha256"}`` del ``PUT``: lo que el vigía tiene que juntar y comprobar."""
+    if not isinstance(valor, dict):
+        raise _invalido("«imagen» es {trozos, tamano, sha256}")
+    tamano = valor.get("tamano")
+    if isinstance(tamano, int) and not isinstance(tamano, bool) and tamano > TOPE_DE_IMAGEN:
+        raise ErrorHTTP(413, "imagen_demasiado_grande", f"Una foto programada pesa como mucho {TOPE_DE_IMAGEN} bytes")
+    tamano = _entero(tamano, "tamano", 1, TOPE_DE_IMAGEN)
+    trozos = _entero(valor.get("trozos"), "trozos", 1, MAX_TROZOS)
+    sha = valor.get("sha256")
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+        raise _invalido("«sha256» son 64 hexadecimales en minúsculas")
+    return trozos, tamano, sha
+
+
 def _texto(valor: object, nombre: str, tope: int, vacio: bool = False) -> str:
     if not isinstance(valor, str) or (not vacio and not valor.strip()) or len(valor) > tope:
         raise _invalido(f"«{nombre}» tiene que ser un texto de hasta {tope} caracteres")
     return valor
 
 
-def cuerpo_valido(datos: dict, base: dict | None = None) -> dict:
+def cuerpo_valido(datos: dict, base: dict | None = None, con_imagen: bool = False) -> dict:
     """El cuerpo del turno a partir de lo que manda la app. Con ``base`` (un cambio parcial), lo que no viene se queda y
-    ``null`` quita ``instructions``, ``effort``, ``model`` y ``provider``."""
+    ``null`` quita ``instructions``, ``effort``, ``model`` y ``provider``. Con una foto (``con_imagen``, la del mensaje o la que
+    ya tenía), el texto puede quedar vacío: una foto sola es un mensaje."""
     cuerpo = dict(base or {})
     if "input" in datos or base is None:
-        cuerpo["input"] = _texto(datos.get("input"), "input", TOPE_DEL_TEXTO)
+        cuerpo["input"] = _texto(datos.get("input"), "input", TOPE_DEL_TEXTO, vacio=con_imagen)
     for campo in ("instructions", "effort", "model", "provider"):
         if campo not in datos:
             continue
@@ -197,7 +244,56 @@ def como_json(p: ProgramadoGuardado) -> dict:
     objeto = {"clave": p.clave, "perfil": p.perfil, "sesion": p.sesion, "hora": p.hora, "estado": p.estado,
               "run_id": p.run_id, "lanzado": p.lanzado, "motivo": p.motivo}
     objeto.update(p.cuerpo)
+    # La foto no vuelve en cada consulta de la app (el temporizador de la conversación pregunta a menudo): solo que la tiene.
+    if objeto.pop("imagen", None) is not None:
+        objeto["con_imagen"] = True
+    objeto.pop("imagen_sha256", None)
     return objeto
+
+
+# -- Los trozos de una foto, en espera
+
+class TrozosEnEspera:
+    """Los trozos de las fotos que la app está subiendo, hasta que el ``PUT`` del mensaje las junta. **En memoria**, a
+    propósito: son transitorios (una hora), un reinicio solo hace que la app repita los que falten (``409
+    imagen_incompleta``) y no hace falta esquema ni limpieza de disco. Cuentan para el tope total.
+
+    **Con cerrojo**: el servidor del vigía atiende cada petición en su hilo (``ThreadingHTTPServer``) y la app sube los
+    trozos de una foto seguidos, mientras el bucle de ``atender`` poda; sumar o podar recorriendo el diccionario mientras
+    otro hilo mete un trozo da ``RuntimeError: dictionary changed size during iteration``."""
+
+    def __init__(self):
+        self._por_clave: dict[str, dict] = {}
+        self._cerrojo = threading.Lock()
+
+    def poner(self, clave: str, n: int, datos: bytes, ahora: float) -> None:
+        with self._cerrojo:
+            entrada = self._por_clave.setdefault(clave, {"desde": ahora, "trozos": {}})
+            entrada["desde"] = ahora
+            entrada["trozos"][n] = datos
+
+    def bytes_en_espera(self, salvo: str | None = None) -> int:
+        with self._cerrojo:
+            return sum(len(t) for c, e in self._por_clave.items() if c != salvo for t in e["trozos"].values())
+
+    def faltan(self, clave: str, trozos: int) -> list[int]:
+        with self._cerrojo:
+            tengo = self._por_clave.get(clave, {}).get("trozos", {})
+            return [n for n in range(trozos) if n not in tengo]
+
+    def juntar(self, clave: str, trozos: int) -> bytes:
+        with self._cerrojo:
+            tengo = self._por_clave[clave]["trozos"]
+            return b"".join(tengo[n] for n in range(trozos))
+
+    def olvidar(self, clave: str) -> None:
+        with self._cerrojo:
+            self._por_clave.pop(clave, None)
+
+    def podar(self, ahora: float) -> None:
+        with self._cerrojo:
+            for clave in [c for c, e in self._por_clave.items() if ahora - e["desde"] > ESPERA_DE_TROZOS]:
+                del self._por_clave[clave]
 
 
 # -- El servicio
@@ -210,6 +306,9 @@ class Programados:
         self.almacen = almacen
         self.reloj = reloj
         self.al_moverse = al_moverse or (lambda: None)
+        # Lo pone el vigía: avisa de un turno recién lanzado con la app cerrada, para arrancarle su Actividad en Vivo.
+        self.al_lanzar = lambda perfil, sesion, run_id, ahora: None
+        self.trozos = TrozosEnEspera()
 
     # La API
 
@@ -226,7 +325,17 @@ class Programados:
             return 200, self.listar(perfil, sesion), sin_cache
         if not ruta.startswith(PREFIJO + "/"):
             raise ErrorHTTP(404, "ruta_desconocida", "Ruta desconocida")
-        clave = clave_valida(ruta[len(PREFIJO) + 1:])
+        resto = ruta[len(PREFIJO) + 1:]
+        if "/" in resto:
+            # Un trozo de la foto: ``{clave}/imagen/{n}``.
+            clave, _, cola = resto.partition("/")
+            partes = cola.split("/")
+            if len(partes) != 2 or partes[0] != "imagen" or not partes[1].isascii() or not partes[1].isdigit():
+                raise ErrorHTTP(404, "ruta_desconocida", "Ruta desconocida")
+            _exigir(metodo, "PUT")
+            self.poner_trozo(clave_valida(clave), int(partes[1]), leer_cuerpo())
+            return 204, None, sin_cache
+        clave = clave_valida(resto)
         if metodo == "PUT":
             estado, objeto = self.crear(clave, _objeto(leer_cuerpo()))
             return estado, objeto, sin_cache
@@ -246,14 +355,19 @@ class Programados:
         ahora = self.reloj()
         perfil, sesion = perfil_valido(datos.get("perfil")), sesion_valida(datos.get("sesion"))
         hora = hora_valida(datos.get("hora"), ahora)
-        cuerpo = cuerpo_valido(datos)
         existente = self.almacen.programado(clave)
+        imagen = self._imagen(clave, datos.get("imagen"), existente) if datos.get("imagen") is not None else None
+        cuerpo = cuerpo_valido(datos, con_imagen=imagen is not None)
+        if imagen is not None:
+            cuerpo["imagen"], cuerpo["imagen_sha256"] = imagen
         if existente is None and self.almacen.contar_programados_pendientes() >= MAX_PENDIENTES:
             raise ErrorHTTP(429, "demasiados_programados", "Hay demasiados mensajes programados esperando")
+        self._cabe_en_el_tope(clave, len(json.dumps(cuerpo)))
         resultado = self.almacen.escribir_programado(
             ProgramadoGuardado(clave=clave, perfil=perfil, sesion=sesion, hora=hora, cuerpo=cuerpo, creado=ahora))
         if resultado == "ya_lanzado":
             raise self._ya_lanzado(clave)
+        self.trozos.olvidar(clave)
         if resultado != "igual":
             self.al_moverse()
         registro.info("programado %s (%s): %s para dentro de %d s", clave[:8], resultado, sesion[:16],
@@ -268,14 +382,55 @@ class Programados:
         if actual.estado != PENDIENTE:
             raise self._ya_lanzado(clave)
         hora = hora_valida(datos["hora"], self.reloj()) if "hora" in datos else actual.hora
-        cuerpo = cuerpo_valido(datos, actual.cuerpo)
+        if "imagen" in datos:
+            raise _invalido("La foto no se cambia con PATCH: se sustituye el mensaje entero con PUT")
+        cuerpo = cuerpo_valido(datos, actual.cuerpo, con_imagen="imagen" in actual.cuerpo)
         if not self.almacen.cambiar_programado(clave, hora, cuerpo):
             # Entre la lectura y el cambio, el vigía lo reclamó: gana el vigía.
             raise self._ya_lanzado(clave)
         self.al_moverse()
         return como_json(self.almacen.programado(clave))
 
+    def poner_trozo(self, clave: str, n: int, datos: bytes) -> None:
+        """``PUT …/{clave}/imagen/{n}``: un trozo de la foto, que espera en memoria al ``PUT`` del mensaje."""
+        if not datos or len(datos) > TROZO_DE_IMAGEN or n >= MAX_TROZOS:
+            raise _invalido(f"Un trozo de foto son de 1 a {TROZO_DE_IMAGEN} bytes, y como mucho {MAX_TROZOS} trozos")
+        actual = self.almacen.programado(clave)
+        if actual is not None and actual.estado != PENDIENTE:
+            raise self._ya_lanzado(clave)
+        ahora = self.reloj()
+        self.trozos.podar(ahora)
+        propio = self.trozos.bytes_en_espera() - self.trozos.bytes_en_espera(salvo=clave) + len(datos)
+        self._cabe_en_el_tope(clave, propio * 4 // 3)
+        self.trozos.poner(clave, n, datos, ahora)
+
+    def _imagen(self, clave: str, declarada: object, existente: ProgramadoGuardado | None) -> tuple[str, str]:
+        """La foto del mensaje: la que dicen los trozos que esperan, o la que el mismo mensaje ya tenía si es el mismo
+        ``PUT`` repetido (la app no sabe si el primero llegó, y los trozos ya se gastaron). ``(base64, sha256)``."""
+        trozos, tamano, sha = imagen_declarada(declarada)
+        if existente is not None and existente.cuerpo.get("imagen_sha256") == sha and "imagen" in existente.cuerpo:
+            return existente.cuerpo["imagen"], sha
+        faltan = self.trozos.faltan(clave, trozos)
+        if faltan:
+            error = ErrorHTTP(409, "imagen_incompleta", "Faltan trozos de la foto")
+            error.extra = {"faltan": faltan[:64]}
+            raise error
+        datos = self.trozos.juntar(clave, trozos)
+        if len(datos) != tamano or hashlib.sha256(datos).hexdigest() != sha:
+            # Lo recibido no es la foto que dice la app: se tira entero y se vuelve a empezar.
+            self.trozos.olvidar(clave)
+            raise ErrorHTTP(422, "imagen_distinta", "Lo recibido no es la foto que declaraste")
+        return base64.b64encode(datos).decode("ascii"), sha
+
+    def _cabe_en_el_tope(self, clave: str, propio: int) -> None:
+        """Lo guardado de todo lo que espera (cuerpos y trozos sueltos de los demás) más lo que va a ocupar este mensaje
+        (``propio``) no pasa de ``TOPE_GUARDADO``."""
+        usado = self.almacen.bytes_de_cuerpos_en_espera(salvo=clave) + self.trozos.bytes_en_espera(salvo=clave)
+        if usado + propio > TOPE_GUARDADO:
+            raise ErrorHTTP(507, "sin_espacio", "Tu servidor no tiene sitio para más mensajes programados con fotos")
+
     def borrar(self, clave: str) -> dict:
+        self.trozos.olvidar(clave)
         resultado = self.almacen.borrar_programado(clave)
         if resultado == "no_existe":
             raise ErrorHTTP(404, "no_encontrado", "No hay ningún mensaje programado con esa clave")
@@ -310,6 +465,7 @@ class Programados:
             except Exception:  # noqa: BLE001 — un mensaje roto no puede parar al resto
                 registro.exception("fallo atendiendo el mensaje programado %s", programado.clave[:8])
         self.almacen.podar_programados(ahora - RECUERDO)
+        self.trozos.podar(ahora)
 
     def _atender(self, programado: ProgramadoGuardado, cliente, ahora: float) -> None:
         decision = decidir(programado, ahora)
@@ -352,6 +508,7 @@ class Programados:
         # Se vigila como los turnos de la app: la respuesta se avisa, y si falla, el aviso de error.
         self.almacen.vigilar_turnos([(run_id, programado.sesion, programado.perfil)], ahora)
         registro.info("programado %s lanzado: run %s", programado.clave[:8], run_id)
+        self.al_lanzar(programado.perfil, programado.sesion, run_id, ahora)
 
     def _terminar(self, programado: ProgramadoGuardado, estado: str, motivo: str, ahora: float) -> None:
         self.almacen.programado_terminado(programado.clave, estado, motivo, ahora)

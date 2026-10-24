@@ -125,6 +125,10 @@ class Vigilante:
         self.almacen = almacen
         # Los mensajes que el usuario dejó para una hora (`programados`, 1.6.6). Sin él, nada.
         self.programados = programados
+        # Lo que se lanza con la app cerrada también puede arrancar su Actividad en Vivo (§20.5).
+        if programados is not None:
+            programados.al_lanzar = lambda perfil, sesion, run_id, ahora: self._iniciar_actividades(
+                perfil, sesion, run_id, ahora, "respuesta")
         # Lo que se mira de Hermes y del servidor sin que nadie lo pida (`observatorio`, desde la 1.6.4). Sin él, nada.
         self.observatorio = observatorio
         # Lo que el instalador deja para avisar del código de recuperación (`recuperacion.Buzon`). Sin buzón, nada de
@@ -585,7 +589,44 @@ class Vigilante:
         # Se vigila como los turnos de la app: si falla sin respuesta, llega el aviso de error.
         self.almacen.vigilar_turnos([(run_id, sid, perfil)], ahora)
         registro.info("entrega %s de %s sin contestar: continuación %s lanzada", decision.delegacion, donde, run_id)
+        self._iniciar_actividades(perfil, sid, run_id, ahora, "segundo-plano")
         return decision.fila, True
+
+    # -- El push de inicio de las Actividades en Vivo (contrato §20.5)
+
+    def _iniciar_actividades(self, perfil: str, sid: str, run_id: str, ahora: float, tipo: str) -> None:
+        """El vigía acaba de lanzar un turno él solo, con la app seguramente cerrada: si el iPhone dijo cómo arrancar una
+        actividad y esa conversación no tiene ya una, se la arranca por push. Nunca rompe el lanzamiento: un fallo aquí es
+        solo una actividad que no sale."""
+        try:
+            # El «Detener» de las que ya hay tiene que parar el run de ahora, no el anterior.
+            self.almacen.actualizar_run_de_actividades(perfil, sid, run_id)
+            for token in self.almacen.iphones_con_inicio():
+                self._iniciar_actividad(token, perfil, sid, run_id, ahora, tipo)
+        except Exception:  # noqa: BLE001
+            self._apuntar_fallo("inicio de actividad", "fallo arrancando la Actividad en Vivo de %s", sid, excepcion=True)
+
+    def _iniciar_actividad(self, token: str, perfil: str, sid: str, run_id: str, ahora: float, tipo: str) -> None:
+        dispositivo = self.almacen.dispositivo(token)
+        iniciado = self.almacen.inicio(token)
+        if dispositivo is None or iniciado is None:
+            return
+        motivo = actividades.decidir_inicio(
+            delante=dispositivo.delante(ahora), silenciada=dispositivo.ajustes.silenciada(sid),
+            avisa=dispositivo.ajustes.avisa_de(tipo),
+            con_actividad=bool(self.almacen.actividades_de_un_iphone(token, perfil, sid)),
+            mandados=self.almacen.inicios_mandados(token, ahora), perfil=perfil, sesion=sid, ahora=ahora)
+        if motivo is not None:
+            registro.debug("sin inicio de actividad para %s en %s: %s", cola(token), sid, motivo)
+            return
+        inicio, caras = iniciado
+        carga = actividades.carga_de_inicio(perfil=perfil, sesion=sid, cara=actividades.cara_de(caras, perfil),
+                                            run=run_id, ahora=ahora, clave=dispositivo.clave)
+        peticion = actividades.peticion_de_inicio(token, dispositivo.entorno, inicio, carga)
+        resultado = self.mensajero.enviar_actividad(dispositivo, inicio, peticion, inicio=True)
+        # Solo lo que salió cuenta para el tope y para no repetir: un relé que no lo entiende (uno de antes) no gasta nada.
+        if resultado.tipo == ENVIADO:
+            self.almacen.anotar_inicio_mandado(token, perfil, sid, ahora)
 
     def _leer(self, cliente, sid: str) -> tuple:
         """Las últimas filas de una conversación, y cuántas se pidieron. Casi siempre bastan 20, las del turno que

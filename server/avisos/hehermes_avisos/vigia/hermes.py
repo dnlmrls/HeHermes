@@ -180,6 +180,11 @@ class ClienteHermes:
         llegó da el mismo run (``replayed``), no otro turno, y si la app lo envía a la vez con la misma clave el servidor
         contesta 409 y sigue habiendo uno solo."""
         envio: dict = {"input": cuerpo["input"], "session_id": sesion}
+        if cuerpo.get("imagen"):
+            # La foto, como la manda la app al enviar (`lanzarRun`): un único turno multimodal, el texto y la imagen en línea.
+            envio["input"] = [{"role": "user", "content": [
+                {"type": "text", "text": cuerpo["input"]},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + cuerpo["imagen"]}}]}]
         if cuerpo.get("instructions"):
             envio["instructions"] = cuerpo["instructions"]
         if cuerpo.get("effort"):

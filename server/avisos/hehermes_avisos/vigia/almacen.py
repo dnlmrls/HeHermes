@@ -35,8 +35,10 @@ registro = logging.getLogger("vigia.almacen")
 # alta o a decir que está delante. La 7 (2026-10-23, «Enviar más tarde»), la tabla `programados`: los mensajes que el usuario deja
 # para una hora y que el vigía lanza a su hora aunque la app esté cerrada (`programados.py`, contrato §19). La 8
 # (2026-10-23, avisos 1.6.7), la tabla `actividades`: el token de cada Actividad en Vivo que la app le registra, para
-# moverla con la app suspendida (`actividades.py`, contrato §20).
-ESQUEMA = 8
+# moverla con la app suspendida (`actividades.py`, contrato §20). La 9 (2026-10-24), el push de inicio (§20.5): las tablas
+# `inicios` (el token con el que iOS deja arrancar una actividad en cada iPhone y las caras de sus agentes) e
+# `inicios_mandados` (los que el vigía ha mandado, para su tope por hora y para no mandar dos de la misma conversación).
+ESQUEMA = 9
 #: El perfil del principal, el de todo lo de antes de los agentes.
 PRINCIPAL = "default"
 
@@ -228,6 +230,25 @@ _TABLA_ACTIVIDADES = """
     );
 """
 
+# Las tablas de la versión 9, las mismas en una base nueva y en una puesta al día. `token` es el del iPhone, `inicio` el que
+# da `Activity.pushToStartTokenUpdates` y `caras` un JSON {perfil: {nombre, color, expresion}}, porque el vigía no sabe
+# pintar la cara de un agente y la actividad que arranca por push la necesita ya hecha.
+_TABLAS_DE_INICIOS = """
+    CREATE TABLE IF NOT EXISTS inicios (
+        token TEXT PRIMARY KEY,
+        inicio TEXT NOT NULL,
+        caras TEXT NOT NULL DEFAULT '{}',
+        alta REAL NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS inicios_mandados (
+        token TEXT NOT NULL,
+        perfil TEXT NOT NULL,
+        sesion TEXT NOT NULL,
+        instante REAL NOT NULL,
+        registrado INTEGER NOT NULL DEFAULT 0
+    );
+"""
+
 # Una base nueva, ya en la última versión. Lo que añade cada paso de `_migrar` tiene que estar también aquí (lo mira una
 # prueba: una base nueva y una puesta al día desde la 1 tienen las mismas columnas).
 _CREAR = f"""
@@ -275,6 +296,7 @@ _CREAR = f"""
     CREATE TABLE IF NOT EXISTS estado (clave TEXT PRIMARY KEY, valor TEXT NOT NULL);
     {_TABLA_PROGRAMADOS}
     {_TABLA_ACTIVIDADES}
+    {_TABLAS_DE_INICIOS}
     PRAGMA user_version = {ESQUEMA};
     COMMIT;
 """
@@ -394,6 +416,10 @@ class Almacen:
                 registro.info("base de datos de la versión %d: se pone al día (las Actividades en Vivo)",
                               max(version, 7))
                 self._con.executescript("BEGIN;" + _TABLA_ACTIVIDADES + "PRAGMA user_version = 8; COMMIT;")
+            if version < 9:
+                registro.info("base de datos de la versión %d: se pone al día (el push de inicio de las actividades)",
+                              max(version, 8))
+                self._con.executescript("BEGIN;" + _TABLAS_DE_INICIOS + "PRAGMA user_version = 9; COMMIT;")
 
     # -- Dispositivos
 
@@ -520,6 +546,8 @@ class Almacen:
             cursor = self._con.execute("DELETE FROM dispositivos WHERE token = ?", (token,))
             # Sus actividades se van con él: sin iPhone no hay permiso con el que mandarlas.
             self._con.execute("DELETE FROM actividades WHERE token = ?", (token,))
+            self._con.execute("DELETE FROM inicios WHERE token = ?", (token,))
+            self._con.execute("DELETE FROM inicios_mandados WHERE token = ?", (token,))
         return cursor.rowcount > 0
 
     # -- Actividades en Vivo (contrato §20)
@@ -540,7 +568,67 @@ class Almacen:
             self._con.execute(
                 "DELETE FROM actividades WHERE token = ? AND actividad NOT IN "
                 "(SELECT actividad FROM actividades WHERE token = ? ORDER BY alta DESC LIMIT ?)", (token, token, maximo))
+            # La app ya ha registrado la actividad de esa conversación: el inicio mandado deja de estar pendiente (sigue
+            # contando para el tope por hora).
+            self._con.execute("UPDATE inicios_mandados SET registrado = 1 WHERE token = ? AND perfil = ? AND sesion = ?",
+                              (token, perfil, sesion))
         return True
+
+    def actualizar_run_de_actividades(self, perfil: str, sesion: str, run_id: str) -> int:
+        """El vigía lanza un turno en esta conversación (la continuación de unos subagentes, un mensaje programado): el
+        «Detener» de sus actividades tiene que parar este run y no el anterior. Con la app suspendida nadie más lo cuenta."""
+        with self._cerrojo:
+            cursor = self._con.execute("UPDATE actividades SET run_id = ? WHERE perfil = ? AND sesion = ?",
+                                       (run_id, perfil, sesion))
+        return cursor.rowcount
+
+    def actividades_de_un_iphone(self, token: str, perfil: str, sesion: str) -> list[Actividad]:
+        with self._cerrojo:
+            filas = self._con.execute(
+                "SELECT actividad, token, perfil, sesion, run_id, alta, vuelta, ultimo FROM actividades "
+                "WHERE token = ? AND perfil = ? AND sesion = ?", (token, perfil, sesion)).fetchall()
+        return [Actividad(*fila) for fila in filas]
+
+    # -- El push de inicio (contrato §20.5)
+
+    def guardar_inicio(self, token: str, inicio: str, caras: str, ahora: float) -> bool:
+        """Apunta el token de inicio de un iPhone dado de alta, con las caras de sus agentes. Cambia el anterior.
+        ``False`` si el iPhone no está dado de alta."""
+        with self._cerrojo:
+            if self._con.execute("SELECT 1 FROM dispositivos WHERE token = ?", (token,)).fetchone() is None:
+                return False
+            self._con.execute(
+                "INSERT INTO inicios (token, inicio, caras, alta) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(token) DO UPDATE SET inicio = excluded.inicio, caras = excluded.caras, alta = excluded.alta",
+                (token, inicio, caras, ahora))
+        return True
+
+    def inicio(self, token: str) -> tuple | None:
+        """``(inicio, caras)`` de un iPhone, o ``None`` si no ha dicho el suyo."""
+        with self._cerrojo:
+            return self._con.execute("SELECT inicio, caras FROM inicios WHERE token = ?", (token,)).fetchone()
+
+    def borrar_inicio(self, token: str) -> bool:
+        with self._cerrojo:
+            cursor = self._con.execute("DELETE FROM inicios WHERE token = ?", (token,))
+        return cursor.rowcount > 0
+
+    def iphones_con_inicio(self) -> list[str]:
+        with self._cerrojo:
+            return [fila[0] for fila in self._con.execute("SELECT token FROM inicios ORDER BY alta").fetchall()]
+
+    def inicios_mandados(self, token: str, ahora: float, hora: float = 3600.0) -> list[tuple]:
+        """Los inicios mandados a ese iPhone en la última ``hora``, como ``(perfil, sesion, instante, registrado)``. Los
+        de más de una hora se olvidan aquí: ya no cuentan para nada."""
+        with self._cerrojo:
+            self._con.execute("DELETE FROM inicios_mandados WHERE instante < ?", (ahora - hora,))
+            return self._con.execute("SELECT perfil, sesion, instante, registrado FROM inicios_mandados WHERE token = ?",
+                                     (token,)).fetchall()
+
+    def anotar_inicio_mandado(self, token: str, perfil: str, sesion: str, ahora: float) -> None:
+        with self._cerrojo:
+            self._con.execute("INSERT INTO inicios_mandados (token, perfil, sesion, instante) VALUES (?, ?, ?, ?)",
+                              (token, perfil, sesion, ahora))
 
     def actividades(self, perfil: str, sesion: str, ahora: float, vida: float) -> list[Actividad]:
         """Las actividades de esa conversación. Las de más de ``vida`` se olvidan aquí: iOS ya las ha quitado."""
@@ -708,6 +796,26 @@ class Almacen:
         with self._cerrojo:
             return self._con.execute("SELECT COUNT(*) FROM programados WHERE estado = 'pendiente'").fetchone()[0]
 
+    def bytes_de_cuerpos_en_espera(self, salvo: str | None = None) -> int:
+        """Lo que ocupan los cuerpos guardados de lo que aún no ha salido (``pendiente`` y ``lanzando``), con sus fotos: el
+        tope total de ``programados``. ``salvo`` es el que se está escribiendo, que se cuenta aparte."""
+        with self._cerrojo:
+            return self._con.execute(
+                "SELECT COALESCE(SUM(LENGTH(cuerpo)), 0) FROM programados WHERE estado IN ('pendiente', 'lanzando') "
+                "AND clave != ?", (salvo or "",)).fetchone()[0]
+
+    def _soltar_la_foto(self, clave: str) -> None:
+        """Quita la foto del cuerpo guardado: ya salió, falló o caducó, y el vigía no la guarda los 7 días que recuerda el
+        mensaje. Dentro del cerrojo de quien lo llama."""
+        fila = self._con.execute("SELECT cuerpo FROM programados WHERE clave = ?", (clave,)).fetchone()
+        if fila is None:
+            return
+        cuerpo = json.loads(fila[0])
+        if "imagen" not in cuerpo and "imagen_sha256" not in cuerpo:
+            return
+        cuerpo.pop("imagen", None)
+        self._con.execute("UPDATE programados SET cuerpo = ? WHERE clave = ?", (json.dumps(cuerpo, sort_keys=True), clave))
+
     def escribir_programado(self, nuevo: ProgramadoGuardado) -> str:
         """Crea el programado o, si su clave ya estaba **y aún no se ha reclamado**, lo sustituye (la hora, la
         conversación y el cuerpo; ``creado`` se queda). Devuelve ``creado``, ``cambiado`` o ``igual``; ``ya_lanzado`` si
@@ -783,8 +891,10 @@ class Almacen:
 
     def programado_lanzado(self, clave: str, run_id: str | None, ahora: float) -> None:
         with self._cerrojo:
-            self._con.execute("UPDATE programados SET estado = 'lanzado', run_id = ?, lanzado = ?, motivo = NULL "
-                              "WHERE clave = ? AND estado = 'lanzando'", (run_id, ahora, clave))
+            cursor = self._con.execute("UPDATE programados SET estado = 'lanzado', run_id = ?, lanzado = ?, motivo = NULL "
+                                       "WHERE clave = ? AND estado = 'lanzando'", (run_id, ahora, clave))
+            if cursor.rowcount:
+                self._soltar_la_foto(clave)
 
     def programado_con_fallo(self, clave: str, fallos: int, hasta: float) -> None:
         with self._cerrojo:
@@ -793,8 +903,10 @@ class Almacen:
     def programado_terminado(self, clave: str, estado: str, motivo: str, ahora: float) -> None:
         """``fallido`` (Hermes lo rechazó) o ``caducado`` (pasó el retraso máximo sin poder lanzarse)."""
         with self._cerrojo:
-            self._con.execute("UPDATE programados SET estado = ?, motivo = ?, lanzado = ? WHERE clave = ? "
-                              "AND estado IN ('pendiente', 'lanzando')", (estado, motivo, ahora, clave))
+            cursor = self._con.execute("UPDATE programados SET estado = ?, motivo = ?, lanzado = ? WHERE clave = ? "
+                                       "AND estado IN ('pendiente', 'lanzando')", (estado, motivo, ahora, clave))
+            if cursor.rowcount:
+                self._soltar_la_foto(clave)
 
     def podar_programados(self, antes_de: float) -> int:
         """Olvida los que ya no son del futuro y llevan mucho: lanzados, fallidos o caducados."""

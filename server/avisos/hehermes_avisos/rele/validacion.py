@@ -14,6 +14,12 @@ un HMAC: un id de sesión o un texto en su lugar se rechazan.
 con el ``token`` del iPhone, como cualquier aviso —el permiso de App Attest y el límite son los suyos—, y van al token
 de la actividad (``actividad``). Su payload es solo ``aps`` con lo que pide Apple para actualizarla o acabarla, y en su
 ``content-state`` solo números, la fase y el sobre: el paso y la respuesta viajan cifrados, y nada en claro pasa.
+
+**El push de inicio** (``event: "start"``, contrato §20.5) es la única excepción, y la más vigilada: Apple lo exige con ``alert``,
+``attributes-type`` y ``attributes``, que viajan sin cifrar por sus servidores. Por eso aquí es una lista cerrada: el tipo
+de atributos solo puede ser ``TurnoEnVivo``, el ``alert`` es un texto fijo (no el de una conversación), y en los atributos
+lo privado (la conversación, el agente y su nombre) va vacío porque va dentro del sobre ``c``. ``update`` y ``end`` no pueden
+llevar ninguna de esas claves.
 """
 
 from __future__ import annotations
@@ -31,7 +37,18 @@ TIPOS = ("alert", "liveactivity")
 # Lo que lleva el ``aps`` de una Actividad en Vivo, y lo único que puede llevar su ``content-state``.
 CLAVES_APS_ACTIVIDAD = frozenset({"timestamp", "event", "content-state", "dismissal-date", "stale-date"})
 CLAVES_ESTADO = frozenset({"fase", "subagentes", "run", "vuelta", "fin", "c"})
-EVENTOS = ("update", "end")
+EVENTOS = ("update", "end", "start")
+# Lo que lleva el ``aps`` de un push de inicio: todas, ni una más ni una menos. Sin ``dismissal-date`` ni ``stale-date``.
+CLAVES_APS_INICIO = frozenset({"timestamp", "event", "content-state", "attributes-type", "attributes", "alert",
+                               "input-push-token"})
+# El único tipo de atributos que arranca la app (``TurnoEnVivo``), y los campos de ``TurnoEnVivo`` que viajan en su
+# push de inicio. ``hilo``, ``perfil`` y ``nombre`` van vacíos en claro: lo suyo está dentro de ``c``.
+TIPO_DE_ATRIBUTOS = "TurnoEnVivo"
+CLAVES_ATRIBUTOS = frozenset({"hilo", "perfil", "nombre", "color", "expresion", "inicio", "c"})
+PRIVADOS_DE_LOS_ATRIBUTOS = ("hilo", "perfil", "nombre")
+# El ``alert`` que Apple exige al arrancar una actividad: fijo y sin datos de nadie. Lo repite el vigía
+# (``vigia.actividades.ALERTA_DE_INICIO``); una prueba comprueba que son el mismo.
+ALERTA_DE_INICIO = ("Hermes", "Hermes está trabajando")
 # La fase es una palabra (``FaseDeLaActividad`` de la app), y el run, el id de Hermes.
 PATRON_FASE = re.compile(r"[a-z]{1,20}")
 PATRON_RUN = re.compile(r"[A-Za-z0-9_-]{1,80}")
@@ -116,16 +133,48 @@ def _es_instante(valor) -> bool:
     return (_es_entero(valor) or isinstance(valor, float)) and 0 <= valor < 10 ** 11
 
 
+def _validar_inicio(aps: dict) -> None:
+    """Lo que solo lleva el push de inicio, que Apple lee en claro: el tipo de atributos, los atributos, la alerta y el
+    ``input-push-token``. Cualquier cosa fuera de la lista cerrada se rechaza."""
+    if aps["attributes-type"] != TIPO_DE_ATRIBUTOS:
+        raise _rechazo(f"attributes-type solo puede ser «{TIPO_DE_ATRIBUTOS}»")
+    atributos = aps["attributes"]
+    if not isinstance(atributos, dict) or set(atributos) != CLAVES_ATRIBUTOS:
+        raise _rechazo("attributes tiene que traer " + ", ".join(sorted(CLAVES_ATRIBUTOS)) + ", y nada más")
+    for campo in PRIVADOS_DE_LOS_ATRIBUTOS:
+        if atributos[campo] != "":
+            raise _rechazo(f"attributes.{campo} tiene que ir vacío: lo suyo va dentro de «c»")
+    for campo in ("color", "expresion"):
+        if not (isinstance(atributos[campo], str) and PATRON_FASE.fullmatch(atributos[campo])):
+            raise _rechazo(f"attributes.{campo} tiene que ser una palabra")
+    if not _es_instante(atributos["inicio"]):
+        raise _rechazo("attributes.inicio tiene que ser un instante en segundos")
+    _validar_sobre(atributos["c"])
+    alerta = aps["alert"]
+    if (not isinstance(alerta, dict) or set(alerta) != {"title", "body"}
+            or (alerta["title"], alerta["body"]) != ALERTA_DE_INICIO):
+        raise _rechazo("aps.alert tiene que ser el texto fijo de un inicio, sin nada de la conversación")
+    # Sin él, desde iOS 18 la actividad nace sin token de actualización y nadie la podría mover.
+    if not (_es_entero(aps["input-push-token"]) and aps["input-push-token"] == 1):
+        raise _rechazo("aps.input-push-token tiene que ser 1")
+
+
 def validar_carga_de_actividad(carga) -> bytes:
     """El payload de una Actividad en Vivo ya comprobado: ``aps`` y nada más; en él, lo que pide Apple; y en su
     ``content-state``, la fase, los números, el run y el sobre. Ni una alerta ni un texto en claro."""
     if not isinstance(carga, dict) or set(carga) != {"aps"}:
         raise _rechazo("el payload de una actividad tiene que traer «aps», y nada más")
     aps = carga["aps"]
-    if not isinstance(aps, dict) or not set(aps) <= CLAVES_APS_ACTIVIDAD:
-        raise _rechazo("aps trae claves que el relé no deja pasar en una actividad")
+    if not isinstance(aps, dict):
+        raise _rechazo("aps tiene que ser un objeto")
     if aps.get("event") not in EVENTOS:
-        raise _rechazo("aps.event tiene que ser «update» o «end»")
+        raise _rechazo("aps.event tiene que ser «update», «end» o «start»")
+    if aps["event"] == "start":
+        if set(aps) != CLAVES_APS_INICIO:
+            raise _rechazo("un inicio lleva exactamente " + ", ".join(sorted(CLAVES_APS_INICIO)))
+        _validar_inicio(aps)
+    elif not set(aps) <= CLAVES_APS_ACTIVIDAD:
+        raise _rechazo("aps trae claves que el relé no deja pasar en una actividad")
     if not _es_entero(aps.get("timestamp")) or not _es_instante(aps["timestamp"]):
         raise _rechazo("aps.timestamp tiene que ser un instante en segundos")
     for fecha in ("dismissal-date", "stale-date"):

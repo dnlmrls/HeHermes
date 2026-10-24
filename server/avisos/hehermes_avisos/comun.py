@@ -346,10 +346,11 @@ class ManejadorJSON(http.server.BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------------------------------------------------
 # Validación compartida
 
-# Apple no promete la longitud de un token (hoy son 32 bytes, 64 caracteres), así que se acepta un margen y se exige lo
-# que sí es seguro: hexadecimal, en minúsculas, con un número par de caracteres. Siempre con `fullmatch`: con `match` y
-# un «$» al final, un «\n» detrás pasaba, llegaba a la URL de Apple y httpx la rechazaba con una excepción sin capturar.
-PATRON_TOKEN = re.compile(r"(?:[0-9a-f]{2}){32,100}")
+# Apple no promete la longitud de un token (el de un iPhone son hoy 32 bytes, 64 caracteres; los de una Actividad en Vivo
+# y el de inicio son más largos y tampoco tienen largo publicado), así que se acepta un margen amplio y se exige lo que sí
+# es seguro: hexadecimal, en minúsculas, con un número par de caracteres. Siempre con `fullmatch`: con `match` y un «$»
+# al final, un «\n» detrás pasaba, llegaba a la URL de Apple y httpx la rechazaba con una excepción sin capturar.
+PATRON_TOKEN = re.compile(r"(?:[0-9a-f]{2}){32,255}")
 ENTORNOS = ("sandbox", "production")
 
 
